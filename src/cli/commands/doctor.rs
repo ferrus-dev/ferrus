@@ -19,12 +19,18 @@ pub async fn run() -> Result<()> {
         println!("warning: {warning}");
     }
     let mcp_checks = register::configured_hq_mcp_checks().await?;
-    for (ok, message) in &mcp_checks {
-        let status = if *ok { "ok" } else { "error" };
-        println!("{status}: {message}");
+    for check in &mcp_checks {
+        let status = if check.ok {
+            "ok"
+        } else if check.fatal {
+            "error"
+        } else {
+            "warning"
+        };
+        println!("{status}: {}", check.message);
     }
 
-    if report.has_errors() || mcp_checks.iter().any(|(ok, _)| !ok) {
+    if report.has_errors() || mcp_checks.iter().any(|check| check.fatal) {
         anyhow::bail!("ferrus doctor found project registration issues");
     }
     Ok(())

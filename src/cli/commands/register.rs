@@ -130,7 +130,13 @@ pub(crate) async fn ensure_configured_hq_mcp_configs() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn configured_hq_mcp_checks() -> Result<Vec<(bool, String)>> {
+pub(crate) struct McpLaunchCheck {
+    pub(crate) ok: bool,
+    pub(crate) fatal: bool,
+    pub(crate) message: String,
+}
+
+pub(crate) async fn configured_hq_mcp_checks() -> Result<Vec<McpLaunchCheck>> {
     let config = Config::load().await?;
     let Some(hq) = config.hq else {
         return Ok(Vec::new());
@@ -148,13 +154,28 @@ pub(crate) async fn configured_hq_mcp_checks() -> Result<Vec<(bool, String)>> {
     ])
 }
 
-fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>) -> (bool, String) {
+fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>) -> McpLaunchCheck {
     match check() {
-        Ok(()) => (true, format!("{role} MCP config is launchable for {agent}")),
-        Err(err) => (
-            false,
-            format!("{role} MCP config is launchable for {agent} ({err})"),
-        ),
+        Ok(()) => McpLaunchCheck {
+            ok: true,
+            fatal: false,
+            message: format!("{role} MCP config is launchable for {agent}"),
+        },
+        Err(err) => {
+            let message = err.to_string();
+            let missing_config = message.contains("MCP config file not found:");
+            McpLaunchCheck {
+                ok: false,
+                fatal: !missing_config,
+                message: if missing_config {
+                    format!(
+                        "{role} MCP config is not registered for {agent}; run `ferrus register --{role} {agent}`"
+                    )
+                } else {
+                    format!("{role} MCP config is launchable for {agent} ({err})")
+                },
+            }
+        }
     }
 }
 
@@ -1064,6 +1085,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--supervisor-model requires --supervisor"));
+    }
+
+    #[test]
+    fn missing_mcp_config_launch_check_is_non_fatal() {
+        let check = mcp_launch_check(ROLE_EXECUTOR, crate::agents::codex::NAME, || {
+            anyhow::bail!(
+                "Invalid MCP configuration:\nMCP config file not found: /tmp/project/.codex/config.toml"
+            )
+        });
+
+        assert!(!check.ok);
+        assert!(!check.fatal);
+        assert!(check.message.contains("MCP config is not registered"));
+        assert!(check.message.contains("ferrus register --executor codex"));
     }
 
     #[tokio::test]
