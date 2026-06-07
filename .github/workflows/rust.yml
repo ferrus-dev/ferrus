@@ -104,13 +104,19 @@ jobs:
           test -d "$tmpdir/.ferrus/runs"
           test -d "$tmpdir/.agents/skills/ferrus"
 
-          project_id="$(sed -n 's/^project_id = "\(.*\)"/\1/p' "$tmpdir/.ferrus/project.toml")"
-          data_dir="$(sed -n 's/^data_dir = "\(.*\)"/\1/p' "$tmpdir/.ferrus/project.toml")"
+          project_id="$(grep '^project_id = ' "$tmpdir/.ferrus/project.toml" | head -n1)"
+          project_id="${project_id#project_id = }"
+          project_id="${project_id#\"}"
+          project_id="${project_id%\"}"
+          data_dir="$(grep '^data_dir = ' "$tmpdir/.ferrus/project.toml" | head -n1)"
+          data_dir="${data_dir#data_dir = }"
+          data_dir="${data_dir#\"}"
+          data_dir="${data_dir%\"}"
           data_dir="${data_dir//\\\\/\\}"
+          test -n "$project_id"
+          test -n "$data_dir"
           if command -v cygpath >/dev/null 2>&1; then
             data_dir="$(cygpath -u "$data_dir")"
           fi
-          test -n "$project_id"
-          test -n "$data_dir"
           test -f "$data_dir/project.toml"
           test -f "$data_dir/ferrus.db"
