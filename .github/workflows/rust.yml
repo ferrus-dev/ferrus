@@ -106,6 +106,11 @@ jobs:
 
           project_id="$(awk -F ' = ' '$1 == "project_id" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
           data_dir="$(awk -F ' = ' '$1 == "data_dir" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
+          sq="'"
+          project_id="${project_id#$sq}"
+          project_id="${project_id%$sq}"
+          data_dir="${data_dir#$sq}"
+          data_dir="${data_dir%$sq}"
           data_dir="${data_dir//\\\\/\\}"
           if [ -z "$project_id" ]; then
             echo "failed to read project_id from .ferrus/project.toml"
