@@ -104,19 +104,27 @@ jobs:
           test -d "$tmpdir/.ferrus/runs"
           test -d "$tmpdir/.agents/skills/ferrus"
 
-          project_id="$(grep '^project_id = ' "$tmpdir/.ferrus/project.toml" | head -n1)"
-          project_id="${project_id#project_id = }"
-          project_id="${project_id#\"}"
-          project_id="${project_id%\"}"
-          data_dir="$(grep '^data_dir = ' "$tmpdir/.ferrus/project.toml" | head -n1)"
-          data_dir="${data_dir#data_dir = }"
-          data_dir="${data_dir#\"}"
-          data_dir="${data_dir%\"}"
+          project_id="$(awk -F ' = ' '$1 == "project_id" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
+          data_dir="$(awk -F ' = ' '$1 == "data_dir" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
           data_dir="${data_dir//\\\\/\\}"
-          test -n "$project_id"
-          test -n "$data_dir"
+          if [ -z "$project_id" ]; then
+            echo "failed to read project_id from .ferrus/project.toml"
+            cat "$tmpdir/.ferrus/project.toml"
+            exit 1
+          fi
+          if [ -z "$data_dir" ]; then
+            echo "failed to read data_dir from .ferrus/project.toml"
+            cat "$tmpdir/.ferrus/project.toml"
+            exit 1
+          fi
           if command -v cygpath >/dev/null 2>&1; then
             data_dir="$(cygpath -u "$data_dir")"
           fi
-          test -f "$data_dir/project.toml"
-          test -f "$data_dir/ferrus.db"
+          test -f "$data_dir/project.toml" || {
+            echo "missing project metadata at $data_dir/project.toml"
+            exit 1
+          }
+          test -f "$data_dir/ferrus.db" || {
+            echo "missing database at $data_dir/ferrus.db"
+            exit 1
+          }
