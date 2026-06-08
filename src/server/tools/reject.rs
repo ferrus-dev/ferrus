@@ -15,6 +15,7 @@ pub const DESCRIPTION: &str = "Reject the current submission with review notes. 
      exhausted). The Executor's check retry counter is reset for the new cycle.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "notes": {
             "type": "string",

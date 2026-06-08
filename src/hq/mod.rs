@@ -2343,12 +2343,12 @@ mod tests {
 
         let workspace = prepare_executor_workspace("t-001").await.unwrap();
 
-        assert_eq!(
+        let tracked_content =
             tokio::fs::read_to_string(workspace.workspace_dir.join("tracked.txt"))
                 .await
-                .unwrap(),
-            "base\napproved\n"
-        );
+                .unwrap()
+                .replace("\r\n", "\n");
+        assert_eq!(tracked_content, "base\napproved\n");
         assert_eq!(
             tokio::fs::read_to_string(workspace.workspace_dir.join("new.txt"))
                 .await

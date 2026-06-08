@@ -99,6 +99,29 @@ mod tests {
         std::env::set_current_dir(previous).unwrap();
     }
 
+    #[test]
+    fn input_schemas_are_object_schemas() {
+        for (name, schema) in [
+            ("answer", answer::INPUT_SCHEMA),
+            ("ask_human", ask_human::INPUT_SCHEMA),
+            ("consult", consult::INPUT_SCHEMA),
+            ("create_spec", create_spec::INPUT_SCHEMA),
+            ("create_task", create_task::INPUT_SCHEMA),
+            ("enqueue_task", enqueue_task::INPUT_SCHEMA),
+            ("reject", reject::INPUT_SCHEMA),
+            ("respond_consult", respond_consult::INPUT_SCHEMA),
+            ("submit", submit::INPUT_SCHEMA),
+        ] {
+            let schema: serde_json::Value =
+                serde_json::from_str(schema).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(
+                schema.get("type").and_then(serde_json::Value::as_str),
+                Some("object"),
+                "{name} input schema must declare root type object"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn lease_owner_check_accepts_agent_database_task_context() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();

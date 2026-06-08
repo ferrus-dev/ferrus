@@ -13,6 +13,7 @@ pub const DESCRIPTION: &str = "Record the Supervisor's consultation response. \
      Writes the response to CONSULT_RESPONSE.md. Must only be called while state is Consultation.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "response": {
             "type": "string",

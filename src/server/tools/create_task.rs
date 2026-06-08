@@ -10,6 +10,7 @@ pub const DESCRIPTION: &str = "Compatibility task creation tool. Prefer /enqueue
      the task description to .ferrus/tasks/<task-id>.md and records a pending SQLite task row.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "description": {
             "type": "string",

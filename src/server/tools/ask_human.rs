@@ -16,6 +16,7 @@ pub const DESCRIPTION: &str = "Ask the human a question. \
      Can be called from Executing, Addressing, Consultation, or Reviewing state.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "question": {
             "type": "string",

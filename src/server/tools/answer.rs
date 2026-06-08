@@ -9,6 +9,7 @@ pub const DESCRIPTION: &str = "Provide a response to a pending human question wh
      Writes the response to ANSWER.md and restores the previous state so the agent can continue.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "response": {
             "type": "string",

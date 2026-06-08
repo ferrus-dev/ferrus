@@ -15,6 +15,7 @@ pub const DESCRIPTION: &str = "Ask the configured Supervisor for a consultation.
      After calling this tool, call /wait_for_consult to block until the answer is ready.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "question": {
             "type": "string",

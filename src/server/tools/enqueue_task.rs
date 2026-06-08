@@ -11,6 +11,7 @@ pub const DESCRIPTION: &str = "Enqueue an approved task artifact for later execu
      .ferrus/tasks/<task-id>.md and records a pending SQLite task row.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "description": {
             "type": "string",

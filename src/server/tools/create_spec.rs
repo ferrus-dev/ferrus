@@ -14,6 +14,7 @@ pub const DESCRIPTION: &str = "Create an approved feature specification. Writes 
      after explicit user approval of the final spec text.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "markdown": {
             "type": "string",

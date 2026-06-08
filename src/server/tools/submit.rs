@@ -35,6 +35,7 @@ Anything deliberately left out, edge cases not handled, or follow-up work needed
 Omit this section if there are none.";
 
 pub const INPUT_SCHEMA: &str = r#"{
+    "type": "object",
     "properties": {
         "content": {
             "type": "string",
