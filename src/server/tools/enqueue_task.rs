@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use neva::prelude::*;
-use neva::types::CallToolRequestParams;
+use serde::Deserialize;
 use tracing::info;
 
 use crate::project;
@@ -13,27 +13,41 @@ pub const DESCRIPTION: &str = "Enqueue an approved task artifact for later execu
 pub const INPUT_SCHEMA: &str = r#"{
     "type": "object",
     "properties": {
-        "description": {
-            "type": "string",
-            "description": "Full approved task description in Markdown"
-        },
-        "spec_path": {
-            "type": "string",
-            "description": "Optional spec path that originated this task"
-        },
-        "milestone_id": {
-            "type": "string",
-            "description": "Optional milestone ID that originated this task"
+        "input": {
+            "type": "object",
+            "description": "Approved task enqueue request",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Full approved task description in Markdown"
+                },
+                "spec_path": {
+                    "type": "string",
+                    "description": "Optional spec path that originated this task"
+                },
+                "milestone_id": {
+                    "type": "string",
+                    "description": "Optional milestone ID that originated this task"
+                }
+            },
+            "required": ["description"]
         }
     },
-    "required": ["description"]
+    "required": ["input"]
 }"#;
 
-pub async fn handler(params: CallToolRequestParams) -> Result<String, Error> {
-    let (description, spec_path, milestone_id) = parse_input(params).map_err(tool_err)?;
-    run(description, spec_path, milestone_id)
+pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
+    let input = parse_input(input).map_err(tool_err)?;
+    run(input.description, input.spec_path, input.milestone_id)
         .await
         .map_err(tool_err)
+}
+
+#[derive(Debug, Deserialize)]
+struct EnqueueTaskInput {
+    description: String,
+    spec_path: Option<String>,
+    milestone_id: Option<String>,
 }
 
 async fn run(
@@ -106,29 +120,23 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn parse_input(params: CallToolRequestParams) -> Result<(String, Option<String>, Option<String>)> {
-    let args = params.args.unwrap_or_default();
-    let description = args
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Cannot enqueue task: description is required."))?;
-    let spec_path = args
-        .get("spec_path")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let milestone_id = args
-        .get("milestone_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    Ok((description, spec_path, milestone_id))
+fn parse_input(input: serde_json::Value) -> Result<EnqueueTaskInput> {
+    let input: EnqueueTaskInput = serde_json::from_value(input).map_err(|err| {
+        anyhow::anyhow!(
+            "Cannot enqueue task: expected input object with description, optional spec_path, and optional milestone_id ({err})."
+        )
+    })?;
+    if input.description.trim().is_empty() {
+        anyhow::bail!("Cannot enqueue task: description is required.");
+    }
+    Ok(input)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::LocalProjectRef;
+    use neva::types::CallToolRequestParams;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -154,25 +162,69 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_reads_named_arguments() {
+    fn input_schema_requires_wrapped_input_object() {
+        let schema: serde_json::Value = serde_json::from_str(INPUT_SCHEMA).unwrap();
+
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|properties| properties.get("input"))
+                .and_then(|input| input.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|required| required.first())
+                .and_then(serde_json::Value::as_str),
+            Some("input")
+        );
+    }
+
+    #[test]
+    fn parse_input_reads_wrapped_request_object() {
+        let input = parse_input(serde_json::json!({
+            "description": "Build task",
+            "spec_path": "docs/specs/spec.md",
+            "milestone_id": "m1.0",
+        }))
+        .unwrap();
+
+        assert_eq!(input.description, "Build task");
+        assert_eq!(input.spec_path.as_deref(), Some("docs/specs/spec.md"));
+        assert_eq!(input.milestone_id.as_deref(), Some("m1.0"));
+    }
+
+    #[test]
+    fn neva_extracts_wrapped_input_as_single_tool_argument() {
         let params = CallToolRequestParams {
             name: "enqueue_task".to_string(),
-            args: Some(HashMap::from([
-                ("description".to_string(), serde_json::json!("Build task")),
-                (
-                    "spec_path".to_string(),
-                    serde_json::json!("docs/specs/spec.md"),
-                ),
-                ("milestone_id".to_string(), serde_json::json!("m1.0")),
-            ])),
+            args: Some(HashMap::from([(
+                "input".to_string(),
+                serde_json::json!({
+                    "description": "Build task",
+                    "spec_path": "docs/specs/spec.md",
+                    "milestone_id": "m1.0",
+                }),
+            )])),
             meta: None,
         };
 
-        let (description, spec_path, milestone_id) = parse_input(params).unwrap();
+        let (input,): (serde_json::Value,) = params.try_into().unwrap();
+        let input = parse_input(input).unwrap();
 
-        assert_eq!(description, "Build task");
-        assert_eq!(spec_path.as_deref(), Some("docs/specs/spec.md"));
-        assert_eq!(milestone_id.as_deref(), Some("m1.0"));
+        assert_eq!(input.description, "Build task");
+        assert_eq!(input.spec_path.as_deref(), Some("docs/specs/spec.md"));
+        assert_eq!(input.milestone_id.as_deref(), Some("m1.0"));
+    }
+
+    #[test]
+    fn parse_input_rejects_bare_string() {
+        let err = parse_input(serde_json::json!("m1.0")).unwrap_err();
+
+        assert!(err.to_string().contains("expected input object"));
     }
 
     #[tokio::test]

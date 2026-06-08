@@ -21,8 +21,8 @@ Required workflow:
   - Show that draft to the user
   - Revise it if needed
   - Call /enqueue_task only after explicit user approval
-  - Call /enqueue_task with a single JSON object: {\"description\":\"<approved task Markdown>\"}
-  - For free-form tasks, omit spec_path and milestone_id from that JSON object
+  - Call /enqueue_task with a single JSON object: {\"input\":{\"description\":\"<approved task Markdown>\"}}
+  - For free-form tasks, omit spec_path and milestone_id from that input object
   - After /enqueue_task, stop
 
 HARD RULES:
@@ -117,8 +117,8 @@ Required workflow:
       - description: the approved task Markdown
       - spec_path: the exact spec path from this prompt
       - milestone_id: the exact milestone ID for that task
-  - The /enqueue_task arguments must be a single JSON object, for example:
-      {\"description\":\"<approved task Markdown>\",\"spec_path\":\"docs/specs/example.md\",\"milestone_id\":\"m1.0\"}
+  - The /enqueue_task arguments must be a single JSON object with an input object, for example:
+      {\"input\":{\"description\":\"<approved task Markdown>\",\"spec_path\":\"docs/specs/example.md\",\"milestone_id\":\"m1.0\"}}
   - Create exactly the requested number of queued tasks; no more and no fewer
   - After all requested tasks have been enqueued, stop
 
