@@ -47,7 +47,7 @@ impl TaskStatus {
     }
 
     pub const fn is_resettable(self) -> bool {
-        !matches!(self, Self::Reset | Self::Complete | Self::Failed)
+        !matches!(self, Self::Reset | Self::Complete)
     }
 
     pub const fn is_terminal(self) -> bool {
@@ -78,5 +78,22 @@ impl FromStr for TaskStatus {
             "reset" => Ok(Self::Reset),
             _ => anyhow::bail!("unknown task status: {value}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskStatus;
+
+    #[test]
+    fn failed_tasks_are_terminal_but_resettable_by_hq() {
+        assert!(TaskStatus::Failed.is_terminal());
+        assert!(TaskStatus::Failed.is_resettable());
+    }
+
+    #[test]
+    fn complete_and_reset_tasks_are_not_resettable() {
+        assert!(!TaskStatus::Complete.is_resettable());
+        assert!(!TaskStatus::Reset.is_resettable());
     }
 }
