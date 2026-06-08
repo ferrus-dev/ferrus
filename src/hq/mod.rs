@@ -5,6 +5,7 @@ mod state_watcher;
 mod tui;
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -997,6 +998,89 @@ impl HqContext {
         .await
     }
 
+    async fn spawn_interactive_supervisor_until_task_enqueued(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        existing_task_ids: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let agent = std::sync::Arc::clone(
+            self.supervisor
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
+        );
+        agent.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
+        let mut cmd = Command::from(
+            agent
+                .spawn(AgentRunMode::Interactive {
+                    prompt: Some(prompt),
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to resolve launcher for supervisor agent {}",
+                        agent.name()
+                    )
+                })?,
+        );
+
+        let ack_rx = self.display.suspend();
+        let _ = ack_rx.await;
+        let mut guard = ResumeGuard::new(self.display.clone());
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+
+        let mut child = cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
+        self.mark_agent_running(ROLE_SUPERVISOR, agent.name(), name, child.id())
+            .await?;
+
+        let mut created_task_id = None;
+        let mut child_status = None;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    child_status = Some(status.with_context(|| format!("Failed to wait for {program}"))?);
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if let Some(task_id) = new_task_id_since(existing_task_ids).await? {
+                        created_task_id = Some(task_id);
+                        self.stop_interactive_child(
+                            &mut child,
+                            "Task enqueued — waiting for supervisor to exit…",
+                        )
+                        .await?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
+        guard.resume_now();
+        self.mark_agent_suspended(name).await?;
+        if let Some(status) = child_status
+            && !status.success()
+        {
+            anyhow::bail!(interactive_exit_error(
+                ROLE_SUPERVISOR,
+                agent.name(),
+                status,
+                &stderr
+            ));
+        }
+        Ok(created_task_id)
+    }
+
     async fn spawn_interactive_executor(&mut self, name: &str, prompt: Option<&str>) -> Result<()> {
         let agent = std::sync::Arc::clone(
             self.executor
@@ -1080,9 +1164,18 @@ impl HqContext {
             None => agent_manager::supervisor_task_prompt(),
         };
 
+        let existing_task_ids = crate::project::list_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
         let supervisor_id = self.supervisor_agent_id()?;
-        self.spawn_interactive_supervisor(&supervisor_id, Some(prompt))
-            .await?;
+        self.spawn_interactive_supervisor_until_task_enqueued(
+            &supervisor_id,
+            prompt,
+            &existing_task_ids,
+        )
+        .await?;
 
         let scheduled = self.schedule_queued_tasks().await?;
         if scheduled == 0 {
@@ -1905,6 +1998,14 @@ fn run_plan_prompt_context(plan: &RunPlan, selected_count: usize) -> String {
     lines.join("\n")
 }
 
+async fn new_task_id_since(existing_task_ids: &HashSet<String>) -> Result<Option<String>> {
+    let tasks = crate::project::list_tasks().await?;
+    Ok(tasks
+        .into_iter()
+        .find(|task| !existing_task_ids.contains(&task.id))
+        .map(|task| task.id))
+}
+
 fn selected_milestone_prompt_context(selected: &SelectedMilestone) -> String {
     format!(
         "spec_path: {}\nmilestone: {}\nmilestone_id: {}\ncompleted: {}\ndepends_on: {}",
@@ -2081,6 +2182,9 @@ async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path)
 }
 
 async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    let workspace_dir = tokio::fs::canonicalize(workspace_dir)
+        .await
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -2107,6 +2211,12 @@ async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Pat
         }
         let relative = PathBuf::from(String::from_utf8_lossy(relative).into_owned());
         let source = project_root.join(&relative);
+        let canonical_source = tokio::fs::canonicalize(&source)
+            .await
+            .unwrap_or_else(|_| source.clone());
+        if canonical_source.starts_with(&workspace_dir) {
+            continue;
+        }
         let metadata = tokio::fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("Failed to stat {}", source.display()))?;
@@ -2354,6 +2464,12 @@ mod tests {
                 .await
                 .unwrap(),
             "new approved file\n"
+        );
+        assert!(
+            !workspace
+                .workspace_dir
+                .join("runtime/worktrees/t-001/tracked.txt")
+                .exists()
         );
 
         std::env::set_current_dir(previous).unwrap();
