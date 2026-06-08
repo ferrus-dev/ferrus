@@ -119,7 +119,7 @@ fn claude_command(
     match mode {
         AgentRunMode::Interactive { prompt } => {
             if let Some(prompt) = prompt {
-                cmd.arg(prompt);
+                cmd.arg("--").arg(prompt);
             }
         }
         AgentRunMode::Headless { prompt } => {
@@ -173,7 +173,7 @@ mod tests {
                 })
                 .unwrap(),
             "claude",
-            &["--mcp-config", &role_config, "plan"],
+            &["--mcp-config", &role_config, "--", "plan"],
         );
     }
 

@@ -1999,11 +1999,137 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
             }
         );
     }
+    seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
 
     Ok(ExecutorWorkspace {
         project_root,
         workspace_dir,
     })
+}
+
+async fn seed_executor_workspace_from_canonical_changes(
+    project_root: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    apply_canonical_tracked_diff(project_root, workspace_dir).await?;
+    copy_canonical_untracked_files(project_root, workspace_dir).await
+}
+
+async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .await
+        .context("Failed to capture canonical workspace diff")?;
+    if !diff.status.success() {
+        let stderr = String::from_utf8_lossy(&diff.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture canonical workspace diff from {}: {}",
+            project_root.display(),
+            if stderr.is_empty() {
+                diff.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    if diff.stdout.is_empty() {
+        return Ok(());
+    }
+
+    let mut apply = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .args(["apply", "--whitespace=nowarn"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to start git apply for executor workspace {}",
+                workspace_dir.display()
+            )
+        })?;
+    if let Some(mut stdin) = apply.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+
+        stdin
+            .write_all(&diff.stdout)
+            .await
+            .context("Failed to stream canonical workspace diff")?;
+    }
+    let output = apply
+        .wait_with_output()
+        .await
+        .context("Failed to apply canonical workspace diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to seed executor workspace {} with approved canonical changes: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .await
+        .context("Failed to list canonical untracked files")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to list canonical untracked files from {}: {}",
+            project_root.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    for relative in output.stdout.split(|byte| *byte == 0) {
+        if relative.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(relative).into_owned());
+        let source = project_root.join(&relative);
+        let metadata = tokio::fs::symlink_metadata(&source)
+            .await
+            .with_context(|| format!("Failed to stat {}", source.display()))?;
+        if metadata.is_dir() {
+            continue;
+        }
+        let destination = workspace_dir.join(&relative);
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        tokio::fs::copy(&source, &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy canonical untracked file {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 async fn git_is_work_tree(path: &Path) -> bool {
@@ -2136,6 +2262,98 @@ mod tests {
             plan.skipped
                 .iter()
                 .any(|milestone| milestone.id == "m2.0" && milestone.reason == "waiting for m1.1")
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_includes_uncommitted_canonical_changes() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
+        tokio::fs::write("tracked.txt", "base\n").await.unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".gitignore", "tracked.txt"])
+            .status()
+            .unwrap();
+        let commit_status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit_status.success());
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::write("tracked.txt", "base\napproved\n")
+            .await
+            .unwrap();
+        tokio::fs::write("new.txt", "new approved file\n")
+            .await
+            .unwrap();
+
+        let workspace = prepare_executor_workspace("t-001").await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join("tracked.txt"))
+                .await
+                .unwrap(),
+            "base\napproved\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join("new.txt"))
+                .await
+                .unwrap(),
+            "new approved file\n"
         );
 
         std::env::set_current_dir(previous).unwrap();
