@@ -11,7 +11,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::agent_id::{
-    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR, agent_id,
+    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID, ROLE_EXECUTOR,
+    ROLE_SUPERVISOR, agent_id,
 };
 use crate::agents::{AgentRunMode, ExecutorAgent, SupervisorAgent};
 use crate::checks::runner;
@@ -778,16 +779,20 @@ impl HqContext {
         );
         agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
         let workspace = prepare_executor_workspace(task_id).await?;
+        let mut env = vec![
+            (ENV_AGENT_ID, name.to_string()),
+            (ENV_TASK_ID, task_id.to_string()),
+        ];
+        if let Some(baseline_tree) = workspace.baseline_tree.as_deref() {
+            env.push((ENV_BASELINE_TREE, baseline_tree.to_string()));
+        }
         let handle = agent_manager::spawn_headless_executor_with_env(
             agent.as_ref(),
             name,
             prompt,
             index,
             self.debug,
-            vec![
-                (ENV_AGENT_ID, name.to_string()),
-                (ENV_TASK_ID, task_id.to_string()),
-            ],
+            env,
             Some(agent_manager::HeadlessWorkspace {
                 workspace_dir: workspace.workspace_dir.clone(),
                 project_root: workspace.project_root.clone(),
@@ -920,6 +925,8 @@ impl HqContext {
         agents::write_agents(&reg).await?;
 
         for task in &resettable {
+            store::clear_scoped_task_artifacts(&task.path, &format!(".ferrus/runs/{}", task.id))
+                .await?;
             crate::project::record_task_status_with_origin(
                 &task.id,
                 &task.path,
@@ -2046,6 +2053,7 @@ async fn reconcile_agent_pids() {
 struct ExecutorWorkspace {
     project_root: PathBuf,
     workspace_dir: PathBuf,
+    baseline_tree: Option<String>,
 }
 
 async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> {
@@ -2064,6 +2072,7 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
             return Ok(ExecutorWorkspace {
                 project_root,
                 workspace_dir,
+                baseline_tree: None,
             });
         }
         anyhow::bail!(
@@ -2101,10 +2110,12 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
         );
     }
     seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
+    let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
 
     Ok(ExecutorWorkspace {
         project_root,
         workspace_dir,
+        baseline_tree: Some(baseline_tree),
     })
 }
 
@@ -2114,6 +2125,72 @@ async fn seed_executor_workspace_from_canonical_changes(
 ) -> Result<()> {
     apply_canonical_tracked_diff(project_root, workspace_dir).await?;
     copy_canonical_untracked_files(project_root, workspace_dir).await
+}
+
+async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .args(["add", "-A", "."])
+        .output()
+        .await
+        .context("Failed to stage executor workspace baseline")?;
+    if !add.status.success() {
+        let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to stage executor workspace baseline at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                add.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .arg("write-tree")
+        .output()
+        .await
+        .context("Failed to capture executor workspace baseline tree")?;
+    if !tree.status.success() {
+        let stderr = String::from_utf8_lossy(&tree.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace baseline tree at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                tree.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let reset_index = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .args(["read-tree", "HEAD"])
+        .output()
+        .await
+        .context("Failed to restore executor workspace index")?;
+    if !reset_index.status.success() {
+        let stderr = String::from_utf8_lossy(&reset_index.stderr)
+            .trim()
+            .to_string();
+        anyhow::bail!(
+            "Failed to restore executor workspace index at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                reset_index.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&tree.stdout).trim().to_string())
 }
 
 async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path) -> Result<()> {
@@ -2517,6 +2594,34 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-001")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-002")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-003")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-001.md", "pending task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-002.md", "executing task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-003.md", "complete task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-001/QUESTION.md", "stale question")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-002/CONSULT_REQUEST.md", "stale consult")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-003/SUBMISSION.md", "complete submission")
+            .await
+            .unwrap();
 
         let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2534,6 +2639,12 @@ mod tests {
         assert_eq!(status("t-001"), Some("reset"));
         assert_eq!(status("t-002"), Some("reset"));
         assert_eq!(status("t-003"), Some("complete"));
+        assert!(!std::path::Path::new(".ferrus/tasks/t-001.md").exists());
+        assert!(!std::path::Path::new(".ferrus/tasks/t-002.md").exists());
+        assert!(std::path::Path::new(".ferrus/tasks/t-003.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-001").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-002").exists());
+        assert!(std::path::Path::new(".ferrus/runs/t-003/SUBMISSION.md").exists());
 
         std::env::set_current_dir(previous).unwrap();
     }

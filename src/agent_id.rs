@@ -6,6 +6,7 @@ pub const ENV_TASK_ID: &str = "FERRUS_TASK_ID";
 #[allow(dead_code)]
 pub const ENV_RUN_ID: &str = "FERRUS_RUN_ID";
 pub const ENV_PROJECT_ROOT: &str = "FERRUS_PROJECT_ROOT";
+pub const ENV_BASELINE_TREE: &str = "FERRUS_BASELINE_TREE";
 
 pub fn agent_id(role: &str, vendor: &str, index: u32) -> String {
     format!("{role}:{vendor}:{index}")

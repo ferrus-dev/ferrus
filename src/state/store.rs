@@ -87,6 +87,11 @@ pub async fn write_integration_error_for_run_dir(run_dir: &str, content: &str) -
     write_path(&run_file(run_dir, "INTEGRATION_ERROR.md"), content).await
 }
 
+pub async fn clear_scoped_task_artifacts(task_path: &str, run_dir: &str) -> Result<()> {
+    remove_path_if_exists(Path::new(task_path)).await?;
+    remove_dir_if_exists(Path::new(run_dir)).await
+}
+
 /// Write a full check log to `.ferrus/logs/check_{attempt}_{ts}.txt`.
 /// Creates the logs directory if it doesn't exist. Returns the file path.
 pub async fn write_check_log(attempt: u32, ts: u64, content: &str) -> Result<PathBuf> {
@@ -216,6 +221,24 @@ async fn write_path(path: &Path, content: &str) -> Result<()> {
     tokio::fs::write(&path, content)
         .await
         .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+async fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let path = resolve_project_path(path);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+    }
+}
+
+async fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    let path = resolve_project_path(path);
+    match tokio::fs::remove_dir_all(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+    }
 }
 
 fn run_file(run_dir: &str, filename: &str) -> PathBuf {

@@ -5,7 +5,7 @@ use tokio::process::Command;
 use tracing::info;
 
 use crate::{
-    agent_id::ENV_PROJECT_ROOT,
+    agent_id::{ENV_BASELINE_TREE, ENV_PROJECT_ROOT},
     config::Config,
     project::{self, RuntimeTaskContext, TaskCheckFailure},
     state::store,
@@ -199,9 +199,20 @@ async fn equivalent_paths(left: &Path, right: &Path) -> bool {
 }
 
 async fn workspace_patch() -> Result<String> {
+    let baseline = std::env::var(ENV_BASELINE_TREE)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string());
+    workspace_patch_against_baseline(&baseline).await
+}
+
+async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
     let _ = Command::new("git").args(["add", "-N", "."]).output().await;
     let output = Command::new("git")
-        .args(["diff", "--binary", "HEAD", "--"])
+        .args(["diff", "--binary"])
+        .arg(baseline)
+        .arg("--")
         .output()
         .await?;
     if !output.status.success() {
@@ -256,6 +267,76 @@ mod tests {
 
     fn teardown(previous: std::path::PathBuf) {
         std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_patch_excludes_seeded_baseline_changes() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write("tracked.txt", "base\n").await.unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .status()
+            .unwrap();
+        let commit_status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit_status.success());
+
+        tokio::fs::write("tracked.txt", "base\napproved\n")
+            .await
+            .unwrap();
+        tokio::fs::write("seeded.txt", "seeded canonical file\n")
+            .await
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A", "."])
+            .status()
+            .unwrap();
+        let baseline = std::process::Command::new("git")
+            .arg("write-tree")
+            .output()
+            .unwrap();
+        assert!(baseline.status.success());
+        let baseline = String::from_utf8_lossy(&baseline.stdout).trim().to_string();
+        std::process::Command::new("git")
+            .args(["read-tree", "HEAD"])
+            .status()
+            .unwrap();
+
+        tokio::fs::write("tracked.txt", "base\napproved\ncurrent\n")
+            .await
+            .unwrap();
+        tokio::fs::write("current.txt", "current task file\n")
+            .await
+            .unwrap();
+
+        let patch = workspace_patch_against_baseline(&baseline).await.unwrap();
+
+        assert!(patch.contains("+current"));
+        assert!(patch.contains("current.txt"));
+        assert!(!patch.contains("seeded.txt"));
+        assert!(!patch.contains("+approved"));
+
+        teardown(previous);
     }
 
     #[tokio::test]
