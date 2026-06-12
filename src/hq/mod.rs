@@ -1060,9 +1060,16 @@ impl HqContext {
                 _ = ticker.tick() => {
                     if let Some(task_id) = new_task_id_since(existing_task_ids).await? {
                         created_task_id = Some(task_id);
+                        if let Some(status) = child
+                            .try_wait()
+                            .with_context(|| format!("Failed to inspect {program} status"))?
+                        {
+                            child_status = Some(status);
+                            break;
+                        }
                         self.stop_interactive_child(
                             &mut child,
-                            "Task enqueued — waiting for supervisor to exit…",
+                            "Task enqueued — returning to HQ…",
                         )
                         .await?;
                         break;
@@ -2088,12 +2095,14 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
         .await
         .with_context(|| format!("Failed to create {}", parent.display()))?;
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&project_root)
-        .args(["worktree", "add", "--detach"])
-        .arg(&workspace_dir)
-        .arg("HEAD")
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&project_root).args(["worktree", "add"]);
+    if git_has_head(&project_root).await {
+        command.args(["--detach"]).arg(&workspace_dir).arg("HEAD");
+    } else {
+        command.arg("--orphan").arg(&workspace_dir);
+    }
+    let output = command
         .output()
         .await
         .context("Failed to run git worktree add")?;
@@ -2123,7 +2132,9 @@ async fn seed_executor_workspace_from_canonical_changes(
     project_root: &Path,
     workspace_dir: &Path,
 ) -> Result<()> {
-    apply_canonical_tracked_diff(project_root, workspace_dir).await?;
+    if git_has_head(project_root).await {
+        apply_canonical_tracked_diff(project_root, workspace_dir).await?;
+    }
     copy_canonical_untracked_files(project_root, workspace_dir).await
 }
 
@@ -2168,10 +2179,14 @@ async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Resul
         );
     }
 
-    let reset_index = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .args(["read-tree", "HEAD"])
+    let mut reset_index = Command::new("git");
+    reset_index.arg("-C").arg(workspace_dir).arg("read-tree");
+    if git_has_head(workspace_dir).await {
+        reset_index.arg("HEAD");
+    } else {
+        reset_index.arg("--empty");
+    }
+    let reset_index = reset_index
         .output()
         .await
         .context("Failed to restore executor workspace index")?;
@@ -2327,6 +2342,16 @@ async fn git_is_work_tree(path: &Path) -> bool {
         .output()
         .await;
     matches!(output, Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+async fn git_has_head(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 fn task_has_active_external_claim(task: &TaskRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -2546,6 +2571,75 @@ mod tests {
             !workspace
                 .workspace_dir
                 .join("runtime/worktrees/t-001/tracked.txt")
+                .exists()
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_starts_from_unborn_git_project() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
+        tokio::fs::write("seed.txt", "uncommitted project file\n")
+            .await
+            .unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let workspace = prepare_executor_workspace("t-unborn").await.unwrap();
+
+        assert!(workspace.baseline_tree.is_some());
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join("seed.txt"))
+                .await
+                .unwrap(),
+            "uncommitted project file\n"
+        );
+        assert!(
+            !workspace
+                .workspace_dir
+                .join("runtime/worktrees/t-unborn/seed.txt")
                 .exists()
         );
 
