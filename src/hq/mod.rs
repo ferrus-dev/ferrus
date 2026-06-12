@@ -2074,12 +2074,20 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
     }
 
     let workspace_dir = registration.data_dir.join("worktrees").join(task_id);
+    let baseline_path = executor_workspace_baseline_path(&registration.data_dir, task_id);
     if tokio::fs::try_exists(&workspace_dir).await? {
         if git_is_work_tree(&workspace_dir).await {
+            copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
+            let mut baseline_tree = read_executor_workspace_baseline_tree(&baseline_path).await?;
+            if baseline_tree.is_none() && !git_has_head(&workspace_dir).await {
+                let captured = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
+                write_executor_workspace_baseline_tree(&baseline_path, &captured).await?;
+                baseline_tree = Some(captured);
+            }
             return Ok(ExecutorWorkspace {
                 project_root,
                 workspace_dir,
-                baseline_tree: None,
+                baseline_tree,
             });
         }
         anyhow::bail!(
@@ -2123,6 +2131,7 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
     }
     seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
     let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
+    write_executor_workspace_baseline_tree(&baseline_path, &baseline_tree).await?;
 
     Ok(ExecutorWorkspace {
         project_root,
@@ -2138,7 +2147,44 @@ async fn seed_executor_workspace_from_canonical_changes(
     if git_has_head(project_root).await {
         apply_canonical_tracked_diff(project_root, workspace_dir).await?;
     }
-    copy_canonical_untracked_files(project_root, workspace_dir).await
+    copy_canonical_untracked_files(project_root, workspace_dir).await?;
+    copy_canonical_agent_config_files(project_root, workspace_dir).await
+}
+
+fn executor_workspace_baseline_path(data_dir: &Path, task_id: &str) -> PathBuf {
+    data_dir
+        .join("worktrees")
+        .join(".baseline-trees")
+        .join(format!("{task_id}.txt"))
+}
+
+async fn read_executor_workspace_baseline_tree(path: &Path) -> Result<Option<String>> {
+    if !tokio::fs::try_exists(path).await? {
+        return Ok(None);
+    }
+    let value = tokio::fs::read_to_string(path).await.with_context(|| {
+        format!(
+            "Failed to read executor workspace baseline {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+}
+
+async fn write_executor_workspace_baseline_tree(path: &Path, baseline_tree: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    tokio::fs::write(path, format!("{baseline_tree}\n"))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write executor workspace baseline {}",
+                path.display()
+            )
+        })
 }
 
 async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
@@ -2334,6 +2380,53 @@ async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Pat
                 )
             })?;
     }
+    Ok(())
+}
+
+async fn copy_canonical_agent_config_files(
+    project_root: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    for relative in [
+        ".claude/mcp-supervisor.json",
+        ".claude/mcp-executor.json",
+        ".claude/settings.local.json",
+        ".codex/config.toml",
+        ".qwen/settings.json",
+    ] {
+        copy_canonical_file_if_present(project_root, workspace_dir, Path::new(relative)).await?;
+    }
+    Ok(())
+}
+
+async fn copy_canonical_file_if_present(
+    project_root: &Path,
+    workspace_dir: &Path,
+    relative: &Path,
+) -> Result<()> {
+    let source = project_root.join(relative);
+    let Ok(metadata) = tokio::fs::symlink_metadata(&source).await else {
+        return Ok(());
+    };
+    if metadata.is_dir() {
+        return Ok(());
+    }
+
+    let destination = workspace_dir.join(relative);
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    tokio::fs::copy(&source, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to copy canonical agent config {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -2591,7 +2684,26 @@ mod tests {
             .args(["init"])
             .status()
             .unwrap();
-        tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
+        tokio::fs::write(
+            ".gitignore",
+            ".ferrus/\n.codex/config.toml\n.claude/mcp-executor.json\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".codex").await.unwrap();
+        tokio::fs::write(
+            ".codex/config.toml",
+            "[mcp_servers.ferrus-executor]\ncommand = \"ferrus\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".claude").await.unwrap();
+        tokio::fs::write(
+            ".claude/mcp-executor.json",
+            "{\"mcpServers\":{\"ferrus-executor\":{\"command\":\"ferrus\",\"args\":[]}}}",
+        )
+        .await
+        .unwrap();
         tokio::fs::write("seed.txt", "uncommitted project file\n")
             .await
             .unwrap();
@@ -2645,6 +2757,29 @@ mod tests {
                 .join("runtime/worktrees/t-unborn/seed.txt")
                 .exists()
         );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".codex/config.toml"))
+                .await
+                .unwrap(),
+            "[mcp_servers.ferrus-executor]\ncommand = \"ferrus\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".claude/mcp-executor.json"))
+                .await
+                .unwrap(),
+            "{\"mcpServers\":{\"ferrus-executor\":{\"command\":\"ferrus\",\"args\":[]}}}"
+        );
+        let baseline_tree = workspace.baseline_tree.clone();
+        assert_eq!(
+            tokio::fs::read_to_string(executor_workspace_baseline_path(&data_dir, "t-unborn"))
+                .await
+                .unwrap()
+                .trim(),
+            baseline_tree.as_deref().unwrap()
+        );
+
+        let resumed_workspace = prepare_executor_workspace("t-unborn").await.unwrap();
+        assert_eq!(resumed_workspace.baseline_tree, baseline_tree);
 
         std::env::set_current_dir(previous).unwrap();
     }
