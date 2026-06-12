@@ -1616,6 +1616,13 @@ async fn claim_task_in_database(
         let lease_active = existing_lease.is_some_and(|lease_until| now < lease_until);
 
         if lease_active && claimed_by.as_deref() == Some(agent_id.as_str()) {
+            renew_task_lease_in_transaction(
+                &transaction,
+                &task_id,
+                &agent_id,
+                ttl_secs,
+                lease_until.as_deref(),
+            )?;
             transaction.commit()?;
             return Ok(TaskClaim::AlreadyClaimed);
         }
@@ -1908,12 +1915,6 @@ fn consultation_context_for_run(
 
 fn run_dir_for_task(task_id: &str) -> String {
     format!(".ferrus/runs/{task_id}")
-}
-
-pub async fn record_task_status_best_effort(task_id: &str, task_path: &str, status: TaskStatus) {
-    if let Err(err) = record_task_status(task_id, task_path, status).await {
-        warn!(error = ?err, task_id, status = status.as_str(), "failed to mirror task status into ferrus.db");
-    }
 }
 
 pub async fn record_runtime_event(

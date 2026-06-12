@@ -79,7 +79,7 @@ async fn ensure_scoped_answer_waiter(
 ) -> Result<()> {
     if let Some(owner) = project::task_human_question_owner(&context.task_id).await? {
         if owner == agent_id {
-            return Ok(());
+            return ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await;
         }
         anyhow::bail!("Cannot wait for answer: question was asked by {owner}, not {agent_id}");
     }
@@ -215,6 +215,53 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn wait_for_answer_renews_question_owner_lease_on_timeout() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-008",
+            ".ferrus/tasks/t-008.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-008", ".ferrus/tasks/t-008.md", "executor:codex:8", 2)
+            .await
+            .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-008",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:8",
+        )
+        .await
+        .unwrap();
+        let original_lease = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-008")
+            .and_then(|task| task.lease_until)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let response = run("executor:codex:8").await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["status"], "timeout");
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-008")
+            .unwrap();
+        assert_eq!(task.status, "awaiting_human");
+        assert_eq!(task.claimed_by.as_deref(), Some("executor:codex:8"));
+        assert!(task.lease_until.unwrap() > original_lease);
 
         teardown(previous);
     }

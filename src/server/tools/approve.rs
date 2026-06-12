@@ -33,18 +33,18 @@ async fn run(agent_id: &str) -> Result<String> {
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     apply_approved_patch(&context).await?;
-    project::record_task_status_best_effort(
-        &context.task_id,
-        &context.task_path,
-        project::TaskStatus::Complete,
-    )
-    .await;
     if let (Some(spec_path), Some(milestone_id)) = (
         context.spec_path.as_deref(),
         context.milestone_id.as_deref(),
     ) {
         specs::complete_milestone(spec_path, milestone_id).await?;
     }
+    project::record_task_status(
+        &context.task_id,
+        &context.task_path,
+        project::TaskStatus::Complete,
+    )
+    .await?;
     cleanup_approved_workspace_best_effort(&context).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),
@@ -385,6 +385,37 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| { reason.contains("patch could not be applied") })
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn approve_keeps_task_reviewing_when_spec_update_fails() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        tokio::fs::create_dir_all("docs/specs/spec.md")
+            .await
+            .unwrap();
+        crate::project::record_task_status_with_origin(
+            "t-009",
+            ".ferrus/tasks/t-009.md",
+            crate::project::TaskStatus::Reviewing,
+            Some("docs/specs/spec.md"),
+            Some("m1.0"),
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-009", ".ferrus/tasks/t-009.md", "supervisor:codex:9", 60)
+            .await
+            .unwrap();
+
+        let error = run("supervisor:codex:9").await.unwrap_err().to_string();
+
+        assert!(error.contains("docs/specs/spec.md"));
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-009").unwrap();
+        assert_eq!(task.status, "reviewing");
+        assert_eq!(task.claimed_by.as_deref(), Some("supervisor:codex:9"));
 
         teardown(previous);
     }

@@ -2096,7 +2096,10 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
         .with_context(|| format!("Failed to create {}", parent.display()))?;
 
     let mut command = Command::new("git");
-    command.arg("-C").arg(&project_root).args(["worktree", "add"]);
+    command
+        .arg("-C")
+        .arg(&project_root)
+        .args(["worktree", "add"]);
     if git_has_head(&project_root).await {
         command.args(["--detach"]).arg(&workspace_dir).arg("HEAD");
     } else {

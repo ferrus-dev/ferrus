@@ -73,7 +73,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         project::record_task_check_passed(&context.task_id).await?;
         write_submission(&context, &content).await?;
         write_submission_patch(&context).await?;
-        record_task_status(&context, project::TaskStatus::Reviewing).await;
+        record_task_status(&context, project::TaskStatus::Reviewing).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
             "submitted",
@@ -94,7 +94,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
             project::record_task_check_passed(&context.task_id).await?;
             write_submission(&context, &content).await?;
             write_submission_patch(&context).await?;
-            record_task_status(&context, project::TaskStatus::Reviewing).await;
+            record_task_status(&context, project::TaskStatus::Reviewing).await?;
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
                 "submitted",
@@ -229,8 +229,11 @@ async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn record_task_status(context: &RuntimeTaskContext, status: project::TaskStatus) {
-    project::record_task_status_best_effort(&context.task_id, &context.task_path, status).await;
+async fn record_task_status(
+    context: &RuntimeTaskContext,
+    status: project::TaskStatus,
+) -> Result<()> {
+    project::record_task_status(&context.task_id, &context.task_path, status).await
 }
 
 #[cfg(test)]
