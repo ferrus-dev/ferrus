@@ -41,9 +41,14 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
     write_question(&context, &question).await?;
     clear_answer(&context).await?;
 
-    let paused_status = context.status.parse::<project::TaskStatus>()?;
-    project::record_task_human_question_requested(&context.task_id, paused_status, agent_id)
-        .await?;
+    let (resume_status, paused_status) = human_pause_context(&context)?;
+    project::record_task_human_question_requested_with_resume(
+        &context.task_id,
+        resume_status,
+        paused_status,
+        agent_id,
+    )
+    .await?;
     let paused = context.status.clone();
 
     info!(paused, "Task → AwaitingHuman");
@@ -89,6 +94,21 @@ fn can_supervisor_ask_during_consultation(context: &RuntimeTaskContext, agent_id
         return false;
     }
     context.status.parse::<project::TaskStatus>().ok() == Some(project::TaskStatus::Consultation)
+}
+
+fn human_pause_context(
+    context: &RuntimeTaskContext,
+) -> Result<(project::TaskStatus, Option<project::TaskStatus>)> {
+    let current_status = context.status.parse::<project::TaskStatus>()?;
+    if current_status == project::TaskStatus::Consultation {
+        let paused_status = context
+            .paused_status
+            .as_deref()
+            .map(str::parse::<project::TaskStatus>)
+            .transpose()?;
+        return Ok((project::TaskStatus::Consultation, paused_status));
+    }
+    Ok((current_status, Some(current_status)))
 }
 
 async fn write_question(context: &RuntimeTaskContext, question: &str) -> Result<()> {
@@ -247,6 +267,60 @@ mod tests {
         assert_eq!(task.status, "awaiting_human");
         assert_eq!(task.paused_status.as_deref(), Some("addressing"));
         assert_eq!(task.claimed_by.as_deref(), Some("executor:codex:1"));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn ask_human_during_consultation_preserves_pre_consult_paused_status() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Addressing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-002", ".ferrus/tasks/t-002.md", "executor:codex:2", 60)
+            .await
+            .unwrap();
+        crate::project::record_task_consultation_requested(
+            "t-002",
+            crate::project::TaskStatus::Addressing,
+        )
+        .await
+        .unwrap();
+
+        run("executor:codex:2", "Can I proceed?".to_string())
+            .await
+            .unwrap();
+
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-002").unwrap();
+        assert_eq!(task.status, "awaiting_human");
+        assert_eq!(task.paused_status.as_deref(), Some("addressing"));
+        let restored = crate::project::restore_task_from_human_answer("t-002")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored,
+            crate::project::TaskHumanAnswerRestore::Restored { ref status }
+                if status == "consultation"
+        ));
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-002").unwrap();
+        assert_eq!(task.status, "consultation");
+        assert_eq!(task.paused_status.as_deref(), Some("addressing"));
+
+        let restored = crate::project::restore_task_from_consultation("t-002")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored,
+            crate::project::TaskConsultRestore::Restored { ref status }
+                if status == "addressing"
+        ));
 
         teardown(previous);
     }

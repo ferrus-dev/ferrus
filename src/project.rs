@@ -1243,9 +1243,25 @@ pub async fn restore_task_from_consultation(task_id: &str) -> Result<TaskConsult
     .await?
 }
 
+#[cfg(test)]
 pub async fn record_task_human_question_requested(
     task_id: &str,
     paused_status: TaskStatus,
+    awaiting_human_by: &str,
+) -> Result<()> {
+    record_task_human_question_requested_with_resume(
+        task_id,
+        paused_status,
+        Some(paused_status),
+        awaiting_human_by,
+    )
+    .await
+}
+
+pub async fn record_task_human_question_requested_with_resume(
+    task_id: &str,
+    resume_status: TaskStatus,
+    paused_status: Option<TaskStatus>,
     awaiting_human_by: &str,
 ) -> Result<()> {
     let database_path = current_database_path().await?;
@@ -1253,16 +1269,18 @@ pub async fn record_task_human_question_requested(
     let awaiting_human_by = awaiting_human_by.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let connection = open_runtime_database(&database_path)?;
+        let paused_status = paused_status.map(TaskStatus::as_str);
         connection.execute(
             r#"
             UPDATE tasks
-            SET status = ?1, paused_status = ?2, awaiting_human_by = ?3
-            WHERE id = ?4
+            SET status = ?1, paused_status = ?2, awaiting_human_by = ?3, awaiting_human_status = ?4
+            WHERE id = ?5
             "#,
             params![
                 TaskStatus::AwaitingHuman.as_str(),
-                paused_status.as_str(),
+                paused_status,
                 awaiting_human_by,
+                resume_status.as_str(),
                 task_id
             ],
         )?;
@@ -1272,7 +1290,8 @@ pub async fn record_task_human_question_requested(
             "task_human_question_requested",
             &serde_json::json!({
                 "task_id": task_id,
-                "paused_status": paused_status.as_str(),
+                "paused_status": paused_status,
+                "resume_status": resume_status.as_str(),
                 "awaiting_human_by": awaiting_human_by,
             }),
         )?;
@@ -1307,12 +1326,18 @@ pub async fn restore_task_from_human_answer(task_id: &str) -> Result<TaskHumanAn
         let transaction = connection.transaction()?;
         let row = transaction
             .query_row(
-                "SELECT status, paused_status FROM tasks WHERE id = ?1",
+                "SELECT status, paused_status, awaiting_human_status FROM tasks WHERE id = ?1",
                 [&task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((status, paused_status)) = row else {
+        let Some((status, paused_status, awaiting_human_status)) = row else {
             transaction.commit()?;
             return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
         };
@@ -1320,15 +1345,21 @@ pub async fn restore_task_from_human_answer(task_id: &str) -> Result<TaskHumanAn
             transaction.commit()?;
             return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
         }
-        let resumed_status =
-            paused_status.unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
+        let resumed_status = awaiting_human_status
+            .or_else(|| paused_status.clone())
+            .unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
+        let restored_paused_status = if resumed_status == TaskStatus::Consultation.as_str() {
+            paused_status
+        } else {
+            None
+        };
         transaction.execute(
             r#"
             UPDATE tasks
-            SET status = ?1, paused_status = NULL, awaiting_human_by = NULL
-            WHERE id = ?2
+            SET status = ?1, paused_status = ?2, awaiting_human_by = NULL, awaiting_human_status = NULL
+            WHERE id = ?3
             "#,
-            params![resumed_status, task_id],
+            params![resumed_status, restored_paused_status, task_id],
         )?;
         insert_event_in_transaction(
             &transaction,
@@ -2649,6 +2680,7 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
             "review_cycles",
             "failure_reason",
             "awaiting_human_by",
+            "awaiting_human_status",
         ] {
             if !column_exists(&connection, "tasks", column)? {
                 return Ok(false);
@@ -2764,7 +2796,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             check_retries INTEGER NOT NULL DEFAULT 0,
             review_cycles INTEGER NOT NULL DEFAULT 0,
             failure_reason TEXT,
-            awaiting_human_by TEXT
+            awaiting_human_by TEXT,
+            awaiting_human_status TEXT
         );
 
         CREATE TABLE IF NOT EXISTS runs (
@@ -2817,6 +2850,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     )?;
     ensure_column(connection, "tasks", "failure_reason", "TEXT")?;
     ensure_column(connection, "tasks", "awaiting_human_by", "TEXT")?;
+    ensure_column(connection, "tasks", "awaiting_human_status", "TEXT")?;
     ensure_column(connection, "project_runtime_state", "selected_spec", "TEXT")?;
     ensure_column(
         connection,
@@ -3249,7 +3283,7 @@ async fn retire_legacy_current_task_row() -> Result<()> {
             .query_row(
                 r#"
                 SELECT status, paused_status, spec_path, milestone_id, check_retries,
-                       review_cycles, failure_reason, awaiting_human_by
+                       review_cycles, failure_reason, awaiting_human_by, awaiting_human_status
                 FROM tasks
                 WHERE id = ?1
                 "#,
@@ -3264,6 +3298,7 @@ async fn retire_legacy_current_task_row() -> Result<()> {
                         row.get::<_, i64>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -3278,6 +3313,7 @@ async fn retire_legacy_current_task_row() -> Result<()> {
             review_cycles,
             failure_reason,
             awaiting_human_by,
+            awaiting_human_status,
         )) = current
         {
             let parsed = status.parse::<TaskStatus>().unwrap_or(TaskStatus::Unknown);
@@ -3286,9 +3322,10 @@ async fn retire_legacy_current_task_row() -> Result<()> {
                     r#"
                     INSERT INTO tasks (
                         id, path, status, paused_status, spec_path, milestone_id,
-                        check_retries, review_cycles, failure_reason, awaiting_human_by
+                        check_retries, review_cycles, failure_reason, awaiting_human_by,
+                        awaiting_human_status
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                     ON CONFLICT(id) DO NOTHING
                     "#,
                     params![
@@ -3302,6 +3339,7 @@ async fn retire_legacy_current_task_row() -> Result<()> {
                         review_cycles,
                         failure_reason,
                         awaiting_human_by,
+                        awaiting_human_status,
                     ],
                 )?;
                 transaction.execute(
@@ -3319,7 +3357,8 @@ async fn retire_legacy_current_task_row() -> Result<()> {
                     lease_until = NULL,
                     last_heartbeat = NULL,
                     failure_reason = NULL,
-                    awaiting_human_by = NULL
+                    awaiting_human_by = NULL,
+                    awaiting_human_status = NULL
                 WHERE id = ?2
                 "#,
                 params![TaskStatus::Reset.as_str(), CURRENT_TASK_ID],
