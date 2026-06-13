@@ -174,13 +174,42 @@ async fn write_submission_patch(context: &RuntimeTaskContext) -> Result<()> {
 }
 
 async fn is_isolated_executor_workspace(context: &RuntimeTaskContext) -> bool {
-    let Some(project_root) = std::env::var(ENV_PROJECT_ROOT)
+    let Some(project_root) = project_root_for_isolation().await else {
+        return false;
+    };
+    is_workspace_isolated_from_project_root(context, &project_root).await
+}
+
+async fn project_root_for_isolation() -> Option<PathBuf> {
+    if let Some(project_root) = project_root_from_env() {
+        return Some(project_root);
+    }
+    project_root_from_local_ref().await
+}
+
+fn project_root_from_env() -> Option<PathBuf> {
+    std::env::var(ENV_PROJECT_ROOT)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
+        .map(PathBuf::from)
+}
+
+async fn project_root_from_local_ref() -> Option<PathBuf> {
+    let local_ref = tokio::fs::read_to_string(".ferrus/project.toml")
+        .await
+        .ok()?;
+    let local_ref = toml::from_str::<project::LocalProjectRef>(&local_ref).ok()?;
+    let metadata_path = Path::new(&local_ref.data_dir).join("project.toml");
+    let metadata = tokio::fs::read_to_string(metadata_path).await.ok()?;
+    let metadata = toml::from_str::<project::ProjectMetadata>(&metadata).ok()?;
+    Some(PathBuf::from(metadata.workspace_dir))
+}
+
+async fn is_workspace_isolated_from_project_root(
+    context: &RuntimeTaskContext,
+    project_root: &Path,
+) -> bool {
     let current_dir = std::env::current_dir().ok();
     let workspace_path = context
         .workspace_path
@@ -191,7 +220,7 @@ async fn is_isolated_executor_workspace(context: &RuntimeTaskContext) -> bool {
     let Some(workspace_path) = workspace_path else {
         return false;
     };
-    !equivalent_paths(&workspace_path, Path::new(&project_root)).await
+    !equivalent_paths(&workspace_path, project_root).await
 }
 
 async fn equivalent_paths(left: &Path, right: &Path) -> bool {
@@ -627,6 +656,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolated_workspace_detection_falls_back_to_project_metadata() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        let canonical = dir.path().join("canonical");
+        let worktree = dir.path().join("worktree");
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(canonical.join(".ferrus"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(worktree.join(".ferrus"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            worktree.join(".ferrus/project.toml"),
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: canonical.to_string_lossy().into_owned(),
+            ferrus_dir: canonical.join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+        std::env::set_current_dir(&worktree).unwrap();
+
+        let context = runtime_context_with_workspace(&worktree);
+
+        assert!(is_isolated_executor_workspace(&context).await);
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
     async fn submit_reclaims_expired_same_agent_lease_before_guarding() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let (_dir, previous) = setup().await;
@@ -817,5 +900,22 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn runtime_context_with_workspace(workspace: &std::path::Path) -> RuntimeTaskContext {
+        RuntimeTaskContext {
+            task_id: "t-test".to_string(),
+            task_path: ".ferrus/tasks/t-test.md".to_string(),
+            spec_path: None,
+            milestone_id: None,
+            run_dir: ".ferrus/runs/t-test".to_string(),
+            status: project::TaskStatus::Executing.as_str().to_string(),
+            paused_status: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+            run_id: None,
+            workspace_path: Some(workspace.to_string_lossy().into_owned()),
+        }
     }
 }
