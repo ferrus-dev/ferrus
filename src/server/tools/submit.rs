@@ -1,6 +1,9 @@
 use anyhow::Result;
 use neva::prelude::*;
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::process::Command;
 use tracing::info;
 
@@ -15,6 +18,8 @@ use super::{
     check_gate::{self, CheckGateResult},
     ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err,
 };
+
+static TEMP_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const DESCRIPTION: &str = "\
 Run the final check gate and, if it passes, submit work for Supervisor review. \
@@ -208,11 +213,92 @@ async fn workspace_patch() -> Result<String> {
 }
 
 async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
-    let _ = Command::new("git").args(["add", "-N", "."]).output().await;
+    let temp_index = temporary_index_path().await?;
+    let patch = workspace_patch_against_baseline_with_temp_index(baseline, &temp_index).await;
+    let _ = tokio::fs::remove_file(&temp_index).await;
+    patch
+}
+
+async fn workspace_patch_against_baseline_with_temp_index(
+    baseline: &str,
+    temp_index: &Path,
+) -> Result<String> {
+    run_git_with_temp_index(temp_index, ["read-tree", baseline]).await?;
+    run_git_with_temp_index(temp_index, ["add", "-A", "."]).await?;
+    let tree = git_output_with_temp_index(temp_index, ["write-tree"]).await?;
     let output = Command::new("git")
         .args(["diff", "--binary"])
         .arg(baseline)
+        .arg(tree.trim())
         .arg("--")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn temporary_index_path() -> Result<PathBuf> {
+    let git_dir = git_output(["rev-parse", "--git-dir"]).await?;
+    let counter = TEMP_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(PathBuf::from(git_dir.trim()).join(format!(
+        "ferrus-submit-index-{}-{counter}",
+        std::process::id()
+    )))
+}
+
+async fn run_git_with_temp_index<const N: usize>(temp_index: &Path, args: [&str; N]) -> Result<()> {
+    let output = Command::new("git")
+        .env("GIT_INDEX_FILE", temp_index)
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn git_output<const N: usize>(args: [&str; N]) -> Result<String> {
+    let output = Command::new("git").args(args).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn git_output_with_temp_index<const N: usize>(
+    temp_index: &Path,
+    args: [&str; N],
+) -> Result<String> {
+    let output = Command::new("git")
+        .env("GIT_INDEX_FILE", temp_index)
+        .args(args)
         .output()
         .await?;
     if !output.status.success() {
@@ -338,6 +424,51 @@ mod tests {
         assert!(patch.contains("current.txt"));
         assert!(!patch.contains("seeded.txt"));
         assert!(!patch.contains("+approved"));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn workspace_patch_includes_untracked_greenfield_files_without_mutating_index() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        let empty_index = dir.path().join(".git/empty-index");
+        assert!(git_env(dir.path(), &empty_index, ["read-tree", "--empty"]).success());
+        let baseline = git_env_output(dir.path(), &empty_index, ["write-tree"]);
+        std::fs::remove_file(&empty_index).unwrap();
+
+        tokio::fs::create_dir_all("src").await.unwrap();
+        tokio::fs::create_dir_all("target/debug").await.unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n/target\n**/*.rs.bk\n")
+            .await
+            .unwrap();
+        tokio::fs::write("Cargo.toml", "[package]\nname = \"demo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::write("src/main.rs", "fn main() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write("target/debug/ignored", "ignored\n")
+            .await
+            .unwrap();
+
+        let patch = workspace_patch_against_baseline(baseline.trim())
+            .await
+            .unwrap();
+
+        assert!(patch.contains("diff --git a/.gitignore b/.gitignore"));
+        assert!(patch.contains("+/target"));
+        assert!(patch.contains("diff --git a/Cargo.toml b/Cargo.toml"));
+        assert!(patch.contains("diff --git a/src/main.rs b/src/main.rs"));
+        assert!(!patch.contains("target/debug/ignored"));
+        assert_eq!(git_output(dir.path(), ["ls-files", "--stage"]), "");
 
         teardown(previous);
     }
@@ -492,5 +623,46 @@ mod tests {
         assert_eq!(task.claimed_by, None);
 
         teardown(previous);
+    }
+
+    fn git_output<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn git_env<const N: usize>(
+        cwd: &std::path::Path,
+        index: &std::path::Path,
+        args: [&str; N],
+    ) -> std::process::ExitStatus {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .env("GIT_INDEX_FILE", index)
+            .args(args)
+            .status()
+            .unwrap()
+    }
+
+    fn git_env_output<const N: usize>(
+        cwd: &std::path::Path,
+        index: &std::path::Path,
+        args: [&str; N],
+    ) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .env("GIT_INDEX_FILE", index)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }
