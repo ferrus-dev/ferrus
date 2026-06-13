@@ -41,13 +41,18 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_mcp_version("2025-03-26")
     });
 
-    let sup = role.as_ref().is_none_or(|r| *r == Role::Supervisor);
-    let exe = role.as_ref().is_none_or(|r| *r == Role::Executor);
+    let all_roles = role.is_none();
+    let supervisor_role = role.as_ref().is_some_and(|r| *r == Role::Supervisor);
+    let executor_role = role.as_ref().is_some_and(|r| *r == Role::Executor);
+    let sup = all_roles || supervisor_role;
+    let exe = all_roles || executor_role;
 
     if sup {
-        app.map_tool("create_task", tools::create_task::handler)
-            .with_description(tools::create_task::DESCRIPTION)
-            .with_input_schema(|_| ToolSchema::from_json_str(tools::create_task::INPUT_SCHEMA));
+        if all_roles {
+            app.map_tool("create_task", tools::create_task::handler)
+                .with_description(tools::create_task::DESCRIPTION)
+                .with_input_schema(|_| ToolSchema::from_json_str(tools::create_task::INPUT_SCHEMA));
+        }
         app.map_tool("enqueue_task", tools::enqueue_task::handler)
             .with_description(tools::enqueue_task::DESCRIPTION)
             .with_input_schema(|_| ToolSchema::from_json_str(tools::enqueue_task::INPUT_SCHEMA));
@@ -195,8 +200,8 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         .with_description("Supervisor review context: state, task, and submission notes");
     }
 
-    // Shared tools (always registered regardless of role)
-    {
+    // Shared tools are role-scoped so tools/list fits Neva's 10-item page size.
+    if all_roles || supervisor_role || executor_role {
         let id = agent_id.clone();
         app.map_tool("ask_human", move |question| {
             let id = id.clone();
@@ -205,7 +210,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         .with_description(tools::ask_human::DESCRIPTION)
         .with_input_schema(|_| ToolSchema::from_json_str(tools::ask_human::INPUT_SCHEMA));
     }
-    {
+    if all_roles || supervisor_role || executor_role {
         let id = agent_id.clone();
         app.map_tool("wait_for_answer", move || {
             let id = id.clone();
@@ -213,10 +218,12 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         })
         .with_description(tools::wait_for_answer::DESCRIPTION);
     }
-    app.map_tool("answer", tools::answer::handler)
-        .with_description(tools::answer::DESCRIPTION)
-        .with_input_schema(|_| ToolSchema::from_json_str(tools::answer::INPUT_SCHEMA));
-    {
+    if all_roles {
+        app.map_tool("answer", tools::answer::handler)
+            .with_description(tools::answer::DESCRIPTION)
+            .with_input_schema(|_| ToolSchema::from_json_str(tools::answer::INPUT_SCHEMA));
+    }
+    if all_roles || executor_role {
         let id = agent_id.clone();
         app.map_tool("status", move || {
             let id = id.clone();
@@ -224,7 +231,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         })
         .with_description(tools::status::DESCRIPTION);
     }
-    {
+    if all_roles || executor_role {
         let id = agent_id.clone();
         app.map_tool("reset", move || {
             let id = id.clone();
@@ -232,7 +239,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         })
         .with_description(tools::reset::DESCRIPTION);
     }
-    {
+    if all_roles || executor_role {
         let id = agent_id.clone();
         app.map_tool("heartbeat", move || {
             let id = id.clone();

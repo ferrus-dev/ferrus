@@ -98,7 +98,6 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 ### Supervisor
 | Tool | From state | Description |
 |---|---|---|
-| `create_task` | Idle | Write task description; moves to Executing |
 | `enqueue_task` | — | Write numbered task artifact and DB `pending` row |
 | `create_spec` | any | Write approved Markdown spec to the configured spec directory |
 | `wait_for_review` | — | Long-poll until state is Reviewing |
@@ -107,6 +106,9 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `reject` | Reviewing | Reject with notes; moves to Addressing |
 | `wait_for_consultation` | — | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
+
+`create_task` remains a compatibility tool only on an unfiltered `ferrus serve` instance; role-scoped
+Supervisor sessions use `enqueue_task` so the full tool list fits on one MCP `tools/list` page.
 
 ### Executor
 | Tool | From state | Description |
@@ -122,9 +124,9 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 |---|---|---|
 | `ask_human` | Executing, Addressing, Consultation, Reviewing | Last-resort human fallback. Write question to QUESTION.md; moves to AwaitingHuman. Call `/wait_for_answer` immediately after. |
 | `wait_for_answer` | AwaitingHuman | Block until the human answers; restores previous state and returns the answer |
-| `status` | any | Print current state, counters, and scoped SQLite task context when called by an active agent |
-| `reset` | Failed | Return to Idle |
-| `heartbeat` | any claimed | Renew lease; returns `{"status":"renewed"}` or `{"status":"error","code":"..."}` |
+| `status` | any | Executor-scoped status and runtime context |
+| `reset` | Failed | Executor-scoped recovery from Failed |
+| `heartbeat` | any claimed | Executor-scoped lease renewal; returns `{"status":"renewed"}` or `{"status":"error","code":"..."}` |
 
 ## MCP resources
 

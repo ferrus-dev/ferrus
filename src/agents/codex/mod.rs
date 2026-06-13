@@ -365,26 +365,21 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "wait_for_consult",
             "wait_for_answer",
             "ask_human",
-            "answer",
             "status",
             "reset",
             "heartbeat",
         ],
         ROLE_SUPERVISOR => &[
-            "create_task",
             "enqueue_task",
             "create_spec",
             "wait_for_review",
             "review_pending",
             "approve",
             "reject",
+            "wait_for_consultation",
             "respond_consult",
             "ask_human",
             "wait_for_answer",
-            "answer",
-            "status",
-            "reset",
-            "heartbeat",
         ],
         _ => &[],
     }
@@ -705,10 +700,17 @@ mod tests {
         let mut entry = toml::Table::new();
         apply_tool_approval_overrides("supervisor", &mut entry);
         let tools = entry.get("tools").and_then(toml::Value::as_table).unwrap();
-        assert!(tools.contains_key("create_task"));
         assert!(tools.contains_key("enqueue_task"));
         assert!(tools.contains_key("create_spec"));
+        assert!(tools.contains_key("wait_for_consultation"));
+        assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
+    }
+
+    #[test]
+    fn codex_role_tool_approval_sets_fit_mcp_first_page() {
+        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 10);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 10);
     }
 
     #[test]
