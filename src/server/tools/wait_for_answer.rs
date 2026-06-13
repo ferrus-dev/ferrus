@@ -79,11 +79,27 @@ async fn ensure_scoped_answer_waiter(
 ) -> Result<()> {
     if let Some(owner) = project::task_human_question_owner(&context.task_id).await? {
         if owner == agent_id {
+            if is_consultation_supervisor_human_wait(context, agent_id).await? {
+                return Ok(());
+            }
             return ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await;
         }
         anyhow::bail!("Cannot wait for answer: question was asked by {owner}, not {agent_id}");
     }
     ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await
+}
+
+async fn is_consultation_supervisor_human_wait(
+    context: &RuntimeTaskContext,
+    agent_id: &str,
+) -> Result<bool> {
+    if !agent_id.starts_with("supervisor:") {
+        return Ok(false);
+    }
+    Ok(project::task_awaiting_human_status(&context.task_id)
+        .await?
+        .as_deref()
+        == Some(project::TaskStatus::Consultation.as_str()))
 }
 
 async fn read_answer(context: &RuntimeTaskContext) -> Result<String> {
@@ -353,6 +369,60 @@ mod tests {
                 .unwrap(),
             "Use the stable path."
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn wait_for_answer_allows_consultation_supervisor_question_owner_without_task_lease() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-009",
+            ".ferrus/tasks/t-009.md",
+            crate::project::TaskStatus::Consultation,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-009", ".ferrus/tasks/t-009.md", "executor:codex:9", 60)
+            .await
+            .unwrap();
+        crate::project::record_run_started("supervisor", "supervisor:codex:9", std::process::id())
+            .await
+            .unwrap();
+        crate::project::attach_running_run_to_task(
+            "supervisor:codex:9",
+            "t-009",
+            ".ferrus/tasks/t-009.md",
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested_with_resume(
+            "t-009",
+            crate::project::TaskStatus::Consultation,
+            Some(crate::project::TaskStatus::Addressing),
+            "supervisor:codex:9",
+        )
+        .await
+        .unwrap();
+        store::write_answer_for_run_dir(".ferrus/runs/t-009", "Use the narrow option.")
+            .await
+            .unwrap();
+
+        let response = run("supervisor:codex:9").await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["status"], "answered");
+        assert_eq!(response["resumed_state"], "consultation");
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-009")
+            .unwrap();
+        assert_eq!(task.status, "consultation");
+        assert_eq!(task.paused_status.as_deref(), Some("addressing"));
+        assert_eq!(task.claimed_by.as_deref(), Some("executor:codex:9"));
 
         teardown(previous);
     }

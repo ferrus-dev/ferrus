@@ -1318,6 +1318,24 @@ pub async fn task_human_question_owner(task_id: &str) -> Result<Option<String>> 
     .await?
 }
 
+pub async fn task_awaiting_human_status(task_id: &str) -> Result<Option<String>> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let connection = open_runtime_database(&database_path)?;
+        let status = connection
+            .query_row(
+                "SELECT awaiting_human_status FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(status)
+    })
+    .await?
+}
+
 pub async fn restore_task_from_human_answer(task_id: &str) -> Result<TaskHumanAnswerRestore> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
