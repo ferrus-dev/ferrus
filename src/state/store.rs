@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::agent_id::ENV_PROJECT_ROOT;
@@ -8,12 +8,12 @@ const FERRUS_DIR: &str = ".ferrus";
 const LOGS_DIR: &str = ".ferrus/logs";
 const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct LocalProjectRef {
     data_dir: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ProjectMetadata {
     workspace_dir: String,
 }
@@ -441,21 +441,20 @@ mod tests {
         std::fs::create_dir_all(canonical.join(".ferrus/tasks")).unwrap();
         std::fs::create_dir_all(worktree.join(".ferrus")).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
+        let local_ref = LocalProjectRef {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
         std::fs::write(
             worktree.join(".ferrus/project.toml"),
-            format!(
-                "project_id = \"test-project\"\nname = \"test\"\ndata_dir = \"{}\"\n",
-                data_dir.display()
-            ),
+            toml::to_string(&local_ref).unwrap(),
         )
         .unwrap();
+        let metadata = ProjectMetadata {
+            workspace_dir: canonical.to_string_lossy().into_owned(),
+        };
         std::fs::write(
             data_dir.join("project.toml"),
-            format!(
-                "id = \"test-project\"\nname = \"test\"\nworkspace_dir = \"{}\"\nferrus_dir = \"{}\"\nversion = 1\ncreated_at = \"2026-01-01T00:00:00Z\"\nlast_opened_at = \"2026-01-01T00:00:00Z\"\n",
-                canonical.display(),
-                canonical.join(".ferrus").display()
-            ),
+            toml::to_string(&metadata).unwrap(),
         )
         .unwrap();
         tokio::fs::write(canonical.join(".ferrus/tasks/t-002.md"), "canonical task")
