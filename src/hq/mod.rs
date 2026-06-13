@@ -2388,6 +2388,7 @@ async fn copy_canonical_agent_config_files(
     workspace_dir: &Path,
 ) -> Result<()> {
     for relative in [
+        ".ferrus/project.toml",
         ".claude/mcp-supervisor.json",
         ".claude/mcp-executor.json",
         ".claude/settings.local.json",
@@ -2768,6 +2769,12 @@ mod tests {
                 .await
                 .unwrap(),
             "{\"mcpServers\":{\"ferrus-executor\":{\"command\":\"ferrus\",\"args\":[]}}}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".ferrus/project.toml"))
+                .await
+                .unwrap(),
+            toml::to_string_pretty(&local_ref).unwrap()
         );
         let baseline_tree = workspace.baseline_tree.clone();
         assert_eq!(

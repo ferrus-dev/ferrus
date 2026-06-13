@@ -1,10 +1,22 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use crate::agent_id::ENV_PROJECT_ROOT;
 
 const FERRUS_DIR: &str = ".ferrus";
 const LOGS_DIR: &str = ".ferrus/logs";
+const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
+
+#[derive(Deserialize)]
+struct LocalProjectRef {
+    data_dir: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectMetadata {
+    workspace_dir: String,
+}
 
 fn path(filename: &str) -> PathBuf {
     resolve_project_path(Path::new(FERRUS_DIR).join(filename))
@@ -15,8 +27,12 @@ pub fn resolve_project_path(path: impl AsRef<Path>) -> PathBuf {
     if path.is_absolute() || !starts_with_ferrus_dir(path) {
         return path.to_path_buf();
     }
+    if path == Path::new(LOCAL_PROJECT_TOML) {
+        return path.to_path_buf();
+    }
     project_root_from_env()
         .map(|root| root.join(path))
+        .or_else(|| canonical_project_root_from_local_project_ref().map(|root| root.join(path)))
         .unwrap_or_else(|| path.to_path_buf())
 }
 
@@ -36,6 +52,15 @@ fn project_root_from_env() -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn canonical_project_root_from_local_project_ref() -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(LOCAL_PROJECT_TOML).ok()?;
+    let local_ref = toml::from_str::<LocalProjectRef>(&contents).ok()?;
+    let metadata_path = Path::new(&local_ref.data_dir).join("project.toml");
+    let metadata = std::fs::read_to_string(metadata_path).ok()?;
+    let metadata = toml::from_str::<ProjectMetadata>(&metadata).ok()?;
+    Some(PathBuf::from(metadata.workspace_dir))
 }
 
 pub async fn read_task() -> Result<String> {
@@ -400,6 +425,51 @@ mod tests {
                 .await
                 .unwrap(),
             ""
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn worktree_project_pointer_resolves_scoped_artifacts_to_canonical_workspace() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        let canonical = dir.path().join("canonical");
+        let worktree = dir.path().join("worktree");
+        let data_dir = dir.path().join("runtime");
+        std::fs::create_dir_all(canonical.join(".ferrus/tasks")).unwrap();
+        std::fs::create_dir_all(worktree.join(".ferrus")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            worktree.join(".ferrus/project.toml"),
+            format!(
+                "project_id = \"test-project\"\nname = \"test\"\ndata_dir = \"{}\"\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("project.toml"),
+            format!(
+                "id = \"test-project\"\nname = \"test\"\nworkspace_dir = \"{}\"\nferrus_dir = \"{}\"\nversion = 1\ncreated_at = \"2026-01-01T00:00:00Z\"\nlast_opened_at = \"2026-01-01T00:00:00Z\"\n",
+                canonical.display(),
+                canonical.join(".ferrus").display()
+            ),
+        )
+        .unwrap();
+        tokio::fs::write(canonical.join(".ferrus/tasks/t-002.md"), "canonical task")
+            .await
+            .unwrap();
+        std::env::set_current_dir(&worktree).unwrap();
+
+        assert_eq!(
+            resolve_project_path(".ferrus/tasks/t-002.md"),
+            canonical.join(".ferrus/tasks/t-002.md")
+        );
+        assert_eq!(
+            read_task_at(".ferrus/tasks/t-002.md").await.unwrap(),
+            "canonical task"
         );
 
         teardown(previous);

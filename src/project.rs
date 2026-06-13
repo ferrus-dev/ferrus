@@ -3371,13 +3371,26 @@ fn project_path(path: impl AsRef<Path>) -> PathBuf {
     if path.is_absolute() || !starts_with_ferrus_dir(path) {
         return path.to_path_buf();
     }
+    if path == Path::new(LOCAL_PROJECT_TOML) {
+        return path.to_path_buf();
+    }
     std::env::var(ENV_PROJECT_ROOT)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|root| root.join(path))
+        .or_else(|| canonical_project_root_from_local_project_ref().map(|root| root.join(path)))
         .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn canonical_project_root_from_local_project_ref() -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(LOCAL_PROJECT_TOML).ok()?;
+    let local_ref = toml::from_str::<LocalProjectRef>(&contents).ok()?;
+    let metadata_path = Path::new(&local_ref.data_dir).join("project.toml");
+    let metadata = std::fs::read_to_string(metadata_path).ok()?;
+    let metadata = toml::from_str::<ProjectMetadata>(&metadata).ok()?;
+    Some(PathBuf::from(metadata.workspace_dir))
 }
 
 fn starts_with_ferrus_dir(path: &Path) -> bool {
