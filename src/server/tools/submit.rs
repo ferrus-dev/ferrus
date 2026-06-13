@@ -1,6 +1,7 @@
 use anyhow::Result;
 use neva::prelude::*;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -14,12 +15,12 @@ use crate::{
     state::store,
 };
 
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 use super::{
     check_gate::{self, CheckGateResult},
     ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err,
 };
-
-static TEMP_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const DESCRIPTION: &str = "\
 Run the final check gate and, if it passes, submit work for Supervisor review. \
@@ -213,24 +214,75 @@ async fn workspace_patch() -> Result<String> {
 }
 
 async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
-    let temp_index = temporary_index_path().await?;
-    let patch = workspace_patch_against_baseline_with_temp_index(baseline, &temp_index).await;
-    let _ = tokio::fs::remove_file(&temp_index).await;
-    patch
+    let tracked = tracked_files().await?;
+    let tracked_set = tracked.iter().cloned().collect::<HashSet<_>>();
+    let baseline_files = baseline_files(baseline).await?;
+    let baseline_set = baseline_files.iter().cloned().collect::<HashSet<_>>();
+    let mut patch = tracked_workspace_patch(baseline, &tracked).await?;
+
+    for path in baseline_files {
+        if tracked_set.contains(&path) {
+            continue;
+        }
+        patch.push_str(&baseline_untracked_path_patch(baseline, &path).await?);
+    }
+
+    for path in untracked_files().await? {
+        if baseline_set.contains(&path) {
+            continue;
+        }
+        patch.push_str(&new_file_patch(&path).await?);
+    }
+    Ok(patch)
 }
 
-async fn workspace_patch_against_baseline_with_temp_index(
-    baseline: &str,
-    temp_index: &Path,
-) -> Result<String> {
-    run_git_with_temp_index(temp_index, ["read-tree", baseline]).await?;
-    run_git_with_temp_index(temp_index, ["add", "-A", "."]).await?;
-    let tree = git_output_with_temp_index(temp_index, ["write-tree"]).await?;
+async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<String> {
+    if tracked.is_empty() {
+        return Ok(String::new());
+    }
+    let mut command = Command::new("git");
+    command.args(["diff", "--binary"]).arg(baseline).arg("--");
+    for path in tracked {
+        command.arg(path);
+    }
+    let output = command.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn tracked_files() -> Result<Vec<String>> {
     let output = Command::new("git")
-        .args(["diff", "--binary"])
+        .args(["ls-files", "-z"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(split_nul_paths(&output.stdout))
+}
+
+async fn baseline_files(baseline: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["ls-tree", "-r", "-z", "--name-only"])
         .arg(baseline)
-        .arg(tree.trim())
-        .arg("--")
         .output()
         .await?;
     if !output.status.success() {
@@ -244,22 +296,12 @@ async fn workspace_patch_against_baseline_with_temp_index(
             }
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(split_nul_paths(&output.stdout))
 }
 
-async fn temporary_index_path() -> Result<PathBuf> {
-    let git_dir = git_output(["rev-parse", "--git-dir"]).await?;
-    let counter = TEMP_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(PathBuf::from(git_dir.trim()).join(format!(
-        "ferrus-submit-index-{}-{counter}",
-        std::process::id()
-    )))
-}
-
-async fn run_git_with_temp_index<const N: usize>(temp_index: &Path, args: [&str; N]) -> Result<()> {
+async fn untracked_files() -> Result<Vec<String>> {
     let output = Command::new("git")
-        .env("GIT_INDEX_FILE", temp_index)
-        .args(args)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()
         .await?;
     if !output.status.success() {
@@ -273,11 +315,36 @@ async fn run_git_with_temp_index<const N: usize>(temp_index: &Path, args: [&str;
             }
         );
     }
-    Ok(())
+    Ok(split_nul_paths(&output.stdout))
 }
 
-async fn git_output<const N: usize>(args: [&str; N]) -> Result<String> {
-    let output = Command::new("git").args(args).output().await?;
+fn split_nul_paths(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+async fn baseline_untracked_path_patch(baseline: &str, path: &str) -> Result<String> {
+    let old = temporary_file_path("baseline-blob");
+    let content = git_show_path(baseline, path).await?;
+    tokio::fs::write(&old, content).await?;
+    let result = if tokio::fs::try_exists(path).await? {
+        no_index_patch(&old, Path::new(path), path, false, false).await
+    } else {
+        no_index_patch(&old, Path::new("/dev/null"), path, false, true).await
+    };
+    let _ = tokio::fs::remove_file(&old).await;
+    result
+}
+
+async fn git_show_path(baseline: &str, path: &str) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("show")
+        .arg(format!("{baseline}:{path}"))
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
@@ -289,19 +356,27 @@ async fn git_output<const N: usize>(args: [&str; N]) -> Result<String> {
             }
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
-async fn git_output_with_temp_index<const N: usize>(
-    temp_index: &Path,
-    args: [&str; N],
+async fn new_file_patch(path: &str) -> Result<String> {
+    no_index_patch(Path::new("/dev/null"), Path::new(path), path, true, false).await
+}
+
+async fn no_index_patch(
+    old: &Path,
+    new: &Path,
+    path: &str,
+    old_null: bool,
+    new_null: bool,
 ) -> Result<String> {
     let output = Command::new("git")
-        .env("GIT_INDEX_FILE", temp_index)
-        .args(args)
+        .args(["diff", "--no-index", "--binary", "--"])
+        .arg(old)
+        .arg(new)
         .output()
         .await?;
-    if !output.status.success() {
+    if !(output.status.success() || output.status.code() == Some(1)) {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
             "Failed to capture executor workspace patch: {}",
@@ -312,7 +387,45 @@ async fn git_output_with_temp_index<const N: usize>(
             }
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(rewrite_no_index_patch_paths(
+        &String::from_utf8_lossy(&output.stdout),
+        path,
+        old_null,
+        new_null,
+    ))
+}
+
+fn rewrite_no_index_patch_paths(patch: &str, path: &str, old_null: bool, new_null: bool) -> String {
+    let mut rewritten = String::new();
+    for line in patch.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches('\n');
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        if line_without_newline.starts_with("diff --git ") {
+            rewritten.push_str(&format!("diff --git a/{path} b/{path}{newline}"));
+        } else if line_without_newline.starts_with("--- ") {
+            let old_path = if old_null {
+                "/dev/null".to_string()
+            } else {
+                format!("a/{path}")
+            };
+            rewritten.push_str(&format!("--- {old_path}{newline}"));
+        } else if line_without_newline.starts_with("+++ ") {
+            let new_path = if new_null {
+                "/dev/null".to_string()
+            } else {
+                format!("b/{path}")
+            };
+            rewritten.push_str(&format!("+++ {new_path}{newline}"));
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    rewritten
+}
+
+fn temporary_file_path(prefix: &str) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{counter}", std::process::id()))
 }
 
 async fn record_task_status(
@@ -468,6 +581,46 @@ mod tests {
         assert!(patch.contains("diff --git a/Cargo.toml b/Cargo.toml"));
         assert!(patch.contains("diff --git a/src/main.rs b/src/main.rs"));
         assert!(!patch.contains("target/debug/ignored"));
+        assert_eq!(git_output(dir.path(), ["ls-files", "--stage"]), "");
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn workspace_patch_includes_changes_to_seeded_untracked_files() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A", "."])
+            .status()
+            .unwrap();
+        let baseline = std::process::Command::new("git")
+            .arg("write-tree")
+            .output()
+            .unwrap();
+        assert!(baseline.status.success());
+        let baseline = String::from_utf8_lossy(&baseline.stdout).trim().to_string();
+        std::process::Command::new("git")
+            .args(["read-tree", "--empty"])
+            .status()
+            .unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n/target\n**/*.rs.bk\n")
+            .await
+            .unwrap();
+
+        let patch = workspace_patch_against_baseline(&baseline).await.unwrap();
+
+        assert!(patch.contains("diff --git a/.gitignore b/.gitignore"));
+        assert!(patch.contains("+/target"));
+        assert!(patch.contains("+**/*.rs.bk"));
         assert_eq!(git_output(dir.path(), ["ls-files", "--stage"]), "");
 
         teardown(previous);
