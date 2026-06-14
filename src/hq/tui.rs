@@ -64,6 +64,7 @@ const COMMANDS: &[(&str, &str)] = &[
 
 pub enum UiMessage {
     Info(String),
+    Success(String),
     Tip(String),
     Muted(String),
     Error(String),
@@ -171,6 +172,7 @@ struct TranscriptLine {
 #[derive(Clone, Copy)]
 enum TranscriptKind {
     Info,
+    Success,
     Tip,
     Muted,
     Error,
@@ -929,6 +931,13 @@ fn handle_message(
     match msg {
         UiMessage::Info(text) => {
             let lines = split_transcript(&text, TranscriptKind::Info);
+            app.messages.extend(lines.iter().cloned());
+            if !app.suspended {
+                redraw_dashboard(stdout, app, ui)?;
+            }
+        }
+        UiMessage::Success(text) => {
+            let lines = split_transcript(&text, TranscriptKind::Success);
             app.messages.extend(lines.iter().cloned());
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
@@ -2210,6 +2219,7 @@ fn activity_text(line: &TranscriptLine) -> String {
 fn transcript_color(kind: TranscriptKind) -> Color {
     match kind {
         TranscriptKind::Info => Color::Grey,
+        TranscriptKind::Success => Color::Green,
         TranscriptKind::Tip => Color::Yellow,
         TranscriptKind::Muted => Color::DarkGrey,
         TranscriptKind::Error => Color::Red,

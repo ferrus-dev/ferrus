@@ -15,6 +15,10 @@ impl Display {
         let _ = self.0.send(UiMessage::Info(msg.into()));
     }
 
+    pub fn success(&self, msg: impl Into<String>) {
+        let _ = self.0.send(UiMessage::Success(msg.into()));
+    }
+
     pub fn info_block(&self, lines: impl IntoIterator<Item = String>) {
         let text = lines.into_iter().collect::<Vec<_>>().join("\n");
         if !text.is_empty() {
@@ -154,6 +158,21 @@ mod tests {
         match msg {
             UiMessage::Info(text) => assert_eq!(text, "first\nsecond"),
             _ => panic!("expected info message"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn success_sends_success_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
+
+        display.success("Task t-001 completed.");
+
+        let msg = rx.try_recv().expect("message should be sent");
+        match msg {
+            UiMessage::Success(text) => assert_eq!(text, "Task t-001 completed."),
+            _ => panic!("expected success message"),
         }
         assert!(rx.try_recv().is_err());
     }

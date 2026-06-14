@@ -60,6 +60,9 @@ pub async fn run(debug: bool) -> Result<()> {
 
     let display = Display(msg_tx);
     let mut ctx = HqContext::new(state_rx.clone(), display.clone(), debug);
+    if let Err(err) = ctx.seed_completed_task_announcements().await {
+        tracing::debug!(error = ?err, "skipped completed task announcement seed");
+    }
     if let Some(hq) = hq_config {
         ctx.set_hq_config(&hq);
     }
@@ -488,6 +491,7 @@ pub(crate) struct HqContext {
     debug: bool,
     state_rx: watch::Receiver<Option<WatchedState>>,
     pub(crate) display: Display,
+    announced_completed_tasks: HashSet<String>,
 }
 
 impl HqContext {
@@ -499,7 +503,15 @@ impl HqContext {
             debug,
             state_rx,
             display,
+            announced_completed_tasks: HashSet::new(),
         }
+    }
+
+    async fn seed_completed_task_announcements(&mut self) -> Result<()> {
+        let tasks = crate::project::list_tasks().await?;
+        self.announced_completed_tasks
+            .extend(completed_task_ids(&tasks));
+        Ok(())
     }
 
     fn set_hq_config(&mut self, hq: &HqConfig) {
@@ -690,7 +702,7 @@ impl HqContext {
 
     fn store_headless_handle(&mut self, name: &str, handle: agent_manager::HeadlessHandle) {
         self.display.muted(format!(
-            "  • Spawning {name}…\n  ╰─ Logs: {}\n\n",
+            "  • Started {name}…\n  ╰─ Logs: {}\n\n",
             handle.log_path.display()
         ));
         self.headless.insert(name.to_string(), handle);
@@ -731,6 +743,7 @@ impl HqContext {
 
         let _ = crate::project::recover_runtime_state().await;
         let tasks = crate::project::list_tasks().await?;
+        self.announce_completed_tasks(&tasks);
         if !tasks.iter().any(|task| {
             is_executor_ready_task_status(&task.status)
                 || is_review_or_consultation_task_status(&task.status)
@@ -747,6 +760,14 @@ impl HqContext {
         self.schedule_queued_tasks_from(tasks, max_parallel, false)
             .await?;
         Ok(())
+    }
+
+    fn announce_completed_tasks(&mut self, tasks: &[TaskRecord]) {
+        for task_id in completed_task_ids(tasks) {
+            if self.announced_completed_tasks.insert(task_id.clone()) {
+                self.display.success(format!("Task {task_id} completed."));
+            }
+        }
     }
 
     async fn reap_exited_headless(&mut self) {
@@ -1314,7 +1335,6 @@ impl HqContext {
         let now = chrono::Utc::now();
         let prompt = agent_manager::reviewer_prompt();
         let mut spawned = 0usize;
-        let mut started_task_ids = Vec::new();
         let mut spawn_error = None;
         let review_tasks = tasks
             .iter()
@@ -1340,7 +1360,6 @@ impl HqContext {
             {
                 Ok(()) => {
                     spawned += 1;
-                    started_task_ids.push(task.id.clone());
                 }
                 Err(err) => {
                     spawn_error = Some(err);
@@ -1349,13 +1368,6 @@ impl HqContext {
             }
         }
 
-        if spawned > 0 {
-            let task_ids = started_task_ids.join(", ");
-            self.display.info(format!(
-                "Started reviewer session(s) for {} task(s): {task_ids}",
-                started_task_ids.len()
-            ));
-        }
         if let Some(err) = spawn_error {
             self.display.error(format!(
                 "Could not start more reviewer sessions after starting {spawned} task(s): {err}",
@@ -1385,7 +1397,6 @@ impl HqContext {
 
         let prompt = agent_manager::consultant_prompt();
         let mut spawned = 0usize;
-        let mut started_task_ids = Vec::new();
         let mut spawn_error = None;
         let consultation_tasks = tasks
             .iter()
@@ -1410,7 +1421,6 @@ impl HqContext {
             {
                 Ok(()) => {
                     spawned += 1;
-                    started_task_ids.push(task.id.clone());
                 }
                 Err(err) => {
                     spawn_error = Some(err);
@@ -1419,13 +1429,6 @@ impl HqContext {
             }
         }
 
-        if spawned > 0 {
-            let task_ids = started_task_ids.join(", ");
-            self.display.info(format!(
-                "Started consultation supervisor session(s) for {} task(s): {task_ids}",
-                started_task_ids.len()
-            ));
-        }
         if let Some(err) = spawn_error {
             self.display.error(format!(
                 "Could not start more consultation supervisor sessions after starting {spawned} task(s): {err}",
@@ -1464,7 +1467,6 @@ impl HqContext {
 
         let requested = ready_count.min(slots);
         let mut spawned = 0usize;
-        let mut started_task_ids = Vec::new();
         let mut spawn_error = None;
         let prompt = agent_manager::executor_prompt();
         let ready_tasks = ready_tasks.into_iter().take(requested).collect::<Vec<_>>();
@@ -1489,7 +1491,6 @@ impl HqContext {
             {
                 Ok(()) => {
                     spawned += 1;
-                    started_task_ids.push(task.id.clone());
                 }
                 Err(err) => {
                     spawn_error = Some(err);
@@ -1498,13 +1499,6 @@ impl HqContext {
             }
         }
 
-        if spawned > 0 {
-            let task_ids = started_task_ids.join(", ");
-            self.display.info(format!(
-                "Started executor session(s) for {} ready task(s): {task_ids}",
-                started_task_ids.len()
-            ));
-        }
         if let Some(err) = spawn_error {
             self.display.error(format!(
                 "Could not start more executor sessions after starting {spawned} task(s): {err}",
@@ -2480,6 +2474,13 @@ fn is_review_or_consultation_task_status(status: &str) -> bool {
     )
 }
 
+fn completed_task_ids(tasks: &[TaskRecord]) -> impl Iterator<Item = String> + '_ {
+    tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Complete.as_str())
+        .map(|task| task.id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2920,10 +2921,70 @@ mod tests {
         let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+        ctx.seed_completed_task_announcements().await.unwrap();
 
         ctx.reconcile_runtime_schedule().await.unwrap();
 
         crate::test_support::assert_no_state_json();
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_runtime_schedule_announces_new_completed_tasks_once() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Pending,
+        )
+        .await
+        .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+        ctx.seed_completed_task_announcements().await.unwrap();
+
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+
+        ctx.reconcile_runtime_schedule().await.unwrap();
+
+        match msg_rx
+            .try_recv()
+            .expect("completion message should be sent")
+        {
+            tui::UiMessage::Success(text) => assert_eq!(text, "Task t-001 completed."),
+            _ => panic!("expected success message"),
+        }
+        assert!(msg_rx.try_recv().is_err());
+
+        ctx.reconcile_runtime_schedule().await.unwrap();
+        assert!(msg_rx.try_recv().is_err());
+
         std::env::set_current_dir(previous).unwrap();
     }
 
