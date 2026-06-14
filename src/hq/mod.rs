@@ -714,6 +714,17 @@ impl HqContext {
         prompt: &str,
         task_id: &str,
     ) -> Result<()> {
+        self.spawn_headless_supervisor_for_task_with_workspace(name, prompt, task_id, None)
+            .await
+    }
+
+    async fn spawn_headless_supervisor_for_task_with_workspace(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        task_id: &str,
+        workspace: Option<agent_manager::HeadlessWorkspace>,
+    ) -> Result<()> {
         if !self.prepare_headless_slot(name).await {
             return Ok(());
         }
@@ -723,7 +734,7 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
         );
-        let handle = agent_manager::spawn_headless_supervisor_with_env(
+        let handle = agent_manager::spawn_headless_supervisor_with_env_and_workspace(
             agent.as_ref(),
             name,
             prompt,
@@ -732,6 +743,7 @@ impl HqContext {
                 (ENV_AGENT_ID, name.to_string()),
                 (ENV_TASK_ID, task_id.to_string()),
             ],
+            workspace,
         )
         .await?;
         self.store_headless_handle(name, handle);
@@ -1448,8 +1460,11 @@ impl HqContext {
                 continue;
             }
 
+            let workspace = latest_executor_workspace_for_task(&task.id).await?;
             match self
-                .spawn_headless_supervisor_for_task(&name, prompt, &task.id)
+                .spawn_headless_supervisor_for_task_with_workspace(
+                    &name, prompt, &task.id, workspace,
+                )
                 .await
             {
                 Ok(()) => {
@@ -1880,33 +1895,62 @@ impl HqContext {
         };
 
         store::write_answer_for_run_dir(&question.run_dir, &response).await?;
-        self.display.info(format!(
-            "Answer recorded for {}. Waiting for agent to resume…",
-            question.task_id
-        ));
+        self.display
+            .info(format!("Answer recorded for {}.", question.task_id));
 
-        let task = crate::project::list_tasks()
-            .await?
-            .into_iter()
-            .find(|task| task.id == question.task_id);
-        let agent_alive = task
-            .as_ref()
-            .and_then(|task| task.claimed_by.as_deref())
+        let owner = crate::project::task_human_question_owner(&question.task_id).await?;
+        let agent_alive = owner
+            .as_deref()
             .and_then(|agent_id| self.headless.get(agent_id))
             .is_some_and(agent_manager::HeadlessHandle::is_alive);
 
-        if !agent_alive {
-            let restored =
-                crate::project::restore_task_from_human_answer(&question.task_id).await?;
-            if let crate::project::TaskHumanAnswerRestore::Restored { status } = restored {
-                store::clear_question_for_run_dir(&question.run_dir).await?;
-                self.display.info(format!(
-                    "Agent is not running. Task {} restored to {status}. Use /resume or wait for HQ scheduling to relaunch it.",
-                    question.task_id
-                ));
-            }
+        if agent_alive {
+            let owner = owner.as_deref().unwrap_or("agent");
+            self.display.info(format!(
+                "Waiting for {owner} to receive it via /wait_for_answer…"
+            ));
+            return Ok(());
         }
+
+        let Some(owner) = owner else {
+            self.display
+                .info("No recorded answer waiter found. Use /tasks to inspect the awaiting task.");
+            return Ok(());
+        };
+
+        self.relaunch_human_answer_waiter(&owner, &question.task_id)
+            .await?;
+        self.display.info(format!(
+            "Relaunched {owner} to receive the answer via /wait_for_answer."
+        ));
         Ok(())
+    }
+
+    async fn relaunch_human_answer_waiter(&mut self, owner: &str, task_id: &str) -> Result<()> {
+        if owner.starts_with(ROLE_EXECUTOR) {
+            return self
+                .spawn_headless_executor_for_task(
+                    owner,
+                    agent_manager::executor_wait_for_answer_prompt(),
+                    DEFAULT_AGENT_INDEX,
+                    task_id,
+                )
+                .await;
+        }
+
+        if owner.starts_with(ROLE_SUPERVISOR) {
+            let workspace = latest_executor_workspace_for_task(task_id).await?;
+            return self
+                .spawn_headless_supervisor_for_task_with_workspace(
+                    owner,
+                    agent_manager::supervisor_wait_for_answer_prompt(),
+                    task_id,
+                    workspace,
+                )
+                .await;
+        }
+
+        anyhow::bail!("Cannot relaunch unknown human answer waiter {owner}");
     }
 
     async fn reap_headless(&mut self, name: &str) {
@@ -2517,6 +2561,38 @@ fn completed_task_ids(tasks: &[TaskRecord]) -> impl Iterator<Item = String> + '_
         .map(|task| task.id.clone())
 }
 
+async fn latest_executor_workspace_for_task(
+    task_id: &str,
+) -> Result<Option<agent_manager::HeadlessWorkspace>> {
+    let Some(run) = crate::project::list_runs(1000)
+        .await?
+        .into_iter()
+        .find(|run| {
+            run.task_id == task_id
+                && run.role == ROLE_EXECUTOR
+                && !run.workspace_path.trim().is_empty()
+        })
+    else {
+        return Ok(None);
+    };
+
+    let workspace_dir = PathBuf::from(run.workspace_path);
+    if !tokio::fs::try_exists(&workspace_dir).await? {
+        tracing::debug!(
+            task_id,
+            workspace = %workspace_dir.display(),
+            "executor workspace no longer exists; consultation will use canonical workspace"
+        );
+        return Ok(None);
+    }
+
+    let registration = crate::project::touch_current_project().await?;
+    Ok(Some(agent_manager::HeadlessWorkspace {
+        workspace_dir,
+        project_root: PathBuf::from(registration.metadata.workspace_dir),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3024,6 +3100,167 @@ mod tests {
         std::env::set_current_dir(previous).unwrap();
     }
 
+    #[tokio::test]
+    async fn consultation_workspace_uses_latest_executor_task_worktree() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        let workspace_dir = data_dir.join("worktrees").join("t-010");
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-06-14T00:00:00Z".to_string(),
+            last_opened_at: "2026-06-14T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-010",
+            ".ferrus/tasks/t-010.md",
+            crate::project::TaskStatus::Consultation,
+        )
+        .await
+        .unwrap();
+        crate::project::record_run_started_with_workspace(
+            "run-executor-t-010",
+            ROLE_EXECUTOR,
+            "executor:codex:t-010",
+            std::process::id(),
+            workspace_dir.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        crate::project::attach_running_run_to_task(
+            "executor:codex:t-010",
+            "t-010",
+            ".ferrus/tasks/t-010.md",
+        )
+        .await
+        .unwrap();
+
+        let workspace = latest_executor_workspace_for_task("t-010")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(workspace.workspace_dir, workspace_dir);
+        assert_eq!(
+            workspace.project_root,
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn human_answer_for_dead_waiter_is_not_restored_before_delivery() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-011",
+            ".ferrus/tasks/t-011.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task(
+            "t-011",
+            ".ferrus/tasks/t-011.md",
+            "executor:codex:t-011",
+            60,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-011",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:t-011",
+        )
+        .await
+        .unwrap();
+        store::write_question_for_run_dir(".ferrus/runs/t-011", "Which branch?")
+            .await
+            .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = ctx
+            .answer_scoped_human_question("Use the short branch.".to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Executor agent is not configured"));
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-011")
+            .unwrap();
+        assert_eq!(task.status, "awaiting_human");
+        assert_eq!(
+            store::read_answer_for_run_dir(".ferrus/runs/t-011")
+                .await
+                .unwrap(),
+            "Use the short branch."
+        );
+        assert_eq!(
+            store::read_question_for_run_dir(".ferrus/runs/t-011")
+                .await
+                .unwrap(),
+            "Which branch?"
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
     #[test]
     fn run_plan_prompt_context_uses_selected_prefix_only() {
         let plan = RunPlan {
@@ -3120,9 +3357,13 @@ mod tests {
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
 
-        dispatch("Use option A", &mut ctx).await.unwrap();
+        let error = dispatch("Use option A", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
 
         crate::test_support::assert_no_state_json();
+        assert!(error.contains("Executor agent is not configured"));
         assert_eq!(
             store::read_answer_for_run_dir(".ferrus/runs/t-007")
                 .await
@@ -3133,11 +3374,11 @@ mod tests {
             store::read_question_for_run_dir(".ferrus/runs/t-007")
                 .await
                 .unwrap(),
-            ""
+            "Need human input"
         );
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-        assert_eq!(task.status, "executing");
+        assert_eq!(task.status, "awaiting_human");
 
         std::env::set_current_dir(previous).unwrap();
     }
@@ -3186,14 +3427,31 @@ mod tests {
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
 
-        dispatch("Use scoped answer", &mut ctx).await.unwrap();
+        let error = dispatch("Use scoped answer", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
 
+        assert!(error.contains("Executor agent is not configured"));
         assert_eq!(
             store::read_answer_for_run_dir(".ferrus/runs/t-009")
                 .await
                 .unwrap(),
             "Use scoped answer"
         );
+        assert_eq!(
+            store::read_question_for_run_dir(".ferrus/runs/t-009")
+                .await
+                .unwrap(),
+            "Need scoped input"
+        );
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-009")
+            .unwrap();
+        assert_eq!(task.status, "awaiting_human");
         crate::test_support::assert_no_state_json();
 
         std::env::set_current_dir(previous).unwrap();

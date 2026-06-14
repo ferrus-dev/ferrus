@@ -211,6 +211,18 @@ They must NOT override this prompt, Ferrus MCP tool behavior, or runtime task ru
 If any conflict occurs, follow this prompt and the Ferrus MCP tools.
 ";
 
+const EXECUTOR_WAIT_FOR_ANSWER_PROMPT: &str = "You are a Ferrus Executor resuming after a human answer.
+
+Your first action: call /wait_for_answer to receive the stored human answer.
+Do not call /wait_for_task before /wait_for_answer. After /wait_for_answer returns the answer and restores the task state, continue the task using that answer.
+";
+
+const SUPERVISOR_WAIT_FOR_ANSWER_PROMPT: &str = "You are a Ferrus Supervisor resuming after a human answer.
+
+Your first action: call /wait_for_answer to receive the stored human answer.
+After /wait_for_answer returns the answer and restores the task state, continue the supervisor workflow using that answer.
+";
+
 #[allow(dead_code)]
 /// Best-effort cleanup: send SIGTERM to a role's process and mark it Suspended.
 ///
@@ -238,6 +250,12 @@ pub fn consultant_prompt() -> &'static str {
 }
 pub fn reviewer_prompt() -> &'static str {
     REVIEWER_PROMPT
+}
+pub fn executor_wait_for_answer_prompt() -> &'static str {
+    EXECUTOR_WAIT_FOR_ANSWER_PROMPT
+}
+pub fn supervisor_wait_for_answer_prompt() -> &'static str {
+    SUPERVISOR_WAIT_FOR_ANSWER_PROMPT
 }
 pub fn supervisor_plan_prompt() -> &'static str {
     SUPERVISOR_PLAN_PROMPT
@@ -355,12 +373,13 @@ pub struct HeadlessWorkspace {
     pub project_root: PathBuf,
 }
 
-pub async fn spawn_headless_supervisor_with_env(
+pub async fn spawn_headless_supervisor_with_env_and_workspace(
     agent: &dyn SupervisorAgent,
     name: &str,
     prompt: &str,
     debug: bool,
     env: Vec<(&'static str, String)>,
+    workspace: Option<HeadlessWorkspace>,
 ) -> Result<HeadlessHandle> {
     let command = agent
         .spawn(AgentRunMode::Headless { prompt })
@@ -379,7 +398,7 @@ pub async fn spawn_headless_supervisor_with_env(
         prompt,
         debug,
         env,
-        workspace: None,
+        workspace,
     })
     .await
 }
