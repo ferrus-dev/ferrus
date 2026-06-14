@@ -1032,6 +1032,27 @@ impl HqContext {
         prompt: &str,
         existing_task_ids: &HashSet<String>,
     ) -> Result<Option<String>> {
+        Ok(self
+            .spawn_interactive_supervisor_until_tasks_enqueued(
+                name,
+                prompt,
+                existing_task_ids,
+                1,
+                "Task enqueued — returning to HQ…",
+            )
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn spawn_interactive_supervisor_until_tasks_enqueued(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        existing_task_ids: &HashSet<String>,
+        expected_count: usize,
+        stop_message: &str,
+    ) -> Result<Vec<String>> {
         use std::process::Stdio;
         use tokio::process::Command;
 
@@ -1069,7 +1090,7 @@ impl HqContext {
         self.mark_agent_running(ROLE_SUPERVISOR, agent.name(), name, child.id())
             .await?;
 
-        let mut created_task_id = None;
+        let mut created_task_ids = Vec::new();
         let mut child_status = None;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
         loop {
@@ -1079,8 +1100,9 @@ impl HqContext {
                     break;
                 }
                 _ = ticker.tick() => {
-                    if let Some(task_id) = new_task_id_since(existing_task_ids).await? {
-                        created_task_id = Some(task_id);
+                    let task_ids = new_task_ids_since(existing_task_ids).await?;
+                    if task_ids.len() >= expected_count {
+                        created_task_ids = task_ids;
                         if let Some(status) = child
                             .try_wait()
                             .with_context(|| format!("Failed to inspect {program} status"))?
@@ -1090,7 +1112,7 @@ impl HqContext {
                         }
                         self.stop_interactive_child(
                             &mut child,
-                            "Task enqueued — returning to HQ…",
+                            stop_message,
                         )
                         .await?;
                         break;
@@ -1113,7 +1135,7 @@ impl HqContext {
                 &stderr
             ));
         }
-        Ok(created_task_id)
+        Ok(created_task_ids)
     }
 
     async fn spawn_interactive_executor(&mut self, name: &str, prompt: Option<&str>) -> Result<()> {
@@ -1295,9 +1317,20 @@ impl HqContext {
             "Review each task draft with the supervisor; approved tasks will be queued as pending.",
         );
 
+        let existing_task_ids = crate::project::list_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
         let supervisor_id = self.supervisor_agent_id()?;
-        self.spawn_interactive_supervisor(&supervisor_id, Some(&prompt))
-            .await?;
+        self.spawn_interactive_supervisor_until_tasks_enqueued(
+            &supervisor_id,
+            &prompt,
+            &existing_task_ids,
+            selected_count,
+            "Batch tasks enqueued — returning to HQ…",
+        )
+        .await?;
         self.display
             .info("Batch preparation session finished. Use /tasks to inspect queued tasks.");
         self.schedule_queued_tasks().await?;
@@ -2006,12 +2039,15 @@ fn run_plan_prompt_context(plan: &RunPlan, selected_count: usize) -> String {
     lines.join("\n")
 }
 
-async fn new_task_id_since(existing_task_ids: &HashSet<String>) -> Result<Option<String>> {
+async fn new_task_ids_since(existing_task_ids: &HashSet<String>) -> Result<Vec<String>> {
     let tasks = crate::project::list_tasks().await?;
-    Ok(tasks
+    let mut task_ids = tasks
         .into_iter()
-        .find(|task| !existing_task_ids.contains(&task.id))
-        .map(|task| task.id))
+        .filter(|task| !existing_task_ids.contains(&task.id))
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    task_ids.sort();
+    Ok(task_ids)
 }
 
 fn selected_milestone_prompt_context(selected: &SelectedMilestone) -> String {
