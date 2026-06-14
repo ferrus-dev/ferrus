@@ -169,7 +169,7 @@ async fn write_submission_patch(context: &RuntimeTaskContext) -> Result<()> {
         return Ok(());
     }
 
-    let patch = workspace_patch().await?;
+    let patch = workspace_patch(context).await?;
     store::write_patch_for_run_dir(&context.run_dir, &patch).await
 }
 
@@ -233,13 +233,33 @@ async fn equivalent_paths(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-async fn workspace_patch() -> Result<String> {
-    let baseline = std::env::var(ENV_BASELINE_TREE)
+async fn workspace_patch(context: &RuntimeTaskContext) -> Result<String> {
+    let baseline = baseline_tree(context).unwrap_or_else(|| "HEAD".to_string());
+    workspace_patch_against_baseline(&baseline).await
+}
+
+fn baseline_tree(context: &RuntimeTaskContext) -> Option<String> {
+    baseline_tree_from_env().or_else(|| baseline_tree_from_project_data(&context.task_id))
+}
+
+fn baseline_tree_from_env() -> Option<String> {
+    std::env::var(ENV_BASELINE_TREE)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "HEAD".to_string());
-    workspace_patch_against_baseline(&baseline).await
+}
+
+fn baseline_tree_from_project_data(task_id: &str) -> Option<String> {
+    let local_ref = std::fs::read_to_string(".ferrus/project.toml").ok()?;
+    let local_ref = toml::from_str::<project::LocalProjectRef>(&local_ref).ok()?;
+    let baseline_path = Path::new(&local_ref.data_dir)
+        .join("worktrees")
+        .join(".baseline-trees")
+        .join(format!("{task_id}.txt"));
+    std::fs::read_to_string(baseline_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
@@ -616,6 +636,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_patch_uses_stored_baseline_when_env_is_absent() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        let _env_guard = EnvVarGuard::remove(ENV_BASELINE_TREE);
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let empty_index = dir.path().join(".git/empty-index");
+        assert!(git_env(dir.path(), &empty_index, ["read-tree", "--empty"]).success());
+        let baseline = git_env_output(dir.path(), &empty_index, ["write-tree"]);
+        std::fs::remove_file(&empty_index).unwrap();
+        let baseline_path = data_dir.join("worktrees/.baseline-trees/t-test.txt");
+        tokio::fs::create_dir_all(baseline_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&baseline_path, &baseline).await.unwrap();
+
+        tokio::fs::write("Cargo.toml", "[package]\nname = \"demo\"\n")
+            .await
+            .unwrap();
+
+        let context = runtime_context_with_workspace(dir.path());
+        let patch = workspace_patch(&context).await.unwrap();
+
+        assert!(patch.contains("diff --git a/Cargo.toml b/Cargo.toml"));
+        assert!(patch.contains("+name = \"demo\""));
+        assert_eq!(git_output(dir.path(), ["ls-files", "--stage"]), "");
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
     async fn workspace_patch_includes_changes_to_seeded_untracked_files() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
@@ -916,6 +986,32 @@ mod tests {
             failure_reason: None,
             run_id: None,
             workspace_path: Some(workspace.to_string_lossy().into_owned()),
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
         }
     }
 }
