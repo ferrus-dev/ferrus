@@ -23,7 +23,7 @@ name = "ferrus"
 path = "src/main.rs"
 
 [dependencies]
-neva = { version = "0.3.4", features = ["server"] }
+neva = { version = "0.3.4", features = ["server", "di"] }
 tokio = { version = "1.52.3", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }

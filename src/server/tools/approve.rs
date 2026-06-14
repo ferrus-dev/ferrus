@@ -16,6 +16,11 @@ use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_er
 pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing → Complete. \
      Must be called after /review_pending.";
 
+pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id).await
+}
+
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
     run(agent_id).await.map_err(tool_err)
 }

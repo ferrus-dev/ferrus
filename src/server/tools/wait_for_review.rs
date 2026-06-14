@@ -23,7 +23,12 @@ pub const DESCRIPTION: &str = "Block until the Executor submits work for review,
      agent can poll again. \
      Returns immediately if a submission is already pending — safe to call on restart.";
 
-pub async fn handler(agent_id: &str) -> Result<String, Error> {
+pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id).await
+}
+
+pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
     run(agent_id).await.map_err(tool_err)
 }
 

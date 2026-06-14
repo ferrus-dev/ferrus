@@ -671,6 +671,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "volga-di",
 ]
 
 [[package]]
@@ -1400,6 +1401,15 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "volga-di"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3929b17119314de4f7bc463ea3a09a92ccc0522b9be8fc9b74d2c113dc9f3db4"
+dependencies = [
+ "http",
+]
 
 [[package]]
 name = "wasi"

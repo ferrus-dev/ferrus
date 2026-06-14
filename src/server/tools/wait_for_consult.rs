@@ -16,6 +16,11 @@ pub const DESCRIPTION: &str = "Block until CONSULT_RESPONSE.md exists, then rest
      return the consultant's response text. Each call waits up to `wait_timeout_secs` and then \
      returns an error telling the agent to call /wait_for_consult again. Must only be called while state is Consultation.";
 
+pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id).await
+}
+
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
     run(agent_id).await.map_err(tool_err)
 }

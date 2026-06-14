@@ -25,6 +25,11 @@ pub const INPUT_SCHEMA: &str = r#"{
     "required": ["notes"]
 }"#;
 
+pub async fn handler(ctx: neva::Context, notes: String) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id, notes).await
+}
+
 pub async fn handler_for_agent(agent_id: &str, notes: String) -> Result<String, Error> {
     run(agent_id, notes).await.map_err(tool_err)
 }

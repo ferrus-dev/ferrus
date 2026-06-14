@@ -77,7 +77,7 @@ pub async fn read_for_agent(
         }
         "runtime_context" => (
             "application/json",
-            read_runtime_context_for_agent(agent_id)
+            read_runtime_context_for_agent(agent_id, None)
                 .await
                 .map_err(to_err)?,
         ),
@@ -93,6 +93,22 @@ pub async fn read_for_agent(
     Ok(ReadResourceResult::from(
         TextResourceContents::new(uri, content).with_mime(mime),
     ))
+}
+
+pub async fn read(ctx: neva::Context, file: String) -> Result<ReadResourceResult, Error> {
+    let server_context = ctx.resolve::<crate::server::ServerContext>()?;
+    let agent_id = server_context.agent_id().to_string();
+    if file == "runtime_context" {
+        let content =
+            read_runtime_context_for_agent(Some(agent_id.as_str()), Some(&server_context))
+                .await
+                .map_err(to_err)?;
+        return Ok(ReadResourceResult::from(
+            TextResourceContents::new("ferrus://runtime_context", content)
+                .with_mime("application/json"),
+        ));
+    }
+    read_for_agent(Some(agent_id.as_str()), file).await
 }
 
 async fn read_review_for_agent(agent_id: Option<&str>) -> anyhow::Result<String> {
@@ -163,7 +179,10 @@ async fn read_current_task_for_agent(agent_id: Option<&str>) -> anyhow::Result<S
     store::read_task().await
 }
 
-async fn read_runtime_context_for_agent(agent_id: Option<&str>) -> anyhow::Result<String> {
+async fn read_runtime_context_for_agent(
+    agent_id: Option<&str>,
+    server_context: Option<&crate::server::ServerContext>,
+) -> anyhow::Result<String> {
     let environment = serde_json::json!({
         ENV_AGENT_ID: std::env::var(ENV_AGENT_ID).ok(),
         ENV_TASK_ID: std::env::var(ENV_TASK_ID).ok(),
@@ -175,6 +194,14 @@ async fn read_runtime_context_for_agent(agent_id: Option<&str>) -> anyhow::Resul
         "environment": environment,
         "task_context": null,
     });
+    if let Some(server_context) = server_context {
+        payload["server"] = serde_json::json!({
+            "agent_id": server_context.agent_id(),
+            "role": server_context.role().map(crate::server::Role::as_str),
+            "agent_name": server_context.agent_name(),
+            "agent_index": server_context.agent_index(),
+        });
+    }
 
     if let Some(agent_id) = agent_id {
         match project::runtime_task_context_for_agent(agent_id).await {

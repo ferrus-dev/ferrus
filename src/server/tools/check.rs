@@ -18,6 +18,11 @@ pub const DESCRIPTION: &str = "Run all configured checks (clippy, fmt, tests, et
      On fail: stay in the current work state (or state → Failed if the retry \
      limit is exhausted).";
 
+pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id).await
+}
+
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
     run(Some(agent_id)).await.map_err(tool_err)
 }

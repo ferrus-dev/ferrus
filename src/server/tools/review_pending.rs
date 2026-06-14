@@ -14,6 +14,11 @@ pub const DESCRIPTION: &str = "Retrieve the pending submission for review. Retur
      the Executor's submission notes (summary, verification steps, known limitations), \
      and any prior review notes. Only valid in state Reviewing.";
 
+pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
+    let agent_id = super::agent_id_from_context(&ctx)?;
+    handler_for_agent(&agent_id).await
+}
+
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
     run(agent_id).await.map_err(tool_err)
 }

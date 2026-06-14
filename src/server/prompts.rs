@@ -30,6 +30,14 @@ pub async fn executor_context_for_agent(agent_id: Option<&str>) -> Result<GetPro
         .with_message(PromptMessage::user().with(sections.join("\n\n---\n\n"))))
 }
 
+pub async fn executor_context(ctx: neva::Context) -> Result<GetPromptResult, Error> {
+    let agent_id = ctx
+        .resolve::<crate::server::ServerContext>()?
+        .agent_id()
+        .to_string();
+    executor_context_for_agent(Some(agent_id.as_str())).await
+}
+
 pub async fn supervisor_review_for_agent(agent_id: Option<&str>) -> Result<GetPromptResult, Error> {
     let runtime_context = runtime_context(agent_id).await.map_err(to_err)?;
     let task = read_task(runtime_context.as_ref()).await.map_err(to_err)?;
@@ -49,6 +57,14 @@ pub async fn supervisor_review_for_agent(agent_id: Option<&str>) -> Result<GetPr
     Ok(GetPromptResult::new()
         .with_descr("Supervisor review context: state, task description, and submission notes")
         .with_message(PromptMessage::user().with(sections.join("\n\n---\n\n"))))
+}
+
+pub async fn supervisor_review(ctx: neva::Context) -> Result<GetPromptResult, Error> {
+    let agent_id = ctx
+        .resolve::<crate::server::ServerContext>()?
+        .agent_id()
+        .to_string();
+    supervisor_review_for_agent(Some(agent_id.as_str())).await
 }
 
 async fn runtime_context(agent_id: Option<&str>) -> anyhow::Result<Option<RuntimeTaskContext>> {
