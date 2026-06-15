@@ -1966,6 +1966,14 @@ fn run_dir_for_task(task_id: &str) -> String {
     format!(".ferrus/runs/{task_id}")
 }
 
+fn default_task_path_for_id(task_id: &str) -> String {
+    if task_id == CURRENT_TASK_ID {
+        CURRENT_TASK_PATH.to_string()
+    } else {
+        format!(".ferrus/tasks/{task_id}.md")
+    }
+}
+
 pub async fn record_runtime_event(
     run_id: Option<String>,
     event_type: &str,
@@ -2012,6 +2020,7 @@ pub async fn record_run_started_with_id(
     record_run_started_with_workspace(run_id, role, agent, pid, workspace_path).await
 }
 
+#[cfg(test)]
 pub async fn record_run_started_with_workspace(
     run_id: &str,
     role: &str,
@@ -2019,8 +2028,22 @@ pub async fn record_run_started_with_workspace(
     pid: u32,
     workspace_path: String,
 ) -> Result<RunRecord> {
+    record_run_started_for_task_with_workspace(run_id, role, agent, pid, None, workspace_path).await
+}
+
+pub async fn record_run_started_for_task_with_workspace(
+    run_id: &str,
+    role: &str,
+    agent: &str,
+    pid: u32,
+    task_id: Option<&str>,
+    workspace_path: String,
+) -> Result<RunRecord> {
     let database_path = current_database_path().await?;
-    let (task_id, task_path) = current_task_identity().await;
+    let (task_id, task_path) = match task_id.map(str::trim).filter(|task_id| !task_id.is_empty()) {
+        Some(task_id) => (task_id.to_string(), default_task_path_for_id(task_id)),
+        None => current_task_identity().await,
+    };
     let run_id = run_id.to_string();
     let role = role.to_string();
     let agent = agent.to_string();
@@ -2081,17 +2104,27 @@ pub async fn record_run_started_with_workspace(
     Ok(record)
 }
 
-pub async fn record_run_started_with_id_best_effort(
+pub async fn record_run_started_for_task_with_id_best_effort(
     run_id: &str,
     role: &str,
     agent: &str,
     pid: u32,
+    task_id: Option<&str>,
     workspace_path: String,
 ) -> Option<String> {
-    match record_run_started_with_workspace(run_id, role, agent, pid, workspace_path).await {
+    match record_run_started_for_task_with_workspace(
+        run_id,
+        role,
+        agent,
+        pid,
+        task_id,
+        workspace_path,
+    )
+    .await
+    {
         Ok(record) => Some(record.id),
         Err(err) => {
-            warn!(error = ?err, run_id, role, agent, pid, "failed to mirror run start into ferrus.db");
+            warn!(error = ?err, run_id, role, agent, pid, task_id, "failed to mirror task-scoped run start into ferrus.db");
             None
         }
     }
@@ -4741,6 +4774,47 @@ mod tests {
         assert!(
             runs.iter()
                 .any(|run| run.id == run_id && run.workspace_path == workspace_path)
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn record_run_started_can_target_requested_task_without_lease() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (dir, previous) = setup_project().await;
+        record_task_status(
+            "t-012",
+            ".ferrus/tasks/t-012.md",
+            crate::project::TaskStatus::AwaitingHuman,
+        )
+        .await
+        .unwrap();
+        let run_id = allocate_run_id("executor", "executor:codex:t-012");
+        let workspace_path = path_string(&dir.path().join("worktrees").join("t-012"));
+
+        let run = record_run_started_for_task_with_workspace(
+            &run_id,
+            "executor",
+            "executor:codex:t-012",
+            std::process::id(),
+            Some("t-012"),
+            workspace_path.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.task_id, "t-012");
+        let context = runtime_task_context_for_agent("executor:codex:t-012")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.task_id, "t-012");
+        assert_eq!(context.task_path, ".ferrus/tasks/t-012.md");
+        assert_eq!(
+            context.workspace_path.as_deref(),
+            Some(workspace_path.as_str())
         );
 
         teardown(previous);

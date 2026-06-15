@@ -1,4 +1,4 @@
-use crate::agent_id::{ENV_PROJECT_ROOT, ENV_RUN_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR};
+use crate::agent_id::{ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR};
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent};
 use crate::platform::{self, ShutdownSignal};
 use crate::state::agents::{AgentEntry, AgentStatus, read_agents, write_agents};
@@ -430,6 +430,12 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .with_context(|| format!("Failed to open log file {}", log_path.display()))?;
     let run_id = crate::project::allocate_run_id(request.role, request.name);
     request.env.push((ENV_RUN_ID, run_id.clone()));
+    let task_id = request
+        .env
+        .iter()
+        .find_map(|(key, value)| (*key == ENV_TASK_ID).then_some(value.trim()))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     if let Some(workspace) = request.workspace.as_ref() {
         request.env.push((
             ENV_PROJECT_ROOT,
@@ -514,11 +520,12 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     }
 
     let pid = child.id();
-    let db_run_id = crate::project::record_run_started_with_id_best_effort(
+    let db_run_id = crate::project::record_run_started_for_task_with_id_best_effort(
         &run_id,
         request.role,
         request.name,
         pid,
+        task_id.as_deref(),
         workspace_path,
     )
     .await;
