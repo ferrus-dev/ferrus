@@ -11,7 +11,10 @@ use crate::{
     state::store,
 };
 
-use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err};
+use super::{
+    check_gate::{self, CheckGateResult},
+    ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err,
+};
 
 pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing → Complete. \
      Must be called after /review_pending.";
@@ -38,6 +41,17 @@ async fn run(agent_id: &str) -> Result<String> {
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     let patch_applied = apply_approved_patch(&context).await?;
+    if patch_applied {
+        let integration_checks = run_post_apply_integration_checks(&context, &config).await;
+        if let Err(err) = integration_checks {
+            if let Err(rollback_err) = rollback_approved_patch(&context).await {
+                anyhow::bail!(
+                    "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+                );
+            }
+            return Err(err);
+        }
+    }
     let transition = async {
         if let (Some(spec_path), Some(milestone_id)) = (
             context.spec_path.as_deref(),
@@ -116,6 +130,60 @@ async fn apply_approved_patch(context: &RuntimeTaskContext) -> Result<bool> {
         );
     }
     Ok(true)
+}
+
+async fn run_post_apply_integration_checks(
+    context: &RuntimeTaskContext,
+    config: &Config,
+) -> Result<()> {
+    if config.checks.commands.is_empty() {
+        info!("No check commands configured; skipping post-approve integration gate");
+        return Ok(());
+    }
+
+    info!("Running post-approve integration gate");
+    let attempt = context.check_retries + 1;
+    match check_gate::run(config, attempt).await? {
+        CheckGateResult::Passed => {
+            project::record_runtime_event_best_effort(
+                context.run_id.clone(),
+                "approve_integration_check_passed",
+                serde_json::json!({
+                    "task_id": context.task_id.as_str(),
+                    "commands": config.checks.commands.len(),
+                }),
+            )
+            .await;
+            Ok(())
+        }
+        CheckGateResult::Failed(failure) => {
+            let reason = format!(
+                "Cannot approve task {} because configured checks failed after applying its patch to the canonical workspace.\n\n{}",
+                context.task_id, failure.report
+            );
+            write_integration_error(context, &reason).await?;
+            project::record_task_integration_failed_best_effort(
+                &context.task_id,
+                context.run_id.as_deref(),
+                &failure.failure_reason,
+            )
+            .await;
+            project::record_runtime_event_best_effort(
+                context.run_id.clone(),
+                "approve_integration_check_failed",
+                serde_json::json!({
+                    "task_id": context.task_id.as_str(),
+                    "failure_reason": failure.failure_reason,
+                }),
+            )
+            .await;
+            anyhow::bail!(
+                "{reason}\n\nIntegration error was saved to {}/INTEGRATION_ERROR.md. \
+                 The task remains in review and the applied patch was rolled back; reject this review with the check details so an Executor can address it.",
+                context.run_dir
+            );
+        }
+    }
 }
 
 async fn rollback_approved_patch(context: &RuntimeTaskContext) -> Result<()> {
@@ -426,6 +494,81 @@ mod tests {
             task.failure_reason
                 .as_deref()
                 .is_some_and(|reason| { reason.contains("patch could not be applied") })
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn approve_rolls_back_patch_when_post_apply_checks_fail() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (dir, previous) = setup().await;
+        tokio::fs::write(
+            "ferrus.toml",
+            "[checks]\ncommands = [\"git grep -q base -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+        )
+        .await
+        .unwrap();
+        if !git(dir.path(), ["init"]).success() {
+            teardown(previous);
+            return;
+        }
+        tokio::fs::write("file.txt", "base\n").await.unwrap();
+        assert!(git(dir.path(), ["add", "file.txt"]).success());
+        assert!(
+            git(
+                dir.path(),
+                [
+                    "-c",
+                    "user.email=ferrus@example.invalid",
+                    "-c",
+                    "user.name=Ferrus",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+            )
+            .success()
+        );
+        tokio::fs::write("file.txt", "broken\n").await.unwrap();
+        let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
+        tokio::fs::write("file.txt", "base\n").await.unwrap();
+        assert!(!patch.trim().is_empty());
+
+        store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
+            .await
+            .unwrap();
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+            .await
+            .unwrap();
+
+        let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+        assert!(error.contains("configured checks failed"));
+        assert!(error.contains("rolled back"));
+        let file = tokio::fs::read_to_string("file.txt").await.unwrap();
+        assert_eq!(file.replace("\r\n", "\n"), "base\n");
+        let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+            .await
+            .unwrap();
+        assert!(integration_error.contains("configured checks failed"));
+        assert!(integration_error.contains("git grep -q base -- file.txt"));
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+        assert_eq!(task.status, "reviewing");
+        assert!(
+            task.failure_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("Commands failed") })
         );
 
         teardown(previous);

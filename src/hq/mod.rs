@@ -1513,14 +1513,20 @@ impl HqContext {
             return Ok(0);
         }
 
-        let requested = ready_count.min(slots);
         let mut spawned = 0usize;
         let mut spawn_error = None;
         let prompt = agent_manager::executor_prompt();
-        let ready_tasks = ready_tasks.into_iter().take(requested).collect::<Vec<_>>();
+        let spawn_tasks = select_executor_spawn_tasks(&ready_tasks, slots, |task| {
+            let Ok(name) = self.executor_agent_id_for_task(&task.id) else {
+                return false;
+            };
+            self.headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+        });
 
-        for task in &ready_tasks {
-            if spawned >= requested {
+        for task in spawn_tasks {
+            if spawned >= slots {
                 break;
             }
             let index = u32::try_from(spawned + 1).context("Executor index exceeds u32 range")?;
@@ -2547,6 +2553,21 @@ fn is_executor_ready_task_status(status: &str) -> bool {
         .is_ok_and(crate::project::TaskStatus::is_executor_ready)
 }
 
+fn select_executor_spawn_tasks<F>(
+    ready_tasks: &[TaskRecord],
+    slots: usize,
+    mut is_live: F,
+) -> Vec<&TaskRecord>
+where
+    F: FnMut(&TaskRecord) -> bool,
+{
+    ready_tasks
+        .iter()
+        .filter(|task| !is_live(task))
+        .take(slots)
+        .collect()
+}
+
 fn is_review_or_consultation_task_status(status: &str) -> bool {
     matches!(
         status.parse::<crate::project::TaskStatus>().ok(),
@@ -2596,6 +2617,23 @@ async fn latest_executor_workspace_for_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_record(id: &str, status: crate::project::TaskStatus) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            path: format!(".ferrus/tasks/{id}.md"),
+            spec_path: None,
+            milestone_id: None,
+            status: status.as_str().to_string(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        }
+    }
 
     #[cfg(unix)]
     fn failed_exit_status() -> std::process::ExitStatus {
@@ -3304,6 +3342,19 @@ mod tests {
 
         assert!(!lines.contains("not wired"));
         assert!(lines.contains("selected  : 1"));
+    }
+
+    #[test]
+    fn executor_spawn_selection_skips_live_tasks_before_slot_limit() {
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Pending),
+            task_record("t-002", crate::project::TaskStatus::Pending),
+        ];
+
+        let selected = select_executor_spawn_tasks(&tasks, 1, |task| task.id == "t-001");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "t-002");
     }
 
     #[cfg(unix)]
