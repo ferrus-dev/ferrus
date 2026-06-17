@@ -143,7 +143,11 @@ async fn run_post_apply_integration_checks(
 
     info!("Running post-approve integration gate");
     let attempt = context.check_retries + 1;
-    match check_gate::run(config, attempt).await? {
+    let log_scope = context
+        .run_id
+        .as_deref()
+        .unwrap_or(context.task_id.as_str());
+    match check_gate::run(config, attempt, log_scope).await? {
         CheckGateResult::Passed => {
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),

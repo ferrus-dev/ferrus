@@ -117,19 +117,37 @@ pub async fn clear_scoped_task_artifacts(task_path: &str, run_dir: &str) -> Resu
     remove_dir_if_exists(Path::new(run_dir)).await
 }
 
-/// Write a full check log to `.ferrus/logs/check_{attempt}_{ts}.txt`.
+/// Write a full check log to `.ferrus/logs/check_{attempt}_{scope}_{ts}.txt`.
 /// Creates the logs directory if it doesn't exist. Returns the file path.
-pub async fn write_check_log(attempt: u32, ts: u64, content: &str) -> Result<PathBuf> {
+pub async fn write_check_log(attempt: u32, ts: u64, scope: &str, content: &str) -> Result<PathBuf> {
     let logs_dir = resolve_project_path(LOGS_DIR);
     tokio::fs::create_dir_all(&logs_dir)
         .await
         .with_context(|| format!("Failed to create {}", logs_dir.display()))?;
-    let filename = format!("check_{attempt}_{ts}.txt");
+    let filename = format!("check_{attempt}_{}_{ts}.txt", sanitize_log_component(scope));
     let p = logs_dir.join(&filename);
     tokio::fs::write(&p, content)
         .await
         .with_context(|| format!("Failed to write {}", p.display()))?;
     Ok(p)
+}
+
+fn sanitize_log_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[allow(dead_code)]
@@ -395,6 +413,36 @@ mod tests {
                 .await
                 .unwrap(),
             "consult response body"
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn check_logs_include_scope_to_avoid_parallel_overwrites() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+
+        let first = write_check_log(1, 123, "r:first", "first log")
+            .await
+            .unwrap();
+        let second = write_check_log(1, 123, "r:second", "second log")
+            .await
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("check_1_r_first_123.txt")
+        );
+        assert_eq!(
+            second.file_name().and_then(|name| name.to_str()),
+            Some("check_1_r_second_123.txt")
+        );
+        assert_eq!(tokio::fs::read_to_string(first).await.unwrap(), "first log");
+        assert_eq!(
+            tokio::fs::read_to_string(second).await.unwrap(),
+            "second log"
         );
 
         teardown(previous);

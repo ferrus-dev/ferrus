@@ -64,7 +64,11 @@ async fn run(agent_id: Option<&str>) -> Result<String> {
 
     info!("Running {} check(s)", config.checks.commands.len());
     let attempt = context.check_retries + 1;
-    match check_gate::run(&config, attempt).await? {
+    let log_scope = context
+        .run_id
+        .as_deref()
+        .unwrap_or(context.task_id.as_str());
+    match check_gate::run(&config, attempt, log_scope).await? {
         CheckGateResult::Passed => {
             project::record_task_check_passed(&context.task_id).await?;
             project::record_runtime_event_best_effort(
