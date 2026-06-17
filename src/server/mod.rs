@@ -2,7 +2,7 @@ use anyhow::Result;
 use neva::App;
 use neva::types::ToolSchema;
 
-use crate::agent_id::{ENV_AGENT_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR, agent_id};
+use crate::agent_id::{ENV_AGENT_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR, agent_id};
 use crate::platform;
 
 mod prompts;
@@ -87,6 +87,8 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
     let all_roles = role.is_none();
     let supervisor_role = role.as_ref().is_some_and(|r| *r == Role::Supervisor);
     let executor_role = role.as_ref().is_some_and(|r| *r == Role::Executor);
+    let task_scoped_supervisor =
+        supervisor_role && task_scope_is_present(std::env::var(ENV_TASK_ID).ok().as_deref());
     let sup = all_roles || supervisor_role;
     let exe = all_roles || executor_role;
 
@@ -96,12 +98,16 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
                 .with_description(tools::create_task::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_task::INPUT_SCHEMA));
         }
-        app.map_tool("enqueue_task", tools::enqueue_task::handler)
-            .with_description(tools::enqueue_task::DESCRIPTION)
-            .with_input_schema(|_| ToolSchema::from_json_str(tools::enqueue_task::INPUT_SCHEMA));
-        app.map_tool("create_spec", tools::create_spec::handler)
-            .with_description(tools::create_spec::DESCRIPTION)
-            .with_input_schema(|_| ToolSchema::from_json_str(tools::create_spec::INPUT_SCHEMA));
+        if all_roles || !task_scoped_supervisor {
+            app.map_tool("enqueue_task", tools::enqueue_task::handler)
+                .with_description(tools::enqueue_task::DESCRIPTION)
+                .with_input_schema(|_| {
+                    ToolSchema::from_json_str(tools::enqueue_task::INPUT_SCHEMA)
+                });
+            app.map_tool("create_spec", tools::create_spec::handler)
+                .with_description(tools::create_spec::DESCRIPTION)
+                .with_input_schema(|_| ToolSchema::from_json_str(tools::create_spec::INPUT_SCHEMA));
+        }
         app.map_tool("wait_for_review", tools::wait_for_review::handler)
             .with_description(tools::wait_for_review::DESCRIPTION);
         app.map_tool("review_pending", tools::review_pending::handler)
@@ -185,11 +191,53 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         app.map_tool("reset", tools::reset::handler)
             .with_description(tools::reset::DESCRIPTION);
     }
-    if all_roles || executor_role {
+    if all_roles || executor_role || task_scoped_supervisor {
         app.map_tool("heartbeat", tools::heartbeat::handler)
             .with_description(tools::heartbeat::DESCRIPTION);
     }
 
     app.run().await;
     Ok(())
+}
+
+fn task_scope_is_present(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_scoped_supervisor_mapping_uses_heartbeat_instead_of_definition_tools() {
+        let all_roles = false;
+        let executor_role = false;
+        let task_scoped_supervisor = task_scope_is_present(Some("t-001"));
+
+        assert!(!(all_roles || !task_scoped_supervisor));
+        assert!(all_roles || executor_role || task_scoped_supervisor);
+    }
+
+    #[test]
+    fn interactive_supervisor_mapping_keeps_definition_tools_without_heartbeat() {
+        let all_roles = false;
+        let executor_role = false;
+        let task_scoped_supervisor = task_scope_is_present(Some("  "));
+
+        assert!(all_roles || !task_scoped_supervisor);
+        assert!(!(all_roles || executor_role || task_scoped_supervisor));
+    }
+
+    #[test]
+    fn executor_and_all_role_servers_still_expose_heartbeat() {
+        let task_scoped_supervisor = task_scope_is_present(None);
+
+        let all_roles = false;
+        let executor_role = true;
+        assert!(all_roles || executor_role || task_scoped_supervisor);
+
+        let all_roles = true;
+        let executor_role = false;
+        assert!(all_roles || executor_role || task_scoped_supervisor);
+    }
 }

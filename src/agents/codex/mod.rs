@@ -380,6 +380,7 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "respond_consult",
             "ask_human",
             "wait_for_answer",
+            "heartbeat",
         ],
         _ => &[],
     }
@@ -703,14 +704,15 @@ mod tests {
         assert!(tools.contains_key("enqueue_task"));
         assert!(tools.contains_key("create_spec"));
         assert!(tools.contains_key("wait_for_consultation"));
+        assert!(tools.contains_key("heartbeat"));
         assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
     }
 
     #[test]
-    fn codex_role_tool_approval_sets_fit_mcp_first_page() {
+    fn codex_tool_approval_sets_match_role_needs() {
         assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 10);
-        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 10);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 11);
     }
 
     #[test]

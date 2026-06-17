@@ -145,6 +145,7 @@ Required workflow:
   - Call /wait_for_review
   - Call /review_pending
   - Evaluate correctness, task alignment, and verification evidence
+  - If review takes substantial time, call /heartbeat periodically before deciding
   - Call /approve or /reject
   - After deciding, stop
 
@@ -832,6 +833,11 @@ mod tests {
     #[test]
     fn reviewer_prompt_has_hard_rules() {
         assert!(reviewer_prompt().contains("HARD RULES"));
+    }
+
+    #[test]
+    fn reviewer_prompt_mentions_heartbeat_for_long_reviews() {
+        assert!(reviewer_prompt().contains("/heartbeat"));
     }
 
     #[test]
