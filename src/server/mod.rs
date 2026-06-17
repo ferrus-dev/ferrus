@@ -73,6 +73,10 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| agent_id(role_str, &agent_name, agent_index));
+    let task_scope_from_env = std::env::var(ENV_TASK_ID).ok();
+    let task_scoped_agent_id = supervisor_task_scope_from_agent_id(&agent_id).is_some();
+    let task_scoped_session =
+        task_scope_is_present(task_scope_from_env.as_deref()) || task_scoped_agent_id;
     let server_context = ServerContext::new(agent_id, role.clone(), agent_name, agent_index);
 
     let mut app = App::new()
@@ -87,8 +91,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
     let all_roles = role.is_none();
     let supervisor_role = role.as_ref().is_some_and(|r| *r == Role::Supervisor);
     let executor_role = role.as_ref().is_some_and(|r| *r == Role::Executor);
-    let task_scoped_supervisor =
-        supervisor_role && task_scope_is_present(std::env::var(ENV_TASK_ID).ok().as_deref());
+    let task_scoped_supervisor = supervisor_role && task_scoped_session;
     let sup = all_roles || supervisor_role;
     let exe = all_roles || executor_role;
 
@@ -204,6 +207,17 @@ fn task_scope_is_present(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
 }
 
+fn supervisor_task_scope_from_agent_id(agent_id: &str) -> Option<&str> {
+    let mut parts = agent_id.split(':');
+    let role = parts.next()?;
+    let _agent_name = parts.next()?;
+    let scope = parts.next()?;
+    if parts.next().is_some() || role != ROLE_SUPERVISOR || scope.parse::<u32>().is_ok() {
+        return None;
+    }
+    Some(scope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +226,8 @@ mod tests {
     fn task_scoped_supervisor_mapping_uses_heartbeat_instead_of_definition_tools() {
         let all_roles = false;
         let executor_role = false;
-        let task_scoped_supervisor = task_scope_is_present(Some("t-001"));
+        let task_scoped_supervisor =
+            supervisor_task_scope_from_agent_id("supervisor:codex:t-001").is_some();
 
         assert!(!(all_roles || !task_scoped_supervisor));
         assert!(all_roles || executor_role || task_scoped_supervisor);
@@ -222,10 +237,31 @@ mod tests {
     fn interactive_supervisor_mapping_keeps_definition_tools_without_heartbeat() {
         let all_roles = false;
         let executor_role = false;
-        let task_scoped_supervisor = task_scope_is_present(Some("  "));
+        let task_scoped_supervisor =
+            supervisor_task_scope_from_agent_id("supervisor:codex:1").is_some();
 
         assert!(all_roles || !task_scoped_supervisor);
         assert!(!(all_roles || executor_role || task_scoped_supervisor));
+    }
+
+    #[test]
+    fn supervisor_task_scope_comes_from_task_agent_id_not_index_agent_id() {
+        assert_eq!(
+            supervisor_task_scope_from_agent_id("supervisor:codex:t-004"),
+            Some("t-004")
+        );
+        assert_eq!(
+            supervisor_task_scope_from_agent_id("supervisor:codex:1"),
+            None
+        );
+        assert_eq!(
+            supervisor_task_scope_from_agent_id("executor:codex:t-004"),
+            None
+        );
+        assert_eq!(
+            supervisor_task_scope_from_agent_id("supervisor:codex:t-004:extra"),
+            None
+        );
     }
 
     #[test]
