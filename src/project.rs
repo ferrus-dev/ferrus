@@ -1481,7 +1481,7 @@ async fn claim_task_by_id_with_statuses(
     let allowed_statuses = allowed_statuses.to_vec();
     tokio::task::spawn_blocking(move || -> Result<ReadyTaskClaim> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now();
         let Some(mut candidate) = task_candidate_by_id(&transaction, &task_id)? else {
             transaction.commit()?;
@@ -1557,7 +1557,7 @@ async fn claim_next_task_with_statuses(
     let statuses = statuses.to_vec();
     tokio::task::spawn_blocking(move || -> Result<ReadyTaskClaim> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now();
         let mut candidates = task_candidates_by_status(&transaction, &statuses)?;
 
@@ -1659,7 +1659,7 @@ async fn claim_task_in_database(
     let agent_id = agent_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<TaskClaim> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_task_exists(&transaction, &task_id, &task_path)?;
         let existing: Option<(Option<String>, Option<String>)> = transaction
             .query_row(

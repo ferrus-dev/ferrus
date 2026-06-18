@@ -104,12 +104,20 @@ pub async fn write_patch_for_run_dir(run_dir: &str, content: &str) -> Result<()>
     write_path(&run_file(run_dir, "PATCH.diff"), content).await
 }
 
+pub async fn clear_patch_for_run_dir(run_dir: &str) -> Result<()> {
+    remove_path_if_exists(&run_file(run_dir, "PATCH.diff")).await
+}
+
 pub async fn read_integration_error_for_run_dir(run_dir: &str) -> Result<String> {
     read_path_or_empty(&run_file(run_dir, "INTEGRATION_ERROR.md")).await
 }
 
 pub async fn write_integration_error_for_run_dir(run_dir: &str, content: &str) -> Result<()> {
     write_path(&run_file(run_dir, "INTEGRATION_ERROR.md"), content).await
+}
+
+pub async fn clear_integration_error_for_run_dir(run_dir: &str) -> Result<()> {
+    remove_path_if_exists(&run_file(run_dir, "INTEGRATION_ERROR.md")).await
 }
 
 pub async fn clear_scoped_task_artifacts(task_path: &str, run_dir: &str) -> Result<()> {

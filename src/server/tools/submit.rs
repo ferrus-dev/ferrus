@@ -170,11 +170,13 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
 }
 
 async fn write_submission(context: &RuntimeTaskContext, content: &str) -> Result<()> {
+    store::clear_integration_error_for_run_dir(&context.run_dir).await?;
     store::write_submission_for_run_dir(&context.run_dir, content).await
 }
 
 async fn write_submission_patch(context: &RuntimeTaskContext) -> Result<()> {
     if !is_isolated_executor_workspace(context).await {
+        store::clear_patch_for_run_dir(&context.run_dir).await?;
         return Ok(());
     }
 
@@ -894,6 +896,89 @@ mod tests {
         assert_eq!(task.check_retries, 0);
         assert_eq!(task.claimed_by, None);
         crate::test_support::assert_no_state_json();
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn submit_clears_stale_integration_error_on_success() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Addressing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "executor:codex:7", 60)
+            .await
+            .unwrap();
+        store::write_integration_error_for_run_dir(
+            ".ferrus/runs/t-007",
+            "# Integration Error\n\nold conflict\n",
+        )
+        .await
+        .unwrap();
+
+        run(
+            Some("executor:codex:7"),
+            "## Summary\nFixed.\n\n## How to verify manually\nInspect it.\n".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+                .await
+                .unwrap(),
+            ""
+        );
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+        assert_eq!(task.status, "reviewing");
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn canonical_submit_clears_stale_isolated_patch() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Addressing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "executor:codex:7", 60)
+            .await
+            .unwrap();
+        store::write_patch_for_run_dir(
+            ".ferrus/runs/t-007",
+            "diff --git a/old.txt b/old.txt\n+stale\n",
+        )
+        .await
+        .unwrap();
+
+        run(
+            Some("executor:codex:7"),
+            "## Summary\nFixed in canonical workspace.\n\n## How to verify manually\nInspect it.\n"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store::read_patch_for_run_dir(".ferrus/runs/t-007")
+                .await
+                .unwrap(),
+            ""
+        );
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+        assert_eq!(task.status, "reviewing");
 
         teardown(previous);
     }
