@@ -1426,14 +1426,6 @@ impl HqContext {
         tasks: &[TaskRecord],
         max_parallel: usize,
     ) -> Result<usize> {
-        let consultation_count = tasks
-            .iter()
-            .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
-            .count();
-        if consultation_count == 0 {
-            return Ok(0);
-        }
-
         let running = self.running_supervisor_count();
         let slots = max_parallel.saturating_sub(running);
         if slots == 0 {
@@ -1443,12 +1435,10 @@ impl HqContext {
         let prompt = agent_manager::consultant_prompt();
         let mut spawned = 0usize;
         let mut spawn_error = None;
-        let consultation_tasks = tasks
-            .iter()
-            .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
-            .take(slots)
-            .cloned()
-            .collect::<Vec<_>>();
+        let consultation_tasks = actionable_consultation_tasks(tasks, slots).await?;
+        if consultation_tasks.is_empty() {
+            return Ok(0);
+        }
 
         for task in &consultation_tasks {
             let name = self.supervisor_agent_id_for_task(&task.id)?;
@@ -2568,6 +2558,44 @@ where
         .collect()
 }
 
+async fn actionable_consultation_tasks(
+    tasks: &[TaskRecord],
+    slots: usize,
+) -> Result<Vec<TaskRecord>> {
+    let mut consultation_tasks = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
+    {
+        if consultation_response_is_ready(&task.id).await? {
+            continue;
+        }
+        consultation_tasks.push(task.clone());
+        if consultation_tasks.len() == slots {
+            break;
+        }
+    }
+    Ok(consultation_tasks)
+}
+
+async fn consultation_response_is_ready(task_id: &str) -> Result<bool> {
+    match store::read_consult_response_for_run_dir(&scoped_run_dir(task_id)).await {
+        Ok(response) => Ok(!response.trim().is_empty()),
+        Err(err) if is_not_found_error(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn scoped_run_dir(task_id: &str) -> String {
+    format!(".ferrus/runs/{task_id}")
+}
+
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|err| err.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn is_review_or_consultation_task_status(status: &str) -> bool {
     matches!(
         status.parse::<crate::project::TaskStatus>().ok(),
@@ -3355,6 +3383,36 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "t-002");
+    }
+
+    #[tokio::test]
+    async fn consultation_selection_skips_tasks_with_existing_response() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-001", "existing answer")
+            .await
+            .unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-003", "")
+            .await
+            .unwrap();
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Consultation),
+            task_record("t-002", crate::project::TaskStatus::Consultation),
+            task_record("t-003", crate::project::TaskStatus::Consultation),
+        ];
+
+        let selected = actionable_consultation_tasks(&tasks, 2).await.unwrap();
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t-002", "t-003"]
+        );
+        std::env::set_current_dir(previous).unwrap();
     }
 
     #[cfg(unix)]
