@@ -329,22 +329,33 @@ pub async fn migrate_current_project() -> Result<ProjectRegistration> {
         .await
         .context("Failed to create .ferrus/runs")?;
     copy_legacy_artifacts().await?;
-    if let Ok(state) = legacy_state::read_legacy_state(project_path(".ferrus/STATE.json")).await
-        && state.state() != LegacyTaskState::Idle
-    {
+    if let Ok(state) = legacy_state::read_legacy_state(project_path(".ferrus/STATE.json")).await {
+        migrate_legacy_project_selection(&state).await?;
         let state_value = state.state();
-        record_task_status_with_origin(
-            "t-001",
-            ".ferrus/tasks/t-001.md",
-            legacy_state::task_status_for_legacy_state(&state_value),
-            state.task_spec.as_deref(),
-            state.task_milestone.as_deref(),
-        )
-        .await?;
+        if state_value != LegacyTaskState::Idle {
+            record_task_status_with_origin(
+                "t-001",
+                ".ferrus/tasks/t-001.md",
+                legacy_state::task_status_for_legacy_state(&state_value),
+                state.task_spec.as_deref(),
+                state.task_milestone.as_deref(),
+            )
+            .await?;
+        }
     }
     retire_legacy_current_task_row().await?;
     remove_legacy_state_files().await?;
     Ok(registration)
+}
+
+async fn migrate_legacy_project_selection(state: &legacy_state::LegacyStateData) -> Result<()> {
+    if let Some(selected_spec) = normalized_metadata_value(state.selected_spec.as_deref()) {
+        write_project_selection(&ProjectSelection {
+            selected_spec: Some(selected_spec),
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn touch_current_project() -> Result<ProjectRegistration> {
@@ -3322,6 +3333,18 @@ async fn copy_legacy_artifacts() -> Result<()> {
         .context("Failed to create .ferrus/runs/t-001")?;
     copy_if_nonempty(".ferrus/REVIEW.md", ".ferrus/runs/t-001/REVIEW.md").await?;
     copy_if_nonempty(".ferrus/SUBMISSION.md", ".ferrus/runs/t-001/SUBMISSION.md").await?;
+    copy_if_nonempty(".ferrus/QUESTION.md", ".ferrus/runs/t-001/QUESTION.md").await?;
+    copy_if_nonempty(".ferrus/ANSWER.md", ".ferrus/runs/t-001/ANSWER.md").await?;
+    copy_if_nonempty(
+        ".ferrus/CONSULT_REQUEST.md",
+        ".ferrus/runs/t-001/CONSULT_REQUEST.md",
+    )
+    .await?;
+    copy_if_nonempty(
+        ".ferrus/CONSULT_RESPONSE.md",
+        ".ferrus/runs/t-001/CONSULT_RESPONSE.md",
+    )
+    .await?;
     Ok(())
 }
 
@@ -3751,6 +3774,65 @@ mod tests {
             Some("docs/specs/spec.md")
         );
         assert_eq!(last_spec_path.as_deref(), Some("docs/specs/spec.md"));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_idle_legacy_selected_spec() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let legacy = legacy_state::LegacyStateData {
+            state: Some(LegacyTaskState::Idle),
+            task_spec: None,
+            task_milestone: None,
+            selected_spec: Some("docs/specs/selected.md".to_string()),
+            selected_milestone: None,
+            updated_at: None,
+        };
+
+        migrate_legacy_project_selection(&legacy).await.unwrap();
+
+        let selection = read_project_selection().await.unwrap();
+        assert_eq!(
+            selection.selected_spec.as_deref(),
+            Some("docs/specs/selected.md")
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn migration_copies_paused_legacy_interaction_artifacts() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        for (path, contents) in [
+            (".ferrus/QUESTION.md", "legacy question"),
+            (".ferrus/ANSWER.md", "legacy answer"),
+            (".ferrus/CONSULT_REQUEST.md", "legacy consult request"),
+            (".ferrus/CONSULT_RESPONSE.md", "legacy consult response"),
+        ] {
+            tokio::fs::write(path, contents).await.unwrap();
+        }
+
+        copy_legacy_artifacts().await.unwrap();
+
+        for (path, expected) in [
+            (".ferrus/runs/t-001/QUESTION.md", "legacy question"),
+            (".ferrus/runs/t-001/ANSWER.md", "legacy answer"),
+            (
+                ".ferrus/runs/t-001/CONSULT_REQUEST.md",
+                "legacy consult request",
+            ),
+            (
+                ".ferrus/runs/t-001/CONSULT_RESPONSE.md",
+                "legacy consult response",
+            ),
+        ] {
+            let contents = tokio::fs::read_to_string(path).await.unwrap();
+            assert_eq!(contents, expected);
+        }
 
         teardown(previous);
     }
