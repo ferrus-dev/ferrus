@@ -27,6 +27,7 @@ const PROJECT_VERSION: u32 = 1;
 const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 const CURRENT_TASK_ID: &str = "current";
 const CURRENT_TASK_PATH: &str = ".ferrus/TASK.md";
+const BASELINE_WORKTREE_METADATA_DIR: &str = ".baseline-trees";
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2589,7 +2590,11 @@ async fn orphaned_worktrees_for(registration: &ProjectRegistration) -> Result<Ve
         if !entry.file_type().await?.is_dir() {
             continue;
         }
-        let task_id = entry.file_name().to_string_lossy().to_string();
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy() == BASELINE_WORKTREE_METADATA_DIR {
+            continue;
+        }
+        let task_id = file_name.to_string_lossy().to_string();
         let canonical_path = tokio::fs::canonicalize(&path)
             .await
             .unwrap_or_else(|_| path.clone());
@@ -4661,6 +4666,9 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::create_dir_all(worktrees_dir.join("t-orphan"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(worktrees_dir.join(BASELINE_WORKTREE_METADATA_DIR))
             .await
             .unwrap();
 
