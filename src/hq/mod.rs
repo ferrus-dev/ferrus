@@ -1381,13 +1381,20 @@ impl HqContext {
         let prompt = agent_manager::reviewer_prompt();
         let mut spawned = 0usize;
         let mut spawn_error = None;
-        let review_tasks = tasks
+        let mut review_tasks = Vec::new();
+        for task in tasks
             .iter()
             .filter(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
-            .filter(|task| !task_has_active_external_claim(task, now))
-            .take(slots)
-            .cloned()
-            .collect::<Vec<_>>();
+        {
+            let expected_agent_id = self.supervisor_agent_id_for_task(&task.id)?;
+            if task_has_active_external_claim(task, &expected_agent_id, now) {
+                continue;
+            }
+            review_tasks.push(task.clone());
+            if review_tasks.len() == slots {
+                break;
+            }
+        }
 
         for task in &review_tasks {
             let name = self.supervisor_agent_id_for_task(&task.id)?;
@@ -1482,11 +1489,16 @@ impl HqContext {
         report_waiting: bool,
     ) -> Result<usize> {
         let now = chrono::Utc::now();
-        let ready_tasks = tasks
+        let mut ready_tasks = Vec::new();
+        for task in tasks
             .into_iter()
             .filter(|task| is_executor_ready_task_status(&task.status))
-            .filter(|task| !task_has_active_external_claim(task, now))
-            .collect::<Vec<_>>();
+        {
+            let expected_agent_id = self.executor_agent_id_for_task(&task.id)?;
+            if !task_has_active_external_claim(&task, &expected_agent_id, now) {
+                ready_tasks.push(task);
+            }
+        }
         let ready_count = ready_tasks.len();
         if ready_count == 0 {
             return Ok(0);
@@ -2522,8 +2534,16 @@ async fn git_has_head(path: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn task_has_active_external_claim(task: &TaskRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if task.claimed_by.is_none() {
+fn task_has_active_external_claim(
+    task: &TaskRecord,
+    expected_agent_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if task
+        .claimed_by
+        .as_deref()
+        .is_none_or(|claimed_by| claimed_by == expected_agent_id)
+    {
         return false;
     }
     task.lease_until
@@ -3436,6 +3456,32 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "t-002");
+    }
+
+    #[test]
+    fn active_task_claim_only_blocks_a_different_agent() {
+        let now = chrono::Utc::now();
+        let mut task = task_record("t-001", crate::project::TaskStatus::Executing);
+        task.claimed_by = Some("executor:codex:t-001".to_string());
+        task.lease_until = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
+
+        assert!(!task_has_active_external_claim(
+            &task,
+            "executor:codex:t-001",
+            now
+        ));
+        assert!(task_has_active_external_claim(
+            &task,
+            "executor:claude-code:t-001",
+            now
+        ));
+
+        task.lease_until = Some((now - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(!task_has_active_external_claim(
+            &task,
+            "executor:claude-code:t-001",
+            now
+        ));
     }
 
     #[tokio::test]
