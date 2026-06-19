@@ -2137,10 +2137,11 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
     let registration = crate::project::touch_current_project().await?;
     let project_root = PathBuf::from(&registration.metadata.workspace_dir);
     if !git_is_work_tree(&project_root).await {
-        anyhow::bail!(
-            "Cannot start isolated executor workspace: {} is not a git worktree.",
-            project_root.display()
-        );
+        return Ok(ExecutorWorkspace {
+            workspace_dir: project_root.clone(),
+            project_root,
+            baseline_tree: None,
+        });
     }
 
     let workspace_dir = registration.data_dir.join("worktrees").join(task_id);
@@ -2849,6 +2850,58 @@ mod tests {
                 .join("runtime/worktrees/t-001/tracked.txt")
                 .exists()
         );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_falls_back_to_canonical_for_non_git_project() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let workspace = prepare_executor_workspace("t-001").await.unwrap();
+        let canonical_project_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+
+        assert_eq!(workspace.project_root, canonical_project_root);
+        assert_eq!(workspace.workspace_dir, canonical_project_root);
+        assert_eq!(workspace.baseline_tree, None);
+        assert!(!data_dir.join("worktrees/t-001").exists());
 
         std::env::set_current_dir(previous).unwrap();
     }
