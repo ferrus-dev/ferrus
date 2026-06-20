@@ -1478,7 +1478,10 @@ impl HqContext {
         let prompt = agent_manager::consultant_prompt();
         let mut spawned = 0usize;
         let mut spawn_error = None;
-        let consultation_tasks = actionable_consultation_tasks(tasks, slots).await?;
+        let live_supervisor_task_ids =
+            crate::project::live_active_run_task_ids_for_role(ROLE_SUPERVISOR).await?;
+        let consultation_tasks =
+            actionable_consultation_tasks(tasks, slots, &live_supervisor_task_ids).await?;
         if consultation_tasks.is_empty() {
             return Ok(0);
         }
@@ -2762,13 +2765,16 @@ where
 async fn actionable_consultation_tasks(
     tasks: &[TaskRecord],
     slots: usize,
+    live_supervisor_task_ids: &HashSet<String>,
 ) -> Result<Vec<TaskRecord>> {
     let mut consultation_tasks = Vec::new();
     for task in tasks
         .iter()
         .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
     {
-        if consultation_response_is_ready(&task.id).await? {
+        if live_supervisor_task_ids.contains(&task.id)
+            || consultation_response_is_ready(&task.id).await?
+        {
             continue;
         }
         consultation_tasks.push(task.clone());
@@ -3721,7 +3727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consultation_selection_skips_tasks_with_existing_response() {
+    async fn consultation_selection_skips_existing_responses_and_live_supervisors() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let previous = std::env::current_dir().unwrap();
@@ -3738,14 +3744,18 @@ mod tests {
             task_record("t-003", crate::project::TaskStatus::Consultation),
         ];
 
-        let selected = actionable_consultation_tasks(&tasks, 2).await.unwrap();
+        let mut live_supervisor_task_ids = HashSet::new();
+        live_supervisor_task_ids.insert("t-002".to_string());
+        let selected = actionable_consultation_tasks(&tasks, 2, &live_supervisor_task_ids)
+            .await
+            .unwrap();
 
         assert_eq!(
             selected
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["t-002", "t-003"]
+            vec!["t-003"]
         );
         std::env::set_current_dir(previous).unwrap();
     }

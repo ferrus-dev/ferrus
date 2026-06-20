@@ -38,21 +38,20 @@ async fn run(agent_id: Option<&str>, response: String) -> Result<String> {
     }
 
     let runtime_context = match agent_id {
-        Some(agent_id) => runtime_task_context_for_agent_best_effort(agent_id)
-            .await
-            .or(
-                match project::attach_running_run_to_next_consultation(agent_id).await {
-                    Ok(context) => context,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = ?err,
-                            agent_id,
-                            "failed to attach supervisor run to consultation"
-                        );
-                        None
-                    }
-                },
-            ),
+        Some(agent_id) => match runtime_task_context_for_agent_best_effort(agent_id).await {
+            Some(context) => Some(context),
+            None => match project::attach_running_run_to_next_consultation(agent_id).await {
+                Ok(context) => context,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        agent_id,
+                        "failed to attach supervisor run to consultation"
+                    );
+                    None
+                }
+            },
+        },
         None => None,
     };
 
@@ -190,6 +189,73 @@ mod tests {
                 .await
                 .unwrap(),
             "Use option A."
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn respond_consult_does_not_reassign_an_existing_non_consultation_run() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        let agent_id = "supervisor:codex:t-001";
+
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_review_task_by_id("t-001", agent_id, 60)
+            .await
+            .unwrap();
+        crate::project::record_run_started_for_task_with_workspace(
+            "run-supervisor-t-001",
+            "supervisor",
+            agent_id,
+            std::process::id(),
+            Some("t-001"),
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+
+        crate::project::record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_consultation_requested(
+            "t-002",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+
+        let error = run(Some(agent_id), "Accidental response".to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("only valid in Consultation state"));
+        let run = crate::project::list_runs(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == "run-supervisor-t-001")
+            .unwrap();
+        assert_eq!(run.task_id, "t-001");
+        assert!(
+            store::read_consult_response_for_run_dir(".ferrus/runs/t-002")
+                .await
+                .unwrap_or_default()
+                .is_empty()
         );
 
         teardown(previous);

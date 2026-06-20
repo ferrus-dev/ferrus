@@ -3998,6 +3998,35 @@ pub async fn live_active_run_task_ids() -> Result<std::collections::HashSet<Stri
     .await?
 }
 
+pub async fn live_active_run_task_ids_for_role(
+    role: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let database_path = current_database_path().await?;
+    let role = role.to_string();
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT task_id, pid
+            FROM runs
+            WHERE role = ?1 AND status IN ('running', 'checking', 'reviewing')
+            "#,
+        )?;
+        let rows = statement.query_map([role], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        let mut task_ids = std::collections::HashSet::new();
+        for row in rows {
+            let (task_id, pid) = row?;
+            if pid.is_some_and(|pid| process_is_alive(pid as u32)) {
+                task_ids.insert(task_id);
+            }
+        }
+        Ok(task_ids)
+    })
+    .await?
+}
+
 fn live_active_run_task_ids_from_database(
     connection: &Connection,
 ) -> Result<std::collections::HashSet<String>> {
@@ -5051,6 +5080,53 @@ mod tests {
                 .any(|event| event.event_type == "task_lease_expired")
         );
 
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn live_active_run_task_ids_can_be_filtered_by_role() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Consultation,
+        )
+        .await
+        .unwrap();
+        let workspace = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        record_run_started_for_task_with_workspace(
+            "run-executor-t-001",
+            "executor",
+            "executor:codex:t-001",
+            std::process::id(),
+            Some("t-001"),
+            workspace.clone(),
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "run-supervisor-t-002",
+            "supervisor",
+            "supervisor:codex:t-002",
+            std::process::id(),
+            Some("t-002"),
+            workspace,
+        )
+        .await
+        .unwrap();
+
+        let supervisor_tasks = live_active_run_task_ids_for_role("supervisor")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            supervisor_tasks,
+            std::collections::HashSet::from(["t-002".to_string()])
+        );
         teardown(previous);
     }
 
