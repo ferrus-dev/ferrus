@@ -334,19 +334,78 @@ pub async fn migrate_current_project() -> Result<ProjectRegistration> {
         migrate_legacy_project_selection(&state).await?;
         let state_value = state.state();
         if state_value != LegacyTaskState::Idle {
-            record_task_status_with_origin(
-                "t-001",
-                ".ferrus/tasks/t-001.md",
-                legacy_state::task_status_for_legacy_state(&state_value),
-                state.task_spec.as_deref(),
-                state.task_milestone.as_deref(),
-            )
-            .await?;
+            migrate_legacy_active_task(&state).await?;
         }
     }
     retire_legacy_current_task_row().await?;
     remove_legacy_state_files().await?;
     Ok(registration)
+}
+
+async fn migrate_legacy_active_task(state: &legacy_state::LegacyStateData) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let legacy_status = state.state();
+    let status = legacy_state::task_status_for_legacy_state(&legacy_status);
+    let paused_state = state
+        .paused_state
+        .as_ref()
+        .map(legacy_state::task_status_for_legacy_state)
+        .map(TaskStatus::as_str);
+    let (paused_status, awaiting_human_status, awaiting_human_by) = match legacy_status {
+        LegacyTaskState::Consultation => (paused_state, None, None),
+        LegacyTaskState::AwaitingHuman => (None, paused_state, state.awaiting_human_by.clone()),
+        _ => (None, None, None),
+    };
+    let spec_path = state.task_spec.clone();
+    let milestone_id = state.task_milestone.clone();
+    let check_retries = state.check_retries;
+    let review_cycles = state.review_cycles;
+    let failure_reason = state.failure_reason.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_task(
+            &transaction,
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            status,
+            spec_path.as_deref(),
+            milestone_id.as_deref(),
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE tasks
+            SET paused_status = ?1, check_retries = ?2, review_cycles = ?3,
+                failure_reason = ?4, awaiting_human_by = ?5, awaiting_human_status = ?6
+            WHERE id = 't-001'
+            "#,
+            params![
+                paused_status,
+                check_retries,
+                review_cycles,
+                failure_reason,
+                awaiting_human_by,
+                awaiting_human_status,
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            None,
+            "task_migrated_from_legacy_state",
+            &serde_json::json!({
+                "task_id": "t-001",
+                "status": status.as_str(),
+                "paused_status": paused_status,
+                "awaiting_human_status": awaiting_human_status,
+                "check_retries": check_retries,
+                "review_cycles": review_cycles,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
 }
 
 async fn migrate_legacy_project_selection(state: &legacy_state::LegacyStateData) -> Result<()> {
@@ -3815,11 +3874,8 @@ mod tests {
         let (_dir, previous) = setup_project().await;
         let legacy = legacy_state::LegacyStateData {
             state: Some(LegacyTaskState::Idle),
-            task_spec: None,
-            task_milestone: None,
             selected_spec: Some("docs/specs/selected.md".to_string()),
-            selected_milestone: None,
-            updated_at: None,
+            ..Default::default()
         };
 
         migrate_legacy_project_selection(&legacy).await.unwrap();
@@ -3829,6 +3885,76 @@ mod tests {
             selection.selected_spec.as_deref(),
             Some("docs/specs/selected.md")
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_consultation_resume_state() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let legacy = legacy_state::LegacyStateData {
+            state: Some(LegacyTaskState::Consultation),
+            paused_state: Some(LegacyTaskState::Addressing),
+            check_retries: 2,
+            review_cycles: 1,
+            failure_reason: Some("legacy check failure".to_string()),
+            ..Default::default()
+        };
+
+        migrate_legacy_active_task(&legacy).await.unwrap();
+        let task = list_tasks().await.unwrap().remove(0);
+        assert_eq!(task.status, TaskStatus::Consultation.as_str());
+        assert_eq!(task.paused_status.as_deref(), Some("addressing"));
+        assert_eq!(task.check_retries, 2);
+        assert_eq!(task.review_cycles, 1);
+        assert_eq!(task.failure_reason.as_deref(), Some("legacy check failure"));
+
+        let restored = restore_task_from_consultation("t-001").await.unwrap();
+        assert!(matches!(
+            restored,
+            TaskConsultRestore::Restored { status } if status == "addressing"
+        ));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_human_answer_resume_state() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let legacy = legacy_state::LegacyStateData {
+            state: Some(LegacyTaskState::AwaitingHuman),
+            paused_state: Some(LegacyTaskState::Reviewing),
+            awaiting_human_by: Some("supervisor:codex:t-001".to_string()),
+            check_retries: 2,
+            review_cycles: 1,
+            ..Default::default()
+        };
+
+        migrate_legacy_active_task(&legacy).await.unwrap();
+        let task = list_tasks().await.unwrap().remove(0);
+        assert_eq!(task.status, TaskStatus::AwaitingHuman.as_str());
+        assert_eq!(task.paused_status, None);
+        assert_eq!(
+            task_awaiting_human_status("t-001")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("reviewing")
+        );
+        assert_eq!(
+            task_human_question_owner("t-001").await.unwrap().as_deref(),
+            Some("supervisor:codex:t-001")
+        );
+        assert_eq!(task.check_retries, 2);
+        assert_eq!(task.review_cycles, 1);
+
+        let restored = restore_task_from_human_answer("t-001").await.unwrap();
+        assert!(matches!(
+            restored,
+            TaskHumanAnswerRestore::Restored { status } if status == "reviewing"
+        ));
 
         teardown(previous);
     }

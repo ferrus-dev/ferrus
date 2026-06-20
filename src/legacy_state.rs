@@ -17,10 +17,20 @@ pub enum LegacyTaskState {
     AwaitingHuman,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LegacyStateData {
     #[serde(default)]
     pub state: Option<LegacyTaskState>,
+    #[serde(default)]
+    pub check_retries: u32,
+    #[serde(default)]
+    pub review_cycles: u32,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub paused_state: Option<LegacyTaskState>,
+    #[serde(default)]
+    pub awaiting_human_by: Option<String>,
     #[serde(default)]
     pub task_spec: Option<String>,
     #[serde(default)]
@@ -61,5 +71,34 @@ pub fn task_status_for_legacy_state(state: &LegacyTaskState) -> TaskStatus {
         LegacyTaskState::Complete => TaskStatus::Complete,
         LegacyTaskState::Failed => TaskStatus::Failed,
         LegacyTaskState::AwaitingHuman => TaskStatus::AwaitingHuman,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_legacy_pause_and_counter_metadata() {
+        let state: LegacyStateData = serde_json::from_str(
+            r#"{
+                "state": "AwaitingHuman",
+                "paused_state": "Reviewing",
+                "awaiting_human_by": "supervisor:codex:1",
+                "check_retries": 2,
+                "review_cycles": 1,
+                "failure_reason": "last failure"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.paused_state, Some(LegacyTaskState::Reviewing));
+        assert_eq!(
+            state.awaiting_human_by.as_deref(),
+            Some("supervisor:codex:1")
+        );
+        assert_eq!(state.check_retries, 2);
+        assert_eq!(state.review_cycles, 1);
+        assert_eq!(state.failure_reason.as_deref(), Some("last failure"));
     }
 }
