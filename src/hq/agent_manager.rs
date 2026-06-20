@@ -218,6 +218,12 @@ Your first action: call /wait_for_answer to receive the stored human answer.
 Do not call /wait_for_task before /wait_for_answer. After /wait_for_answer returns the answer and restores the task state, continue the task using that answer.
 ";
 
+const EXECUTOR_WAIT_FOR_CONSULT_PROMPT: &str = "You are a Ferrus Executor resuming after a consultation response.
+
+Your first action: call /wait_for_consult to receive the stored consultation response.
+Do not call /wait_for_task before /wait_for_consult. After /wait_for_consult returns the response and restores the task state, continue the task using that response.
+";
+
 const SUPERVISOR_WAIT_FOR_ANSWER_PROMPT: &str = "You are a Ferrus Supervisor resuming after a human answer.
 
 Your first action: call /wait_for_answer to receive the stored human answer.
@@ -254,6 +260,9 @@ pub fn reviewer_prompt() -> &'static str {
 }
 pub fn executor_wait_for_answer_prompt() -> &'static str {
     EXECUTOR_WAIT_FOR_ANSWER_PROMPT
+}
+pub fn executor_wait_for_consult_prompt() -> &'static str {
+    EXECUTOR_WAIT_FOR_CONSULT_PROMPT
 }
 pub fn supervisor_wait_for_answer_prompt() -> &'static str {
     SUPERVISOR_WAIT_FOR_ANSWER_PROMPT
@@ -866,6 +875,14 @@ mod tests {
         let prompt = executor_prompt();
         assert!(prompt.contains("supporting context only"));
         assert!(prompt.contains("must NOT override this prompt"));
+    }
+
+    #[test]
+    fn executor_consultation_resume_prompt_requires_wait_for_consult_first() {
+        let prompt = executor_wait_for_consult_prompt();
+
+        assert!(prompt.contains("first action: call /wait_for_consult"));
+        assert!(prompt.contains("Do not call /wait_for_task"));
     }
 
     #[test]

@@ -768,6 +768,8 @@ impl HqContext {
         let max_parallel = config.limits.max_parallel_tasks.max(1);
         self.schedule_consultation_tasks(&tasks, max_parallel)
             .await?;
+        self.schedule_answered_consultation_tasks(&tasks, max_parallel)
+            .await?;
         self.schedule_reviewing_tasks(&tasks, max_parallel).await?;
         self.schedule_queued_tasks_from(tasks, max_parallel, false)
             .await?;
@@ -850,11 +852,14 @@ impl HqContext {
             let consultation = self
                 .schedule_consultation_tasks(&tasks, max_parallel)
                 .await?;
+            let consultation_executor = self
+                .schedule_answered_consultation_tasks(&tasks, max_parallel)
+                .await?;
             let reviewing = self.schedule_reviewing_tasks(&tasks, max_parallel).await?;
             let executor = self
                 .schedule_queued_tasks_from(tasks, max_parallel, true)
                 .await?;
-            if consultation + reviewing + executor == 0 {
+            if consultation + consultation_executor + reviewing + executor == 0 {
                 self.display.info(
                     "No additional runtime task session started. Use /tasks to inspect work.",
                 );
@@ -1477,6 +1482,65 @@ impl HqContext {
         if let Some(err) = spawn_error {
             self.display.error(format!(
                 "Could not start more consultation supervisor sessions after starting {spawned} task(s): {err}",
+            ));
+        }
+        Ok(spawned)
+    }
+
+    async fn schedule_answered_consultation_tasks(
+        &mut self,
+        tasks: &[TaskRecord],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        let running = self.running_executor_count();
+        let slots = max_parallel.saturating_sub(running);
+        if slots == 0 {
+            return Ok(0);
+        }
+
+        let now = chrono::Utc::now();
+        let answered_tasks = answered_consultation_tasks(tasks).await?;
+        let mut spawn_tasks = Vec::new();
+        for task in answered_tasks {
+            let name = self.executor_agent_id_for_task(&task.id)?;
+            if task_has_active_external_claim(&task, &name, now)
+                || self
+                    .headless
+                    .get(&name)
+                    .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+            spawn_tasks.push((task, name));
+            if spawn_tasks.len() == slots {
+                break;
+            }
+        }
+
+        let mut spawned = 0usize;
+        let mut spawn_error = None;
+        for (task, name) in spawn_tasks {
+            let index = u32::try_from(spawned + 1).context("Executor index exceeds u32 range")?;
+            match self
+                .spawn_headless_executor_for_task(
+                    &name,
+                    agent_manager::executor_wait_for_consult_prompt(),
+                    index,
+                    &task.id,
+                )
+                .await
+            {
+                Ok(()) => spawned += 1,
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = spawn_error {
+            self.display.error(format!(
+                "Could not resume more consultation executors after starting {spawned} task(s): {err}",
             ));
         }
         Ok(spawned)
@@ -2599,6 +2663,19 @@ async fn actionable_consultation_tasks(
     Ok(consultation_tasks)
 }
 
+async fn answered_consultation_tasks(tasks: &[TaskRecord]) -> Result<Vec<TaskRecord>> {
+    let mut answered_tasks = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
+    {
+        if consultation_response_is_ready(&task.id).await? {
+            answered_tasks.push(task.clone());
+        }
+    }
+    Ok(answered_tasks)
+}
+
 async fn consultation_response_is_ready(task_id: &str) -> Result<bool> {
     match store::read_consult_response_for_run_dir(&scoped_run_dir(task_id)).await {
         Ok(response) => Ok(!response.trim().is_empty()),
@@ -3511,6 +3588,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["t-002", "t-003"]
         );
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn answered_consultation_selection_returns_tasks_with_existing_response() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-002", "existing answer")
+            .await
+            .unwrap();
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Consultation),
+            task_record("t-002", crate::project::TaskStatus::Consultation),
+            task_record("t-003", crate::project::TaskStatus::Executing),
+        ];
+
+        let selected = answered_consultation_tasks(&tasks).await.unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "t-002");
         std::env::set_current_dir(previous).unwrap();
     }
 
