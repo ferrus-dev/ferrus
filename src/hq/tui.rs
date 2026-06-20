@@ -88,6 +88,12 @@ pub enum UiMessage {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HqInput {
+    pub text: String,
+    pub human_question_task_id: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct StatusSnapshot {
     pub task_state: String,
@@ -187,6 +193,8 @@ pub struct App {
     runtime_runs: Vec<RunRecord>,
     runtime_snapshot_at: Option<Instant>,
     question: Option<String>,
+    question_task_id: Option<String>,
+    answering_question_task_id: Option<String>,
     last_error: Option<String>,
     input: String,
     cursor_pos: usize,
@@ -218,6 +226,8 @@ impl App {
             runtime_runs: Vec::new(),
             runtime_snapshot_at: None,
             question: None,
+            question_task_id: None,
+            answering_question_task_id: None,
             last_error: None,
             input: String::new(),
             cursor_pos: 0,
@@ -252,6 +262,9 @@ impl App {
     }
 
     fn insert_char(&mut self, ch: char) {
+        if self.input.is_empty() && ch != '/' {
+            self.answering_question_task_id = self.question_task_id.clone();
+        }
         let idx = byte_index_for_char(&self.input, self.cursor_pos);
         self.input.insert(idx, ch);
         self.cursor_pos += 1;
@@ -260,6 +273,9 @@ impl App {
     }
 
     fn insert_newline(&mut self) {
+        if self.input.is_empty() {
+            self.answering_question_task_id = self.question_task_id.clone();
+        }
         let idx = byte_index_for_char(&self.input, self.cursor_pos);
         self.input.insert(idx, '\n');
         self.cursor_pos += 1;
@@ -291,6 +307,9 @@ impl App {
         let start = byte_index_for_char(&self.input, self.cursor_pos - 1);
         self.input.replace_range(start..end, "");
         self.cursor_pos -= 1;
+        if self.input.is_empty() {
+            self.answering_question_task_id = None;
+        }
         self.history_idx = None;
         self.update_command_context();
     }
@@ -302,6 +321,9 @@ impl App {
         let start = byte_index_for_char(&self.input, self.cursor_pos);
         let end = byte_index_for_char(&self.input, self.cursor_pos + 1);
         self.input.replace_range(start..end, "");
+        if self.input.is_empty() {
+            self.answering_question_task_id = None;
+        }
         self.history_idx = None;
         self.update_command_context();
     }
@@ -475,7 +497,7 @@ impl App {
         self.clear_completion();
     }
 
-    fn accept_completion_and_submit(&mut self, cmd_tx: &mpsc::UnboundedSender<String>) {
+    fn accept_completion_and_submit(&mut self, cmd_tx: &mpsc::UnboundedSender<HqInput>) {
         self.accept_completion();
         self.submit_input(cmd_tx);
     }
@@ -528,7 +550,7 @@ impl App {
         }
     }
 
-    fn submit_input(&mut self, cmd_tx: &mpsc::UnboundedSender<String>) {
+    fn submit_input(&mut self, cmd_tx: &mpsc::UnboundedSender<HqInput>) {
         let line = self.input.trim().to_string();
         if line.is_empty() {
             return;
@@ -537,7 +559,15 @@ impl App {
         if line == "/quit" {
             self.should_quit = true;
         }
-        let _ = cmd_tx.send(line.clone());
+        let human_question_task_id = if line.starts_with('/') {
+            None
+        } else {
+            self.answering_question_task_id.clone()
+        };
+        let _ = cmd_tx.send(HqInput {
+            text: line.clone(),
+            human_question_task_id,
+        });
         if !line.contains('\n') && self.history.last() != Some(&line) {
             self.history.push(line);
             if self.history.len() > MAX_HISTORY {
@@ -546,6 +576,7 @@ impl App {
             }
         }
         self.input.clear();
+        self.answering_question_task_id = None;
         self.cursor_pos = 0;
         self.history_idx = None;
         self.history_saved.clear();
@@ -570,7 +601,7 @@ struct TerminalUi {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     mut msg_rx: mpsc::UnboundedReceiver<UiMessage>,
-    cmd_tx: mpsc::UnboundedSender<String>,
+    cmd_tx: mpsc::UnboundedSender<HqInput>,
     mut state_rx: watch::Receiver<Option<WatchedState>>,
     debug: bool,
     supervisor_type: String,
@@ -744,12 +775,16 @@ async fn refresh_dashboard_snapshot(app: &mut App, force: bool) -> bool {
         } else {
             question.question.clone()
         };
-        Some(format!("{prefix}{body}"))
+        Some((question.task_id.clone(), format!("{prefix}{body}")))
     } else {
         None
     };
-    if app.question != next_question {
+    let (next_question_task_id, next_question) = next_question
+        .map(|(task_id, question)| (Some(task_id), Some(question)))
+        .unwrap_or((None, None));
+    if app.question != next_question || app.question_task_id != next_question_task_id {
         app.question = next_question;
+        app.question_task_id = next_question_task_id;
         changed = true;
     }
 
@@ -760,7 +795,7 @@ async fn refresh_dashboard_snapshot(app: &mut App, force: bool) -> bool {
 fn handle_event(
     event: Event,
     app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<String>,
+    cmd_tx: &mpsc::UnboundedSender<HqInput>,
     stdout: &mut Stdout,
     ui: &mut TerminalUi,
 ) -> Result<()> {
@@ -3232,12 +3267,39 @@ mod tui_tests {
         let original_history_len = app.history.len();
         app.input = "first\nsecond".into();
         app.cursor_pos = app.input.chars().count();
+        app.question_task_id = Some("t-002".to_string());
+        app.answering_question_task_id = Some("t-002".to_string());
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         app.submit_input(&cmd_tx);
 
-        assert_eq!(cmd_rx.try_recv().unwrap(), "first\nsecond");
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            HqInput {
+                text: "first\nsecond".to_string(),
+                human_question_task_id: Some("t-002".to_string()),
+            }
+        );
         assert_eq!(app.history.len(), original_history_len);
+    }
+
+    #[test]
+    fn human_answer_keeps_the_question_target_from_typing_start() {
+        let mut app = App::new();
+        app.question_task_id = Some("t-001".to_string());
+        app.insert_text("first line\nsecond line");
+        app.question_task_id = Some("t-002".to_string());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        app.submit_input(&cmd_tx);
+
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            HqInput {
+                text: "first line\nsecond line".to_string(),
+                human_question_task_id: Some("t-001".to_string()),
+            }
+        );
     }
 
     #[test]

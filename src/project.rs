@@ -147,6 +147,12 @@ pub struct HumanQuestion {
     pub question: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredHumanWaiter {
+    pub task_id: String,
+    pub awaiting_human_by: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RuntimeTaskContext {
@@ -869,12 +875,32 @@ pub async fn list_tasks() -> Result<Vec<TaskRecord>> {
 }
 
 pub async fn list_human_questions() -> Result<Vec<HumanQuestion>> {
-    let tasks = list_tasks().await?;
+    let database_path = current_database_path().await?;
+    let tasks = tokio::task::spawn_blocking(move || -> Result<Vec<TaskRecord>> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, path, spec_path, milestone_id, status, paused_status, claimed_by,
+                   lease_until, last_heartbeat, check_retries, review_cycles, failure_reason
+            FROM tasks
+            WHERE status = ?1 AND human_answer_recorded = 0
+            ORDER BY
+                CASE WHEN human_question_order IS NULL THEN 0 ELSE 1 END,
+                human_question_order,
+                id
+            "#,
+        )?;
+        let rows =
+            statement.query_map([TaskStatus::AwaitingHuman.as_str()], task_record_from_row)?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row?);
+        }
+        Ok(tasks)
+    })
+    .await??;
     let mut questions = Vec::new();
-    for task in tasks
-        .into_iter()
-        .filter(|task| task.status == TaskStatus::AwaitingHuman.as_str())
-    {
+    for task in tasks {
         let run_dir = run_dir_for_task(&task.id);
         let question = crate::state::store::read_question_for_run_dir(&run_dir)
             .await
@@ -889,6 +915,54 @@ pub async fn list_human_questions() -> Result<Vec<HumanQuestion>> {
         });
     }
     Ok(questions)
+}
+
+pub async fn list_answered_human_waiters() -> Result<Vec<AnsweredHumanWaiter>> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<Vec<AnsweredHumanWaiter>> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, awaiting_human_by
+            FROM tasks
+            WHERE status = ?1
+              AND human_answer_recorded = 1
+              AND awaiting_human_by IS NOT NULL
+            ORDER BY
+                CASE WHEN human_question_order IS NULL THEN 0 ELSE 1 END,
+                human_question_order,
+                id
+            "#,
+        )?;
+        let rows = statement.query_map([TaskStatus::AwaitingHuman.as_str()], |row| {
+            Ok(AnsweredHumanWaiter {
+                task_id: row.get(0)?,
+                awaiting_human_by: row.get(1)?,
+            })
+        })?;
+        let mut waiters = Vec::new();
+        for row in rows {
+            waiters.push(row?);
+        }
+        Ok(waiters)
+    })
+    .await?
+}
+
+async fn recover_recorded_human_answers() -> Result<usize> {
+    let questions = list_human_questions().await?;
+    let mut recovered = 0usize;
+    for question in questions {
+        let answer = crate::state::store::read_answer_for_run_dir(&question.run_dir)
+            .await
+            .unwrap_or_default();
+        if answer.trim().is_empty() {
+            continue;
+        }
+        record_task_human_answer(&question.task_id).await?;
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 #[allow(dead_code)]
@@ -1482,12 +1556,14 @@ pub async fn record_task_human_question_requested_with_resume(
     let task_id = task_id.to_string();
     let awaiting_human_by = awaiting_human_by.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = open_runtime_database(&database_path)?;
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let paused_status = paused_status.map(TaskStatus::as_str);
-        connection.execute(
+        transaction.execute(
             r#"
             UPDATE tasks
-            SET status = ?1, paused_status = ?2, awaiting_human_by = ?3, awaiting_human_status = ?4
+            SET status = ?1, paused_status = ?2, awaiting_human_by = ?3,
+                awaiting_human_status = ?4, human_answer_recorded = 0
             WHERE id = ?5
             "#,
             params![
@@ -1498,8 +1574,8 @@ pub async fn record_task_human_question_requested_with_resume(
                 task_id
             ],
         )?;
-        insert_event(
-            &connection,
+        insert_event_in_transaction(
+            &transaction,
             None,
             "task_human_question_requested",
             &serde_json::json!({
@@ -1509,6 +1585,41 @@ pub async fn record_task_human_question_requested_with_resume(
                 "awaiting_human_by": awaiting_human_by,
             }),
         )?;
+        let question_order = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE tasks SET human_question_order = ?1 WHERE id = ?2",
+            params![question_order, task_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn record_task_human_answer(task_id: &str) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            r#"
+            UPDATE tasks
+            SET human_answer_recorded = 1
+            WHERE id = ?1 AND status = ?2
+            "#,
+            params![task_id, TaskStatus::AwaitingHuman.as_str()],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("Task {task_id} is not waiting for a human answer.");
+        }
+        insert_event_in_transaction(
+            &transaction,
+            None,
+            "task_human_answer_recorded",
+            &serde_json::json!({ "task_id": task_id }),
+        )?;
+        transaction.commit()?;
         Ok(())
     })
     .await?
@@ -1588,7 +1699,9 @@ pub async fn restore_task_from_human_answer(task_id: &str) -> Result<TaskHumanAn
         transaction.execute(
             r#"
             UPDATE tasks
-            SET status = ?1, paused_status = ?2, awaiting_human_by = NULL, awaiting_human_status = NULL
+            SET status = ?1, paused_status = ?2, awaiting_human_by = NULL,
+                awaiting_human_status = NULL, human_question_order = NULL,
+                human_answer_recorded = 0
             WHERE id = ?3
             "#,
             params![resumed_status, restored_paused_status, task_id],
@@ -2674,7 +2787,7 @@ pub async fn recover_expired_task_leases() -> Result<usize> {
     tokio::task::spawn_blocking(move || -> Result<usize> {
         let connection = open_runtime_database(&database_path)?;
         let now = Utc::now();
-        let live_run_task_ids = live_active_run_task_ids(&connection)?;
+        let live_run_task_ids = live_active_run_task_ids_from_database(&connection)?;
         let mut statement = connection.prepare(
             "SELECT id, claimed_by, lease_until FROM tasks WHERE claimed_by IS NOT NULL",
         )?;
@@ -2722,6 +2835,7 @@ pub async fn recover_expired_task_leases() -> Result<usize> {
 pub async fn recover_runtime_state() -> Result<RuntimeRecovery> {
     let interrupted_runs = recover_interrupted_runs().await?;
     let expired_task_leases = recover_expired_task_leases().await?;
+    recover_recorded_human_answers().await?;
     Ok(RuntimeRecovery {
         interrupted_runs,
         expired_task_leases,
@@ -2898,7 +3012,7 @@ async fn preview_expired_task_leases(database_path: &Path) -> Result<usize> {
             Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("Failed to open {}", database_path.display()))?;
         let now = Utc::now();
-        let live_run_task_ids = live_active_run_task_ids(&connection)?;
+        let live_run_task_ids = live_active_run_task_ids_from_database(&connection)?;
         let mut statement =
             connection.prepare("SELECT id, lease_until FROM tasks WHERE claimed_by IS NOT NULL")?;
         let rows = statement.query_map([], |row| {
@@ -3071,7 +3185,9 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             review_cycles INTEGER NOT NULL DEFAULT 0,
             failure_reason TEXT,
             awaiting_human_by TEXT,
-            awaiting_human_status TEXT
+            awaiting_human_status TEXT,
+            human_question_order INTEGER,
+            human_answer_recorded INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS runs (
@@ -3125,6 +3241,13 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     ensure_column(connection, "tasks", "failure_reason", "TEXT")?;
     ensure_column(connection, "tasks", "awaiting_human_by", "TEXT")?;
     ensure_column(connection, "tasks", "awaiting_human_status", "TEXT")?;
+    ensure_column(connection, "tasks", "human_question_order", "INTEGER")?;
+    ensure_column(
+        connection,
+        "tasks",
+        "human_answer_recorded",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(connection, "project_runtime_state", "selected_spec", "TEXT")?;
     ensure_column(
         connection,
@@ -3866,7 +3989,18 @@ fn process_is_alive(pid: u32) -> bool {
     platform::pid_is_alive(pid)
 }
 
-fn live_active_run_task_ids(connection: &Connection) -> Result<std::collections::HashSet<String>> {
+pub async fn live_active_run_task_ids() -> Result<std::collections::HashSet<String>> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>> {
+        let connection = open_runtime_database(&database_path)?;
+        live_active_run_task_ids_from_database(&connection)
+    })
+    .await?
+}
+
+fn live_active_run_task_ids_from_database(
+    connection: &Connection,
+) -> Result<std::collections::HashSet<String>> {
     let mut statement = connection.prepare(
         "SELECT task_id, pid FROM runs WHERE status IN ('running', 'checking', 'reviewing')",
     )?;
@@ -4451,34 +4585,55 @@ mod tests {
     async fn list_human_questions_reads_scoped_awaiting_human_tasks() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let (_dir, previous) = setup_project().await;
-        record_task_status(
-            "t-002",
-            ".ferrus/tasks/t-002.md",
-            crate::project::TaskStatus::Executing,
-        )
-        .await
-        .unwrap();
-        record_task_human_question_requested(
-            "t-002",
-            crate::project::TaskStatus::Executing,
-            "executor:codex:2",
-        )
-        .await
-        .unwrap();
-        crate::state::store::write_question_for_run_dir(
-            ".ferrus/runs/t-002",
-            "Which option should I use?",
-        )
-        .await
-        .unwrap();
+        for task_id in ["t-010", "t-002"] {
+            record_task_status(
+                task_id,
+                &format!(".ferrus/tasks/{task_id}.md"),
+                crate::project::TaskStatus::Executing,
+            )
+            .await
+            .unwrap();
+            record_task_human_question_requested(
+                task_id,
+                crate::project::TaskStatus::Executing,
+                &format!("executor:codex:{task_id}"),
+            )
+            .await
+            .unwrap();
+            crate::state::store::write_question_for_run_dir(
+                &format!(".ferrus/runs/{task_id}"),
+                &format!("Question for {task_id}"),
+            )
+            .await
+            .unwrap();
+        }
 
         let questions = list_human_questions().await.unwrap();
 
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].task_id, "t-010");
+        assert_eq!(questions[1].task_id, "t-002");
+
+        record_task_human_answer("t-010").await.unwrap();
+        let questions = list_human_questions().await.unwrap();
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].task_id, "t-002");
-        assert_eq!(questions[0].task_path, ".ferrus/tasks/t-002.md");
-        assert_eq!(questions[0].run_dir, ".ferrus/runs/t-002");
-        assert_eq!(questions[0].question, "Which option should I use?");
+        let waiters = list_answered_human_waiters().await.unwrap();
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(waiters[0].task_id, "t-010");
+        assert_eq!(waiters[0].awaiting_human_by, "executor:codex:t-010");
+
+        crate::state::store::write_answer_for_run_dir(
+            ".ferrus/runs/t-002",
+            "answer written before database update",
+        )
+        .await
+        .unwrap();
+        recover_runtime_state().await.unwrap();
+        assert!(list_human_questions().await.unwrap().is_empty());
+        let waiters = list_answered_human_waiters().await.unwrap();
+        assert_eq!(waiters.len(), 2);
+        assert_eq!(waiters[1].task_id, "t-002");
 
         teardown(previous);
     }

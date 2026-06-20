@@ -45,7 +45,7 @@ pub async fn run(debug: bool) -> Result<()> {
     tokio::spawn(state_watcher::watch(state_tx));
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<tui::UiMessage>();
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<tui::HqInput>();
 
     let hq_config = load_hq_config_from_config().await;
     let supervisor_type = hq_config
@@ -104,8 +104,8 @@ pub async fn run(debug: bool) -> Result<()> {
             }
             maybe_cmd = cmd_rx.recv() => {
                 match maybe_cmd {
-                    Some(cmd) => {
-                        let line = cmd.as_str();
+                    Some(input) => {
+                        let line = input.text.as_str();
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -113,7 +113,14 @@ pub async fn run(debug: bool) -> Result<()> {
                             ctx.display.muted("Bye.");
                             break Ok(());
                         }
-                        if let Err(err) = dispatch(line, &mut ctx).await {
+                        if let Err(err) = dispatch_with_human_question_target(
+                            line,
+                            input.human_question_task_id.as_deref(),
+                            false,
+                            &mut ctx,
+                        )
+                        .await
+                        {
                             ctx.display.error(err.to_string());
                         }
                     }
@@ -186,10 +193,25 @@ async fn load_agent_version_from_version_command(command: std::process::Command)
         .to_string()
 }
 
+#[cfg(test)]
 async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
+    dispatch_with_human_question_target(line, None, true, ctx).await
+}
+
+async fn dispatch_with_human_question_target(
+    line: &str,
+    human_question_task_id: Option<&str>,
+    allow_fifo_fallback: bool,
+    ctx: &mut HqContext,
+) -> Result<()> {
     // When state is AwaitingHuman, non-command input is treated as the human's answer.
     if !line.starts_with('/') {
-        if ctx.has_pending_human_question().await? {
+        if human_question_task_id.is_some() {
+            return ctx
+                .answer_scoped_human_question_for_task(line.to_string(), human_question_task_id)
+                .await;
+        }
+        if allow_fifo_fallback && ctx.has_pending_human_question().await? {
             return ctx.answer(line.to_string()).await;
         }
         anyhow::bail!("Commands must start with '/' — try /status, /task, /quit");
@@ -279,7 +301,7 @@ async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
                 "  /quit              Exit HQ\n",
                 "\n",
                 "When an agent asks a question (state = AwaitingHuman):\n",
-                "  Type your answer and press Enter (no slash prefix needed).",
+                "  Type your answer and press Enter; queued questions are shown one at a time.",
             ));
         }
         ShellCommand::Reset => ctx.reset().await?,
@@ -755,17 +777,21 @@ impl HqContext {
 
         let _ = crate::project::recover_runtime_state().await;
         let tasks = crate::project::list_tasks().await?;
+        let answered_human_waiters = crate::project::list_answered_human_waiters().await?;
         self.announce_completed_tasks(&tasks);
         if !tasks.iter().any(|task| {
             is_executor_ready_task_status(&task.status)
                 || is_review_or_consultation_task_status(&task.status)
-        }) {
+        }) && answered_human_waiters.is_empty()
+        {
             return Ok(());
         }
 
         self.ensure_hq_config().await?;
         let config = Config::load().await?;
         let max_parallel = config.limits.max_parallel_tasks.max(1);
+        self.schedule_answered_human_tasks(&answered_human_waiters, max_parallel)
+            .await?;
         self.schedule_consultation_tasks(&tasks, max_parallel)
             .await?;
         self.schedule_answered_consultation_tasks(&tasks, max_parallel)
@@ -841,14 +867,18 @@ impl HqContext {
     async fn resume(&mut self) -> Result<()> {
         let _ = crate::project::recover_runtime_state().await;
         let tasks = crate::project::list_tasks().await?;
+        let answered_human_waiters = crate::project::list_answered_human_waiters().await?;
         let has_runtime_work = tasks.iter().any(|task| {
             is_executor_ready_task_status(&task.status)
                 || is_review_or_consultation_task_status(&task.status)
-        });
+        }) || !answered_human_waiters.is_empty();
         if has_runtime_work {
             self.ensure_hq_config().await?;
             let config = Config::load().await?;
             let max_parallel = config.limits.max_parallel_tasks.max(1);
+            let human_answer = self
+                .schedule_answered_human_tasks(&answered_human_waiters, max_parallel)
+                .await?;
             let consultation = self
                 .schedule_consultation_tasks(&tasks, max_parallel)
                 .await?;
@@ -859,7 +889,7 @@ impl HqContext {
             let executor = self
                 .schedule_queued_tasks_from(tasks, max_parallel, true)
                 .await?;
-            if consultation + consultation_executor + reviewing + executor == 0 {
+            if human_answer + consultation + consultation_executor + reviewing + executor == 0 {
                 self.display.info(
                     "No additional runtime task session started. Use /tasks to inspect work.",
                 );
@@ -1383,6 +1413,7 @@ impl HqContext {
         }
 
         let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
         let prompt = agent_manager::reviewer_prompt();
         let mut spawned = 0usize;
         let mut spawn_error = None;
@@ -1392,7 +1423,7 @@ impl HqContext {
             .filter(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
         {
             let expected_agent_id = self.supervisor_agent_id_for_task(&task.id)?;
-            if task_has_active_external_claim(task, &expected_agent_id, now) {
+            if task_claim_blocks_spawn(task, &expected_agent_id, now, &live_run_task_ids) {
                 continue;
             }
             review_tasks.push(task.clone());
@@ -1499,11 +1530,12 @@ impl HqContext {
         }
 
         let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
         let answered_tasks = answered_consultation_tasks(tasks).await?;
         let mut spawn_tasks = Vec::new();
         for task in answered_tasks {
             let name = self.executor_agent_id_for_task(&task.id)?;
-            if task_has_active_external_claim(&task, &name, now)
+            if task_claim_blocks_spawn(&task, &name, now, &live_run_task_ids)
                 || self
                     .headless
                     .get(&name)
@@ -1546,6 +1578,66 @@ impl HqContext {
         Ok(spawned)
     }
 
+    async fn schedule_answered_human_tasks(
+        &mut self,
+        waiters: &[crate::project::AnsweredHumanWaiter],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        if waiters.is_empty() {
+            return Ok(0);
+        }
+
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let mut executor_slots = max_parallel.saturating_sub(self.running_executor_count());
+        let mut supervisor_slots = max_parallel.saturating_sub(self.running_supervisor_count());
+        let mut spawned = 0usize;
+
+        for waiter in waiters {
+            if live_run_task_ids.contains(&waiter.task_id)
+                || self
+                    .headless
+                    .get(&waiter.awaiting_human_by)
+                    .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+
+            let slot = if waiter.awaiting_human_by.starts_with(ROLE_EXECUTOR) {
+                &mut executor_slots
+            } else if waiter.awaiting_human_by.starts_with(ROLE_SUPERVISOR) {
+                &mut supervisor_slots
+            } else {
+                tracing::warn!(
+                    task_id = waiter.task_id,
+                    owner = waiter.awaiting_human_by,
+                    "cannot resume answered human question for unknown agent role"
+                );
+                continue;
+            };
+            if *slot == 0 {
+                continue;
+            }
+
+            match self
+                .relaunch_human_answer_waiter(&waiter.awaiting_human_by, &waiter.task_id)
+                .await
+            {
+                Ok(()) => {
+                    *slot -= 1;
+                    spawned += 1;
+                }
+                Err(err) => {
+                    self.display.error(format!(
+                        "Could not resume {} for answered task {}: {err}",
+                        waiter.awaiting_human_by, waiter.task_id
+                    ));
+                }
+            }
+        }
+
+        Ok(spawned)
+    }
+
     async fn schedule_queued_tasks_from(
         &mut self,
         tasks: Vec<TaskRecord>,
@@ -1553,13 +1645,14 @@ impl HqContext {
         report_waiting: bool,
     ) -> Result<usize> {
         let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
         let mut ready_tasks = Vec::new();
         for task in tasks
             .into_iter()
             .filter(|task| is_executor_ready_task_status(&task.status))
         {
             let expected_agent_id = self.executor_agent_id_for_task(&task.id)?;
-            if !task_has_active_external_claim(&task, &expected_agent_id, now) {
+            if !task_claim_blocks_spawn(&task, &expected_agent_id, now, &live_run_task_ids) {
                 ready_tasks.push(task);
             }
         }
@@ -1933,11 +2026,7 @@ impl HqContext {
         if response.trim().is_empty() {
             anyhow::bail!("Answer cannot be empty.");
         }
-        if self.has_scoped_human_question().await? {
-            return self.answer_scoped_human_question(response).await;
-        }
-
-        anyhow::bail!("No task is currently waiting for a human answer.")
+        self.answer_scoped_human_question(response).await
     }
 
     async fn has_pending_human_question(&self) -> Result<bool> {
@@ -1958,15 +2047,23 @@ impl HqContext {
     }
 
     async fn answer_scoped_human_question(&mut self, response: String) -> Result<()> {
-        let Some(question) = crate::project::list_human_questions()
-            .await?
-            .into_iter()
-            .next()
-        else {
-            anyhow::bail!("No task is currently waiting for a human answer.");
-        };
+        self.answer_scoped_human_question_for_task(response, None)
+            .await
+    }
+
+    async fn answer_scoped_human_question_for_task(
+        &mut self,
+        response: String,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        if response.trim().is_empty() {
+            anyhow::bail!("Answer cannot be empty.");
+        }
+        let question =
+            select_human_question(crate::project::list_human_questions().await?, task_id)?;
 
         store::write_answer_for_run_dir(&question.run_dir, &response).await?;
+        crate::project::record_task_human_answer(&question.task_id).await?;
         self.display
             .info(format!("Answer recorded for {}.", question.task_id));
 
@@ -2598,22 +2695,41 @@ async fn git_has_head(path: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn task_has_active_external_claim(
+fn task_claim_blocks_spawn(
     task: &TaskRecord,
     expected_agent_id: &str,
     now: chrono::DateTime<chrono::Utc>,
+    live_run_task_ids: &HashSet<String>,
 ) -> bool {
-    if task
-        .claimed_by
-        .as_deref()
-        .is_none_or(|claimed_by| claimed_by == expected_agent_id)
-    {
+    let Some(claimed_by) = task.claimed_by.as_deref() else {
         return false;
-    }
-    task.lease_until
+    };
+    let lease_active = task
+        .lease_until
         .as_deref()
         .and_then(|lease_until| chrono::DateTime::parse_from_rfc3339(lease_until).ok())
-        .is_some_and(|lease_until| lease_until.with_timezone(&chrono::Utc) > now)
+        .is_some_and(|lease_until| lease_until.with_timezone(&chrono::Utc) > now);
+    if live_run_task_ids.contains(task.id.as_str()) {
+        return true;
+    }
+    claimed_by != expected_agent_id && lease_active
+}
+
+fn select_human_question(
+    questions: Vec<crate::project::HumanQuestion>,
+    task_id: Option<&str>,
+) -> Result<crate::project::HumanQuestion> {
+    if let Some(task_id) = task_id {
+        return questions
+            .into_iter()
+            .find(|question| question.task_id == task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task {task_id} is not waiting for a human answer."));
+    }
+
+    questions
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No task is currently waiting for a human answer."))
 }
 
 fn is_resettable_task_status(status: &str) -> bool {
@@ -3536,29 +3652,72 @@ mod tests {
     }
 
     #[test]
-    fn active_task_claim_only_blocks_a_different_agent() {
+    fn task_claim_blocks_live_expected_or_active_external_agent() {
         let now = chrono::Utc::now();
         let mut task = task_record("t-001", crate::project::TaskStatus::Executing);
         task.claimed_by = Some("executor:codex:t-001".to_string());
         task.lease_until = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
+        let mut live_run_task_ids = HashSet::new();
 
-        assert!(!task_has_active_external_claim(
+        assert!(!task_claim_blocks_spawn(
             &task,
             "executor:codex:t-001",
-            now
+            now,
+            &live_run_task_ids,
         ));
-        assert!(task_has_active_external_claim(
+        assert!(task_claim_blocks_spawn(
             &task,
             "executor:claude-code:t-001",
-            now
+            now,
+            &live_run_task_ids,
+        ));
+
+        live_run_task_ids.insert("t-001".to_string());
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
         ));
 
         task.lease_until = Some((now - chrono::Duration::seconds(1)).to_rfc3339());
-        assert!(!task_has_active_external_claim(
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+        assert!(task_claim_blocks_spawn(
             &task,
             "executor:claude-code:t-001",
-            now
+            now,
+            &live_run_task_ids,
         ));
+
+        live_run_task_ids.clear();
+        assert!(!task_claim_blocks_spawn(
+            &task,
+            "executor:claude-code:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+    }
+
+    #[test]
+    fn human_question_selection_uses_fifo_or_presented_task_id() {
+        let question = |task_id: &str| crate::project::HumanQuestion {
+            task_id: task_id.to_string(),
+            task_path: format!(".ferrus/tasks/{task_id}.md"),
+            run_dir: format!(".ferrus/runs/{task_id}"),
+            question: format!("Question for {task_id}"),
+        };
+        let questions = vec![question("t-001"), question("t-002")];
+
+        let selected = select_human_question(questions.clone(), None).unwrap();
+        assert_eq!(selected.task_id, "t-001");
+
+        let selected = select_human_question(questions, Some("t-002")).unwrap();
+        assert_eq!(selected.task_id, "t-002");
     }
 
     #[tokio::test]
@@ -3686,6 +3845,99 @@ mod tests {
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
         assert_eq!(task.status, "awaiting_human");
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_human_answers_follow_fifo_and_preserve_presented_task() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        for task_id in ["t-021", "t-022"] {
+            crate::project::record_task_status(
+                task_id,
+                &format!(".ferrus/tasks/{task_id}.md"),
+                crate::project::TaskStatus::Executing,
+            )
+            .await
+            .unwrap();
+            crate::project::record_task_human_question_requested(
+                task_id,
+                crate::project::TaskStatus::Executing,
+                &format!("executor:codex:{task_id}"),
+            )
+            .await
+            .unwrap();
+            store::write_question_for_run_dir(
+                &format!(".ferrus/runs/{task_id}"),
+                &format!("Question for {task_id}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = dispatch("First answer", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Executor agent is not configured"));
+        assert_eq!(
+            store::read_answer_for_run_dir(".ferrus/runs/t-021")
+                .await
+                .unwrap(),
+            "First answer"
+        );
+        assert!(!std::path::Path::new(".ferrus/runs/t-022/ANSWER.md").exists());
+        let questions = crate::project::list_human_questions().await.unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].task_id, "t-022");
+
+        let error =
+            dispatch_with_human_question_target("Stale answer", Some("t-021"), false, &mut ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("Task t-021 is not waiting"));
+        assert!(!std::path::Path::new(".ferrus/runs/t-022/ANSWER.md").exists());
+
+        let error = dispatch_with_human_question_target(
+            "Use option B\n\n- preserve formatting",
+            Some("t-022"),
+            false,
+            &mut ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Executor agent is not configured"));
+        assert_eq!(
+            store::read_answer_for_run_dir(".ferrus/runs/t-022")
+                .await
+                .unwrap(),
+            "Use option B\n\n- preserve formatting"
+        );
 
         std::env::set_current_dir(previous).unwrap();
     }
