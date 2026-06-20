@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use neva::prelude::*;
 use tracing::info;
 
@@ -29,22 +29,7 @@ async fn run(description: String) -> Result<String> {
         anyhow::bail!("Cannot create task: description is empty.");
     }
 
-    let artifact = project::allocate_task_artifact().await?;
-    tokio::fs::write(&artifact.path, &description)
-        .await
-        .with_context(|| format!("Failed to write {}", artifact.path))?;
-    tokio::fs::create_dir_all(&artifact.run_dir)
-        .await
-        .with_context(|| format!("Failed to create {}", artifact.run_dir))?;
-
-    project::record_task_status_with_origin(
-        &artifact.id,
-        &artifact.path,
-        project::TaskStatus::Pending,
-        None,
-        None,
-    )
-    .await?;
+    let artifact = project::create_pending_task_artifact(&description, None, None).await?;
     project::record_runtime_event_best_effort(
         None,
         "task_created",
@@ -121,6 +106,34 @@ mod tests {
         assert_eq!(tasks[0].id, "t-001");
         assert_eq!(tasks[0].path, ".ferrus/tasks/t-001.md");
         assert_eq!(tasks[0].status, "pending");
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn concurrent_task_creation_reserves_distinct_ids() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+
+        let (first, second) = tokio::join!(
+            run("First task".to_string()),
+            run("Second task".to_string())
+        );
+
+        assert!(first.is_ok(), "first create failed: {first:?}");
+        assert!(second.is_ok(), "second create failed: {second:?}");
+        let tasks = project::list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "t-001");
+        assert_eq!(tasks[1].id, "t-002");
+        assert_eq!(tasks[0].status, "pending");
+        assert_eq!(tasks[1].status, "pending");
+        let contents = [
+            tokio::fs::read_to_string(&tasks[0].path).await.unwrap(),
+            tokio::fs::read_to_string(&tasks[1].path).await.unwrap(),
+        ];
+        assert!(contents.contains(&"First task".to_string()));
+        assert!(contents.contains(&"Second task".to_string()));
 
         teardown(previous);
     }

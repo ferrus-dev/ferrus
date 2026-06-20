@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use neva::prelude::*;
 use serde::Deserialize;
 use tracing::info;
@@ -77,18 +77,8 @@ async fn run(
         );
     }
 
-    let artifact = project::allocate_task_artifact().await?;
-    tokio::fs::write(&artifact.path, &description)
-        .await
-        .with_context(|| format!("Failed to write {}", artifact.path))?;
-    tokio::fs::create_dir_all(&artifact.run_dir)
-        .await
-        .with_context(|| format!("Failed to create {}", artifact.run_dir))?;
-
-    project::record_task_status_with_origin(
-        &artifact.id,
-        &artifact.path,
-        project::TaskStatus::Pending,
+    let artifact = project::create_pending_task_artifact(
+        &description,
         spec_path.as_deref(),
         milestone_id.as_deref(),
     )
@@ -280,6 +270,33 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("already has task t-001"));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn concurrent_enqueue_allows_only_one_task_per_origin() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+
+        let first = run(
+            "First task".to_string(),
+            Some("docs/specs/spec.md".to_string()),
+            Some("m1.0".to_string()),
+        );
+        let second = run(
+            "Second task".to_string(),
+            Some("docs/specs/spec.md".to_string()),
+            Some("m1.0".to_string()),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        let error = first.err().or_else(|| second.err()).unwrap();
+        assert!(error.to_string().contains("already has task"));
+        let tasks = project::list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "pending");
 
         teardown(previous);
     }

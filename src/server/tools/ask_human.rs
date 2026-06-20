@@ -10,7 +10,7 @@ use crate::{
 use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err};
 
 pub const DESCRIPTION: &str = "Ask the human a question. \
-     Writes the question to QUESTION.md, transitions state to AwaitingHuman, \
+     Writes the question to the task-scoped run directory, transitions state to AwaitingHuman, \
      and returns immediately. You MUST call /wait_for_answer immediately after \
      to block until the human responds — do not call any other tools in between. \
      Can be called from Executing, Addressing, Consultation, or Reviewing state.";
@@ -55,10 +55,11 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
     )
     .await?;
     let paused = context.status.clone();
+    let question_path = format!("{}/QUESTION.md", context.run_dir.trim_end_matches('/'));
 
     info!(paused, "Task → AwaitingHuman");
     Ok(format!(
-        "Your question has been written to `.ferrus/QUESTION.md`.\n\
+        "Your question has been written to `{question_path}`.\n\
          State is now AwaitingHuman (paused from {paused}).\n\
          Call /wait_for_answer immediately to block until the human responds.\n\
          Do NOT call any other tools while waiting."
@@ -180,11 +181,13 @@ mod tests {
             .await
             .unwrap();
 
-        run("executor:codex:7", "Which path should I take?".to_string())
+        let response = run("executor:codex:7", "Which path should I take?".to_string())
             .await
             .unwrap();
 
         crate::test_support::assert_no_state_json();
+        assert!(response.contains("`.ferrus/runs/t-007/QUESTION.md`"));
+        assert!(!response.contains("`.ferrus/QUESTION.md`"));
         assert_eq!(
             store::read_question_for_run_dir(".ferrus/runs/t-007")
                 .await

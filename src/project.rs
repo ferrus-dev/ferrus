@@ -3,7 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -474,7 +474,37 @@ pub async fn touch_current_project() -> Result<ProjectRegistration> {
     })
 }
 
-pub async fn allocate_task_artifact() -> Result<TaskArtifact> {
+pub async fn create_pending_task_artifact(
+    description: &str,
+    spec_path: Option<&str>,
+    milestone_id: Option<&str>,
+) -> Result<TaskArtifact> {
+    let artifact = reserve_task_artifact().await?;
+    let result = async {
+        tokio::fs::write(&artifact.path, description)
+            .await
+            .with_context(|| format!("Failed to write {}", artifact.path))?;
+        tokio::fs::create_dir_all(&artifact.run_dir)
+            .await
+            .with_context(|| format!("Failed to create {}", artifact.run_dir))?;
+        finalize_task_artifact_reservation(&artifact, spec_path, milestone_id).await
+    }
+    .await;
+
+    if let Err(err) = result {
+        if let Err(cleanup_err) = discard_task_artifact_reservation(&artifact).await {
+            return Err(err.context(format!(
+                "Also failed to discard task reservation {}: {cleanup_err}",
+                artifact.id
+            )));
+        }
+        return Err(err);
+    }
+
+    Ok(artifact)
+}
+
+async fn reserve_task_artifact() -> Result<TaskArtifact> {
     let tasks_dir = Path::new(".ferrus/tasks");
     let runs_dir = Path::new(".ferrus/runs");
     tokio::fs::create_dir_all(tasks_dir)
@@ -484,25 +514,138 @@ pub async fn allocate_task_artifact() -> Result<TaskArtifact> {
         .await
         .context("Failed to create .ferrus/runs")?;
 
-    let mut max_number = max_task_number_from_files(tasks_dir).await?;
-    if let Ok(database_path) = current_database_path().await {
-        max_number = max_number.max(max_task_number_from_database(&database_path).await?);
-    }
-
-    let mut number = max_number + 1;
-    loop {
-        let id = format!("t-{number:03}");
-        let task_path = tasks_dir.join(format!("{id}.md"));
-        if !task_path.exists() {
-            // Store project-local artifact paths with `/` separators. Rust accepts these paths on
-            // Windows too, and keeping the serialized STATE/DB value stable avoids platform drift.
-            return Ok(TaskArtifact {
-                path: format!(".ferrus/tasks/{id}.md"),
-                run_dir: format!(".ferrus/runs/{id}"),
-                id,
-            });
+    let max_file_number = max_task_number_from_files(tasks_dir).await?;
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<TaskArtifact> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let max_number = max_file_number.max(max_task_number_in_database(&transaction)?);
+        let mut number = max_number
+            .checked_add(1)
+            .context("Cannot allocate another task id: numeric range exhausted")?;
+        loop {
+            let id = format!("t-{number:03}");
+            let path = format!(".ferrus/tasks/{id}.md");
+            let reserved = transaction.execute(
+                "INSERT OR IGNORE INTO tasks (id, path, status) VALUES (?1, ?2, ?3)",
+                params![id, path, TaskStatus::Unknown.as_str()],
+            )?;
+            if reserved == 1 {
+                transaction.commit()?;
+                return Ok(TaskArtifact {
+                    run_dir: format!(".ferrus/runs/{id}"),
+                    id,
+                    path,
+                });
+            }
+            number = number
+                .checked_add(1)
+                .context("Cannot allocate another task id: numeric range exhausted")?;
         }
-        number += 1;
+    })
+    .await?
+}
+
+async fn finalize_task_artifact_reservation(
+    artifact: &TaskArtifact,
+    spec_path: Option<&str>,
+    milestone_id: Option<&str>,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let artifact = artifact.clone();
+    let spec_path = spec_path.map(str::to_string);
+    let milestone_id = milestone_id.map(str::to_string);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(spec_path), Some(milestone_id)) =
+            (spec_path.as_deref(), milestone_id.as_deref())
+        {
+            let duplicate = transaction.query_row(
+                r#"
+                SELECT id
+                FROM tasks
+                WHERE spec_path = ?1 AND milestone_id = ?2 AND id <> ?3
+                  AND status NOT IN (?4, ?5, ?6)
+                ORDER BY id
+                LIMIT 1
+                "#,
+                params![
+                    spec_path,
+                    milestone_id,
+                    artifact.id,
+                    TaskStatus::Reset.as_str(),
+                    TaskStatus::Complete.as_str(),
+                    TaskStatus::Failed.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+            if let Some(duplicate) = duplicate {
+                anyhow::bail!(
+                    "Cannot enqueue task: milestone {milestone_id} from {spec_path} already has task {duplicate}."
+                );
+            }
+        }
+
+        let finalized = transaction.execute(
+            r#"
+            UPDATE tasks
+            SET status = ?1, spec_path = ?2, milestone_id = ?3
+            WHERE id = ?4 AND status = ?5
+            "#,
+            params![
+                TaskStatus::Pending.as_str(),
+                spec_path,
+                milestone_id,
+                artifact.id,
+                TaskStatus::Unknown.as_str(),
+            ],
+        )?;
+        if finalized != 1 {
+            anyhow::bail!("Task reservation {} is no longer available", artifact.id);
+        }
+        insert_event_in_transaction(
+            &transaction,
+            None,
+            "task_status_changed",
+            &serde_json::json!({
+                "task_id": artifact.id,
+                "status": TaskStatus::Pending.as_str(),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+async fn discard_task_artifact_reservation(artifact: &TaskArtifact) -> Result<()> {
+    remove_path_if_exists(Path::new(&artifact.path), false).await?;
+    remove_path_if_exists(Path::new(&artifact.run_dir), true).await?;
+    let database_path = current_database_path().await?;
+    let task_id = artifact.id.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = open_runtime_database(&database_path)?;
+        connection.execute(
+            "DELETE FROM tasks WHERE id = ?1 AND status = ?2",
+            params![task_id, TaskStatus::Unknown.as_str()],
+        )?;
+        Ok(())
+    })
+    .await?
+}
+
+async fn remove_path_if_exists(path: &Path, directory: bool) -> Result<()> {
+    let result = if directory {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
     }
 }
 
@@ -2843,21 +2986,16 @@ async fn max_task_number_from_files(tasks_dir: &Path) -> Result<u32> {
     Ok(max_number)
 }
 
-async fn max_task_number_from_database(path: &Path) -> Result<u32> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<u32> {
-        let connection = open_runtime_database(&path)?;
-        let mut statement = connection.prepare("SELECT id FROM tasks WHERE id LIKE 't-%'")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut max_number = 0;
-        for row in rows {
-            if let Some(number) = parse_task_number(&row?) {
-                max_number = max_number.max(number);
-            }
+fn max_task_number_in_database(connection: &Connection) -> Result<u32> {
+    let mut statement = connection.prepare("SELECT id FROM tasks WHERE id LIKE 't-%'")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut max_number = 0;
+    for row in rows {
+        if let Some(number) = parse_task_number(&row?) {
+            max_number = max_number.max(number);
         }
-        Ok(max_number)
-    })
-    .await?
+    }
+    Ok(max_number)
 }
 
 async fn read_task_records_from_database(path: &Path) -> Result<Vec<TaskRecord>> {
@@ -2909,6 +3047,7 @@ async fn current_task_identity() -> (String, String) {
 fn open_runtime_database(path: &Path) -> Result<Connection> {
     let connection =
         Connection::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    connection.busy_timeout(Duration::from_secs(5))?;
     initialize_schema(&connection)?;
     Ok(connection)
 }
