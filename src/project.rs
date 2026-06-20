@@ -2472,6 +2472,7 @@ pub async fn recover_expired_task_leases() -> Result<usize> {
     tokio::task::spawn_blocking(move || -> Result<usize> {
         let connection = open_runtime_database(&database_path)?;
         let now = Utc::now();
+        let live_run_task_ids = live_active_run_task_ids(&connection)?;
         let mut statement = connection.prepare(
             "SELECT id, claimed_by, lease_until FROM tasks WHERE claimed_by IS NOT NULL",
         )?;
@@ -2490,7 +2491,9 @@ pub async fn recover_expired_task_leases() -> Result<usize> {
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc));
-            if parsed_lease.is_none_or(|lease_until| now >= lease_until) {
+            if parsed_lease.is_none_or(|lease_until| now >= lease_until)
+                && !live_run_task_ids.contains(&task_id)
+            {
                 expired.push((task_id, claimed_by, lease_until));
             }
         }
@@ -2693,17 +2696,23 @@ async fn preview_expired_task_leases(database_path: &Path) -> Result<usize> {
             Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("Failed to open {}", database_path.display()))?;
         let now = Utc::now();
+        let live_run_task_ids = live_active_run_task_ids(&connection)?;
         let mut statement =
-            connection.prepare("SELECT lease_until FROM tasks WHERE claimed_by IS NOT NULL")?;
-        let rows = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
+            connection.prepare("SELECT id, lease_until FROM tasks WHERE claimed_by IS NOT NULL")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
 
         let mut expired = 0;
         for row in rows {
-            let parsed_lease = row?
+            let (task_id, lease_until) = row?;
+            let parsed_lease = lease_until
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc));
-            if parsed_lease.is_none_or(|lease_until| now >= lease_until) {
+            if parsed_lease.is_none_or(|lease_until| now >= lease_until)
+                && !live_run_task_ids.contains(&task_id)
+            {
                 expired += 1;
             }
         }
@@ -3659,6 +3668,23 @@ fn process_is_alive(pid: u32) -> bool {
     platform::pid_is_alive(pid)
 }
 
+fn live_active_run_task_ids(connection: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut statement = connection.prepare(
+        "SELECT task_id, pid FROM runs WHERE status IN ('running', 'checking', 'reviewing')",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    let mut task_ids = std::collections::HashSet::new();
+    for row in rows {
+        let (task_id, pid) = row?;
+        if pid.is_some_and(|pid| process_is_alive(pid as u32)) {
+            task_ids.insert(task_id);
+        }
+    }
+    Ok(task_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4604,6 +4630,37 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "task_lease_expired")
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn recover_expired_task_leases_preserves_claims_with_live_runs() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        claim_task("t-001", ".ferrus/tasks/t-001.md", "executor:codex:t-001", 0)
+            .await
+            .unwrap();
+        record_run_started_for_task_with_workspace(
+            &allocate_run_id("executor", "executor:codex:t-001"),
+            "executor",
+            "executor:codex:t-001",
+            std::process::id(),
+            Some("t-001"),
+            path_string(&std::env::current_dir().unwrap()),
+        )
+        .await
+        .unwrap();
+        let database_path = current_database_path().await.unwrap();
+
+        let preview = preview_runtime_recovery_from(&database_path).await.unwrap();
+        let recovered = recover_expired_task_leases().await.unwrap();
+        let tasks = list_tasks().await.unwrap();
+
+        assert_eq!(preview.expired_task_leases, 0);
+        assert_eq!(recovered, 0);
+        assert_eq!(tasks[0].claimed_by.as_deref(), Some("executor:codex:t-001"));
+        assert!(tasks[0].lease_until.is_some());
 
         teardown(previous);
     }
