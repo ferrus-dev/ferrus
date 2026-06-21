@@ -245,14 +245,11 @@ async fn cleanup_approved_workspace(context: &RuntimeTaskContext) -> Result<bool
     else {
         return Ok(false);
     };
-    if !tokio::fs::try_exists(&workspace_path).await? {
-        return Ok(false);
-    }
-
     let local_ref_content =
         tokio::fs::read_to_string(store::resolve_project_path(".ferrus/project.toml")).await?;
     let local_ref: project::LocalProjectRef = toml::from_str(&local_ref_content)?;
-    let managed_root = PathBuf::from(local_ref.data_dir).join("worktrees");
+    let data_dir = PathBuf::from(local_ref.data_dir);
+    let managed_root = data_dir.join("worktrees");
     let canonical_workspace = tokio::fs::canonicalize(&workspace_path)
         .await
         .unwrap_or(workspace_path);
@@ -264,25 +261,28 @@ async fn cleanup_approved_workspace(context: &RuntimeTaskContext) -> Result<bool
     }
 
     let project_root = std::env::current_dir()?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&project_root)
-        .args(["worktree", "remove", "--force"])
-        .arg(&canonical_workspace)
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to remove approved task worktree at {}: {}",
-            canonical_workspace.display(),
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
+    if tokio::fs::try_exists(&canonical_workspace).await? {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&canonical_workspace)
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "Failed to remove approved task worktree at {}: {}",
+                canonical_workspace.display(),
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            );
+        }
     }
+    project::remove_executor_baseline(&project_root, &data_dir, &context.task_id).await?;
     Ok(true)
 }
 
@@ -714,6 +714,21 @@ mod tests {
             .success()
         );
         assert!(workspace_path.is_dir());
+        let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+            .trim()
+            .to_string();
+        crate::project::pin_executor_baseline_tree(dir.path(), "t-007", &baseline_tree)
+            .await
+            .unwrap();
+        let baseline_metadata = dir
+            .path()
+            .join(".ferrus/projects/test-project/worktrees/.baseline-trees/t-007.txt");
+        tokio::fs::create_dir_all(baseline_metadata.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&baseline_metadata, format!("{baseline_tree}\n"))
+            .await
+            .unwrap();
 
         crate::project::record_task_status(
             "t-007",
@@ -754,6 +769,14 @@ mod tests {
         run("supervisor:codex:7").await.unwrap();
 
         assert!(!workspace_path.exists());
+        assert!(!baseline_metadata.exists());
+        let baseline_ref = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-007"])
+            .output()
+            .unwrap();
+        assert!(!baseline_ref.status.success());
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
         assert_eq!(task.status, "complete");

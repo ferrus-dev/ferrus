@@ -28,6 +28,7 @@ const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 const CURRENT_TASK_ID: &str = "current";
 const CURRENT_TASK_PATH: &str = ".ferrus/TASK.md";
 const BASELINE_WORKTREE_METADATA_DIR: &str = ".baseline-trees";
+const BASELINE_REF_PREFIX: &str = "refs/ferrus/baselines";
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2851,12 +2852,92 @@ pub async fn preview_orphaned_worktrees() -> Result<usize> {
     Ok(orphaned_worktrees().await?.len())
 }
 
+pub async fn pin_executor_baseline_tree(
+    project_root: &Path,
+    task_id: &str,
+    baseline_tree: &str,
+) -> Result<()> {
+    let baseline_ref = executor_baseline_ref(task_id);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["update-ref", &baseline_ref, baseline_tree])
+        .output()
+        .await
+        .with_context(|| format!("Failed to create executor baseline ref {baseline_ref}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to create executor baseline ref {baseline_ref}: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(())
+}
+
+pub async fn remove_executor_baseline(
+    project_root: &Path,
+    data_dir: &Path,
+    task_id: &str,
+) -> Result<()> {
+    let baseline_ref = executor_baseline_ref(task_id);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["update-ref", "-d", &baseline_ref])
+        .output()
+        .await
+        .with_context(|| format!("Failed to remove executor baseline ref {baseline_ref}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to remove executor baseline ref {baseline_ref}: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let metadata_path = data_dir
+        .join("worktrees")
+        .join(BASELINE_WORKTREE_METADATA_DIR)
+        .join(format!("{task_id}.txt"));
+    match tokio::fs::remove_file(&metadata_path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to remove executor baseline metadata {}",
+                    metadata_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+fn executor_baseline_ref(task_id: &str) -> String {
+    format!("{BASELINE_REF_PREFIX}/{task_id}")
+}
+
 pub async fn recover_orphaned_worktrees() -> Result<usize> {
     let registration = touch_current_project().await?;
     let project_root = PathBuf::from(&registration.metadata.workspace_dir);
     let worktrees = orphaned_worktrees_for(&registration).await?;
     let mut removed = 0usize;
     for worktree in worktrees {
+        let task_id = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid managed worktree path {}", worktree.display()))?
+            .to_string();
         let output = Command::new("git")
             .arg("-C")
             .arg(&project_root)
@@ -2882,6 +2963,7 @@ pub async fn recover_orphaned_worktrees() -> Result<usize> {
                 }
             );
         }
+        remove_executor_baseline(&project_root, &registration.data_dir, &task_id).await?;
         removed += 1;
     }
     Ok(removed)

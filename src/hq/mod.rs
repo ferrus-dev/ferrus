@@ -2328,8 +2328,19 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
             let mut baseline_tree = read_executor_workspace_baseline_tree(&baseline_path).await?;
             if baseline_tree.is_none() && !git_has_head(&workspace_dir).await {
                 let captured = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
-                write_executor_workspace_baseline_tree(&baseline_path, &captured).await?;
+                persist_executor_workspace_baseline(
+                    &project_root,
+                    &registration.data_dir,
+                    &baseline_path,
+                    task_id,
+                    &captured,
+                )
+                .await?;
                 baseline_tree = Some(captured);
+            }
+            if let Some(baseline_tree) = baseline_tree.as_deref() {
+                crate::project::pin_executor_baseline_tree(&project_root, task_id, baseline_tree)
+                    .await?;
             }
             return Ok(ExecutorWorkspace {
                 project_root,
@@ -2378,7 +2389,14 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
     }
     seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
     let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
-    write_executor_workspace_baseline_tree(&baseline_path, &baseline_tree).await?;
+    persist_executor_workspace_baseline(
+        &project_root,
+        &registration.data_dir,
+        &baseline_path,
+        task_id,
+        &baseline_tree,
+    )
+    .await?;
 
     Ok(ExecutorWorkspace {
         project_root,
@@ -2432,6 +2450,21 @@ async fn write_executor_workspace_baseline_tree(path: &Path, baseline_tree: &str
                 path.display()
             )
         })
+}
+
+async fn persist_executor_workspace_baseline(
+    project_root: &Path,
+    data_dir: &Path,
+    path: &Path,
+    task_id: &str,
+    baseline_tree: &str,
+) -> Result<()> {
+    crate::project::pin_executor_baseline_tree(project_root, task_id, baseline_tree).await?;
+    if let Err(err) = write_executor_workspace_baseline_tree(path, baseline_tree).await {
+        let _ = crate::project::remove_executor_baseline(project_root, data_dir, task_id).await;
+        return Err(err);
+    }
+    Ok(())
 }
 
 async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
@@ -3069,6 +3102,30 @@ mod tests {
                 .join("runtime/worktrees/t-001/tracked.txt")
                 .exists()
         );
+        let baseline_tree = workspace.baseline_tree.as_deref().unwrap();
+        let baseline_ref = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-001"])
+            .output()
+            .unwrap();
+        assert!(baseline_ref.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&baseline_ref.stdout).trim(),
+            baseline_tree
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["gc", "--prune=now"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["cat-file", "-e", &format!("{baseline_tree}^{{tree}}")])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         std::env::set_current_dir(previous).unwrap();
     }
@@ -3235,9 +3292,25 @@ mod tests {
                 .trim(),
             baseline_tree.as_deref().unwrap()
         );
+        assert!(
+            std::process::Command::new("git")
+                .args(["update-ref", "-d", "refs/ferrus/baselines/t-unborn"])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let resumed_workspace = prepare_executor_workspace("t-unborn").await.unwrap();
         assert_eq!(resumed_workspace.baseline_tree, baseline_tree);
+        let restored_ref = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-unborn"])
+            .output()
+            .unwrap();
+        assert!(restored_ref.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&restored_ref.stdout).trim(),
+            baseline_tree.as_deref().unwrap()
+        );
 
         std::env::set_current_dir(previous).unwrap();
     }
