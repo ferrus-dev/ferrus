@@ -26,16 +26,7 @@ pub async fn handler(response: String) -> Result<String, Error> {
 async fn run(response: String) -> Result<String> {
     if let Some(question) = project::list_human_questions().await?.into_iter().next() {
         store::write_answer_for_run_dir(&question.run_dir, &response).await?;
-        project::record_runtime_event_best_effort(
-            None,
-            "human_answer_recorded",
-            serde_json::json!({
-                "task_id": question.task_id,
-                "run_dir": question.run_dir,
-                "answer_bytes": response.len(),
-            }),
-        )
-        .await;
+        project::record_task_human_answer(&question.task_id).await?;
         return Ok(format!(
             "Response recorded for `{}` in `{}/ANSWER.md`. The waiting agent can call /wait_for_answer and continue.",
             question.task_id, question.run_dir
@@ -105,6 +96,19 @@ mod tests {
                 .await
                 .unwrap(),
             "Use the stable path."
+        );
+        assert!(
+            crate::project::list_human_questions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::project::list_answered_human_waiters().await.unwrap(),
+            [crate::project::AnsweredHumanWaiter {
+                task_id: "t-007".to_string(),
+                awaiting_human_by: "executor:codex:7".to_string(),
+            }]
         );
         crate::test_support::assert_no_state_json();
         teardown(previous);
