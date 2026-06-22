@@ -24,6 +24,10 @@ pub async fn handler(response: String) -> Result<String, Error> {
 }
 
 async fn run(response: String) -> Result<String> {
+    if response.trim().is_empty() {
+        anyhow::bail!("Human answer cannot be empty.");
+    }
+
     if let Some(question) = project::list_human_questions().await?.into_iter().next() {
         store::write_answer_for_run_dir(&question.run_dir, &response).await?;
         project::record_task_human_answer(&question.task_id).await?;
@@ -111,6 +115,45 @@ mod tests {
             }]
         );
         crate::test_support::assert_no_state_json();
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn answer_rejects_whitespace_without_hiding_the_question() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Addressing,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-007",
+            crate::project::TaskStatus::Addressing,
+            "executor:codex:7",
+        )
+        .await
+        .unwrap();
+        store::write_question_for_run_dir(".ferrus/runs/t-007", "Which path?")
+            .await
+            .unwrap();
+
+        let error = run(" \n\t ".to_string()).await.unwrap_err().to_string();
+
+        assert_eq!(error, "Human answer cannot be empty.");
+        assert!(!std::path::Path::new(".ferrus/runs/t-007/ANSWER.md").exists());
+        let questions = crate::project::list_human_questions().await.unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].task_id, "t-007");
+        assert!(
+            crate::project::list_answered_human_waiters()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
         teardown(previous);
     }
 }
