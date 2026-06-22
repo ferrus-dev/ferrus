@@ -736,7 +736,10 @@ mod tests {
 
         let error = run("supervisor:codex:9").await.unwrap_err().to_string();
 
-        assert!(error.contains("docs/specs/spec.md"));
+        assert!(
+            error.replace('\\', "/").contains("docs/specs/spec.md"),
+            "unexpected error: {error}"
+        );
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-009").unwrap();
         assert_eq!(task.status, "reviewing");
@@ -798,7 +801,10 @@ mod tests {
 
         let error = run("supervisor:codex:10").await.unwrap_err().to_string();
 
-        assert!(error.contains("docs/specs/spec.md"));
+        assert!(
+            error.replace('\\', "/").contains("docs/specs/spec.md"),
+            "unexpected error: {error}"
+        );
         let file = tokio::fs::read_to_string("file.txt").await.unwrap();
         assert_eq!(file.replace("\r\n", "\n"), "old\n");
         let tasks = crate::project::list_tasks().await.unwrap();
