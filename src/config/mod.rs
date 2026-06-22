@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agents::{ExecutorAgent, SupervisorAgent, parse_executor_agent, parse_supervisor_agent};
@@ -224,9 +225,14 @@ fn default_spec_directory() -> String {
 
 impl Config {
     pub async fn load() -> Result<Self> {
-        let contents = tokio::fs::read_to_string("ferrus.toml")
+        Self::load_from(Path::new(".")).await
+    }
+
+    pub async fn load_from(project_root: &Path) -> Result<Self> {
+        let path = project_root.join("ferrus.toml");
+        let contents = tokio::fs::read_to_string(&path)
             .await
-            .context("ferrus.toml not found — run `ferrus init` first")?;
+            .with_context(|| format!("{} not found — run `ferrus init` first", path.display()))?;
         Self::from_toml(&contents)
     }
 

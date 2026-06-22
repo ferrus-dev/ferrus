@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 
 use crate::platform;
 
@@ -16,11 +17,19 @@ pub struct CheckResult {
 
 /// Run every configured check command in order, collecting stdout/stderr for each.
 pub async fn run_checks(commands: &[String]) -> Result<CheckResult> {
+    run_checks_with_cwd(commands, None).await
+}
+
+pub async fn run_checks_in(commands: &[String], cwd: &Path) -> Result<CheckResult> {
+    run_checks_with_cwd(commands, Some(cwd)).await
+}
+
+async fn run_checks_with_cwd(commands: &[String], cwd: Option<&Path>) -> Result<CheckResult> {
     let mut results = Vec::with_capacity(commands.len());
     let mut passed = true;
 
     for cmd in commands {
-        let result = run_command(cmd)
+        let result = run_command(cmd, cwd)
             .await
             .with_context(|| format!("Failed to spawn command: {cmd}"))?;
         if !result.passed {
@@ -35,7 +44,7 @@ pub async fn run_checks(commands: &[String]) -> Result<CheckResult> {
     })
 }
 
-async fn run_command(cmd: &str) -> Result<CommandResult> {
+async fn run_command(cmd: &str, cwd: Option<&Path>) -> Result<CommandResult> {
     if cmd.trim().is_empty() {
         return Ok(CommandResult {
             command: cmd.to_string(),
@@ -45,7 +54,11 @@ async fn run_command(cmd: &str) -> Result<CommandResult> {
         });
     }
 
-    let output = platform::shell_command(cmd)
+    let mut command = platform::shell_command(cmd);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
         .output()
         .await
         .with_context(|| format!("Failed to run check command `{cmd}`"))?;

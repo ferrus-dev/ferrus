@@ -481,6 +481,46 @@ pub async fn touch_current_project() -> Result<ProjectRegistration> {
     })
 }
 
+pub async fn canonical_project_root() -> Result<PathBuf> {
+    if let Some(project_root) = std::env::var(ENV_PROJECT_ROOT)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return tokio::fs::canonicalize(&project_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to resolve canonical project root from {ENV_PROJECT_ROOT}: {}",
+                    project_root.display()
+                )
+            });
+    }
+
+    let local_ref = read_local_project_ref()
+        .await
+        .context("Failed to resolve canonical project root from .ferrus/project.toml")?;
+    let metadata_path = Path::new(&local_ref.data_dir).join("project.toml");
+    let metadata = read_project_metadata_from(&metadata_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to resolve canonical project root from {}",
+                metadata_path.display()
+            )
+        })?;
+    let project_root = PathBuf::from(metadata.workspace_dir);
+    tokio::fs::canonicalize(&project_root)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to canonicalize project workspace {}",
+                project_root.display()
+            )
+        })
+}
+
 pub async fn create_pending_task_artifact(
     description: &str,
     spec_path: Option<&str>,

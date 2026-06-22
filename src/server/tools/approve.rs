@@ -29,7 +29,8 @@ pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
 }
 
 async fn run(agent_id: &str) -> Result<String> {
-    let config = Config::load().await?;
+    let project_root = project::canonical_project_root().await?;
+    let config = Config::load_from(&project_root).await?;
     let context = require_runtime_task_context(agent_id).await?;
 
     if context.status.parse::<project::TaskStatus>()? != project::TaskStatus::Reviewing {
@@ -40,11 +41,12 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
-    let patch_applied = apply_approved_patch(&context).await?;
+    let patch_applied = apply_approved_patch(&context, &project_root).await?;
     if patch_applied {
-        let integration_checks = run_post_apply_integration_checks(&context, &config).await;
+        let integration_checks =
+            run_post_apply_integration_checks(&context, &config, &project_root).await;
         if let Err(err) = integration_checks {
-            if let Err(rollback_err) = rollback_approved_patch(&context).await {
+            if let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await {
                 anyhow::bail!(
                     "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
                 );
@@ -57,7 +59,8 @@ async fn run(agent_id: &str) -> Result<String> {
             context.spec_path.as_deref(),
             context.milestone_id.as_deref(),
         ) {
-            specs::complete_milestone(spec_path, milestone_id).await?;
+            let spec_path = canonical_approval_path(&project_root, spec_path);
+            specs::complete_milestone(&spec_path.to_string_lossy(), milestone_id).await?;
         }
         project::record_task_status(
             &context.task_id,
@@ -68,14 +71,16 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     .await;
     if let Err(err) = transition {
-        if patch_applied && let Err(rollback_err) = rollback_approved_patch(&context).await {
+        if patch_applied
+            && let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await
+        {
             anyhow::bail!(
                 "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
             );
         }
         return Err(err);
     }
-    cleanup_approved_workspace_best_effort(&context).await;
+    cleanup_approved_workspace_best_effort(&context, &project_root).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),
         "approved",
@@ -89,17 +94,16 @@ async fn run(agent_id: &str) -> Result<String> {
     Ok("Task approved. State: Complete. Well done!".to_string())
 }
 
-async fn apply_approved_patch(context: &RuntimeTaskContext) -> Result<bool> {
+async fn apply_approved_patch(context: &RuntimeTaskContext, project_root: &Path) -> Result<bool> {
     let patch = store::read_patch_for_run_dir(&context.run_dir).await?;
     if patch.trim().is_empty() {
         return Ok(false);
     }
 
-    let project_root = std::env::current_dir()?;
     let patch_path = store::resolve_project_path(Path::new(&context.run_dir).join("PATCH.diff"));
     let output = Command::new("git")
         .arg("-C")
-        .arg(&project_root)
+        .arg(project_root)
         .args(["apply", "--whitespace=nowarn"])
         .arg(&patch_path)
         .output()
@@ -135,6 +139,7 @@ async fn apply_approved_patch(context: &RuntimeTaskContext) -> Result<bool> {
 async fn run_post_apply_integration_checks(
     context: &RuntimeTaskContext,
     config: &Config,
+    project_root: &Path,
 ) -> Result<()> {
     if config.checks.commands.is_empty() {
         info!("No check commands configured; skipping post-approve integration gate");
@@ -147,7 +152,7 @@ async fn run_post_apply_integration_checks(
         .run_id
         .as_deref()
         .unwrap_or(context.task_id.as_str());
-    match check_gate::run(config, attempt, log_scope).await? {
+    match check_gate::run_in(config, attempt, log_scope, project_root).await? {
         CheckGateResult::Passed => {
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
@@ -190,12 +195,11 @@ async fn run_post_apply_integration_checks(
     }
 }
 
-async fn rollback_approved_patch(context: &RuntimeTaskContext) -> Result<()> {
-    let project_root = std::env::current_dir()?;
+async fn rollback_approved_patch(context: &RuntimeTaskContext, project_root: &Path) -> Result<()> {
     let patch_path = store::resolve_project_path(Path::new(&context.run_dir).join("PATCH.diff"));
     let output = Command::new("git")
         .arg("-C")
-        .arg(&project_root)
+        .arg(project_root)
         .args(["apply", "-R", "--whitespace=nowarn"])
         .arg(&patch_path)
         .output()
@@ -224,8 +228,8 @@ async fn write_integration_error(context: &RuntimeTaskContext, reason: &str) -> 
     store::write_integration_error_for_run_dir(&context.run_dir, &content).await
 }
 
-async fn cleanup_approved_workspace_best_effort(context: &RuntimeTaskContext) {
-    if let Err(err) = cleanup_approved_workspace(context).await {
+async fn cleanup_approved_workspace_best_effort(context: &RuntimeTaskContext, project_root: &Path) {
+    if let Err(err) = cleanup_approved_workspace(context, project_root).await {
         tracing::warn!(
             error = ?err,
             task_id = context.task_id,
@@ -235,7 +239,10 @@ async fn cleanup_approved_workspace_best_effort(context: &RuntimeTaskContext) {
     }
 }
 
-async fn cleanup_approved_workspace(context: &RuntimeTaskContext) -> Result<bool> {
+async fn cleanup_approved_workspace(
+    context: &RuntimeTaskContext,
+    project_root: &Path,
+) -> Result<bool> {
     let Some(workspace_path) = context
         .workspace_path
         .as_deref()
@@ -260,11 +267,10 @@ async fn cleanup_approved_workspace(context: &RuntimeTaskContext) -> Result<bool
         return Ok(false);
     }
 
-    let project_root = std::env::current_dir()?;
     if tokio::fs::try_exists(&canonical_workspace).await? {
         let output = Command::new("git")
             .arg("-C")
-            .arg(&project_root)
+            .arg(project_root)
             .args(["worktree", "remove", "--force"])
             .arg(&canonical_workspace)
             .output()
@@ -282,8 +288,17 @@ async fn cleanup_approved_workspace(context: &RuntimeTaskContext) -> Result<bool
             );
         }
     }
-    project::remove_executor_baseline(&project_root, &data_dir, &context.task_id).await?;
+    project::remove_executor_baseline(project_root, &data_dir, &context.task_id).await?;
     Ok(true)
+}
+
+fn canonical_approval_path(project_root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    }
 }
 
 fn is_managed_workspace_path(path: &Path, managed_root: &Path) -> bool {
@@ -317,6 +332,25 @@ mod tests {
         tokio::fs::write(
             ".ferrus/project.toml",
             toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-06-22T00:00:00Z".to_string(),
+            last_opened_at: "2026-06-22T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
         )
         .await
         .unwrap();
@@ -431,6 +465,108 @@ mod tests {
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
         assert_eq!(task.status, "complete");
 
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn approve_from_executor_worktree_updates_and_checks_canonical_workspace() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (dir, previous) = setup().await;
+        if !git(dir.path(), ["init"]).success() {
+            teardown(previous);
+            return;
+        }
+        tokio::fs::write("file.txt", "old\n").await.unwrap();
+        assert!(git(dir.path(), ["add", "file.txt"]).success());
+        assert!(
+            git(
+                dir.path(),
+                [
+                    "-c",
+                    "user.email=ferrus@example.invalid",
+                    "-c",
+                    "user.name=Ferrus",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+            )
+            .success()
+        );
+        tokio::fs::write("file.txt", "new\n").await.unwrap();
+        let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
+        tokio::fs::write("file.txt", "old\n").await.unwrap();
+        store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            "ferrus.toml",
+            "[checks]\ncommands = [\"git grep -q new -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+            .await
+            .unwrap();
+
+        let review_workspace = dir.path().join("review-worktree");
+        assert!(
+            git_path(
+                dir.path(),
+                ["worktree", "add", "--detach"],
+                &review_workspace,
+                ["HEAD"],
+            )
+            .success()
+        );
+        tokio::fs::create_dir_all(review_workspace.join(".ferrus"))
+            .await
+            .unwrap();
+        tokio::fs::copy(
+            ".ferrus/project.toml",
+            review_workspace.join(".ferrus/project.toml"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::copy("ferrus.toml", review_workspace.join("ferrus.toml"))
+            .await
+            .unwrap();
+        std::env::set_current_dir(&review_workspace).unwrap();
+
+        run("supervisor:codex:7").await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("file.txt"))
+                .await
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "new\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(review_workspace.join("file.txt"))
+                .await
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "old\n"
+        );
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-007")
+            .unwrap();
+        assert_eq!(task.status, "complete");
+
+        std::env::set_current_dir(dir.path()).unwrap();
         teardown(previous);
     }
 
