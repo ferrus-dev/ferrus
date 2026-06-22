@@ -14,7 +14,7 @@ It runs a Supervisor → Executor → Reviewer loop over your repository — not
 Tasks are planned, implemented, checked, and reviewed in a structured, restart-safe flow. Unlike chat-based agents, ferrus enforces structure and lifecycle.
 
 Everything is explicit:
-- State lives on disk (`.ferrus/`)
+- Runtime state lives in SQLite; task context lives in scoped Markdown artifacts
 - Agents are stateless between runs
 - Crashes are recoverable
 - No hidden context
@@ -56,7 +56,7 @@ Internally, agent support is normalized through `src/agents/`: `mod.rs` defines 
 
 HQ watches state transitions and spawns the right agent at the right time.
 
-State is shared through `.ferrus/` on disk — plain text files agents read and write via their tools. If an agent crashes and restarts, it picks up exactly where it left off.
+State is coordinated through `ferrus.db`, with human-readable task context under `.ferrus/tasks/` and `.ferrus/runs/`. If an agent crashes and restarts, Ferrus can recover its run and task lease without reconstructing state from Markdown files.
 
 ---
 
@@ -101,8 +101,8 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | `/spec` | Draft, approve, and save a feature specification |
 | `/milestones` | Select the current spec and milestone |
 | `/reset-spec` | Clear the selected spec and milestone |
-| `/check` | Run the Ferrus check gate from HQ, using the normal task-state rules |
-| `/check --force` | Run configured checks from HQ without modifying state |
+| `/check` | Run configured checks from HQ when the current workflow permits; does not mutate task state |
+| `/check --force` | Run configured checks from HQ regardless of task status; does not mutate task state |
 | `/supervisor` | Open an interactive supervisor session (no initial prompt) |
 | `/executor` | Open an interactive executor session (no initial prompt) |
 | `/resume` | Manually resume the executor headlessly; also recovers Consultation by relaunching both supervisor and executor |
@@ -113,7 +113,7 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | `/events [--limit N] [--run <id>]` | List SQLite runtime events |
 | `/attach <name>` | Show log path for a running headless agent |
 | `/stop` | Stop all running agent sessions (prompts for confirmation) |
-| `/reset` | Reset state to Idle and clear task files (prompts for confirmation) |
+| `/reset` | Force-reset resettable tasks and clear their scoped artifacts (prompts for confirmation) |
 | `/init [--agents-path]` | Initialize ferrus in the current directory |
 | `/register [--supervisor <agent>] [--executor <agent>]` | Register Claude Code or Codex configs from HQ |
 | `/model <supervisor|executor> <model>` | Update the supervisor or executor model override |
@@ -129,43 +129,39 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 
 ```
 ferrus> /task
-  └─ supervisor spawns → you describe the task → supervisor calls create_task
+  └─ supervisor spawns → you describe the task → supervisor calls enqueue_task
        └─ executor spawns (headless) → implements → check → submit
             └─ reviewer spawns (headless) → reads submission → approve or reject
                  ├─ approved → Complete
                  └─ rejected → executor re-spawns with feedback
 ```
 
-Agents are **stateless between runs** — context lives in `.ferrus/*.md`. Each spawn receives a short prompt pointing to those files and exits when its job is done.
+Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task row and scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`; each spawn exits when its job is done.
 
 ---
 
 ## State machine
 
 ```
-Idle
- └─► Executing                              ← create_task
-       ├─► Consultation                     ← consult
-       │     └─► Executing                  ← wait_for_consult
-       ├─► Executing                        ← check / submit (final check failed, retries < max)
-       ├─► Failed                           ← check / submit (final check failed, retries ≥ max)
-       └─► Reviewing                        ← submit (final check passed)
-             ├─► Complete                   ← approve
-             ├─► Failed                     ← reject (cycles ≥ max)
-             └─► Addressing                 ← reject (cycles < max)
-                   ├─► Consultation         ← consult
-                   │     └─► Addressing     ← wait_for_consult
-                   ├─► Addressing           ← check / submit (final check failed, retries < max)
-                   ├─► Failed               ← check / submit (final check failed, retries ≥ max)
-                   └─► Reviewing            ← submit (final check passed)
+pending
+ └─► executing      ← /wait_for_task claim
+       ├─► addressing ← /reject → work loop
+       ├─► consultation ← /consult
+       │     └─► (restore paused status) ← /wait_for_consult
+       ├─► awaiting_human ← /ask_human
+       │     └─► (restore paused status) ← /wait_for_answer
+       ├─► reviewing ← /submit final gate pass
+       │     ├─► addressing ← /reject
+       │     └─► complete ← /approve
+       └─► failed ← retry or review-cycle limit
 ```
 
 Any active Executor work state (Executing, Addressing) can pause to `Consultation` via `/consult`. HQ spawns the configured Supervisor in consultation mode, and the executor immediately calls `/wait_for_consult` to block until the Supervisor answers via `/respond_consult`.
 
 Any active state, including `Consultation`, can pause to `AwaitingHuman` via `/ask_human`. The agent immediately calls `/wait_for_answer` to block until the human responds. The human types their answer in the HQ terminal (raw text, no slash prefix). `/wait_for_answer` restores the previous state and returns the answer.
 
-- `/task` from `Complete` → silently resets to Idle and starts the next task (no extra step needed).
-- `/reset` → Idle from any state; prompts for confirmation if an agent is actively working.
+- Each task advances independently; `max_parallel_tasks` controls concurrent executors.
+- HQ `/reset` force-resets resettable tasks and clears their scoped artifacts. MCP `/reset` is only valid for a failed task.
 
 ---
 
@@ -176,7 +172,7 @@ Any active state, including `Consultation`, can pause to `AwaitingHuman` via `/a
 Scaffolds ferrus in the current project (default `--agents-path .agents`):
 
 - Creates `ferrus.toml` with default limits and an empty check command list
-- Creates `.ferrus/` runtime directory with all state files and `logs/`
+- Creates `.ferrus/` templates, task/run artifact directories, `agents.json`, and `logs/`
 - Registers the project in `~/.ferrus/projects/<project-id>/`
 - Writes `.ferrus/project.toml` with the project id and local data directory
 - Creates `~/.ferrus/projects/<project-id>/project.toml` with project metadata
@@ -194,11 +190,11 @@ Starts the agent coordination server on stdio. Agents load this as an MCP server
 
 | `--role` | Tools exposed |
 |---|---|
-| `supervisor` | `create_task`, `create_spec`, `wait_for_review`, `review_pending`, `approve`, `reject`, `respond_consult`, `ask_human`, `wait_for_answer`, `answer`, `status`, `reset`, `heartbeat` |
-| `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `wait_for_answer`, `ask_human`, `answer`, `status`, `reset`, `heartbeat` |
+| `supervisor` | Definition sessions: `enqueue_task`, `create_spec`; task sessions: `wait_for_review`, `review_pending`, `approve`, `reject`, `wait_for_consultation`, `respond_consult`, `ask_human`, `wait_for_answer`, `heartbeat` |
+| `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `ask_human`, `wait_for_answer`, `status`, `reset`, `heartbeat` |
 | *(omitted)* | All tools |
 
-The `status` tool includes scoped SQLite task context when called by a running agent with a resolved runtime identity.
+The unfiltered server additionally exposes compatibility tools such as `create_task` and `answer`. The `status` tool includes scoped SQLite task context when called by a running agent with a resolved runtime identity.
 
 ### `ferrus register [--supervisor <agent>] [--supervisor-model <model>] [--executor <agent>] [--executor-model <model>]`
 
@@ -212,7 +208,7 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 
 ### `ferrus doctor`
 
-Checks that `.ferrus/project.toml`, `~/.ferrus/projects/<project-id>/project.toml`, `STATE.json`, task artifacts, and `ferrus.db` agree with the current workspace. It also reports recoverable runtime drift that can be fixed with `ferrus recover`.
+Checks that `.ferrus/project.toml`, global project metadata, task/run artifacts, and the `ferrus.db` schema agree with the current workspace. It also reports interrupted runs and expired leases that can be fixed with `ferrus recover`.
 
 ### `ferrus projects list`
 
@@ -220,7 +216,7 @@ Lists projects registered under `~/.ferrus/projects`, including project id, name
 
 ### `ferrus recover`
 
-Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases are released, and stale `STATE.json` lease mirrors are cleared.
+Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled.
 
 Use `ferrus recover --dry-run` to print the pending recovery counters without changing runtime state.
 Use `ferrus recover --worktrees` to also remove orphaned managed task worktrees that no active task or active run still owns. Combine it with `--dry-run` to preview the orphan count without removing anything.
@@ -239,7 +235,7 @@ Prints recent runtime events from `ferrus.db`. Use `--run <id>` or `--run-id <id
 
 ### `ferrus migrate` / `ferrus upgrade`
 
-Registers an existing pre-registry project in `~/.ferrus/projects/<project-id>/`, initializes the SQLite database, creates `.ferrus/tasks/` and `.ferrus/runs/`, and copies non-empty legacy task/review/submission artifacts into the new artifact layout.
+Registers an existing pre-registry project in `~/.ferrus/projects/<project-id>/`, initializes the SQLite database, creates `.ferrus/tasks/` and `.ferrus/runs/`, and imports non-empty legacy task, review, submission, human-question, and consultation artifacts into the scoped layout.
 
 ---
 
@@ -258,6 +254,7 @@ max_check_retries = 20   # consecutive check failures before state → Failed
 max_review_cycles = 3    # reject→fix cycles before state → Failed
 max_feedback_lines = 30  # trailing lines per failing command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call before it returns timeout so the agent can poll again
+max_parallel_tasks = 1   # maximum number of concurrent executor sessions
 
 [lease]
 ttl_secs = 90                  # how long a claimed lease is valid without renewal
@@ -275,7 +272,7 @@ agent = "codex"        # agent for executor role: claude-code | codex | qwen-cod
 model = ""             # optional override; empty = agent default
 ```
 
-Check commands run in the directory where `ferrus serve` was started. Full output is written to `.ferrus/logs/check_<attempt>_<ts>.txt`. `/check` and `/submit` return a short failure summary inline so the Executor gets the signal without persisting technical noise into task context.
+Check commands run in the active task workspace. Full output is written to `.ferrus/logs/check_<attempt>_<scope>_<ts>.txt`, where the task/run scope prevents parallel checks from overwriting each other. `/check` and `/submit` return a short failure summary inline.
 
 ---
 
@@ -285,41 +282,39 @@ Ferrus now separates human-readable project artifacts from machine-local runtime
 
 | Path | Contents |
 |---|---|
-| `.ferrus/` | Project-local Markdown artifacts, templates, and current compatibility state files |
+| `.ferrus/` | Project-local templates, task/run artifacts, agent registry, and logs |
 | `~/.ferrus/projects/<project-id>/` | Machine-local project metadata, SQLite runtime database, and global logs |
 
-The current release still uses `.ferrus/STATE.json` as the compatibility state-machine snapshot for the single-task Supervisor/Executor loop. Executor task claims and heartbeat renewals are coordinated through `ferrus.db` task lease columns, with `STATE.json` updated as a mirror until the full cutover. `ferrus.db` also mirrors task status, lifecycle events, reset events, and HQ-spawned headless runs as the durable coordination substrate for the upcoming multi-task, multi-executor runtime. On HQ startup, global project metadata is touched, stale running DB rows whose PIDs are gone are marked `interrupted`, expired task leases are released, and stale `STATE.json` lease mirrors are cleared.
+SQLite is the runtime source of truth. `ferrus.db` stores task status, claims and leases, run ownership, lifecycle events, retry counters, paused interaction metadata, and selected-spec state. Markdown files are scoped task intent and run artifacts, not a mirrored state machine. On HQ startup Ferrus marks dead active runs as `interrupted`, preserves leases backed by live runs, releases other expired leases, and resumes recoverable task flows.
 
 ### `.ferrus/`
 
 | File | Contents |
 |---|---|
 | `project.toml` | Local pointer to `~/.ferrus/projects/<project-id>/` |
-| `STATE.json` | Compatibility state snapshot, mirrored lease fields, retry/cycle counters, schema version, timestamp |
-| `STATE.lock` | Advisory lock file for atomic claiming (do not delete) |
 | `agents.json` | Runtime registry for agent sessions, statuses, PIDs, and log ownership |
-| `TASK.md` | Compatibility mirror of the active task description |
-| `REVIEW.md` | Compatibility mirror of active review notes |
-| `SUBMISSION.md` | Compatibility mirror of active submission notes |
-| `QUESTION.md` | Compatibility mirror of the pending human question |
-| `ANSWER.md` | Compatibility mirror of the human answer |
+| `TASK.md` | Task drafting template |
 | `CONSULT_TEMPLATE.md` | Read-only consultation request template |
 | `SPEC_TEMPLATE.md` | Read-only feature specification template |
-| `LAST_SPEC_PATH` | Last path written by `/create_spec` for HQ handoff |
-| `CONSULT_REQUEST.md` | Compatibility mirror of the pending supervisor consultation request |
-| `CONSULT_RESPONSE.md` | Compatibility mirror of the supervisor consultation response |
-| `tasks/` | Task descriptions such as `tasks/t-001.md`; active task files are cleared on reset |
-| `runs/` | Execution-attempt artifacts such as `runs/t-001/REVIEW.md`, `SUBMISSION.md`, `QUESTION.md`, `ANSWER.md`, and consultation files; active run files are cleared on reset |
-| `logs/` | Full stdout + stderr per check run; PTY session logs per agent |
+| `tasks/<task-id>.md` | Numbered task intent artifact |
+| `runs/<task-id>/SUBMISSION.md` | Executor submission notes |
+| `runs/<task-id>/REVIEW.md` | Supervisor review or rejection notes |
+| `runs/<task-id>/QUESTION.md` | Pending human question |
+| `runs/<task-id>/ANSWER.md` | Human answer |
+| `runs/<task-id>/CONSULT_REQUEST.md` | Executor consultation request |
+| `runs/<task-id>/CONSULT_RESPONSE.md` | Supervisor consultation response |
+| `runs/<task-id>/PATCH.diff` | Patch produced from an isolated executor workspace |
+| `runs/<task-id>/INTEGRATION_ERROR.md` | Recoverable patch or integration-check failure context |
+| `logs/` | Scoped check output and PTY session logs per agent |
 
-`STATE.json` is written atomically (write to `.tmp`, then rename) so a crash mid-write never leaves it corrupt. `.ferrus/` is gitignored by `ferrus init`.
+`.ferrus/` is gitignored by `ferrus init`.
 
 ### `~/.ferrus/projects/<project-id>/`
 
 | File | Contents |
 |---|---|
 | `project.toml` | Project id, name, workspace path, `.ferrus` path, git metadata, timestamps, schema version |
-| `ferrus.db` | SQLite database with `tasks` lease fields plus mirrored `runs` and `events` runtime records |
+| `ferrus.db` | SQLite source of truth for tasks, runs, events, leases, counters, and project runtime state |
 | `logs/` | Reserved for machine-local logs that should not be committed |
 
 ---

@@ -56,9 +56,10 @@ pending
 ## CLI
 
 ```sh
-ferrus init [--agents-path <path>]              # scaffold project files and skill files
+ferrus init [--agents-path <path>]              # scaffold project files and register ~/.ferrus runtime
 ferrus serve [--role supervisor|executor]       # start MCP server on stdio
 ferrus register --supervisor <a> --executor <a> # write MCP config for agents
+ferrus doctor                                   # verify project metadata, artifacts, and runtime DB
 ferrus projects list                            # inspect ~/.ferrus project registry
 ferrus recover                                  # recover interrupted runs and stale leases
 ferrus recover --dry-run                        # preview recovery without mutating runtime state
@@ -66,6 +67,7 @@ ferrus recover --worktrees                      # remove orphaned managed task w
 ferrus tasks list                               # inspect SQLite task runtime rows
 ferrus runs list                                # inspect SQLite run attempts
 ferrus events list                              # inspect SQLite runtime events
+ferrus migrate                                  # import legacy project state into SQLite
 ```
 
 Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
@@ -75,8 +77,11 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | Command | Description |
 |---|---|
 | `/plan` | Free-form planning session with the supervisor (no task created) |
-| `/task` | Define a task with the supervisor, then run executor→review loop |
+| `/task` | Queue one task from the next ready milestone, then run the scheduler |
+| `/task --manual` | Queue one free-form task without spec context |
 | `/spec` | Draft, approve, and save a feature specification |
+| `/milestones` | Select the current spec |
+| `/reset-spec` | Clear the selected spec |
 | `/supervisor` | Open an interactive supervisor session (no initial prompt) |
 | `/executor` | Open an interactive executor session (no initial prompt) |
 | `/review` | Manually spawn supervisor in review mode (escape hatch) |
@@ -88,9 +93,10 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `/events [--limit N] [--run <id>]` | List SQLite runtime events |
 | `/attach <name>` | Show log path for a running headless agent |
 | `/stop` | Stop all running agent sessions |
-| `/reset` | Reset state to Idle (clears task files) |
+| `/reset` | Force-reset resettable tasks and clear their scoped artifacts |
 | `/init` | Initialize ferrus in the current directory |
 | `/register` | Register agent configs |
+| `/model` | Update the supervisor or executor model override |
 | `/quit` | Exit HQ |
 
 ## MCP tools
@@ -98,12 +104,14 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 ### Supervisor
 | Tool | From state | Description |
 |---|---|---|
+| `create_task` | — | Compatibility alias for queued task creation on unfiltered servers |
 | `enqueue_task` | — | Write numbered task artifact and DB `pending` row |
 | `create_spec` | any | Write approved Markdown spec to the configured spec directory |
 | `wait_for_review` | — | Long-poll until state is Reviewing |
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
 | `reject` | Reviewing | Reject with notes; moves to Addressing |
+| `wait_for_consultation` | — | Attach the supervisor run to a pending consultation |
 | `wait_for_consultation` | — | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
 
@@ -122,10 +130,10 @@ Supervisor sessions use `enqueue_task` so the full tool list fits on one MCP `to
 ### Shared
 | Tool | From state | Description |
 |---|---|---|
-| `ask_human` | Executing, Addressing, Consultation, Reviewing | Last-resort human fallback. Write question to QUESTION.md; moves to AwaitingHuman. Call `/wait_for_answer` immediately after. |
+| `ask_human` | Executing, Addressing, Consultation, Reviewing | Last-resort human fallback. Write a scoped question; moves to AwaitingHuman. Call `/wait_for_answer` immediately after. |
 | `wait_for_answer` | AwaitingHuman | Block until the human answers; restores previous state and returns the answer |
 | `status` | any | Executor-scoped status and runtime context |
-| `reset` | Failed | Executor-scoped recovery from Failed |
+| `reset` | Failed | Mark the failed task as reset |
 | `heartbeat` | any claimed | Executor-scoped lease renewal; returns `{"status":"renewed"}` or `{"status":"error","code":"..."}` |
 
 ## MCP resources
@@ -163,6 +171,7 @@ max_check_retries = 20   # check failures before Failed
 max_review_cycles = 3    # reject→fix cycles before Failed
 max_feedback_lines = 30  # lines per command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call; agents should call again after timeout
+max_parallel_tasks = 1   # max concurrent executor sessions
 
 [lease]
 ttl_secs = 90            # lease validity without renewal
@@ -172,10 +181,18 @@ heartbeat_interval_secs = 30  # how often to call /heartbeat
 directory = "docs/specs" # where /create_spec writes approved specs
 ```
 
-## Runtime files (`.ferrus/`)
+## Runtime files
+
+Ferrus separates project-local artifacts from machine-local runtime state. `.ferrus/` stores
+human-readable project files and task/run artifacts. `~/.ferrus/projects/<project-id>/` stores
+project metadata and `ferrus.db`, the runtime source of truth.
+
+### `.ferrus/`
 
 | File | Contents |
 |---|---|
+| `project.toml` | Local pointer to `~/.ferrus/projects/<project-id>/` |
+| `agents.json` | Runtime registry for agent sessions, statuses, PIDs, and logs |
 | `TASK.md` | Task drafting template |
 | `CONSULT_TEMPLATE.md` | Read-only consultation request template |
 | `SPEC_TEMPLATE.md` | Read-only feature specification template |
@@ -188,5 +205,12 @@ directory = "docs/specs" # where /create_spec writes approved specs
 | `runs/<task-id>/CONSULT_RESPONSE.md` | Scoped Supervisor consultation response |
 | `runs/<task-id>/PATCH.diff` | Scoped implementation patch |
 | `runs/<task-id>/INTEGRATION_ERROR.md` | Scoped integration/check failure context |
-| `runs/<task-id>/logs/` | Scoped execution logs |
-| `logs/check_<n>_<ts>.txt` | Full check output |
+| `logs/check_<attempt>_<scope>_<ts>.txt` | Full check output, uniquely scoped for parallel runs |
+| `logs/` | PTY session logs per agent |
+
+### `~/.ferrus/projects/<project-id>/`
+
+| File | Contents |
+|---|---|
+| `project.toml` | Project metadata and canonical workspace paths |
+| `ferrus.db` | SQLite source of truth for tasks, runs, events, leases, counters, and project runtime state |

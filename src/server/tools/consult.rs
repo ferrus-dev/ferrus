@@ -61,10 +61,11 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
 
     info!(paused, "Task → Consultation");
     Ok(format!(
-        "Consultation requested in `.ferrus/CONSULT_REQUEST.md`.\n\
+        "Consultation requested in `{}/CONSULT_REQUEST.md`.\n\
          State is now Consultation (paused from {paused}).\n\
          HQ should spawn the configured Supervisor in consultation mode.\n\
          Call /wait_for_consult to block until the response is ready.",
+        context.run_dir,
     ))
 }
 
@@ -169,8 +170,9 @@ mod tests {
             .unwrap();
         let request = "## Problem\nNeed design input.\n\n## What I tried\nCompared options.\n\n## Options (if any)\n- A\n\n## Question\nWhich option?\n";
 
-        run("executor:codex:7", request.to_string()).await.unwrap();
+        let response = run("executor:codex:7", request.to_string()).await.unwrap();
 
+        assert!(response.contains(".ferrus/runs/t-007/CONSULT_REQUEST.md"));
         assert_eq!(
             tokio::fs::read_to_string(".ferrus/runs/t-007/CONSULT_REQUEST.md")
                 .await

@@ -14,7 +14,7 @@ use crate::{
 use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err};
 
 pub const DESCRIPTION: &str = "Block until the human provides an answer to the question you asked via /ask_human. \
-     Polls .ferrus/ANSWER.md until it has content, then restores the paused state and \
+     Polls the task-scoped ANSWER.md until it has content, then restores the paused state and \
      returns the answer. \
      Returns {\"status\":\"answered\", \"answer\":\"...\", \"resumed_state\":\"...\"} on success, \
      or {\"status\":\"timeout\"} if `wait_timeout_secs` elapses for this call. On timeout, call this tool again \

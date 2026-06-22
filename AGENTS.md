@@ -4,7 +4,7 @@ Coding guidance for AI agents working in this repository.
 
 ## Project
 
-`ferrus` is a Rust AI agent orchestrator for software projects. It drives a **Supervisor–Executor** workflow: the Supervisor plans tasks and reviews submissions, the Executor implements and checks its own work. State is shared via `.ferrus/` on disk; coordination uses MCP as an implementation detail.
+`ferrus` is a Rust AI agent orchestrator for software projects. It drives a **Supervisor–Executor** workflow: the Supervisor plans tasks and reviews submissions, the Executor implements and checks its own work. SQLite is the runtime source of truth; `.ferrus/` contains scoped human-readable artifacts. Coordination uses MCP as an implementation detail.
 
 Licensed under Apache 2.0.
 
@@ -79,7 +79,7 @@ pending
        └─► failed ← /check, /submit, or /reject hits retry/cycle limit
 ```
 
-**Runtime artifacts**: `.ferrus/TASK.md`, `.ferrus/SPEC_TEMPLATE.md`, and `.ferrus/CONSULT_TEMPLATE.md` are templates. Task intent lives in `.ferrus/tasks/<task-id>.md`. Execution artifacts live under `.ferrus/runs/<task-id>/`, including `SUBMISSION.md`, `REVIEW.md`, `QUESTION.md`, `ANSWER.md`, `CONSULT_REQUEST.md`, `CONSULT_RESPONSE.md`, `PATCH.diff`, `INTEGRATION_ERROR.md`, and `logs/`. Do not write root `.ferrus/REVIEW.md`, `.ferrus/SUBMISSION.md`, `.ferrus/QUESTION.md`, `.ferrus/ANSWER.md`, `.ferrus/CONSULT_REQUEST.md`, or `.ferrus/CONSULT_RESPONSE.md`.
+**Runtime artifacts**: `.ferrus/TASK.md`, `.ferrus/SPEC_TEMPLATE.md`, and `.ferrus/CONSULT_TEMPLATE.md` are templates. Task intent lives in `.ferrus/tasks/<task-id>.md`. Execution artifacts live under `.ferrus/runs/<task-id>/`, including `SUBMISSION.md`, `REVIEW.md`, `QUESTION.md`, `ANSWER.md`, `CONSULT_REQUEST.md`, `CONSULT_RESPONSE.md`, `PATCH.diff`, and `INTEGRATION_ERROR.md`. Check and agent session logs live under `.ferrus/logs/`. Do not write root `.ferrus/REVIEW.md`, `.ferrus/SUBMISSION.md`, `.ferrus/QUESTION.md`, `.ferrus/ANSWER.md`, `.ferrus/CONSULT_REQUEST.md`, or `.ferrus/CONSULT_RESPONSE.md`.
 
 **Lease fields**: `claimed_by`, `lease_until`, `last_heartbeat` live on SQLite task rows. Claim/renew/release through `project` helpers so ownership, TTL, and events stay consistent.
 

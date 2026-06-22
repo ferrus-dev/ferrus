@@ -67,7 +67,10 @@ async fn run(agent_id: Option<&str>, response: String) -> Result<String> {
 
     write_consult_response(&context, &response).await?;
     info!("Consultation response recorded");
-    Ok("Consultation response recorded in `.ferrus/CONSULT_RESPONSE.md`.".to_string())
+    Ok(format!(
+        "Consultation response recorded in `{}/CONSULT_RESPONSE.md`.",
+        context.run_dir
+    ))
 }
 
 async fn write_consult_response(context: &RuntimeTaskContext, response: &str) -> Result<()> {
@@ -132,10 +135,11 @@ mod tests {
             .await
             .unwrap();
 
-        run(Some("supervisor:codex:1"), "Use option A.".to_string())
+        let response = run(Some("supervisor:codex:1"), "Use option A.".to_string())
             .await
             .unwrap();
 
+        assert!(response.contains(".ferrus/runs/t-007/CONSULT_RESPONSE.md"));
         assert_eq!(
             store::read_consult_response_for_run_dir(".ferrus/runs/t-007")
                 .await

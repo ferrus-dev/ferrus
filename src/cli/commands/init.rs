@@ -308,11 +308,12 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `/resume` | Resume the executor headlessly; also recovers Consultation by relaunching both consultant and executor |
 | `/status` | Show task state, agent list, and session log paths |
 | `/tasks` | List SQLite task runtime rows |
+| `/run [--limit N]` | Plan a batch run from ready milestones in the selected spec |
 | `/runs [--limit N]` | List SQLite run attempts |
 | `/events [--limit N] [--run <id>]` | List SQLite runtime events |
 | `/attach <name>` | Show log path for a running headless agent |
 | `/stop` | Stop all running agent sessions |
-| `/reset` | Reset state to Idle (clears task files) |
+| `/reset` | Force-reset resettable tasks and clear their scoped artifacts |
 | `/init` | Initialize ferrus in the current directory |
 | `/register` | Register agent configs |
 | `/model` | Update the supervisor or executor model override |
@@ -330,7 +331,11 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
 | `reject` | Reviewing | Reject with notes; moves to Addressing |
+| `wait_for_consultation` | — | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
+
+`create_task` remains a compatibility tool only on an unfiltered `ferrus serve` instance; role-scoped
+Supervisor sessions use `enqueue_task` so the full tool list fits on one MCP `tools/list` page.
 
 ### Executor
 | Tool | From state | Description |
@@ -344,17 +349,17 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 ### Shared
 | Tool | From state | Description |
 |---|---|---|
-| `ask_human` | Executing, Addressing, Consultation, Reviewing | Last-resort human fallback. Write question to QUESTION.md; moves to AwaitingHuman. Call `/wait_for_answer` immediately after. |
+| `ask_human` | Executing, Addressing, Consultation, Reviewing | Last-resort human fallback. Write a scoped question; moves to AwaitingHuman. Call `/wait_for_answer` immediately after. |
 | `wait_for_answer` | AwaitingHuman | Block until the human answers; restores previous state and returns the answer |
 | `status` | any | Print current state, counters, and scoped SQLite task context when called by an active agent |
-| `reset` | Failed | Return to Idle |
+| `reset` | Failed | Mark the failed task as reset |
 | `heartbeat` | any claimed | Renew lease; returns `{"status":"renewed"}` or `{"status":"error","code":"..."}` |
 
 ## MCP resources
 
 | URI | Contents |
 |---|---|
-| `ferrus://task` | Current task description (compatibility/current context) |
+| `ferrus://task` | Task description resolved from the caller's runtime context |
 | `ferrus://task/<task-id>` | Numbered task artifact, for example `.ferrus/tasks/t-001.md` |
 | `ferrus://task_template` | Task drafting template (`TASK.md`) |
 | `ferrus://review` | Scoped Supervisor rejection notes (`REVIEW.md`) |
@@ -411,23 +416,24 @@ Ferrus separates project-local artifacts from machine-local runtime state:
 - `.ferrus/` stores human-readable project files and task/run artifacts.
 - `~/.ferrus/projects/<project-id>/` stores machine-local metadata, `ferrus.db`, and logs.
 
-SQLite is the runtime coordination store. Executor task claims and heartbeat renewals are coordinated
+SQLite is the runtime source of truth. Executor task claims and heartbeat renewals are coordinated
 through `ferrus.db` task lease columns. `ferrus.db` also stores task status, lifecycle events, reset
 events, and HQ-spawned headless runs as the durable substrate for multi-task and multi-executor
 coordination. On HQ startup, global project metadata is touched, stale running DB rows whose PIDs are
-gone are marked `interrupted`, and expired task leases are released.
+gone are marked `interrupted`, leases backed by live runs are preserved, and other expired leases are released.
 
 ### `.ferrus/`
 
 | File | Contents |
 |---|---|
 | `project.toml` | Local pointer to `~/.ferrus/projects/<project-id>/` |
+| `agents.json` | Runtime registry for agent sessions, statuses, PIDs, and logs |
 | `TASK.md` | Task drafting template |
 | `CONSULT_TEMPLATE.md` | Read-only consultation request template |
 | `SPEC_TEMPLATE.md` | Read-only feature specification template |
 | `tasks/` | Task descriptions such as `tasks/t-001.md`; active task files are cleared on reset |
 | `runs/` | Execution-attempt artifacts such as `runs/t-001/REVIEW.md`, `SUBMISSION.md`, `QUESTION.md`, `ANSWER.md`, and consultation files; active run files are cleared on reset |
-| `logs/check_<n>_<ts>.txt` | Full check output |
+| `logs/check_<attempt>_<scope>_<ts>.txt` | Full check output, uniquely scoped for parallel runs |
 
 ### `~/.ferrus/projects/<project-id>/`
 

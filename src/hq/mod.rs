@@ -291,7 +291,7 @@ async fn dispatch_with_human_question_target(
                 "  /events --run <id> List SQLite runtime events for one run\n",
                 "  /attach <name>     Show log path for a running headless agent\n",
                 "  /stop              Stop all running agent sessions\n",
-                "  /reset             Reset state to Idle (clears task files)\n",
+                "  /reset             Force-reset tasks and clear scoped artifacts\n",
                 "  /init              Initialize ferrus in the current directory\n",
                 "  /register          Register agent configs and permissions\n",
                 "  /model <role> <model>\n",
