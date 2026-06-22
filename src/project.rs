@@ -3785,6 +3785,9 @@ fn column_exists(connection: &Connection, table_name: &str, column_name: &str) -
 
 async fn copy_legacy_artifacts() -> Result<()> {
     copy_if_nonempty(".ferrus/TASK.md", ".ferrus/tasks/t-001.md").await?;
+    tokio::fs::write(".ferrus/TASK.md", crate::templates::TASK_TEMPLATE)
+        .await
+        .context("Failed to restore .ferrus/TASK.md template")?;
     tokio::fs::create_dir_all(".ferrus/runs/t-001")
         .await
         .context("Failed to create .ferrus/runs/t-001")?;
@@ -4388,6 +4391,9 @@ mod tests {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let (_dir, previous) = setup_project().await;
         tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        tokio::fs::write(".ferrus/TASK.md", "legacy task")
+            .await
+            .unwrap();
         for (path, contents) in [
             (".ferrus/QUESTION.md", "legacy question"),
             (".ferrus/ANSWER.md", "legacy answer"),
@@ -4398,6 +4404,17 @@ mod tests {
         }
 
         copy_legacy_artifacts().await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(".ferrus/tasks/t-001.md")
+                .await
+                .unwrap(),
+            "legacy task"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(".ferrus/TASK.md").await.unwrap(),
+            crate::templates::TASK_TEMPLATE
+        );
 
         for (path, expected) in [
             (".ferrus/runs/t-001/QUESTION.md", "legacy question"),

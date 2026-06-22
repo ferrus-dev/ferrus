@@ -2737,6 +2737,9 @@ fn task_claim_blocks_spawn(
     now: chrono::DateTime<chrono::Utc>,
     live_run_task_ids: &HashSet<String>,
 ) -> bool {
+    if live_run_task_ids.contains(task.id.as_str()) {
+        return true;
+    }
     let Some(claimed_by) = task.claimed_by.as_deref() else {
         return false;
     };
@@ -2745,9 +2748,6 @@ fn task_claim_blocks_spawn(
         .as_deref()
         .and_then(|lease_until| chrono::DateTime::parse_from_rfc3339(lease_until).ok())
         .is_some_and(|lease_until| lease_until.with_timezone(&chrono::Utc) > now);
-    if live_run_task_ids.contains(task.id.as_str()) {
-        return true;
-    }
     claimed_by != expected_agent_id && lease_active
 }
 
@@ -3777,6 +3777,20 @@ mod tests {
         assert!(!task_claim_blocks_spawn(
             &task,
             "executor:claude-code:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+    }
+
+    #[test]
+    fn task_claim_blocks_live_unclaimed_run() {
+        let now = chrono::Utc::now();
+        let task = task_record("t-001", crate::project::TaskStatus::Pending);
+        let live_run_task_ids = HashSet::from(["t-001".to_string()]);
+
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
             now,
             &live_run_task_ids,
         ));
