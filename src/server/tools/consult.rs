@@ -29,7 +29,7 @@ pub async fn handler(
     ctx: neva::di::Dc<crate::server::ServerContext>,
     question: String,
 ) -> Result<String, neva::prelude::Error> {
-    handler_for_agent(&ctx.agent_id(), question).await
+    handler_for_agent(ctx.agent_id(), question).await
 }
 
 pub async fn handler_for_agent(
