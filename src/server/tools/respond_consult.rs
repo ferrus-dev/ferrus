@@ -23,7 +23,10 @@ pub const INPUT_SCHEMA: &str = r#"{
     "required": ["response"]
 }"#;
 
-pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>, response: String) -> Result<String, Error> {
+pub async fn handler(
+    ctx: neva::di::Dc<crate::server::ServerContext>,
+    response: String,
+) -> Result<String, Error> {
     handler_for_agent(ctx.agent_id(), response).await
 }
 

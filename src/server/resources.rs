@@ -95,13 +95,15 @@ pub async fn read_for_agent(
     ))
 }
 
-pub async fn read(ctx: neva::di::Dc<crate::server::ServerContext>, file: String) -> Result<ReadResourceResult, Error> {
+pub async fn read(
+    ctx: neva::di::Dc<crate::server::ServerContext>,
+    file: String,
+) -> Result<ReadResourceResult, Error> {
     let agent_id = ctx.agent_id();
     if file == "runtime_context" {
-        let content =
-            read_runtime_context_for_agent(Some(agent_id), Some(&ctx))
-                .await
-                .map_err(to_err)?;
+        let content = read_runtime_context_for_agent(Some(agent_id), Some(&ctx))
+            .await
+            .map_err(to_err)?;
         return Ok(ReadResourceResult::from(
             TextResourceContents::new("ferrus://runtime_context", content)
                 .with_mime("application/json"),

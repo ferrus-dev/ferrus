@@ -59,7 +59,9 @@ pub async fn supervisor_review_for_agent(agent_id: Option<&str>) -> Result<GetPr
         .with_message(PromptMessage::user().with(sections.join("\n\n---\n\n"))))
 }
 
-pub async fn supervisor_review(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<GetPromptResult, Error> {
+pub async fn supervisor_review(
+    ctx: neva::di::Dc<crate::server::ServerContext>,
+) -> Result<GetPromptResult, Error> {
     supervisor_review_for_agent(Some(ctx.agent_id())).await
 }
 
