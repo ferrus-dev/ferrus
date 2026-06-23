@@ -25,9 +25,8 @@ pub const DESCRIPTION: &str = "Block until a task is ready to work on, then atom
      Call this at the start of each Executor session; after a rejection, the next Executor \
      session should call it again to claim the Addressing work.";
 
-pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
 }
 
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {

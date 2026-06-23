@@ -26,9 +26,8 @@ pub const INPUT_SCHEMA: &str = r#"{
     "required": ["question"]
 }"#;
 
-pub async fn handler(ctx: neva::Context, question: String) -> Result<String, neva::prelude::Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id, question).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>, question: String) -> Result<String, neva::prelude::Error> {
+    handler_for_agent(ctx.agent_id(), question).await
 }
 
 pub async fn handler_for_agent(

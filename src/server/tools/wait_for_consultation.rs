@@ -14,9 +14,8 @@ pub const DESCRIPTION: &str = "Block until an Executor consultation request is r
      when consultation is ready, or {\"status\":\"timeout\"} on timeout. \
      Each call waits up to `wait_timeout_secs` (see ferrus.toml), then returns timeout so the Supervisor can poll again.";
 
-pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
 }
 
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {

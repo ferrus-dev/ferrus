@@ -8,9 +8,8 @@ use super::tool_err;
 pub const DESCRIPTION: &str = "Query the current state of the ferrus orchestration system. Returns state, \
      retry counters, scoped task context, and any failure reason. Safe to call from any state.";
 
-pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
 }
 
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {

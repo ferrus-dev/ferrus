@@ -95,12 +95,11 @@ pub async fn read_for_agent(
     ))
 }
 
-pub async fn read(ctx: neva::Context, file: String) -> Result<ReadResourceResult, Error> {
-    let server_context = ctx.resolve::<crate::server::ServerContext>()?;
-    let agent_id = server_context.agent_id().to_string();
+pub async fn read(ctx: neva::di::Dc<crate::server::ServerContext>, file: String) -> Result<ReadResourceResult, Error> {
+    let agent_id = ctx.agent_id();
     if file == "runtime_context" {
         let content =
-            read_runtime_context_for_agent(Some(agent_id.as_str()), Some(&server_context))
+            read_runtime_context_for_agent(Some(agent_id), Some(&ctx))
                 .await
                 .map_err(to_err)?;
         return Ok(ReadResourceResult::from(
@@ -108,7 +107,7 @@ pub async fn read(ctx: neva::Context, file: String) -> Result<ReadResourceResult
                 .with_mime("application/json"),
         ));
     }
-    read_for_agent(Some(agent_id.as_str()), file).await
+    read_for_agent(Some(agent_id), file).await
 }
 
 async fn read_review_for_agent(agent_id: Option<&str>) -> anyhow::Result<String> {

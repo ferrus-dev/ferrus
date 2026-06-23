@@ -32,13 +32,6 @@ pub(super) fn tool_err(e: anyhow::Error) -> Error {
     )
 }
 
-pub(super) fn agent_id_from_context(ctx: &neva::Context) -> Result<String, Error> {
-    Ok(ctx
-        .resolve::<crate::server::ServerContext>()?
-        .agent_id()
-        .to_string())
-}
-
 pub(super) async fn ensure_lease_owner_or_reclaim(
     agent_id: &str,
     ttl_secs: u64,

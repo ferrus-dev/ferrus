@@ -8,9 +8,8 @@ use super::{require_runtime_task_context, tool_err};
 
 pub const DESCRIPTION: &str = "Human escape hatch: reset a Failed SQLite task row.";
 
-pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
 }
 
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {

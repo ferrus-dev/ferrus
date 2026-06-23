@@ -17,9 +17,8 @@ pub const DESCRIPTION: &str = "Renew the task lease for the calling agent. Valid
      Error codes: not_claimed (no active lease), claimed_by_other (different agent holds lease), \
      expired (your lease timed out before renewal), invalid_state (state cannot be leased).";
 
-pub async fn handler(ctx: neva::Context) -> Result<String, Error> {
-    let agent_id = super::agent_id_from_context(&ctx)?;
-    handler_for_agent(&agent_id).await
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
 }
 
 pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
