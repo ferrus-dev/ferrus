@@ -302,24 +302,56 @@ async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<S
     if tracked.is_empty() {
         return Ok(String::new());
     }
-    let mut command = Command::new("git");
-    command.args(["diff", "--binary"]).arg(baseline).arg("--");
-    for path in tracked {
-        command.arg(path);
+    // Restricting the diff to tracked pathspecs keeps baseline-only paths (handled separately
+    // as untracked) out of this patch. Spread the pathspecs across batched invocations rather
+    // than expanding every tracked path into a single argv, which can exceed the OS arg limit
+    // in repos with many files (`git diff` does not support `--pathspec-from-file`).
+    let mut patch = String::new();
+    for batch in tracked_pathspec_batches(tracked) {
+        let mut command = Command::new("git");
+        command.args(["diff", "--binary"]).arg(baseline).arg("--");
+        for path in batch {
+            command.arg(path);
+        }
+        let output = command.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "Failed to capture executor workspace patch: {}",
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            );
+        }
+        patch.push_str(&String::from_utf8_lossy(&output.stdout));
     }
-    let output = command.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
+    Ok(patch)
+}
+
+/// Conservative per-invocation cap on the cumulative byte length of pathspec arguments.
+/// Sized for the tightest platform rather than per-OS: Windows caps the whole command line
+/// at 32767 characters, far below the Unix `ARG_MAX` (1 MiB on macOS, ~2 MiB on Linux). This
+/// leaves headroom under that limit for the `git diff` prefix and per-argument quoting.
+const PATHSPEC_ARGV_BUDGET: usize = 24_000;
+
+fn tracked_pathspec_batches(tracked: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, path) in tracked.iter().enumerate() {
+        // +1 accounts for the NUL terminator each argv entry carries.
+        let cost = path.len() + 1;
+        if index > start && used + cost > PATHSPEC_ARGV_BUDGET {
+            batches.push(&tracked[start..index]);
+            start = index;
+            used = 0;
+        }
+        used += cost;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    batches.push(&tracked[start..]);
+    batches
 }
 
 async fn tracked_files() -> Result<Vec<String>> {
@@ -501,6 +533,37 @@ async fn record_task_status(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn tracked_pathspec_batches_keeps_short_lists_in_one_batch() {
+        let tracked = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let batches = tracked_pathspec_batches(&tracked);
+        assert_eq!(batches, vec![tracked.as_slice()]);
+    }
+
+    #[test]
+    fn tracked_pathspec_batches_splits_when_argv_budget_exceeded() {
+        let path = "x".repeat(1024);
+        let count = (PATHSPEC_ARGV_BUDGET / (path.len() + 1)) + 5;
+        let tracked = vec![path; count];
+        let batches = tracked_pathspec_batches(&tracked);
+        assert!(batches.len() > 1, "expected multiple batches");
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            count,
+            "every path must appear exactly once across batches"
+        );
+        for batch in &batches {
+            assert!(!batch.is_empty(), "batches must be non-empty");
+        }
+    }
+
+    #[test]
+    fn tracked_pathspec_batches_keeps_oversized_single_path() {
+        let tracked = vec!["y".repeat(PATHSPEC_ARGV_BUDGET * 2)];
+        let batches = tracked_pathspec_batches(&tracked);
+        assert_eq!(batches, vec![tracked.as_slice()]);
+    }
 
     async fn setup() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();

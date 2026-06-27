@@ -2326,7 +2326,7 @@ async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> 
         if git_is_work_tree(&workspace_dir).await {
             copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
             let mut baseline_tree = read_executor_workspace_baseline_tree(&baseline_path).await?;
-            if baseline_tree.is_none() && !git_has_head(&workspace_dir).await {
+            if baseline_tree.is_none() {
                 let captured = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
                 persist_executor_workspace_baseline(
                     &project_root,
