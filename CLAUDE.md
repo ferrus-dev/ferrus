@@ -41,7 +41,7 @@ Before submitting, `cargo clippy -- -D warnings`, `cargo fmt --check`, and `carg
   `.ferrus/runs/<task-id>/`.
 - Treat `.ferrus/TASK.md`, `.ferrus/SPEC_TEMPLATE.md`, and `.ferrus/CONSULT_TEMPLATE.md` as templates.
 - Do not recreate `.ferrus/STATE.json`, `.ferrus/STATE.lock`, or root runtime artifact mirrors.
-- Keep backend-specific behavior inside `src/agents/{claude,codex,qwen}`.
+- Keep backend-specific behavior inside `src/agents/{claude,codex,qwen,opencode}`.
 
 ## Ferrus CLI
 

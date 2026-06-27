@@ -26,10 +26,11 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
+- **opencode** (experimental) — convenient for running local models. ⚠️ The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
 
 Agents are treated as interchangeable workers — ferrus provides the runtime, coordination, and state.
 
-Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, and `qwen/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
+Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, and `opencode/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
 
 > 💡 **Status**: ferrus is currently in alpha and not ready for production.
 
@@ -205,6 +206,7 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 | `claude-code` | `.claude/mcp-supervisor.json` or `.claude/mcp-executor.json` + `.claude/settings.local.json` permissions |
 | `codex` | `.codex/config.toml` |
 | `qwen-code` | `.qwen/settings.json` |
+| `opencode` | `opencode.json` |
 
 ### `ferrus doctor`
 
@@ -264,11 +266,11 @@ heartbeat_interval_secs = 30   # how often agents should call heartbeat
 directory = "docs/specs"       # where /create_spec writes approved specs
 
 [hq.supervisor]
-agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex | qwen-code
+agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex | qwen-code | opencode
 model = ""             # optional override; empty = agent default
 
 [hq.executor]
-agent = "codex"        # agent for executor role: claude-code | codex | qwen-code
+agent = "codex"        # agent for executor role: claude-code | codex | qwen-code (opencode executor is experimental/unstable — see Supported agents)
 model = ""             # optional override; empty = agent default
 ```
 

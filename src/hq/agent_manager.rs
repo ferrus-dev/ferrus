@@ -180,6 +180,8 @@ Escalation rules:
 
 Hard rules:
   - NEVER run tests/builds manually — always use /check
+  - Ferrus owns version control: NEVER run `git commit`, `git add`, `git push`, `git checkout`, `git reset`, or any command that changes git history or staging — make your changes in the working tree only and let /submit hand them off
+  - Stay inside your assigned workspace directory; do not edit files outside it
   - Do NOT emulate Ferrus tools by editing `.ferrus/` files or manually advancing state
   - A green /check during development is diagnostic, not completion by itself; /submit is still required
   - You run headlessly — do not ask questions in the terminal
@@ -852,6 +854,14 @@ mod tests {
     #[test]
     fn executor_prompt_forbids_manual_checks() {
         assert!(executor_prompt().contains("NEVER"));
+    }
+
+    #[test]
+    fn executor_prompt_forbids_direct_git_version_control() {
+        let prompt = executor_prompt();
+        assert!(prompt.contains("Ferrus owns version control"));
+        assert!(prompt.contains("git commit"));
+        assert!(prompt.contains("let /submit hand them off"));
     }
 
     #[test]
