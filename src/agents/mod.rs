@@ -5,6 +5,7 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod goose;
 pub(crate) mod opencode;
 pub(crate) mod qwen;
 
@@ -188,10 +189,11 @@ pub fn parse_supervisor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Supervisor::new(model))),
+        goose::NAME => Ok(Arc::new(goose::Supervisor::new(model))),
         opencode::NAME => Ok(Arc::new(opencode::Supervisor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Supervisor::new(model))),
         other => bail!(
-            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"opencode\", \"qwen-code\"."
+            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
@@ -212,15 +214,16 @@ pub fn parse_executor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Executor::new(model))),
+        goose::NAME => Ok(Arc::new(goose::Executor::new(model))),
         opencode::NAME => Ok(Arc::new(opencode::Executor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Executor::new(model))),
         other => bail!(
-            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"opencode\", \"qwen-code\"."
+            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
 
-fn current_exe_string() -> Result<String> {
+pub(crate) fn current_exe_string() -> Result<String> {
     // Persist the exact executable path so generated MCP configs keep working
     // even when Ferrus is launched outside of PATH-based resolution.
     Ok(std::env::current_exe()
@@ -229,7 +232,7 @@ fn current_exe_string() -> Result<String> {
         .into_owned())
 }
 
-fn serve_args(role: &str, agent_name: &str, _index: u32) -> Vec<String> {
+pub(crate) fn serve_args(role: &str, agent_name: &str, _index: u32) -> Vec<String> {
     // Ferrus reconnects to agents through `ferrus serve`, so every backend uses
     // the same role-level argument shape. Concrete agent/task/run identity is
     // supplied at runtime through FERRUS_* environment variables.
@@ -424,6 +427,7 @@ mod tests {
         assert!(err.contains("Unknown supervisor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("goose"));
         assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }
@@ -437,6 +441,7 @@ mod tests {
         assert!(err.contains("Unknown executor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("goose"));
         assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }

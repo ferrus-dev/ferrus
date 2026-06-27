@@ -372,6 +372,7 @@ fn parse_agent_type(s: &str) -> Option<crate::cli::commands::register::Agent> {
     match s {
         "claude-code" => Some(Agent::ClaudeCode),
         "codex" => Some(Agent::Codex),
+        "goose" => Some(Agent::Goose),
         "opencode" => Some(Agent::OpenCode),
         "qwen-code" => Some(Agent::QwenCode),
         _ => None,

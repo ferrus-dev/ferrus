@@ -41,6 +41,7 @@ src/
   agents/codex/mod.rs        # Codex launchers, stdin prompt transport, TOML MCP config and tool approvals
   agents/qwen/mod.rs         # Qwen Code launchers, model override handling, JSON settings tool approvals
   agents/opencode/mod.rs     # opencode launchers, `run` headless mode, opencode.json MCP config (experimental; executor isolation unstable)
+  agents/goose/mod.rs        # goose launchers, `run`/`session`, role-scoped Ferrus MCP server via --with-extension, GOOSE_MODEL/GOOSE_MODE env (experimental)
   platform/                  # OS-specific process, shell, and parent-lifecycle helpers
   state/store.rs             # Async read/write of project-local .ferrus/ artifacts
   state/agents.rs            # AgentEntry, AgentsRegistry — .ferrus/agents.json lifecycle tracking
@@ -88,7 +89,7 @@ pending
 
 **Spec selection**: `project_runtime_state` stores the selected spec. Task rows store `spec_path` and `milestone_id`; milestone display text is resolved from spec Markdown by milestone `ID`. Keep milestone IDs stable across title edits.
 
-**Agent adapters**: keep backend-specific CLI behavior inside `src/agents/{claude,codex,qwen,opencode}`. Shared orchestration should depend on the `SupervisorAgent` and `ExecutorAgent` traits, not on a concrete agent CLI. When adding an agent, implement both role adapters, model normalization, headless prompt transport if needed, version/config entry behavior, registration wiring, and focused tests. Note: `opencode` is experimental — it binds a project to a single working directory by git root-commit in its own global store, so it does not honor HQ's per-task isolated worktree and is only reliable for the supervisor/reviewer role for now.
+**Agent adapters**: keep backend-specific CLI behavior inside `src/agents/{claude,codex,qwen,opencode,goose}`. Shared orchestration should depend on the `SupervisorAgent` and `ExecutorAgent` traits, not on a concrete agent CLI. When adding an agent, implement both role adapters, model normalization, headless prompt transport if needed, version/config entry behavior, registration wiring, and focused tests. Note: `opencode` is experimental — it binds a project to a single working directory by git root-commit in its own global store, so it does not honor HQ's per-task isolated worktree and is only reliable for the supervisor/reviewer role for now.
 
 **HQ checks**: HQ `/check` runs configured commands directly and does not mutate task state. Task retry accounting belongs to executor MCP `/check`.
 

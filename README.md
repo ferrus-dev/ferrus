@@ -26,11 +26,12 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
+- **goose** (experimental) — MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable, but the integration is new and not yet fully validated end-to-end.
 - **opencode** (experimental) — convenient for running local models. ⚠️ The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
 
 Agents are treated as interchangeable workers — ferrus provides the runtime, coordination, and state.
 
-Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, and `opencode/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
+Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, `opencode/`, and `goose/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
 
 > 💡 **Status**: ferrus is currently in alpha and not ready for production.
 
@@ -207,6 +208,7 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 | `codex` | `.codex/config.toml` |
 | `qwen-code` | `.qwen/settings.json` |
 | `opencode` | `opencode.json` |
+| `goose` | none — the Ferrus MCP server is attached at launch via `--with-extension` |
 
 ### `ferrus doctor`
 
@@ -266,11 +268,11 @@ heartbeat_interval_secs = 30   # how often agents should call heartbeat
 directory = "docs/specs"       # where /create_spec writes approved specs
 
 [hq.supervisor]
-agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex | qwen-code | opencode
+agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex | qwen-code | goose | opencode
 model = ""             # optional override; empty = agent default
 
 [hq.executor]
-agent = "codex"        # agent for executor role: claude-code | codex | qwen-code (opencode executor is experimental/unstable — see Supported agents)
+agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable — see Supported agents
 model = ""             # optional override; empty = agent default
 ```
 

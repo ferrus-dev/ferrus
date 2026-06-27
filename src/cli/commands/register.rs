@@ -10,6 +10,8 @@ pub enum Agent {
     #[value(name = crate::agents::claude::NAME)]
     ClaudeCode,
     Codex,
+    #[value(name = crate::agents::goose::NAME)]
+    Goose,
     #[value(name = crate::agents::opencode::NAME)]
     OpenCode,
     #[value(name = crate::agents::qwen::NAME)]
@@ -22,6 +24,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => crate::agents::claude::NAME,
             Agent::Codex => crate::agents::codex::NAME,
+            Agent::Goose => crate::agents::goose::NAME,
             Agent::OpenCode => crate::agents::opencode::NAME,
             Agent::QwenCode => crate::agents::qwen::NAME,
         }
@@ -186,6 +189,7 @@ fn agent_from_name(name: &str) -> Result<Agent> {
     match name {
         crate::agents::claude::NAME => Ok(Agent::ClaudeCode),
         crate::agents::codex::NAME => Ok(Agent::Codex),
+        crate::agents::goose::NAME => Ok(Agent::Goose),
         crate::agents::opencode::NAME => Ok(Agent::OpenCode),
         crate::agents::qwen::NAME => Ok(Agent::QwenCode),
         other => anyhow::bail!("Unknown ferrus agent '{other}'"),
@@ -202,6 +206,7 @@ async fn register_role(
     match agent {
         Agent::ClaudeCode => register_claude_code(role, agent_name, model, update_agent_docs).await,
         Agent::Codex => register_codex(role, agent_name, model, update_agent_docs).await,
+        Agent::Goose => register_goose(role).await,
         Agent::OpenCode => register_opencode(role, agent_name, model, update_agent_docs).await,
         Agent::QwenCode => register_qwen_code(role, agent_name, model, update_agent_docs).await,
     }
@@ -448,6 +453,18 @@ async fn register_opencode(
     if update_agent_docs {
         append_to_agents_md(role).await?;
     }
+    Ok(())
+}
+
+async fn register_goose(role: &str) -> Result<()> {
+    // goose attaches the role-scoped Ferrus MCP server at launch via `--with-extension`
+    // (see `src/agents/goose`), so there is no per-project config file to write. The hq
+    // config (`ferrus.toml`) is still updated by the caller. Ensure goose has a model
+    // provider configured (e.g. a local LM Studio/Ollama provider) with `goose configure`.
+    let key = mcp_server_name(role);
+    println!(
+        "Configured {role} for goose; the `{key}` MCP server is attached at launch (no config file written)."
+    );
     Ok(())
 }
 
