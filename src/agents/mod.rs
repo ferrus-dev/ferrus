@@ -5,6 +5,7 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod opencode;
 pub(crate) mod qwen;
 
 use anyhow::{Context, Result, bail};
@@ -187,9 +188,10 @@ pub fn parse_supervisor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Supervisor::new(model))),
+        opencode::NAME => Ok(Arc::new(opencode::Supervisor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Supervisor::new(model))),
         other => bail!(
-            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"qwen-code\"."
+            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
@@ -210,9 +212,10 @@ pub fn parse_executor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Executor::new(model))),
+        opencode::NAME => Ok(Arc::new(opencode::Executor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Executor::new(model))),
         other => bail!(
-            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"qwen-code\"."
+            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
@@ -421,6 +424,7 @@ mod tests {
         assert!(err.contains("Unknown supervisor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }
 
@@ -433,6 +437,7 @@ mod tests {
         assert!(err.contains("Unknown executor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }
 

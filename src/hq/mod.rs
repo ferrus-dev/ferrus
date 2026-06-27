@@ -372,6 +372,8 @@ fn parse_agent_type(s: &str) -> Option<crate::cli::commands::register::Agent> {
     match s {
         "claude-code" => Some(Agent::ClaudeCode),
         "codex" => Some(Agent::Codex),
+        "opencode" => Some(Agent::OpenCode),
+        "qwen-code" => Some(Agent::QwenCode),
         _ => None,
     }
 }
@@ -2674,6 +2676,7 @@ async fn copy_canonical_agent_config_files(
         ".claude/settings.local.json",
         ".codex/config.toml",
         ".qwen/settings.json",
+        "opencode.json",
     ] {
         copy_canonical_file_if_present(project_root, workspace_dir, Path::new(relative)).await?;
     }

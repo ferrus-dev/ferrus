@@ -10,6 +10,8 @@ pub enum Agent {
     #[value(name = crate::agents::claude::NAME)]
     ClaudeCode,
     Codex,
+    #[value(name = crate::agents::opencode::NAME)]
+    OpenCode,
     #[value(name = crate::agents::qwen::NAME)]
     QwenCode,
 }
@@ -20,6 +22,7 @@ impl Agent {
         match self {
             Agent::ClaudeCode => crate::agents::claude::NAME,
             Agent::Codex => crate::agents::codex::NAME,
+            Agent::OpenCode => crate::agents::opencode::NAME,
             Agent::QwenCode => crate::agents::qwen::NAME,
         }
     }
@@ -183,6 +186,7 @@ fn agent_from_name(name: &str) -> Result<Agent> {
     match name {
         crate::agents::claude::NAME => Ok(Agent::ClaudeCode),
         crate::agents::codex::NAME => Ok(Agent::Codex),
+        crate::agents::opencode::NAME => Ok(Agent::OpenCode),
         crate::agents::qwen::NAME => Ok(Agent::QwenCode),
         other => anyhow::bail!("Unknown ferrus agent '{other}'"),
     }
@@ -198,6 +202,7 @@ async fn register_role(
     match agent {
         Agent::ClaudeCode => register_claude_code(role, agent_name, model, update_agent_docs).await,
         Agent::Codex => register_codex(role, agent_name, model, update_agent_docs).await,
+        Agent::OpenCode => register_opencode(role, agent_name, model, update_agent_docs).await,
         Agent::QwenCode => register_qwen_code(role, agent_name, model, update_agent_docs).await,
     }
 }
@@ -388,6 +393,60 @@ async fn register_qwen_code(
     update_gitignore(&[".qwen/settings.json"]).await?;
     if update_agent_docs {
         append_to_qwen_md(role).await?;
+    }
+    Ok(())
+}
+
+async fn register_opencode(
+    role: &str,
+    agent_name: &str,
+    model: Option<&str>,
+    update_agent_docs: bool,
+) -> Result<()> {
+    let path = crate::agents::opencode::opencode_config_path();
+
+    let mut root: serde_json::Value = if path.exists() {
+        let content = tokio::fs::read_to_string(path).await?;
+        serde_json::from_str(&content).context("Failed to parse opencode.json")?
+    } else {
+        serde_json::json!({ "$schema": "https://opencode.ai/config.json" })
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("opencode.json root is not a JSON object"))?;
+    let servers = root_obj
+        .entry("mcp")
+        .or_insert_with(|| serde_json::json!({}));
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("opencode.json mcp is not a JSON object"))?;
+
+    let index = DEFAULT_AGENT_INDEX;
+    let key = mcp_server_name(role);
+    let McpConfigEntry { command, args, .. } = config_entry(role, agent_name, index, model)?;
+
+    // opencode expects a single `command` array (executable followed by its
+    // arguments) and selects the model through the launch flag, not the MCP entry.
+    let mut command_array = Vec::with_capacity(args.len() + 1);
+    command_array.push(serde_json::Value::String(command));
+    command_array.extend(args.into_iter().map(serde_json::Value::String));
+    servers_obj.insert(
+        key.clone(),
+        serde_json::json!({
+            "type": "local",
+            "command": command_array,
+            "enabled": true,
+        }),
+    );
+    println!("Registered {key} in opencode.json");
+
+    let content = serde_json::to_string_pretty(&root)?;
+    tokio::fs::write(path, content).await?;
+
+    update_gitignore(&["opencode.json"]).await?;
+    if update_agent_docs {
+        append_to_agents_md(role).await?;
     }
     Ok(())
 }
