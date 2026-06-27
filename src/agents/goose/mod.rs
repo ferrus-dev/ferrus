@@ -26,6 +26,16 @@ pub(crate) const NAME: &str = "goose";
 /// Actual CLI executable name used to launch goose.
 const EXECUTABLE: &str = "goose";
 
+/// Default ceiling on agent turns for an unattended (headless) run. Bounds a runaway
+/// agent — for example a weak local model that keeps failing to compile and never
+/// reaches `/submit` — so the run terminates instead of looping indefinitely. Override
+/// it by exporting `GOOSE_MAX_TURNS` before launching Ferrus (the flag is skipped when
+/// that variable is set).
+const DEFAULT_MAX_TURNS: u32 = 150;
+/// Default ceiling on identical consecutive tool calls. Catches tight loops where the
+/// agent repeats the exact same call; complements the broader per-turn limit.
+const DEFAULT_MAX_TOOL_REPETITIONS: u32 = 25;
+
 /// Interactive and headless supervisor launcher for goose.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
@@ -116,9 +126,15 @@ fn goose_command(role: &str, mode: AgentRunMode<'_>, model: Option<&str>) -> Res
         AgentRunMode::Headless { prompt } => {
             // Auto-approve tool calls so an unattended run never blocks on confirmation.
             cmd.env("GOOSE_MODE", "auto");
-            cmd.arg("run")
-                .arg("--no-session")
-                .arg("--with-extension")
+            cmd.arg("run").arg("--no-session");
+            // Loop guards so a thrashing agent fails cleanly instead of running forever.
+            // `--max-turns` defers to GOOSE_MAX_TURNS when the user set it explicitly.
+            if std::env::var_os("GOOSE_MAX_TURNS").is_none() {
+                cmd.arg("--max-turns").arg(DEFAULT_MAX_TURNS.to_string());
+            }
+            cmd.arg("--max-tool-repetitions")
+                .arg(DEFAULT_MAX_TOOL_REPETITIONS.to_string());
+            cmd.arg("--with-extension")
                 .arg(&extension)
                 .arg("--text")
                 .arg(prompt);
@@ -187,6 +203,24 @@ mod tests {
         assert!(extension.ends_with("serve --role executor --agent-name goose"));
 
         assert_eq!(env_of(&command, "GOOSE_MODE").as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn headless_run_sets_loop_guards() {
+        let command = Executor::new(None)
+            .spawn(AgentRunMode::Headless { prompt: "x" })
+            .unwrap();
+        let args = args_of(&command);
+        assert!(
+            args.contains(&"--max-tool-repetitions".to_string()),
+            "headless runs must cap identical tool repetitions"
+        );
+        // `--max-turns` is applied by default but yields to an explicit GOOSE_MAX_TURNS.
+        assert!(
+            args.contains(&"--max-turns".to_string())
+                || std::env::var_os("GOOSE_MAX_TURNS").is_some(),
+            "headless runs must bound total turns unless GOOSE_MAX_TURNS is set"
+        );
     }
 
     #[test]

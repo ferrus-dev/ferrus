@@ -26,7 +26,7 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
-- **goose** (experimental) — MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable, but the integration is new and not yet fully validated end-to-end.
+- **goose** (experimental) — MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever — raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
 - **opencode** (experimental) — convenient for running local models. ⚠️ The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
 
 Agents are treated as interchangeable workers — ferrus provides the runtime, coordination, and state.
