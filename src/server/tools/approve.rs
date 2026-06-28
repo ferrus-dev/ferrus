@@ -242,23 +242,15 @@ async fn cleanup_approved_workspace(
     context: &RuntimeTaskContext,
     project_root: &Path,
 ) -> Result<bool> {
-    let Some(workspace_path) = context
-        .workspace_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-    else {
-        return Ok(false);
-    };
     let local_ref_content =
         tokio::fs::read_to_string(store::resolve_project_path(".ferrus/project.toml")).await?;
     let local_ref: project::LocalProjectRef = toml::from_str(&local_ref_content)?;
     let data_dir = PathBuf::from(local_ref.data_dir);
     let managed_root = data_dir.join("worktrees");
-    let canonical_workspace = tokio::fs::canonicalize(&workspace_path)
+    let task_workspace = managed_root.join(&context.task_id);
+    let canonical_workspace = tokio::fs::canonicalize(&task_workspace)
         .await
-        .unwrap_or(workspace_path);
+        .unwrap_or(task_workspace);
     let canonical_managed_root = tokio::fs::canonicalize(&managed_root)
         .await
         .unwrap_or(managed_root);
@@ -883,7 +875,7 @@ mod tests {
             "supervisor",
             "supervisor:codex:7",
             std::process::id(),
-            workspace_path.to_string_lossy().into_owned(),
+            dir.path().to_string_lossy().into_owned(),
         )
         .await
         .unwrap();
@@ -904,7 +896,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context.workspace_path.as_deref(),
-            Some(workspace_path.to_string_lossy().as_ref())
+            Some(dir.path().to_string_lossy().as_ref())
         );
 
         run("supervisor:codex:7").await.unwrap();

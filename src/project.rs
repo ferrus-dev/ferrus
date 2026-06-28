@@ -3005,23 +3005,31 @@ pub async fn remove_executor_baseline(
     task_id: &str,
 ) -> Result<()> {
     let baseline_ref = executor_baseline_ref(task_id);
-    let output = Command::new("git")
+    let exists = Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["update-ref", "-d", &baseline_ref])
+        .args(["show-ref", "--verify", "--quiet", &baseline_ref])
         .output()
-        .await
-        .with_context(|| format!("Failed to remove executor baseline ref {baseline_ref}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to remove executor baseline ref {baseline_ref}: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
+        .await;
+    if matches!(exists, Ok(output) if output.status.success()) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["update-ref", "-d", &baseline_ref])
+            .output()
+            .await
+            .with_context(|| format!("Failed to remove executor baseline ref {baseline_ref}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "Failed to remove executor baseline ref {baseline_ref}: {}",
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            );
+        }
     }
 
     let metadata_path = data_dir
