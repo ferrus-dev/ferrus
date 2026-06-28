@@ -111,7 +111,6 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
 | `reject` | Reviewing | Reject with notes; moves to Addressing |
-| `wait_for_consultation` | — | Attach the supervisor run to a pending consultation |
 | `wait_for_consultation` | — | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
 

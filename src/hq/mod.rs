@@ -1548,7 +1548,8 @@ impl HqContext {
         tasks: &[TaskRecord],
         max_parallel: usize,
     ) -> Result<usize> {
-        let running = self.running_executor_count();
+        let max_parallel = executor_parallel_limit(max_parallel).await?;
+        let running = self.occupied_executor_slots().await?;
         let slots = max_parallel.saturating_sub(running);
         if slots == 0 {
             return Ok(0);
@@ -1613,7 +1614,9 @@ impl HqContext {
         }
 
         let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
-        let mut executor_slots = max_parallel.saturating_sub(self.running_executor_count());
+        let executor_max_parallel = executor_parallel_limit(max_parallel).await?;
+        let mut executor_slots =
+            executor_max_parallel.saturating_sub(self.occupied_executor_slots().await?);
         let mut supervisor_slots = max_parallel.saturating_sub(self.running_supervisor_count());
         let mut spawned = 0usize;
 
@@ -1671,6 +1674,7 @@ impl HqContext {
     ) -> Result<usize> {
         let now = chrono::Utc::now();
         let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let max_parallel = executor_parallel_limit(max_parallel).await?;
         let mut ready_tasks = Vec::new();
         for task in tasks
             .into_iter()
@@ -1686,7 +1690,7 @@ impl HqContext {
             return Ok(0);
         }
 
-        let running = self.running_executor_count();
+        let running = self.occupied_executor_slots().await?;
         let slots = max_parallel.saturating_sub(running);
         if slots == 0 {
             if report_waiting {
@@ -1745,11 +1749,15 @@ impl HqContext {
         Ok(spawned)
     }
 
-    fn running_executor_count(&self) -> usize {
-        self.headless
-            .iter()
-            .filter(|(name, handle)| name.starts_with(ROLE_EXECUTOR) && handle.is_alive())
-            .count()
+    async fn occupied_executor_slots(&self) -> Result<usize> {
+        let live_db_task_ids =
+            crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+        Ok(occupied_executor_slots_from_handles(
+            live_db_task_ids,
+            self.headless.iter().filter_map(|(name, handle)| {
+                (name.starts_with(ROLE_EXECUTOR) && handle.is_alive()).then_some(name.as_str())
+            }),
+        ))
     }
 
     fn running_supervisor_count(&self) -> usize {
@@ -2754,6 +2762,44 @@ async fn git_has_head(path: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+async fn executor_parallel_limit(configured: usize) -> Result<usize> {
+    let configured = configured.max(1);
+    if configured == 1 {
+        return Ok(1);
+    }
+
+    let registration = crate::project::touch_current_project().await?;
+    let project_root = PathBuf::from(&registration.metadata.workspace_dir);
+    if git_is_work_tree(&project_root).await {
+        Ok(configured)
+    } else {
+        Ok(1)
+    }
+}
+
+fn occupied_executor_slots_from_handles<'a>(
+    mut live_db_task_ids: HashSet<String>,
+    live_headless_names: impl IntoIterator<Item = &'a str>,
+) -> usize {
+    let mut unscoped_live_handles = 0usize;
+    for name in live_headless_names {
+        if let Some(task_id) = task_id_from_scoped_agent_name(name) {
+            live_db_task_ids.insert(task_id.to_string());
+        } else {
+            unscoped_live_handles += 1;
+        }
+    }
+    live_db_task_ids.len() + unscoped_live_handles
+}
+
+fn task_id_from_scoped_agent_name(name: &str) -> Option<&str> {
+    let mut parts = name.splitn(3, ':');
+    let role = parts.next()?;
+    parts.next()?;
+    let task_id = parts.next()?;
+    (role == ROLE_EXECUTOR && task_id.starts_with("t-")).then_some(task_id)
+}
+
 fn task_claim_blocks_spawn(
     task: &TaskRecord,
     expected_agent_id: &str,
@@ -3201,6 +3247,52 @@ mod tests {
         assert_eq!(workspace.workspace_dir, canonical_project_root);
         assert_eq!(workspace.baseline_tree, None);
         assert!(!data_dir.join("worktrees/t-001").exists());
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_parallel_limit_caps_non_git_projects() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executor_parallel_limit(4).await.unwrap(), 1);
 
         std::env::set_current_dir(previous).unwrap();
     }
@@ -3817,6 +3909,30 @@ mod tests {
             now,
             &live_run_task_ids,
         ));
+    }
+
+    #[test]
+    fn occupied_executor_slots_merge_live_db_runs_and_headless_handles() {
+        let live_db_task_ids = HashSet::from(["t-001".to_string(), "t-003".to_string()]);
+        let slots = occupied_executor_slots_from_handles(
+            live_db_task_ids,
+            [
+                "executor:codex:t-001",
+                "executor:codex:t-002",
+                "executor:codex:1",
+            ],
+        );
+
+        assert_eq!(slots, 4);
+        assert_eq!(
+            task_id_from_scoped_agent_name("executor:codex:t-004"),
+            Some("t-004")
+        );
+        assert_eq!(task_id_from_scoped_agent_name("executor:codex:1"), None);
+        assert_eq!(
+            task_id_from_scoped_agent_name("supervisor:codex:t-004"),
+            None
+        );
     }
 
     #[test]
