@@ -78,8 +78,12 @@ pending
        ├─► reviewing ← /submit final gate pass (Executor)
        │     ├─► addressing → work loop
        │     └─► complete ← /approve (Supervisor)
-       └─► failed ← /check, /submit, or /reject hits retry/cycle limit
+       └─► failed ← /check, /submit, or /reject hits retry/cycle limit,
+                    or HQ re-dispatches the executor `max_executor_dispatches`
+                    times in one work phase without reaching review
 ```
+
+**Executor dispatch guard**: a headless executor session that hits its turn limit and exits without submitting is respawned by HQ. `limits.max_executor_dispatches` (default 6) bounds those respawns per work phase via the `tasks.executor_dispatches` counter — checked in `spawn_headless_executor_for_task`, incremented per spawn, reset when a fresh `/reject` starts a new Addressing phase. When the budget is exhausted the task is moved to Failed instead of churning forever. Set it to `0` to disable the guard.
 
 **Runtime artifacts**: `.ferrus/TASK.md`, `.ferrus/SPEC_TEMPLATE.md`, and `.ferrus/CONSULT_TEMPLATE.md` are templates. Task intent lives in `.ferrus/tasks/<task-id>.md`. Execution artifacts live under `.ferrus/runs/<task-id>/`, including `SUBMISSION.md`, `REVIEW.md`, `QUESTION.md`, `ANSWER.md`, `CONSULT_REQUEST.md`, `CONSULT_RESPONSE.md`, `PATCH.diff`, and `INTEGRATION_ERROR.md`. Check and agent session logs live under `.ferrus/logs/`. Do not write root `.ferrus/REVIEW.md`, `.ferrus/SUBMISSION.md`, `.ferrus/QUESTION.md`, `.ferrus/ANSWER.md`, `.ferrus/CONSULT_REQUEST.md`, or `.ferrus/CONSULT_RESPONSE.md`.
 

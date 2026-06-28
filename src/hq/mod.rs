@@ -842,6 +842,25 @@ impl HqContext {
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
         agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
+
+        // Account for this dispatch only once we are committed to spawning (the
+        // executor is configured and launchable). Bounds the respawn loop of a
+        // session that keeps exiting without reaching review.
+        let max_dispatches = Config::load().await?.limits.max_executor_dispatches;
+        match crate::project::record_executor_dispatch(task_id, max_dispatches).await? {
+            crate::project::ExecutorDispatchOutcome::Proceed { dispatches } => {
+                tracing::debug!(task_id, dispatches, max_dispatches, "executor dispatch");
+            }
+            crate::project::ExecutorDispatchOutcome::LimitExceeded { dispatches } => {
+                self.display.error(format!(
+                    "Task {task_id} reached the executor dispatch limit ({dispatches}/{max_dispatches}) \
+                     for this work phase without reaching review.\n\nState is now Failed. Inspect with \
+                     /tasks; adjust limits.max_executor_dispatches or refine the task before retrying."
+                ));
+                return Ok(());
+            }
+        }
+
         let workspace = prepare_executor_workspace(task_id).await?;
         let mut env = vec![
             (ENV_AGENT_ID, name.to_string()),

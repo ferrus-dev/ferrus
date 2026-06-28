@@ -12,6 +12,7 @@ max_review_cycles = 3   # reject→fix cycles before state → Failed
 max_feedback_lines = 30 # trailing lines per failing command shown in /check and /submit output (full output always in .ferrus/logs/)
 wait_timeout_secs = 60 # max duration of a single wait_* tool call before it returns timeout so the agent can poll again
 max_parallel_tasks = 1 # max concurrent executor sessions; set to 2+ to run independent tasks in parallel
+max_executor_dispatches = 6 # executor (re)spawns per work phase before state → Failed; bounds a session that keeps exiting without submitting
 
 [agents]
 path = ".agents" # root directory for agent skill files
@@ -392,6 +393,7 @@ max_review_cycles = 3    # reject→fix cycles before Failed
 max_feedback_lines = 30  # lines per command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call; agents should call again after timeout
 max_parallel_tasks = 1   # max concurrent executor sessions
+max_executor_dispatches = 6 # executor (re)spawns per work phase before Failed
 
 [lease]
 ttl_secs = 90            # lease validity without renewal

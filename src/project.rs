@@ -234,6 +234,17 @@ pub enum TaskReviewRejection {
     LimitExceeded { cycles: u32 },
 }
 
+/// Outcome of accounting for one executor dispatch (spawn) against the
+/// per-work-phase ceiling.
+#[derive(Debug, Clone)]
+pub enum ExecutorDispatchOutcome {
+    /// The dispatch is within budget; HQ may spawn the executor session.
+    Proceed { dispatches: u32 },
+    /// The task has already consumed its dispatch budget for this phase without
+    /// reaching review; it has been transitioned to Failed and must not be spawned.
+    LimitExceeded { dispatches: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub enum TaskConsultRestore {
     Restored { status: String },
@@ -1475,6 +1486,7 @@ pub async fn record_task_review_rejected(
                 r#"
                 UPDATE tasks
                 SET status = ?1, review_cycles = ?2, check_retries = 0,
+                    executor_dispatches = 0,
                     failure_reason = NULL,
                     claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
                 WHERE id = ?3
@@ -1494,6 +1506,74 @@ pub async fn record_task_review_rejected(
             transaction.commit()?;
             Ok(TaskReviewRejection::Addressing { cycles })
         }
+    })
+    .await?
+}
+
+/// Accounts for one executor dispatch (HQ spawning an executor session) for a
+/// task and enforces the per-work-phase ceiling. Each spawn increments the
+/// counter; a session that exits without advancing the task is respawned and
+/// counted again. When the budget is exhausted the task is moved to Failed so a
+/// task that never reaches review cannot churn forever. The counter is reset at
+/// the start of each work phase (a fresh rejection back to Addressing).
+pub async fn record_executor_dispatch(
+    task_id: &str,
+    max_dispatches: u32,
+) -> Result<ExecutorDispatchOutcome> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<ExecutorDispatchOutcome> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction()?;
+        let dispatches = task_executor_dispatches(&transaction, &task_id)?;
+        // `max_dispatches == 0` disables the guard entirely.
+        if max_dispatches != 0 && dispatches >= max_dispatches {
+            transaction.execute(
+                r#"
+                UPDATE tasks
+                SET status = ?1, failure_reason = ?2,
+                    claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
+                WHERE id = ?3
+                "#,
+                params![
+                    TaskStatus::Failed.as_str(),
+                    format!(
+                        "Executor was dispatched {max_dispatches} times in one work phase \
+                         without reaching review."
+                    ),
+                    task_id
+                ],
+            )?;
+            insert_event_in_transaction(
+                &transaction,
+                None,
+                "task_executor_dispatch_limit_exceeded",
+                &serde_json::json!({
+                    "task_id": task_id,
+                    "executor_dispatches": dispatches,
+                    "max_executor_dispatches": max_dispatches,
+                }),
+            )?;
+            transaction.commit()?;
+            return Ok(ExecutorDispatchOutcome::LimitExceeded { dispatches });
+        }
+        let dispatches = dispatches + 1;
+        transaction.execute(
+            "UPDATE tasks SET executor_dispatches = ?1 WHERE id = ?2",
+            params![dispatches, task_id],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            None,
+            "task_executor_dispatched",
+            &serde_json::json!({
+                "task_id": task_id,
+                "executor_dispatches": dispatches,
+                "max_executor_dispatches": max_dispatches,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(ExecutorDispatchOutcome::Proceed { dispatches })
     })
     .await?
 }
@@ -3309,7 +3389,9 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             awaiting_human_by TEXT,
             awaiting_human_status TEXT,
             human_question_order INTEGER,
-            human_answer_recorded INTEGER NOT NULL DEFAULT 0
+            human_answer_recorded INTEGER NOT NULL DEFAULT 0,
+            -- Appended to match the ensure_column migration order for existing DBs.
+            executor_dispatches INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS runs (
@@ -3358,6 +3440,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         connection,
         "tasks",
         "review_cycles",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "tasks",
+        "executor_dispatches",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(connection, "tasks", "failure_reason", "TEXT")?;
@@ -3581,6 +3669,18 @@ fn task_review_cycles(connection: &Connection, task_id: &str) -> Result<u32> {
         .optional()?
         .unwrap_or(0);
     Ok(cycles as u32)
+}
+
+fn task_executor_dispatches(connection: &Connection, task_id: &str) -> Result<u32> {
+    let dispatches = connection
+        .query_row(
+            "SELECT executor_dispatches FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(dispatches as u32)
 }
 
 struct ReadyTaskCandidate {
@@ -5038,6 +5138,88 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Task rejected 2 times")
         );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn executor_dispatch_budget_fails_task_after_limit() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+
+        for expected in 1..=3 {
+            match record_executor_dispatch("t-001", 3).await.unwrap() {
+                ExecutorDispatchOutcome::Proceed { dispatches } => assert_eq!(dispatches, expected),
+                other => panic!("expected Proceed, got {other:?}"),
+            }
+        }
+
+        // The fourth attempt exhausts the per-phase budget: the task fails and is
+        // not dispatched again.
+        match record_executor_dispatch("t-001", 3).await.unwrap() {
+            ExecutorDispatchOutcome::LimitExceeded { dispatches } => assert_eq!(dispatches, 3),
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
+
+        let tasks = list_tasks().await.unwrap();
+        assert_eq!(tasks[0].status, "failed");
+        assert_eq!(tasks[0].claimed_by, None);
+        assert!(
+            tasks[0]
+                .failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dispatched 3 times")
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn executor_dispatch_budget_resets_on_new_review_cycle() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+
+        for expected in 1..=2 {
+            match record_executor_dispatch("t-001", 6).await.unwrap() {
+                ExecutorDispatchOutcome::Proceed { dispatches } => assert_eq!(dispatches, expected),
+                other => panic!("expected Proceed, got {other:?}"),
+            }
+        }
+
+        // A fresh rejection back to Addressing begins a new work phase, which
+        // restores the full dispatch budget.
+        record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        record_task_review_rejected("t-001", 5).await.unwrap();
+
+        match record_executor_dispatch("t-001", 6).await.unwrap() {
+            ExecutorDispatchOutcome::Proceed { dispatches } => assert_eq!(dispatches, 1),
+            other => panic!("expected dispatch budget reset to 1, got {other:?}"),
+        }
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn executor_dispatch_budget_disabled_when_zero() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+
+        for expected in 1..=10 {
+            match record_executor_dispatch("t-001", 0).await.unwrap() {
+                ExecutorDispatchOutcome::Proceed { dispatches } => assert_eq!(dispatches, expected),
+                other => panic!("expected Proceed with guard disabled, got {other:?}"),
+            }
+        }
+
+        let tasks = list_tasks().await.unwrap();
+        assert_eq!(tasks[0].status, "executing");
 
         teardown(previous);
     }

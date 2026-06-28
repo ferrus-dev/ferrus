@@ -42,6 +42,14 @@ pub struct LimitsConfig {
     /// Maximum number of executor sessions HQ may run at the same time.
     #[serde(default = "default_max_parallel_tasks")]
     pub max_parallel_tasks: usize,
+    /// Maximum number of executor sessions HQ will dispatch for a single task
+    /// within one work phase before giving up and marking it Failed. A session
+    /// that hits its turn limit and exits without submitting is respawned; this
+    /// bounds that respawn loop so a task that never reaches review cannot churn
+    /// forever. The counter resets when a new work phase begins (a fresh
+    /// rejection back to Addressing).
+    #[serde(default = "default_max_executor_dispatches")]
+    pub max_executor_dispatches: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +221,9 @@ const fn default_wait_timeout_secs() -> u64 {
 const fn default_max_parallel_tasks() -> usize {
     1
 }
+const fn default_max_executor_dispatches() -> u32 {
+    6
+}
 const fn default_ttl_secs() -> u64 {
     90
 }
@@ -379,6 +390,7 @@ commands = ["cargo test"]
         assert_eq!(config.limits.max_feedback_lines, 30);
         assert_eq!(config.limits.wait_timeout_secs, 60);
         assert_eq!(config.limits.max_parallel_tasks, 1);
+        assert_eq!(config.limits.max_executor_dispatches, 6);
     }
 
     #[test]
