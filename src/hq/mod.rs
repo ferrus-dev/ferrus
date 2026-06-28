@@ -843,22 +843,21 @@ impl HqContext {
         );
         agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
 
-        // Account for this dispatch only once we are committed to spawning (the
-        // executor is configured and launchable). Bounds the respawn loop of a
-        // session that keeps exiting without reaching review.
+        // Gate the dispatch against the per-work-phase budget before committing
+        // to any setup. This bounds the respawn loop of a session that keeps
+        // exiting without reaching review. The counter itself is incremented
+        // only after the session actually starts (below), so a failed
+        // worktree/process setup does not burn the budget.
         let max_dispatches = Config::load().await?.limits.max_executor_dispatches;
-        match crate::project::record_executor_dispatch(task_id, max_dispatches).await? {
-            crate::project::ExecutorDispatchOutcome::Proceed { dispatches } => {
-                tracing::debug!(task_id, dispatches, max_dispatches, "executor dispatch");
-            }
-            crate::project::ExecutorDispatchOutcome::LimitExceeded { dispatches } => {
-                self.display.error(format!(
-                    "Task {task_id} reached the executor dispatch limit ({dispatches}/{max_dispatches}) \
-                     for this work phase without reaching review.\n\nState is now Failed. Inspect with \
-                     /tasks; adjust limits.max_executor_dispatches or refine the task before retrying."
-                ));
-                return Ok(());
-            }
+        if let crate::project::ExecutorDispatchOutcome::LimitExceeded { dispatches } =
+            crate::project::enforce_executor_dispatch_limit(task_id, max_dispatches).await?
+        {
+            self.display.error(format!(
+                "Task {task_id} reached the executor dispatch limit ({dispatches}/{max_dispatches}) \
+                 for this work phase without reaching review.\n\nState is now Failed. Inspect with \
+                 /tasks; adjust limits.max_executor_dispatches or refine the task before retrying."
+            ));
+            return Ok(());
         }
 
         let workspace = prepare_executor_workspace(task_id).await?;
@@ -883,6 +882,12 @@ impl HqContext {
         )
         .await?;
         self.store_headless_handle(name, handle);
+
+        // The session is now running: account for this dispatch against the
+        // per-work-phase budget gated above. Done last so setup failures don't
+        // consume the budget.
+        let dispatches = crate::project::record_executor_dispatch(task_id).await?;
+        tracing::debug!(task_id, dispatches, max_dispatches, "executor dispatch");
         Ok(())
     }
 
