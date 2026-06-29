@@ -105,15 +105,64 @@ impl ExecutorAgent for Executor {
 }
 
 /// Builds the `--with-extension` command string that attaches the role-scoped
-/// Ferrus MCP server. goose splits this on whitespace, so it carries the same
-/// `ferrus serve --role <role> --agent-name goose` shape used everywhere else.
+/// Ferrus MCP server. goose expects this as one command string, so each component
+/// is shell-quoted before joining.
 fn ferrus_extension_command(role: &str) -> Result<String> {
     let exe = current_exe_string()?;
     let args = serve_args(role, NAME, DEFAULT_AGENT_INDEX);
-    Ok(std::iter::once(exe)
-        .chain(args)
+    Ok(quote_command_components(std::iter::once(exe).chain(args)))
+}
+
+fn quote_command_components(components: impl IntoIterator<Item = String>) -> String {
+    components
+        .into_iter()
+        .map(|component| quote_command_component(&component))
         .collect::<Vec<_>>()
-        .join(" "))
+        .join(" ")
+}
+
+#[cfg(not(windows))]
+fn quote_command_component(component: &str) -> String {
+    if !component.is_empty()
+        && component
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b':' | b'='))
+    {
+        return component.to_string();
+    }
+    format!("'{}'", component.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn quote_command_component(component: &str) -> String {
+    if !component.is_empty()
+        && component.bytes().all(|byte| {
+            matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b':' | b'\\' | b'=')
+        })
+    {
+        return component.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in component.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 fn goose_command(role: &str, mode: AgentRunMode<'_>, model: Option<&str>) -> Result<Command> {
@@ -231,6 +280,40 @@ mod tests {
         let args = args_of(&command);
         let ext_idx = args.iter().position(|a| a == "--with-extension").unwrap();
         assert!(args[ext_idx + 1].ends_with("serve --role supervisor --agent-name goose"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn extension_command_quotes_components_for_posix_shells() {
+        let command = quote_command_components([
+            "/Applications/Ferrus Beta/ferrus".to_string(),
+            "serve".to_string(),
+            "--role".to_string(),
+            "executor".to_string(),
+            "agent's-name".to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            "'/Applications/Ferrus Beta/ferrus' serve --role executor 'agent'\"'\"'s-name'"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extension_command_quotes_components_for_windows_command_lines() {
+        let command = quote_command_components([
+            r"C:\Program Files\Ferrus\ferrus.exe".to_string(),
+            "serve".to_string(),
+            "--role".to_string(),
+            "executor".to_string(),
+            r#"agent"name"#.to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Ferrus\ferrus.exe" serve --role executor "agent\"name""#
+        );
     }
 
     #[test]
