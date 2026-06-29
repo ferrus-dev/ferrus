@@ -347,13 +347,17 @@ pub async fn migrate_current_project() -> Result<ProjectRegistration> {
     tokio::fs::create_dir_all(".ferrus/runs")
         .await
         .context("Failed to create .ferrus/runs")?;
-    copy_legacy_artifacts().await?;
     if let Ok(state) = legacy_state::read_legacy_state(project_path(".ferrus/STATE.json")).await {
         migrate_legacy_project_selection(&state).await?;
         let state_value = state.state();
         if state_value != LegacyTaskState::Idle {
+            copy_legacy_artifacts(true).await?;
             migrate_legacy_active_task(&state).await?;
+        } else {
+            copy_legacy_artifacts(false).await?;
         }
+    } else {
+        copy_legacy_artifacts(false).await?;
     }
     retire_legacy_current_task_row().await?;
     remove_legacy_state_files().await?;
@@ -3915,11 +3919,16 @@ fn column_exists(connection: &Connection, table_name: &str, column_name: &str) -
     Ok(false)
 }
 
-async fn copy_legacy_artifacts() -> Result<()> {
-    copy_if_nonempty(".ferrus/TASK.md", ".ferrus/tasks/t-001.md").await?;
+async fn copy_legacy_artifacts(copy_task: bool) -> Result<()> {
+    if copy_task {
+        copy_if_nonempty(".ferrus/TASK.md", ".ferrus/tasks/t-001.md").await?;
+    }
     tokio::fs::write(".ferrus/TASK.md", crate::templates::TASK_TEMPLATE)
         .await
         .context("Failed to restore .ferrus/TASK.md template")?;
+    if !copy_task {
+        return Ok(());
+    }
     tokio::fs::create_dir_all(".ferrus/runs/t-001")
         .await
         .context("Failed to create .ferrus/runs/t-001")?;
@@ -4535,7 +4544,7 @@ mod tests {
             tokio::fs::write(path, contents).await.unwrap();
         }
 
-        copy_legacy_artifacts().await.unwrap();
+        copy_legacy_artifacts(true).await.unwrap();
 
         assert_eq!(
             tokio::fs::read_to_string(".ferrus/tasks/t-001.md")
@@ -4563,6 +4572,27 @@ mod tests {
             let contents = tokio::fs::read_to_string(path).await.unwrap();
             assert_eq!(contents, expected);
         }
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn migration_does_not_create_phantom_task_artifact_for_idle_state() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        tokio::fs::write(".ferrus/TASK.md", "legacy draft task")
+            .await
+            .unwrap();
+
+        copy_legacy_artifacts(false).await.unwrap();
+
+        assert!(!std::path::Path::new(".ferrus/tasks/t-001.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-001").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(".ferrus/TASK.md").await.unwrap(),
+            crate::templates::TASK_TEMPLATE
+        );
 
         teardown(previous);
     }
