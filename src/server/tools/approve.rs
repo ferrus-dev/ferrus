@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neva::prelude::*;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::info;
 
@@ -40,12 +42,42 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
-    let patch_applied = apply_approved_patch(&context, &project_root).await?;
-    if patch_applied {
-        let integration_checks =
-            run_post_apply_integration_checks(&context, &config, &project_root).await;
-        if let Err(err) = integration_checks {
-            if let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await {
+    {
+        let _approval_lock = acquire_canonical_approval_lock(&context).await?;
+
+        let patch_applied = apply_approved_patch(&context, &project_root).await?;
+        if patch_applied {
+            let integration_checks =
+                run_post_apply_integration_checks(&context, &config, &project_root).await;
+            if let Err(err) = integration_checks {
+                if let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await {
+                    anyhow::bail!(
+                        "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+                    );
+                }
+                return Err(err);
+            }
+        }
+        let transition = async {
+            if let (Some(spec_path), Some(milestone_id)) = (
+                context.spec_path.as_deref(),
+                context.milestone_id.as_deref(),
+            ) {
+                let spec_path = canonical_approval_path(&project_root, spec_path);
+                specs::complete_milestone(&spec_path.to_string_lossy(), milestone_id).await?;
+            }
+            project::record_task_status(
+                &context.task_id,
+                &context.task_path,
+                project::TaskStatus::Complete,
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = transition {
+            if patch_applied
+                && let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await
+            {
                 anyhow::bail!(
                     "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
                 );
@@ -53,32 +85,7 @@ async fn run(agent_id: &str) -> Result<String> {
             return Err(err);
         }
     }
-    let transition = async {
-        if let (Some(spec_path), Some(milestone_id)) = (
-            context.spec_path.as_deref(),
-            context.milestone_id.as_deref(),
-        ) {
-            let spec_path = canonical_approval_path(&project_root, spec_path);
-            specs::complete_milestone(&spec_path.to_string_lossy(), milestone_id).await?;
-        }
-        project::record_task_status(
-            &context.task_id,
-            &context.task_path,
-            project::TaskStatus::Complete,
-        )
-        .await
-    }
-    .await;
-    if let Err(err) = transition {
-        if patch_applied
-            && let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await
-        {
-            anyhow::bail!(
-                "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
-            );
-        }
-        return Err(err);
-    }
+
     cleanup_approved_workspace_best_effort(&context, &project_root).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),
@@ -227,6 +234,125 @@ async fn write_integration_error(context: &RuntimeTaskContext, reason: &str) -> 
     store::write_integration_error_for_run_dir(&context.run_dir, &content).await
 }
 
+struct CanonicalApprovalLock {
+    path: PathBuf,
+}
+
+impl Drop for CanonicalApprovalLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn acquire_canonical_approval_lock(
+    context: &RuntimeTaskContext,
+) -> Result<CanonicalApprovalLock> {
+    let local_ref_content =
+        tokio::fs::read_to_string(store::resolve_project_path(".ferrus/project.toml")).await?;
+    let local_ref: project::LocalProjectRef = toml::from_str(&local_ref_content)?;
+    let lock_path = PathBuf::from(local_ref.data_dir).join("canonical-approval.lock");
+    acquire_canonical_approval_lock_at(&lock_path, &context.task_id).await
+}
+
+async fn acquire_canonical_approval_lock_at(
+    lock_path: &Path,
+    task_id: &str,
+) -> Result<CanonicalApprovalLock> {
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    loop {
+        match try_create_canonical_approval_lock(lock_path, task_id).await {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {
+                if remove_stale_canonical_approval_lock(lock_path).await? {
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn try_create_canonical_approval_lock(
+    lock_path: &Path,
+    task_id: &str,
+) -> Result<Option<CanonicalApprovalLock>> {
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+        .await
+    {
+        Ok(mut file) => {
+            let content = format!("pid={}\ntask_id={task_id}\n", std::process::id());
+            if let Err(err) = file.write_all(content.as_bytes()).await {
+                let _ = tokio::fs::remove_file(lock_path).await;
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to write canonical approval lock {}",
+                        lock_path.display()
+                    )
+                });
+            }
+            Ok(Some(CanonicalApprovalLock {
+                path: lock_path.to_path_buf(),
+            }))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to create canonical approval lock {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
+async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> {
+    let contents = match tokio::fs::read_to_string(lock_path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to read canonical approval lock {}",
+                    lock_path.display()
+                )
+            });
+        }
+    };
+
+    let Some(pid) = canonical_approval_lock_pid(&contents) else {
+        return Ok(false);
+    };
+    if crate::platform::pid_is_alive(pid) {
+        return Ok(false);
+    }
+
+    match tokio::fs::remove_file(lock_path).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to remove stale canonical approval lock {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
+fn canonical_approval_lock_pid(contents: &str) -> Option<u32> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.parse().ok())
+    })
+}
+
 async fn cleanup_approved_workspace_best_effort(context: &RuntimeTaskContext, project_root: &Path) {
     if let Err(err) = cleanup_approved_workspace(context, project_root).await {
         tracing::warn!(
@@ -350,6 +476,42 @@ mod tests {
 
     fn teardown(previous: std::path::PathBuf) {
         std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_lock_is_released_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("canonical-approval.lock");
+
+        let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+            .await
+            .unwrap();
+
+        assert!(lock_path.exists());
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert_eq!(
+            canonical_approval_lock_pid(&contents),
+            Some(std::process::id())
+        );
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_lock_replaces_dead_owner() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("canonical-approval.lock");
+        tokio::fs::write(&lock_path, "pid=2147483647\ntask_id=t-old\n")
+            .await
+            .unwrap();
+
+        let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+            .await
+            .unwrap();
+
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert!(contents.contains("task_id=t-007"));
+        drop(lock);
     }
 
     #[tokio::test]
