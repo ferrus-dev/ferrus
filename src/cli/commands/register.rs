@@ -178,7 +178,7 @@ fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>)
                         "{role} MCP config is not registered for {agent}; run `ferrus register --{role} {agent}`"
                     )
                 } else {
-                    format!("{role} MCP config is launchable for {agent} ({err})")
+                    format!("{role} MCP config is not launchable for {agent} ({err})")
                 },
             }
         }

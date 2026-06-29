@@ -47,8 +47,25 @@ async fn run(agent_id: &str) -> Result<String> {
 
         let patch_applied = apply_approved_patch(&context, &project_root).await?;
         if patch_applied {
+            // The approved patch may have changed ferrus.toml, so run the integration
+            // gate against the configuration as it exists in the post-apply repository
+            // state rather than the config loaded before the patch was applied.
+            let post_apply_config = match Config::load_from(&project_root).await {
+                Ok(config) => config,
+                Err(err) => {
+                    if let Err(rollback_err) =
+                        rollback_approved_patch(&context, &project_root).await
+                    {
+                        anyhow::bail!(
+                            "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+                        );
+                    }
+                    return Err(err);
+                }
+            };
             let integration_checks =
-                run_post_apply_integration_checks(&context, &config, &project_root).await;
+                run_post_apply_integration_checks(&context, &post_apply_config, &project_root)
+                    .await;
             if let Err(err) = integration_checks {
                 if let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await {
                     anyhow::bail!(
