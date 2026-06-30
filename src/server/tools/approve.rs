@@ -299,34 +299,64 @@ async fn try_create_canonical_approval_lock(
     lock_path: &Path,
     task_id: &str,
 ) -> Result<Option<CanonicalApprovalLock>> {
-    match std::fs::OpenOptions::new()
+    let temp_path = canonical_approval_lock_temp_path(lock_path, task_id);
+    let content = format!("pid={}\ntask_id={task_id}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(lock_path)
-    {
-        Ok(mut file) => {
-            let content = format!("pid={}\ntask_id={task_id}\n", std::process::id());
-            if let Err(err) = file.write_all(content.as_bytes()) {
-                let _ = tokio::fs::remove_file(lock_path).await;
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to write canonical approval lock {}",
-                        lock_path.display()
-                    )
-                });
-            }
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "Failed to create temporary canonical approval lock {}",
+                temp_path.display()
+            )
+        })?;
+    if let Err(err) = file.write_all(content.as_bytes()) {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(err).with_context(|| {
+            format!(
+                "Failed to write temporary canonical approval lock {}",
+                temp_path.display()
+            )
+        });
+    }
+    drop(file);
+
+    match std::fs::hard_link(&temp_path, lock_path) {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
             Ok(Some(CanonicalApprovalLock {
                 path: lock_path.to_path_buf(),
             }))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "Failed to create canonical approval lock {}",
-                lock_path.display()
-            )
-        }),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            Ok(None)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            Err(err).with_context(|| {
+                format!(
+                    "Failed to publish canonical approval lock {}",
+                    lock_path.display()
+                )
+            })
+        }
     }
+}
+
+fn canonical_approval_lock_temp_path(lock_path: &Path, task_id: &str) -> PathBuf {
+    let task_id = task_id.replace(std::path::MAIN_SEPARATOR, "_");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    lock_path.with_file_name(format!(
+        ".canonical-approval.lock.{}.{}.{}.tmp",
+        std::process::id(),
+        task_id,
+        nonce
+    ))
 }
 
 async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> {
@@ -559,6 +589,36 @@ mod tests {
             Some(std::process::id())
         );
         assert!(contents.contains("task_id=t-007"));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_lock_contention_preserves_existing_lock() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("canonical-approval.lock");
+        let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+            .await
+            .unwrap();
+
+        let acquired = try_create_canonical_approval_lock(&lock_path, "t-008")
+            .await
+            .unwrap();
+
+        assert!(acquired.is_none());
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert!(contents.contains("task_id=t-007"));
+        assert!(!contents.contains("task_id=t-008"));
+        let temp_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".canonical-approval.lock.")
+            })
+            .count();
+        assert_eq!(temp_files, 0);
         drop(lock);
     }
 
