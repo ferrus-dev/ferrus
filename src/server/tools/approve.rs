@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use neva::prelude::*;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::info;
 
@@ -299,15 +299,14 @@ async fn try_create_canonical_approval_lock(
     lock_path: &Path,
     task_id: &str,
 ) -> Result<Option<CanonicalApprovalLock>> {
-    match tokio::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock_path)
-        .await
     {
         Ok(mut file) => {
             let content = format!("pid={}\ntask_id={task_id}\n", std::process::id());
-            if let Err(err) = file.write_all(content.as_bytes()).await {
+            if let Err(err) = file.write_all(content.as_bytes()) {
                 let _ = tokio::fs::remove_file(lock_path).await;
                 return Err(err).with_context(|| {
                     format!(
@@ -345,7 +344,18 @@ async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> 
     };
 
     let Some(pid) = canonical_approval_lock_pid(&contents) else {
-        return Ok(false);
+        match tokio::fs::remove_file(lock_path).await {
+            Ok(()) => return Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to remove malformed canonical approval lock {}",
+                        lock_path.display()
+                    )
+                });
+            }
+        }
     };
     if crate::platform::pid_is_alive(pid) {
         return Ok(false);
@@ -527,6 +537,27 @@ mod tests {
             .unwrap();
 
         let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert!(contents.contains("task_id=t-007"));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn canonical_approval_lock_replaces_malformed_owner() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("canonical-approval.lock");
+        tokio::fs::write(&lock_path, "task_id=t-old\n")
+            .await
+            .unwrap();
+
+        let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+            .await
+            .unwrap();
+
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert_eq!(
+            canonical_approval_lock_pid(&contents),
+            Some(std::process::id())
+        );
         assert!(contents.contains("task_id=t-007"));
         drop(lock);
     }
