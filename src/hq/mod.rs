@@ -1618,7 +1618,7 @@ impl HqContext {
             return Ok(0);
         }
 
-        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let live_run_agents = crate::project::live_active_run_agents().await?;
         let executor_max_parallel = executor_parallel_limit(max_parallel).await?;
         let mut executor_slots =
             executor_max_parallel.saturating_sub(self.occupied_executor_slots().await?);
@@ -1626,12 +1626,13 @@ impl HqContext {
         let mut spawned = 0usize;
 
         for waiter in waiters {
-            if live_run_task_ids.contains(&waiter.task_id)
-                || self
-                    .headless
+            if answered_human_owner_is_live(
+                &waiter.awaiting_human_by,
+                &live_run_agents,
+                self.headless
                     .get(&waiter.awaiting_human_by)
-                    .is_some_and(agent_manager::HeadlessHandle::is_alive)
-            {
+                    .is_some_and(agent_manager::HeadlessHandle::is_alive),
+            ) {
                 continue;
             }
 
@@ -2805,6 +2806,14 @@ fn task_id_from_scoped_agent_name(name: &str) -> Option<&str> {
     (role == ROLE_EXECUTOR && task_id.starts_with("t-")).then_some(task_id)
 }
 
+fn answered_human_owner_is_live(
+    owner: &str,
+    live_run_agents: &HashSet<String>,
+    live_headless_owner: bool,
+) -> bool {
+    live_headless_owner || live_run_agents.contains(owner)
+}
+
 fn task_claim_blocks_spawn(
     task: &TaskRecord,
     expected_agent_id: &str,
@@ -3938,6 +3947,27 @@ mod tests {
             task_id_from_scoped_agent_name("supervisor:codex:t-004"),
             None
         );
+    }
+
+    #[test]
+    fn answered_human_resume_only_blocks_live_question_owner() {
+        let live_run_agents = HashSet::from(["executor:codex:t-001".to_string()]);
+
+        assert!(!answered_human_owner_is_live(
+            "supervisor:codex:t-001",
+            &live_run_agents,
+            false,
+        ));
+        assert!(answered_human_owner_is_live(
+            "executor:codex:t-001",
+            &live_run_agents,
+            false,
+        ));
+        assert!(answered_human_owner_is_live(
+            "supervisor:codex:t-001",
+            &HashSet::new(),
+            true,
+        ));
     }
 
     #[test]

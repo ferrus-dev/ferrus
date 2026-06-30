@@ -4293,6 +4293,28 @@ pub async fn live_active_run_task_ids_for_role(
     .await?
 }
 
+pub async fn live_active_run_agents() -> Result<std::collections::HashSet<String>> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut statement = connection.prepare(
+            "SELECT agent, pid FROM runs WHERE status IN ('running', 'checking', 'reviewing')",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        let mut agents = std::collections::HashSet::new();
+        for row in rows {
+            let (agent, pid) = row?;
+            if pid.is_some_and(|pid| process_is_alive(pid as u32)) {
+                agents.insert(agent);
+            }
+        }
+        Ok(agents)
+    })
+    .await?
+}
+
 fn live_active_run_task_ids_from_database(
     connection: &Connection,
 ) -> Result<std::collections::HashSet<String>> {
@@ -5530,10 +5552,18 @@ mod tests {
         let supervisor_tasks = live_active_run_task_ids_for_role("supervisor")
             .await
             .unwrap();
+        let live_agents = live_active_run_agents().await.unwrap();
 
         assert_eq!(
             supervisor_tasks,
             std::collections::HashSet::from(["t-002".to_string()])
+        );
+        assert_eq!(
+            live_agents,
+            std::collections::HashSet::from([
+                "executor:codex:t-001".to_string(),
+                "supervisor:codex:t-002".to_string()
+            ])
         );
         teardown(previous);
     }
