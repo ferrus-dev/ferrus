@@ -11,6 +11,7 @@ use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR, legacy_mcp_server_name, mc
 use anyhow::Result;
 #[cfg(windows)]
 use anyhow::anyhow;
+use std::collections::BTreeSet;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::process::Command;
@@ -158,15 +159,14 @@ fn codex_version_command() -> Result<Command> {
     Ok(cmd)
 }
 
-fn apply_opposite_role_mcp_override(command: &mut Command, role: &str, index: u32) {
+fn apply_opposite_role_mcp_override(command: &mut Command, role: &str, _index: u32) {
     let config_paths = codex_config_paths();
-    apply_opposite_role_mcp_override_with_paths(command, role, index, &config_paths);
+    apply_opposite_role_mcp_override_with_paths(command, role, &config_paths);
 }
 
 fn apply_opposite_role_mcp_override_with_paths(
     command: &mut Command,
     role: &str,
-    index: u32,
     config_paths: &[std::path::PathBuf],
 ) {
     let opposite_role = match role {
@@ -175,13 +175,14 @@ fn apply_opposite_role_mcp_override_with_paths(
         _ => return,
     };
     let opposite_server = mcp_server_name(opposite_role);
-    let legacy_opposite_server = legacy_mcp_server_name(opposite_role, index);
     if codex_mcp_server_configured_in_paths(&opposite_server, config_paths) {
         command
             .arg("--config")
             .arg(format!("mcp_servers.{opposite_server}.enabled=false"));
     }
-    if codex_mcp_server_configured_in_paths(&legacy_opposite_server, config_paths) {
+    for legacy_opposite_server in
+        codex_legacy_mcp_servers_configured_in_paths(opposite_role, config_paths)
+    {
         command.arg("--config").arg(format!(
             "mcp_servers.{legacy_opposite_server}.enabled=false"
         ));
@@ -192,6 +193,41 @@ fn codex_mcp_server_configured_in_paths(server: &str, paths: &[std::path::PathBu
     paths
         .iter()
         .any(|path| toml_config_has_mcp_server(path, server))
+}
+
+fn codex_legacy_mcp_servers_configured_in_paths(
+    role: &str,
+    paths: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut servers = BTreeSet::new();
+    for path in paths {
+        servers.extend(toml_config_legacy_mcp_servers_for_role(path, role));
+    }
+    servers.into_iter().collect()
+}
+
+fn toml_config_legacy_mcp_servers_for_role(path: &std::path::Path, role: &str) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = content.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(servers) = root.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    servers
+        .keys()
+        .filter(|server| is_legacy_mcp_server_for_role(server, role))
+        .cloned()
+        .collect()
+}
+
+fn is_legacy_mcp_server_for_role(server: &str, role: &str) -> bool {
+    let prefix = format!("ferrus-{role}-");
+    server
+        .strip_prefix(&prefix)
+        .is_some_and(|index| !index.is_empty() && index.parse::<u32>().is_ok())
 }
 
 fn codex_config_paths() -> Vec<std::path::PathBuf> {
@@ -389,7 +425,6 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_id::DEFAULT_AGENT_INDEX;
     #[cfg(not(windows))]
     use crate::agents::tests::assert_program_and_args;
     #[cfg(windows)]
@@ -539,7 +574,6 @@ mod tests {
         apply_opposite_role_mcp_override_with_paths(
             &mut command,
             ROLE_EXECUTOR,
-            DEFAULT_AGENT_INDEX,
             &[dir.path().join("config.toml")],
         );
         let args = command_args(&command);
@@ -556,12 +590,7 @@ mod tests {
         )
         .unwrap();
         let mut command = Command::new("codex");
-        apply_opposite_role_mcp_override_with_paths(
-            &mut command,
-            ROLE_EXECUTOR,
-            DEFAULT_AGENT_INDEX,
-            &[config_path],
-        );
+        apply_opposite_role_mcp_override_with_paths(&mut command, ROLE_EXECUTOR, &[config_path]);
         let args = command_args(&command);
         assert!(
             args.iter()
@@ -573,6 +602,46 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "mcp_servers.ferrus-supervisor-1.enabled=false"),
             "missing legacy opposite role should not be synthesized in {args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_disables_all_configured_legacy_opposite_role_servers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.ferrus-supervisor-1]
+command = "ferrus"
+args = []
+
+[mcp_servers.ferrus-supervisor-3]
+command = "ferrus"
+args = []
+
+[mcp_servers.ferrus-executor-1]
+command = "ferrus"
+args = []
+"#,
+        )
+        .unwrap();
+        let mut command = Command::new("codex");
+        apply_opposite_role_mcp_override_with_paths(&mut command, ROLE_EXECUTOR, &[config_path]);
+        let args = command_args(&command);
+
+        for server in ["ferrus-supervisor-1", "ferrus-supervisor-3"] {
+            assert!(
+                args.iter()
+                    .any(|arg| arg == &format!("mcp_servers.{server}.enabled=false")),
+                "expected configured legacy opposite role server {server} to be disabled in {args:?}"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "mcp_servers.ferrus-executor-1.enabled=false"),
+            "same-role legacy server should stay enabled in {args:?}"
         );
     }
 
