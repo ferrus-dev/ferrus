@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::state::agents::{AgentStatus, AgentsRegistry};
 
 use super::{
-    state_watcher::{TransitionSnapshot, WatchedState, format_elapsed},
+    state_watcher::WatchedState,
     tui::{StatusSnapshot, UiMessage},
 };
 
@@ -13,6 +13,17 @@ pub struct Display(pub mpsc::UnboundedSender<UiMessage>);
 impl Display {
     pub fn info(&self, msg: impl Into<String>) {
         let _ = self.0.send(UiMessage::Info(msg.into()));
+    }
+
+    pub fn success(&self, msg: impl Into<String>) {
+        let _ = self.0.send(UiMessage::Success(msg.into()));
+    }
+
+    pub fn info_block(&self, lines: impl IntoIterator<Item = String>) {
+        let text = lines.into_iter().collect::<Vec<_>>().join("\n");
+        if !text.is_empty() {
+            self.info(text);
+        }
     }
 
     pub fn tip(&self, msg: impl Into<String>) {
@@ -27,11 +38,6 @@ impl Display {
         let _ = self.0.send(UiMessage::Error(msg.into()));
     }
 
-    pub fn transition(&self, transition: &TransitionSnapshot) {
-        let (from, to) = format_transition_parts(transition);
-        let _ = self.0.send(UiMessage::Transition { from, to });
-    }
-
     pub fn status(&self, watched: &WatchedState, agents: &AgentsRegistry) {
         let mut snapshot = StatusSnapshot::from_watched_state(watched);
         snapshot.supervisor_status =
@@ -40,25 +46,12 @@ impl Display {
             agent_status_label(agents, crate::agent_id::ROLE_EXECUTOR).to_string();
         let _ = self.0.send(UiMessage::StatusUpdate(snapshot));
 
-        let state = &watched.state;
-        self.info(format!("state      : {:?}", state.state));
-        if let Some(by) = &state.claimed_by {
-            self.info(format!("claimed_by : {by}"));
-        }
-        if state.check_retries > 0 {
-            self.info(format!("retries    : {}", state.check_retries));
-        }
-        if state.review_cycles > 0 {
-            self.info(format!("cycles     : {}", state.review_cycles));
-        }
-        if let Some(spec) = &state.selected_spec {
-            self.info(format!("spec       : {spec}"));
-        }
-        if let Some(milestone) = &state.selected_milestone {
-            self.info(format!("milestone  : {milestone}"));
+        let mut lines = Vec::new();
+        if let Some(spec) = &watched.selected_spec_display {
+            lines.push(format!("spec       : {spec}"));
         }
         if agents.agents.is_empty() {
-            self.info("agents     : none");
+            lines.push("agents     : none".to_string());
         } else {
             for agent in &agents.agents {
                 let status = match agent.status {
@@ -70,9 +63,10 @@ impl Display {
                     .pid
                     .map(|pid| format!(" pid={pid}"))
                     .unwrap_or_default();
-                self.info(format!("  [{:<10}] {:<10}{}", agent.role, status, pid));
+                lines.push(format!("  [{:<10}] {:<10}{}", agent.role, status, pid));
             }
         }
+        self.info_block(lines);
     }
 
     pub fn suspend(&self) -> oneshot::Receiver<()> {
@@ -141,85 +135,82 @@ fn agent_status_label<'a>(agents: &'a AgentsRegistry, role: &str) -> &'a str {
     }
 }
 
-fn format_transition_parts(transition: &TransitionSnapshot) -> (Option<String>, String) {
-    let hide_elapsed = transition.from == crate::state::machine::TaskState::Idle
-        || transition.to == crate::state::machine::TaskState::Complete;
-
-    let from = if transition.used_total {
-        None
-    } else if hide_elapsed {
-        Some(format!("{:?}", transition.from))
-    } else {
-        Some(format!(
-            "{:?} ({})",
-            transition.from,
-            format_elapsed(transition.elapsed)
-        ))
-    };
-
-    let to = if transition.used_total && !hide_elapsed {
-        format!(
-            "{:?} ({})",
-            transition.to,
-            format_elapsed(transition.elapsed)
-        )
-    } else {
-        format!("{:?}", transition.to)
-    };
-
-    (from, to)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use tokio::sync::mpsc;
 
-    use crate::state::machine::TaskState;
+    use crate::{
+        agent_id::ROLE_SUPERVISOR,
+        hq::{state_watcher::WatchedState, tui::UiMessage},
+        state::agents::{AgentEntry, AgentStatus, AgentsRegistry},
+    };
 
-    use super::{TransitionSnapshot, format_transition_parts};
+    use super::Display;
 
     #[test]
-    fn hides_elapsed_when_transition_starts_from_idle() {
-        let transition = TransitionSnapshot {
-            from: TaskState::Idle,
-            to: TaskState::Executing,
-            elapsed: Duration::from_secs(84),
-            used_total: false,
-        };
+    fn info_block_sends_one_multiline_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
 
-        let (from, to) = format_transition_parts(&transition);
+        display.info_block(vec!["first".to_string(), "second".to_string()]);
 
-        assert_eq!(from, Some("Idle".to_string()));
-        assert_eq!(to, "Executing");
+        let msg = rx.try_recv().expect("message should be sent");
+        match msg {
+            UiMessage::Info(text) => assert_eq!(text, "first\nsecond"),
+            _ => panic!("expected info message"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn hides_elapsed_when_transition_ends_at_complete() {
-        let transition = TransitionSnapshot {
-            from: TaskState::Reviewing,
-            to: TaskState::Complete,
-            elapsed: Duration::from_secs(84),
-            used_total: true,
-        };
+    fn success_sends_success_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
 
-        let (from, to) = format_transition_parts(&transition);
+        display.success("Task t-001 completed.");
 
-        assert_eq!(from, None);
-        assert_eq!(to, "Complete");
+        let msg = rx.try_recv().expect("message should be sent");
+        match msg {
+            UiMessage::Success(text) => assert_eq!(text, "Task t-001 completed."),
+            _ => panic!("expected success message"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn keeps_elapsed_for_other_transitions() {
-        let transition = TransitionSnapshot {
-            from: TaskState::Executing,
-            to: TaskState::Addressing,
-            elapsed: Duration::from_secs(84),
-            used_total: false,
+    fn status_sends_details_as_one_transcript_block() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
+        let watched = WatchedState {
+            selected_spec_display: Some("spec".into()),
+            selected_milestones: Vec::new(),
+        };
+        let agents = AgentsRegistry {
+            agents: vec![AgentEntry {
+                role: ROLE_SUPERVISOR.into(),
+                agent_type: "codex".into(),
+                name: "supervisor".into(),
+                pid: None,
+                status: AgentStatus::Suspended,
+                started_at: None,
+            }],
         };
 
-        let (from, to) = format_transition_parts(&transition);
+        display.status(&watched, &agents);
 
-        assert_eq!(from, Some("Executing (1m 24s)".to_string()));
-        assert_eq!(to, "Addressing");
+        assert!(matches!(
+            rx.try_recv().expect("status update should be sent"),
+            UiMessage::StatusUpdate(_)
+        ));
+        let msg = rx.try_recv().expect("status details should be sent");
+        match msg {
+            UiMessage::Info(text) => {
+                assert!(text.contains("spec       : spec\n"));
+                assert!(!text.contains("milestone  :"));
+                assert!(text.contains("  [supervisor] suspended"));
+            }
+            _ => panic!("expected info message"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 }

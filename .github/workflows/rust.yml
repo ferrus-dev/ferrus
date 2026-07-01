@@ -77,17 +77,59 @@ jobs:
           repo_root="$PWD"
           bin_path="$repo_root/target/debug/$BIN_NAME"
           tmpdir="$(mktemp -d)"
+          home_dir="$(mktemp -d)"
+          home_native="$home_dir"
+          if command -v cygpath >/dev/null 2>&1; then
+            home_native="$(cygpath -w "$home_dir")"
+          fi
+          export HOME="$home_dir"
+          export USERPROFILE="$home_native"
 
           "$bin_path" --version
 
           (
             cd "$tmpdir"
             "$bin_path" init
+            "$bin_path" doctor
           )
 
           test -f "$tmpdir/ferrus.toml"
-          test -f "$tmpdir/.ferrus/STATE.json"
-          test -f "$tmpdir/.ferrus/STATE.lock"
+          test -f "$tmpdir/.ferrus/project.toml"
+          test ! -f "$tmpdir/.ferrus/STATE.json"
+          test ! -f "$tmpdir/.ferrus/STATE.lock"
           test -f "$tmpdir/.ferrus/agents.json"
           test -f "$tmpdir/.ferrus/CONSULT_TEMPLATE.md"
+          test -f "$tmpdir/.ferrus/TASK.md"
+          test -d "$tmpdir/.ferrus/tasks"
+          test -d "$tmpdir/.ferrus/runs"
           test -d "$tmpdir/.agents/skills/ferrus"
+
+          project_id="$(awk -F ' = ' '$1 == "project_id" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
+          data_dir="$(awk -F ' = ' '$1 == "data_dir" { gsub(/^"|"$/, "", $2); print $2; exit }' "$tmpdir/.ferrus/project.toml")"
+          sq="'"
+          project_id="${project_id#$sq}"
+          project_id="${project_id%$sq}"
+          data_dir="${data_dir#$sq}"
+          data_dir="${data_dir%$sq}"
+          data_dir="${data_dir//\\\\/\\}"
+          if [ -z "$project_id" ]; then
+            echo "failed to read project_id from .ferrus/project.toml"
+            cat "$tmpdir/.ferrus/project.toml"
+            exit 1
+          fi
+          if [ -z "$data_dir" ]; then
+            echo "failed to read data_dir from .ferrus/project.toml"
+            cat "$tmpdir/.ferrus/project.toml"
+            exit 1
+          fi
+          if command -v cygpath >/dev/null 2>&1; then
+            data_dir="$(cygpath -u "$data_dir")"
+          fi
+          test -f "$data_dir/project.toml" || {
+            echo "missing project metadata at $data_dir/project.toml"
+            exit 1
+          }
+          test -f "$data_dir/ferrus.db" || {
+            echo "missing database at $data_dir/ferrus.db"
+            exit 1
+          }

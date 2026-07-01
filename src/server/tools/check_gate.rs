@@ -19,8 +19,29 @@ pub(super) struct CheckFailure {
     pub report: String,
 }
 
-pub(super) async fn run(config: &Config, attempt: u32) -> Result<CheckGateResult> {
-    let result = runner::run_checks(&config.checks.commands).await?;
+pub(super) async fn run(config: &Config, attempt: u32, log_scope: &str) -> Result<CheckGateResult> {
+    run_with_cwd(config, attempt, log_scope, None).await
+}
+
+pub(super) async fn run_in(
+    config: &Config,
+    attempt: u32,
+    log_scope: &str,
+    cwd: &Path,
+) -> Result<CheckGateResult> {
+    run_with_cwd(config, attempt, log_scope, Some(cwd)).await
+}
+
+async fn run_with_cwd(
+    config: &Config,
+    attempt: u32,
+    log_scope: &str,
+    cwd: Option<&Path>,
+) -> Result<CheckGateResult> {
+    let result = match cwd {
+        Some(cwd) => runner::run_checks_in(&config.checks.commands, cwd).await?,
+        None => runner::run_checks(&config.checks.commands).await?,
+    };
     if result.passed {
         return Ok(CheckGateResult::Passed);
     }
@@ -30,7 +51,7 @@ pub(super) async fn run(config: &Config, attempt: u32) -> Result<CheckGateResult
         .unwrap_or_default()
         .as_secs();
     let log_content = build_full_log(&result.commands);
-    let log_path = store::write_check_log(attempt, ts, &log_content).await?;
+    let log_path = store::write_check_log(attempt, ts, log_scope, &log_content).await?;
 
     let failed_commands: Vec<&str> = result
         .commands

@@ -225,6 +225,9 @@ warn_existing_install() {
 
 install_binary() {
     mkdir -p "$INSTALL_DIR"
+    if [ -n "${HOME:-}" ]; then
+        mkdir -p "${HOME}/.ferrus/projects"
+    fi
     tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
 
     BIN_PATH="$TMP_DIR/ferrus-${TARGET}/ferrus"

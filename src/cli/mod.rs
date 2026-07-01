@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::server::Role;
+use crate::{agent_id::DEFAULT_AGENT_INDEX, server::Role};
 
 pub mod commands;
 
@@ -37,7 +37,7 @@ enum Commands {
         #[arg(long, default_value = "unknown")]
         agent_name: String,
         /// Index disambiguating multiple agents of the same role and name (e.g. 1, 2)
-        #[arg(long, default_value_t = 0u32)]
+        #[arg(long, default_value_t = DEFAULT_AGENT_INDEX)]
         agent_index: u32,
     },
     /// Write MCP config files so agents can launch ferrus automatically
@@ -54,6 +54,40 @@ enum Commands {
         /// Optional model override to store for the Executor
         #[arg(long, value_name = "MODEL")]
         executor_model: Option<String>,
+    },
+    /// Check that local and global ferrus project metadata are consistent
+    Doctor,
+    /// Migrate an existing ferrus project to the global project registry
+    #[command(visible_alias = "upgrade")]
+    Migrate,
+    /// Recover ferrus.db runtime state after crashes or stale leases
+    Recover {
+        /// Show pending recovery work without mutating ferrus.db
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove managed task worktrees that no active task or active run still owns
+        #[arg(long)]
+        worktrees: bool,
+    },
+    /// Inspect globally registered ferrus projects
+    Projects {
+        #[command(subcommand)]
+        command: commands::projects::ProjectsCommand,
+    },
+    /// Inspect task runtime records from ferrus.db
+    Tasks {
+        #[command(subcommand)]
+        command: commands::tasks::TasksCommand,
+    },
+    /// Inspect run attempt records from ferrus.db
+    Runs {
+        #[command(subcommand)]
+        command: commands::runs::RunsCommand,
+    },
+    /// Inspect runtime event records from ferrus.db
+    Events {
+        #[command(subcommand)]
+        command: commands::events::EventsCommand,
     },
 }
 
@@ -86,6 +120,15 @@ impl Cli {
                 commands::register::run(supervisor, supervisor_model, executor, executor_model)
                     .await
             }
+            Some(Commands::Doctor) => commands::doctor::run().await,
+            Some(Commands::Migrate) => commands::migrate::run().await,
+            Some(Commands::Recover { dry_run, worktrees }) => {
+                commands::recover::run(dry_run, worktrees).await
+            }
+            Some(Commands::Projects { command }) => commands::projects::run(command).await,
+            Some(Commands::Tasks { command }) => commands::tasks::run(command).await,
+            Some(Commands::Runs { command }) => commands::runs::run(command).await,
+            Some(Commands::Events { command }) => commands::events::run(command).await,
             None => crate::hq::run(debug).await,
         }
     }

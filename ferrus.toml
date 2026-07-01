@@ -14,6 +14,9 @@ wait_timeout_secs = 60 # max duration of a single wait_* tool call before it ret
 [agents]
 path = ".agents" # root directory for agent skill files
 
+[agents.claude]
+mcp_isolation = "merge-user"
+
 [lease]
 ttl_secs = 90              # how long a claimed lease is valid without renewal
 heartbeat_interval_secs = 30 # how often agents should call /heartbeat

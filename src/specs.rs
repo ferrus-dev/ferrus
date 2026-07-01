@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
-use crate::{config::Config, state::machine::StateData};
+use crate::{config::Config, project::ProjectSelection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Milestone {
@@ -24,7 +27,38 @@ impl Milestone {
 pub struct SpecDocument {
     pub path: String,
     pub milestones: Vec<Milestone>,
+    #[allow(dead_code)]
     lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MilestoneReadiness {
+    Ready,
+    Pending,
+    Done,
+}
+
+impl MilestoneReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Pending => "pending",
+            Self::Done => "done",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MilestonePlanItem {
+    pub milestone: Milestone,
+    pub readiness: MilestoneReadiness,
+    pub blocked_by: Vec<String>,
+}
+
+impl SpecDocument {
+    pub fn milestone_plan(&self) -> Vec<MilestonePlanItem> {
+        milestone_plan(&self.milestones)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,14 +66,6 @@ pub struct SelectedMilestone {
     pub spec_path: String,
     pub spec_display: String,
     pub milestone: Milestone,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SelectedMilestoneState {
-    MissingSelection,
-    SpecMissing(String),
-    MilestoneMissing(String),
-    Found(SelectedMilestone),
 }
 
 pub async fn list_spec_paths() -> Result<Vec<String>> {
@@ -121,68 +147,65 @@ pub fn parse_spec(path: &str, content: &str) -> SpecDocument {
     }
 }
 
-pub async fn select_first_incomplete(state: &mut StateData, spec_path: &str) -> Result<()> {
+pub fn milestone_plan(milestones: &[Milestone]) -> Vec<MilestonePlanItem> {
+    let completed_refs = milestones
+        .iter()
+        .filter(|milestone| milestone.completed)
+        .flat_map(milestone_refs)
+        .collect::<HashSet<_>>();
+
+    milestones
+        .iter()
+        .cloned()
+        .map(|milestone| {
+            if milestone.completed {
+                return MilestonePlanItem {
+                    milestone,
+                    readiness: MilestoneReadiness::Done,
+                    blocked_by: Vec::new(),
+                };
+            }
+
+            let blocked_by = dependency_refs(&milestone.depends_on)
+                .into_iter()
+                .filter(|dependency| !completed_refs.contains(&normalize_ref(dependency)))
+                .collect::<Vec<_>>();
+            let readiness = if blocked_by.is_empty() {
+                MilestoneReadiness::Ready
+            } else {
+                MilestoneReadiness::Pending
+            };
+
+            MilestonePlanItem {
+                milestone,
+                readiness,
+                blocked_by,
+            }
+        })
+        .collect()
+}
+
+pub async fn first_incomplete_selection(spec_path: &str) -> Result<ProjectSelection> {
+    Ok(ProjectSelection {
+        selected_spec: Some(spec_path.to_string()),
+    })
+}
+
+pub async fn first_incomplete_milestone_id(spec_path: &str) -> Result<Option<String>> {
     let spec = load_spec(spec_path).await?;
-    state.selected_spec = Some(spec_path.to_string());
-    state.selected_milestone = spec
+    Ok(spec
         .milestones
         .iter()
         .find(|milestone| !milestone.completed)
-        .map(|milestone| milestone.id.clone());
-    Ok(())
+        .map(|milestone| milestone.id.clone()))
 }
 
-pub async fn resolve_selected(state: &StateData) -> Result<SelectedMilestoneState> {
-    let Some(spec_path) = state
-        .selected_spec
-        .as_deref()
-        .filter(|path| !path.is_empty())
-    else {
-        return Ok(SelectedMilestoneState::MissingSelection);
-    };
-    let Some(milestone_id) = state
-        .selected_milestone
-        .as_deref()
-        .filter(|id| !id.is_empty())
-    else {
-        return Ok(SelectedMilestoneState::MissingSelection);
-    };
-
-    if !Path::new(spec_path).exists() {
-        return Ok(SelectedMilestoneState::SpecMissing(spec_path.to_string()));
-    }
-
-    let spec = load_spec(spec_path).await?;
-    let Some(milestone) = spec
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == milestone_id)
-        .cloned()
-    else {
-        return Ok(SelectedMilestoneState::MilestoneMissing(
-            milestone_id.to_string(),
-        ));
-    };
-
-    Ok(SelectedMilestoneState::Found(SelectedMilestone {
-        spec_path: spec.path.clone(),
-        spec_display: spec_display_name(&spec.path),
-        milestone,
-    }))
-}
-
-pub async fn complete_task_milestone_and_advance(state: &mut StateData) -> Result<()> {
-    let Some(spec_path) = state.task_spec.clone() else {
-        return Ok(());
-    };
-    let Some(milestone_id) = state.task_milestone.clone() else {
-        return Ok(());
-    };
+pub async fn complete_milestone(spec_path: &str, milestone_id: &str) -> Result<()> {
     if !Path::new(&spec_path).exists() {
         return Ok(());
     }
 
-    let mut spec = load_spec(&spec_path).await?;
+    let mut spec = load_spec(spec_path).await?;
     let Some(current_idx) = spec
         .milestones
         .iter()
@@ -194,19 +217,9 @@ pub async fn complete_task_milestone_and_advance(state: &mut StateData) -> Resul
     if !spec.milestones[current_idx].completed {
         mark_line_completed(&mut spec.lines[spec.milestones[current_idx].line_index]);
         spec.milestones[current_idx].completed = true;
-        write_spec_lines(&spec_path, &spec.lines).await?;
+        write_spec_lines(spec_path, &spec.lines).await?;
     }
 
-    if state.selected_spec.as_deref() == Some(spec_path.as_str())
-        && state.selected_milestone.as_deref() == Some(milestone_id.as_str())
-    {
-        state.selected_milestone = spec
-            .milestones
-            .iter()
-            .skip(current_idx + 1)
-            .find(|milestone| !milestone.completed)
-            .map(|milestone| milestone.id.clone());
-    }
     Ok(())
 }
 
@@ -281,12 +294,48 @@ fn parse_child_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     Some(value)
 }
 
+fn dependency_refs(depends_on: &str) -> Vec<String> {
+    let depends_on = depends_on.trim();
+    if depends_on.is_empty()
+        || matches!(
+            depends_on.to_ascii_lowercase().as_str(),
+            "none" | "n/a" | "na" | "-"
+        )
+    {
+        return Vec::new();
+    }
+
+    depends_on
+        .split(',')
+        .map(str::trim)
+        .filter(|dependency| !dependency.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn milestone_refs(milestone: &Milestone) -> Vec<String> {
+    let mut refs = vec![
+        normalize_ref(&milestone.id),
+        normalize_ref(&milestone.marker),
+    ];
+    if let Some(marker) = milestone.marker.strip_prefix('#') {
+        refs.push(normalize_ref(marker));
+    }
+    refs
+}
+
+fn normalize_ref(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+#[allow(dead_code)]
 fn mark_line_completed(line: &mut String) {
     if let Some(pos) = line.find("- [ ]") {
         line.replace_range(pos..pos + 5, "- [x]");
     }
 }
 
+#[allow(dead_code)]
 async fn write_spec_lines(path: &str, lines: &[String]) -> Result<()> {
     let mut content = lines.join("\n");
     if !content.ends_with('\n') {
@@ -342,83 +391,77 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_selected_treats_missing_spec_and_milestone_as_no_selection() {
-        let state = StateData::default();
+    #[test]
+    fn classifies_milestones_by_dependency_readiness() {
+        let spec = parse_spec(
+            "docs/specs/2026-05-22-multi-task-sqlite-dashboard.md",
+            "## Milestones\n\
+             - [x] #1.0 Storage foundation\n\
+               - ID: m1.0\n\
+               - Depends on: none\n\n\
+             - [ ] #1.1 Dashboard readiness\n\
+               - ID: m1.1\n\
+               - Depends on: m1.0\n\n\
+             - [ ] #2.0 Scheduler\n\
+               - ID: m2.0\n\
+               - Depends on: m1.1\n\n\
+             - [ ] #2.1 Batch flow\n\
+               - ID: m2.1\n\
+               - Depends on: #1.0, m1.1\n",
+        );
 
-        let selected = resolve_selected(&state).await.unwrap();
+        let plan = spec.milestone_plan();
 
-        assert_eq!(selected, SelectedMilestoneState::MissingSelection);
+        assert_eq!(plan[0].readiness, MilestoneReadiness::Done);
+        assert_eq!(plan[0].blocked_by, Vec::<String>::new());
+        assert_eq!(plan[1].readiness, MilestoneReadiness::Ready);
+        assert_eq!(plan[1].blocked_by, Vec::<String>::new());
+        assert_eq!(plan[2].readiness, MilestoneReadiness::Pending);
+        assert_eq!(plan[2].blocked_by, vec!["m1.1"]);
+        assert_eq!(plan[3].readiness, MilestoneReadiness::Pending);
+        assert_eq!(plan[3].blocked_by, vec!["m1.1"]);
+    }
+
+    #[test]
+    fn dependency_readiness_accepts_marker_references() {
+        let spec = parse_spec(
+            "docs/specs/spec.md",
+            "## Milestones\n\
+             - [x] #1.0 First\n\
+               - ID: m1.0\n\
+               - Depends on: none\n\n\
+             - [ ] #1.1 Second\n\
+               - ID: m1.1\n\
+               - Depends on: #1.0\n",
+        );
+
+        let plan = spec.milestone_plan();
+
+        assert_eq!(plan[1].readiness, MilestoneReadiness::Ready);
     }
 
     #[tokio::test]
-    async fn resolve_selected_treats_partial_selection_as_no_selection() {
-        let state = StateData {
-            selected_spec: Some("docs/specs/spec.md".to_string()),
-            ..StateData::default()
-        };
-
-        let selected = resolve_selected(&state).await.unwrap();
-
-        assert_eq!(selected, SelectedMilestoneState::MissingSelection);
-    }
-
-    #[tokio::test]
-    async fn completes_task_milestone_and_advances_when_selection_matches_origin() {
+    async fn complete_milestone_marks_matching_origin_done() {
         let (_dir, path) = write_test_spec();
-        let mut state = StateData {
-            selected_spec: Some(path.display().to_string()),
-            selected_milestone: Some("m1.0".to_string()),
-            task_spec: Some(path.display().to_string()),
-            task_milestone: Some("m1.0".to_string()),
-            ..StateData::default()
-        };
 
-        complete_task_milestone_and_advance(&mut state)
+        complete_milestone(&path.display().to_string(), "m1.0")
             .await
             .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("- [x] #1.0 Define spec workflow"));
-        assert_eq!(state.selected_milestone.as_deref(), Some("m1.1"));
     }
 
     #[tokio::test]
-    async fn leaves_milestones_untouched_for_manual_task_without_origin() {
+    async fn complete_milestone_ignores_unknown_origin() {
         let (_dir, path) = write_test_spec();
-        let mut state = StateData {
-            selected_spec: Some(path.display().to_string()),
-            selected_milestone: Some("m1.0".to_string()),
-            ..StateData::default()
-        };
 
-        complete_task_milestone_and_advance(&mut state)
+        complete_milestone(&path.display().to_string(), "m9.9")
             .await
             .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("- [ ] #1.0 Define spec workflow"));
-        assert_eq!(state.selected_milestone.as_deref(), Some("m1.0"));
-    }
-
-    #[tokio::test]
-    async fn does_not_advance_user_changed_selection_after_completing_origin() {
-        let (_dir, path) = write_test_spec();
-        let mut state = StateData {
-            selected_spec: Some(path.display().to_string()),
-            selected_milestone: Some("m1.1".to_string()),
-            task_spec: Some(path.display().to_string()),
-            task_milestone: Some("m1.0".to_string()),
-            ..StateData::default()
-        };
-
-        complete_task_milestone_and_advance(&mut state)
-            .await
-            .unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("- [x] #1.0 Define spec workflow"));
-        assert_eq!(state.selected_milestone.as_deref(), Some("m1.1"));
     }
 
     fn write_test_spec() -> (tempfile::TempDir, std::path::PathBuf) {

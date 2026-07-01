@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::state::store;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +66,7 @@ const AGENTS_FILE: &str = ".ferrus/agents.json";
 
 #[allow(dead_code)]
 pub async fn read_agents() -> Result<AgentsRegistry> {
-    let p = std::path::Path::new(AGENTS_FILE);
+    let p = store::resolve_project_path(AGENTS_FILE);
     if !p.exists() {
         return Ok(AgentsRegistry::default());
     }
@@ -77,12 +79,13 @@ pub async fn read_agents() -> Result<AgentsRegistry> {
 #[allow(dead_code)]
 pub async fn write_agents(registry: &AgentsRegistry) -> Result<()> {
     let json = serde_json::to_string_pretty(registry)?;
-    tokio::fs::create_dir_all(".ferrus")
+    let ferrus_dir = store::resolve_project_path(".ferrus");
+    tokio::fs::create_dir_all(&ferrus_dir)
         .await
         .context("Failed to create .ferrus directory")?;
-    let tmp_path = ".ferrus/agents.json.tmp";
-    let dst_path = ".ferrus/agents.json";
-    tokio::fs::write(tmp_path, &json).await?;
+    let tmp_path = store::resolve_project_path(".ferrus/agents.json.tmp");
+    let dst_path = store::resolve_project_path(AGENTS_FILE);
+    tokio::fs::write(&tmp_path, &json).await?;
     tokio::fs::rename(tmp_path, dst_path)
         .await
         .context("Failed to rename agents.json.tmp → agents.json")

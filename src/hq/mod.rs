@@ -5,33 +5,47 @@ mod state_watcher;
 mod tui;
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use crate::agent_id::{DEFAULT_AGENT_INDEX, ROLE_EXECUTOR, ROLE_SUPERVISOR, agent_id};
+use crate::agent_id::{
+    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID, ROLE_EXECUTOR,
+    ROLE_SUPERVISOR, agent_id,
+};
 use crate::agents::{AgentRunMode, ExecutorAgent, SupervisorAgent};
 use crate::checks::runner;
 use crate::config::{Config, HqConfig, HqRole, update_hq_agent_config};
 use crate::platform;
-use crate::specs::{self, SelectedMilestone, SelectedMilestoneState};
-use crate::state::{
-    agents,
-    machine::{StateData, TaskState},
-    store,
-};
+use crate::project::{ProjectSelection, TaskRecord};
+use crate::specs::{self, MilestoneReadiness, SelectedMilestone};
+use crate::state::{agents, store};
 use crate::update_check;
 use commands::{ModelTarget, ShellCommand, parse_command};
 use display::Display;
 use state_watcher::WatchedState;
 
 pub async fn run(debug: bool) -> Result<()> {
+    if let Err(err) = crate::project::touch_current_project().await {
+        tracing::debug!(error = ?err, "skipped ferrus project touch");
+    }
+    if let Ok(recovery) = crate::project::recover_runtime_state().await
+        && (recovery.interrupted_runs > 0 || recovery.expired_task_leases > 0)
+    {
+        tracing::info!(
+            interrupted_runs = recovery.interrupted_runs,
+            expired_task_leases = recovery.expired_task_leases,
+            "recovered ferrus.db runtime state"
+        );
+    }
     reconcile_agent_pids().await;
 
     let (state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
     tokio::spawn(state_watcher::watch(state_tx));
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<tui::UiMessage>();
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<tui::HqInput>();
 
     let hq_config = load_hq_config_from_config().await;
     let supervisor_type = hq_config
@@ -46,6 +60,9 @@ pub async fn run(debug: bool) -> Result<()> {
 
     let display = Display(msg_tx);
     let mut ctx = HqContext::new(state_rx.clone(), display.clone(), debug);
+    if let Err(err) = ctx.seed_completed_task_announcements().await {
+        tracing::debug!(error = ?err, "skipped completed task announcement seed");
+    }
     if let Some(hq) = hq_config {
         ctx.set_hq_config(&hq);
     }
@@ -69,29 +86,26 @@ pub async fn run(debug: bool) -> Result<()> {
     ));
 
     let mut tui_finished = false;
+    let mut scheduler_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    scheduler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let loop_result: Result<()> = loop {
         tokio::select! {
+            _ = scheduler_tick.tick() => {
+                if let Err(err) = ctx.reconcile_runtime_schedule().await {
+                    tracing::debug!(error = ?err, "skipped runtime schedule reconciliation");
+                }
+            }
             changed = ctx.state_rx.changed() => {
-                if changed.is_ok() {
-                    let snap = ctx.state_rx.borrow_and_update().clone();
-                    if let Some(watched) = snap {
-                        let prev = ctx.last_task_state.clone();
-                        if prev.as_ref() != Some(&watched.state.state) {
-                            if let Some(ref transition) = watched.transition {
-                                ctx.display.transition(transition);
-                            }
-                            ctx.on_state_change(&watched.state).await;
-                        }
-                        ctx.last_task_state = Some(watched.state.state.clone());
-                    }
-                } else {
+                if changed.is_err() {
                     break Ok(());
                 }
+                let _ = ctx.state_rx.borrow_and_update();
             }
             maybe_cmd = cmd_rx.recv() => {
                 match maybe_cmd {
-                    Some(cmd) => {
-                        let line = cmd.as_str();
+                    Some(input) => {
+                        let line = input.text.as_str();
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -99,7 +113,14 @@ pub async fn run(debug: bool) -> Result<()> {
                             ctx.display.muted("Bye.");
                             break Ok(());
                         }
-                        if let Err(err) = dispatch(line, &mut ctx).await {
+                        if let Err(err) = dispatch_with_human_question_target(
+                            line,
+                            input.human_question_task_id.as_deref(),
+                            false,
+                            &mut ctx,
+                        )
+                        .await
+                        {
                             ctx.display.error(err.to_string());
                         }
                     }
@@ -172,11 +193,25 @@ async fn load_agent_version_from_version_command(command: std::process::Command)
         .to_string()
 }
 
+#[cfg(test)]
 async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
+    dispatch_with_human_question_target(line, None, true, ctx).await
+}
+
+async fn dispatch_with_human_question_target(
+    line: &str,
+    human_question_task_id: Option<&str>,
+    allow_fifo_fallback: bool,
+    ctx: &mut HqContext,
+) -> Result<()> {
     // When state is AwaitingHuman, non-command input is treated as the human's answer.
     if !line.starts_with('/') {
-        let state = store::read_state().await?;
-        if state.state == TaskState::AwaitingHuman {
+        if human_question_task_id.is_some() {
+            return ctx
+                .answer_scoped_human_question_for_task(line.to_string(), human_question_task_id)
+                .await;
+        }
+        if allow_fifo_fallback && ctx.has_pending_human_question().await? {
             return ctx.answer(line.to_string()).await;
         }
         anyhow::bail!("Commands must start with '/' — try /status, /task, /quit");
@@ -191,40 +226,55 @@ async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
             let watched = if let Some(watched) = ctx.state_rx.borrow().clone() {
                 watched
             } else {
-                let state = store::read_state().await?;
                 WatchedState {
-                    state,
-                    state_elapsed: std::time::Duration::default(),
-                    transition: None,
                     selected_spec_display: None,
-                    selected_milestone_display: None,
+                    selected_milestones: Vec::new(),
                 }
             };
             ctx.display.status(&watched, &reg);
             if !ctx.headless.is_empty() {
-                ctx.display.info("Headless agents:");
+                let mut lines = vec!["Headless agents:".to_string()];
                 for (name, handle) in &ctx.headless {
                     let status = if handle.is_alive() {
                         "running"
                     } else {
                         "exited"
                     };
-                    ctx.display.info(format!(
+                    lines.push(format!(
                         "  {name} ({status}) — tail logs: {}",
                         handle.log_path.display()
                     ));
                 }
+                ctx.display.info_block(lines);
             }
+        }
+        ShellCommand::Tasks => {
+            let tasks = crate::project::list_tasks().await?;
+            ctx.display
+                .info_block(crate::runtime_table::task_lines(&tasks));
+        }
+        ShellCommand::Run { limit } => ctx.run_batch_plan(limit).await?,
+        ShellCommand::Runs { limit } => {
+            let runs = crate::project::list_runs(limit).await?;
+            ctx.display
+                .info_block(crate::runtime_table::run_lines(&runs));
+        }
+        ShellCommand::Events { limit, run_id } => {
+            let events = crate::project::list_events(limit, run_id.clone()).await?;
+            ctx.display.info_block(crate::runtime_table::event_lines(
+                &events,
+                run_id.as_deref(),
+            ));
         }
         ShellCommand::Check { force } => ctx.check(force).await?,
         ShellCommand::Help => {
             ctx.display.info(concat!(
                 "ferrus HQ commands:\n",
                 "  /plan              Free-form planning session with the supervisor\n",
-                "  /task              Define a task from the selected milestone, then run executor→review loop\n",
-                "  /task --manual     Define a free-form task without selected milestone context\n",
-                "  /milestones        Select the current spec and milestone\n",
-                "  /reset-spec        Clear the selected spec and milestone\n",
+                "  /task              Queue one task from the next ready milestone, then run the scheduler\n",
+                "  /task --manual     Queue one free-form task without spec context\n",
+                "  /milestones        Select the current spec\n",
+                "  /reset-spec        Clear the selected spec\n",
                 "  /spec              Draft, approve, and save a feature specification\n",
                 "  /check             Run the Ferrus check gate deterministically from HQ\n",
                 "  /check --force     Run configured checks from HQ without state requirements\n",
@@ -233,9 +283,15 @@ async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
                 "  /resume            Resume the executor headlessly; recovers Consultation too\n",
                 "  /review            Manually spawn supervisor in review mode\n",
                 "  /status            Show task state, agent list, and session log paths\n",
+                "  /tasks             List SQLite task runtime rows\n",
+                "  /run [--limit N]   Plan a batch run from ready milestones\n",
+                "  /runs [--limit N]  List SQLite run attempts\n",
+                "  /events [--limit N]\n",
+                "                     List SQLite runtime events\n",
+                "  /events --run <id> List SQLite runtime events for one run\n",
                 "  /attach <name>     Show log path for a running headless agent\n",
                 "  /stop              Stop all running agent sessions\n",
-                "  /reset             Reset state to Idle (clears task files)\n",
+                "  /reset             Force-reset tasks and clear scoped artifacts\n",
                 "  /init              Initialize ferrus in the current directory\n",
                 "  /register          Register agent configs and permissions\n",
                 "  /model <role> <model>\n",
@@ -245,7 +301,7 @@ async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
                 "  /quit              Exit HQ\n",
                 "\n",
                 "When an agent asks a question (state = AwaitingHuman):\n",
-                "  Type your answer and press Enter (no slash prefix needed).",
+                "  Type your answer and press Enter; queued questions are shown one at a time.",
             ));
         }
         ShellCommand::Reset => ctx.reset().await?,
@@ -316,6 +372,9 @@ fn parse_agent_type(s: &str) -> Option<crate::cli::commands::register::Agent> {
     match s {
         "claude-code" => Some(Agent::ClaudeCode),
         "codex" => Some(Agent::Codex),
+        "goose" => Some(Agent::Goose),
+        "opencode" => Some(Agent::OpenCode),
+        "qwen-code" => Some(Agent::QwenCode),
         _ => None,
     }
 }
@@ -347,10 +406,90 @@ impl Drop for ResumeGuard {
     }
 }
 
+fn clear_primary_screen() {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    );
+    let _ = stdout.flush();
+}
+
+fn capture_interactive_stderr(
+    child: &mut tokio::process::Child,
+) -> Option<tokio::task::JoinHandle<String>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut stderr = child.stderr.take()?;
+    Some(tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut buf = [0; 8192];
+        loop {
+            let read = stderr.read(&mut buf).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            let chunk = &buf[..read];
+            captured.extend_from_slice(chunk);
+            if captured.len() > 8192 {
+                let extra = captured.len() - 8192;
+                captured.drain(0..extra);
+            }
+        }
+        String::from_utf8_lossy(&captured).trim().to_string()
+    }))
+}
+
+async fn finish_interactive_stderr(handle: Option<tokio::task::JoinHandle<String>>) -> String {
+    match handle {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+fn interactive_exit_error(
+    role: &str,
+    agent_type: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    let mut message = format!("{role} agent ({agent_type}) exited with {status}");
+    if !stderr.trim().is_empty() {
+        message.push_str("\n\nstderr:\n");
+        message.push_str(stderr.trim());
+    }
+    message
+}
+
 enum TaskMilestoneSelection {
     UseFallback,
     Use(SelectedMilestone),
     Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunPlanMilestone {
+    id: String,
+    marker: String,
+    title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkippedRunMilestone {
+    id: String,
+    marker: String,
+    title: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunPlan {
+    spec_path: String,
+    eligible: Vec<RunPlanMilestone>,
+    skipped: Vec<SkippedRunMilestone>,
 }
 
 impl ModelTarget {
@@ -374,10 +513,10 @@ pub(crate) struct HqContext {
     pub(crate) executor: Option<std::sync::Arc<dyn ExecutorAgent>>,
     /// Headless agent handles — executor and reviewer both run without a PTY.
     pub(crate) headless: std::collections::HashMap<String, agent_manager::HeadlessHandle>,
-    pub(crate) last_task_state: Option<TaskState>,
     debug: bool,
     state_rx: watch::Receiver<Option<WatchedState>>,
     pub(crate) display: Display,
+    announced_completed_tasks: HashSet<String>,
 }
 
 impl HqContext {
@@ -386,11 +525,18 @@ impl HqContext {
             supervisor: None,
             executor: None,
             headless: std::collections::HashMap::new(),
-            last_task_state: None,
             debug,
             state_rx,
             display,
+            announced_completed_tasks: HashSet::new(),
         }
+    }
+
+    async fn seed_completed_task_announcements(&mut self) -> Result<()> {
+        let tasks = crate::project::list_tasks().await?;
+        self.announced_completed_tasks
+            .extend(completed_task_ids(&tasks));
+        Ok(())
     }
 
     fn set_hq_config(&mut self, hq: &HqConfig) {
@@ -399,15 +545,15 @@ impl HqContext {
     }
 
     fn executor_agent_id(&self) -> Result<String> {
+        self.executor_agent_id_for_index(DEFAULT_AGENT_INDEX)
+    }
+
+    fn executor_agent_id_for_index(&self, index: u32) -> Result<String> {
         let executor = self
             .executor
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?;
-        Ok(agent_id(
-            ROLE_EXECUTOR,
-            executor.name(),
-            DEFAULT_AGENT_INDEX,
-        ))
+        Ok(agent_id(ROLE_EXECUTOR, executor.name(), index))
     }
 
     fn supervisor_agent_id(&self) -> Result<String> {
@@ -462,127 +608,6 @@ impl HqContext {
         Ok(())
     }
 
-    pub(crate) async fn on_state_change(&mut self, state: &StateData) {
-        if self.last_task_state.is_none() {
-            self.last_task_state = Some(state.state.clone());
-            return;
-        }
-        let Some(ref prev) = self.last_task_state else {
-            return;
-        };
-
-        let action = transition_action(prev, &state.state);
-
-        let result = match action {
-            TransitionAction::SpawnExecutor => self.handle_spawn_executor_transition().await,
-            TransitionAction::SpawnReviewer => self.handle_spawn_reviewer_transition().await,
-            TransitionAction::SpawnConsultant => self.handle_spawn_consultant_transition().await,
-            TransitionAction::KillReviewerSpawnExecutor => {
-                self.handle_restart_executor_transition().await
-            }
-            TransitionAction::TaskComplete => {
-                self.handle_terminal_tip(
-                    "Tip: Use /spec to create a new spec or /task to start a new task.",
-                )
-                .await
-            }
-            TransitionAction::TaskFailed => {
-                self.handle_terminal_tip("Tip: Use /status for details, /reset to try again.")
-                    .await
-            }
-            TransitionAction::PauseForHuman => self.handle_pause_for_human().await,
-            // (AwaitingHuman, Executing|Addressing|...) → NoOp: the executor either
-            // resumed via /wait_for_answer (alive path) or was relaunched by answer()
-            // (dead path). No further action needed from the state watcher.
-            TransitionAction::NoOp => Ok(()),
-        };
-
-        if let Err(err) = result {
-            self.display.error(err.to_string());
-        }
-    }
-
-    async fn handle_spawn_executor_transition(&mut self) -> Result<()> {
-        let executor_id = self
-            .executor_agent_id_after_config()
-            .await
-            .context("Failed to load executor config")?;
-        self.spawn_headless_executor(&executor_id, agent_manager::executor_prompt())
-            .await
-            .context("Failed to spawn executor")
-    }
-
-    async fn handle_spawn_reviewer_transition(&mut self) -> Result<()> {
-        let executor_id = self.executor_agent_id()?;
-        self.shutdown_headless(&executor_id).await;
-        let supervisor_id = self
-            .supervisor_agent_id_after_config()
-            .await
-            .context("Failed to load supervisor config")?;
-        self.spawn_headless_supervisor(&supervisor_id, agent_manager::reviewer_prompt())
-            .await
-            .context("Failed to spawn reviewer")
-    }
-
-    async fn handle_spawn_consultant_transition(&mut self) -> Result<()> {
-        let supervisor_id = self
-            .supervisor_agent_id_after_config()
-            .await
-            .context("Failed to load supervisor config")?;
-        self.spawn_headless_supervisor(&supervisor_id, agent_manager::consultant_prompt())
-            .await
-            .context("Failed to spawn consultation supervisor")
-    }
-
-    async fn handle_restart_executor_transition(&mut self) -> Result<()> {
-        let supervisor_id = self.supervisor_agent_id()?;
-        self.shutdown_headless(&supervisor_id).await;
-        let executor_id = self
-            .executor_agent_id_after_config()
-            .await
-            .context("Failed to load executor config")?;
-        self.spawn_headless_executor(&executor_id, agent_manager::executor_prompt())
-            .await
-            .context("Failed to spawn executor")
-    }
-
-    async fn handle_terminal_tip(&mut self, message: &str) -> Result<()> {
-        let agent_ids = [
-            self.executor_agent_id().ok(),
-            self.supervisor_agent_id().ok(),
-        ];
-        for name in agent_ids.into_iter().flatten() {
-            self.shutdown_headless(&name).await;
-        }
-        self.display.tip(message);
-        Ok(())
-    }
-
-    async fn handle_pause_for_human(&mut self) -> Result<()> {
-        match store::read_question().await {
-            Ok(q) if !q.trim().is_empty() => {
-                self.display.info(format!(
-                    "\n[AWAITING YOUR ANSWER]\n{q}\n\nType your answer and press Enter."
-                ));
-            }
-            _ => {
-                self.display
-                    .info("[AWAITING YOUR ANSWER] Type your response and press Enter.");
-            }
-        }
-        Ok(())
-    }
-
-    async fn executor_agent_id_after_config(&mut self) -> Result<String> {
-        self.ensure_hq_config().await?;
-        self.executor_agent_id()
-    }
-
-    async fn supervisor_agent_id_after_config(&mut self) -> Result<String> {
-        self.ensure_hq_config().await?;
-        self.supervisor_agent_id()
-    }
-
     async fn mark_agent_running(
         &self,
         role: &str,
@@ -634,15 +659,24 @@ impl HqContext {
         let mut child = cmd
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
         self.mark_agent_running(role, agent_type, name, child.id())
             .await?;
 
-        let _ = child.wait().await;
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("Failed to wait for {program}"))?;
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
         guard.resume_now();
         self.mark_agent_suspended(name).await?;
+        if !status.success() {
+            anyhow::bail!(interactive_exit_error(role, agent_type, status, &stderr));
+        }
         Ok(())
     }
 
@@ -693,13 +727,29 @@ impl HqContext {
 
     fn store_headless_handle(&mut self, name: &str, handle: agent_manager::HeadlessHandle) {
         self.display.muted(format!(
-            "  • Spawning {name}…\n  ╰─ Logs: {}\n\n",
+            "  • Started {name}…\n  ╰─ Logs: {}\n\n",
             handle.log_path.display()
         ));
         self.headless.insert(name.to_string(), handle);
     }
 
-    async fn spawn_headless_supervisor(&mut self, name: &str, prompt: &str) -> Result<()> {
+    async fn spawn_headless_supervisor_for_task(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        self.spawn_headless_supervisor_for_task_with_workspace(name, prompt, task_id, None)
+            .await
+    }
+
+    async fn spawn_headless_supervisor_for_task_with_workspace(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        task_id: &str,
+        workspace: Option<agent_manager::HeadlessWorkspace>,
+    ) -> Result<()> {
         if !self.prepare_headless_slot(name).await {
             return Ok(());
         }
@@ -709,14 +759,79 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
         );
-        let handle =
-            agent_manager::spawn_headless_supervisor(agent.as_ref(), name, prompt, self.debug)
-                .await?;
+        let handle = agent_manager::spawn_headless_supervisor_with_env_and_workspace(
+            agent.as_ref(),
+            name,
+            prompt,
+            self.debug,
+            vec![
+                (ENV_AGENT_ID, name.to_string()),
+                (ENV_TASK_ID, task_id.to_string()),
+            ],
+            workspace,
+        )
+        .await?;
         self.store_headless_handle(name, handle);
         Ok(())
     }
 
-    async fn spawn_headless_executor(&mut self, name: &str, prompt: &str) -> Result<()> {
+    async fn reconcile_runtime_schedule(&mut self) -> Result<()> {
+        self.reap_exited_headless().await;
+
+        let _ = crate::project::recover_runtime_state().await;
+        let tasks = crate::project::list_tasks().await?;
+        let answered_human_waiters = crate::project::list_answered_human_waiters().await?;
+        self.announce_completed_tasks(&tasks);
+        if !tasks.iter().any(|task| {
+            is_executor_ready_task_status(&task.status)
+                || is_review_or_consultation_task_status(&task.status)
+        }) && answered_human_waiters.is_empty()
+        {
+            return Ok(());
+        }
+
+        self.ensure_hq_config().await?;
+        let config = Config::load().await?;
+        let max_parallel = config.limits.max_parallel_tasks.max(1);
+        self.schedule_answered_human_tasks(&answered_human_waiters, max_parallel)
+            .await?;
+        self.schedule_consultation_tasks(&tasks, max_parallel)
+            .await?;
+        self.schedule_answered_consultation_tasks(&tasks, max_parallel)
+            .await?;
+        self.schedule_reviewing_tasks(&tasks, max_parallel).await?;
+        self.schedule_queued_tasks_from(tasks, max_parallel, false)
+            .await?;
+        Ok(())
+    }
+
+    fn announce_completed_tasks(&mut self, tasks: &[TaskRecord]) {
+        for task_id in completed_task_ids(tasks) {
+            if self.announced_completed_tasks.insert(task_id.clone()) {
+                self.display.success(format!("Task {task_id} completed."));
+            }
+        }
+    }
+
+    async fn reap_exited_headless(&mut self) {
+        let exited = self
+            .headless
+            .iter()
+            .filter(|(_, handle)| !handle.is_alive())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in exited {
+            self.reap_headless(&name).await;
+        }
+    }
+
+    async fn spawn_headless_executor_for_task(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        index: u32,
+        task_id: &str,
+    ) -> Result<()> {
         if !self.prepare_headless_slot(name).await {
             return Ok(());
         }
@@ -726,120 +841,144 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
-        let handle =
-            agent_manager::spawn_headless_executor(agent.as_ref(), name, prompt, self.debug)
-                .await?;
+        agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
+
+        // Gate the dispatch against the per-work-phase budget before committing
+        // to any setup. This bounds the respawn loop of a session that keeps
+        // exiting without reaching review. The counter itself is incremented
+        // only after the session actually starts (below), so a failed
+        // worktree/process setup does not burn the budget.
+        let max_dispatches = Config::load().await?.limits.max_executor_dispatches;
+        if let crate::project::ExecutorDispatchOutcome::LimitExceeded { dispatches } =
+            crate::project::enforce_executor_dispatch_limit(task_id, max_dispatches).await?
+        {
+            self.display.error(format!(
+                "Task {task_id} reached the executor dispatch limit ({dispatches}/{max_dispatches}) \
+                 for this work phase without reaching review.\n\nState is now Failed. Inspect with \
+                 /tasks; adjust limits.max_executor_dispatches or refine the task before retrying."
+            ));
+            return Ok(());
+        }
+
+        let workspace = prepare_executor_workspace(task_id).await?;
+        let mut env = vec![
+            (ENV_AGENT_ID, name.to_string()),
+            (ENV_TASK_ID, task_id.to_string()),
+        ];
+        if let Some(baseline_tree) = workspace.baseline_tree.as_deref() {
+            env.push((ENV_BASELINE_TREE, baseline_tree.to_string()));
+        }
+        let handle = agent_manager::spawn_headless_executor_with_env(
+            agent.as_ref(),
+            name,
+            prompt,
+            index,
+            self.debug,
+            env,
+            Some(agent_manager::HeadlessWorkspace {
+                workspace_dir: workspace.workspace_dir.clone(),
+                project_root: workspace.project_root.clone(),
+            }),
+        )
+        .await?;
         self.store_headless_handle(name, handle);
+
+        // The session is now running: account for this dispatch against the
+        // per-work-phase budget gated above. Done last so setup failures don't
+        // consume the budget.
+        let dispatches = crate::project::record_executor_dispatch(task_id).await?;
+        tracing::debug!(task_id, dispatches, max_dispatches, "executor dispatch");
         Ok(())
     }
 
     async fn resume(&mut self) -> Result<()> {
-        if self
-            .headless
-            .iter()
-            .any(|(name, handle)| name.starts_with(ROLE_EXECUTOR) && handle.is_alive())
-        {
-            self.display.info(
-                "An executor is already running — work is in progress. Plan a new task first with /plan.",
-            );
+        let _ = crate::project::recover_runtime_state().await;
+        let tasks = crate::project::list_tasks().await?;
+        let answered_human_waiters = crate::project::list_answered_human_waiters().await?;
+        let has_runtime_work = tasks.iter().any(|task| {
+            is_executor_ready_task_status(&task.status)
+                || is_review_or_consultation_task_status(&task.status)
+        }) || !answered_human_waiters.is_empty();
+        if has_runtime_work {
+            self.ensure_hq_config().await?;
+            let config = Config::load().await?;
+            let max_parallel = config.limits.max_parallel_tasks.max(1);
+            let human_answer = self
+                .schedule_answered_human_tasks(&answered_human_waiters, max_parallel)
+                .await?;
+            let consultation = self
+                .schedule_consultation_tasks(&tasks, max_parallel)
+                .await?;
+            let consultation_executor = self
+                .schedule_answered_consultation_tasks(&tasks, max_parallel)
+                .await?;
+            let reviewing = self.schedule_reviewing_tasks(&tasks, max_parallel).await?;
+            let executor = self
+                .schedule_queued_tasks_from(tasks, max_parallel, true)
+                .await?;
+            if human_answer + consultation + consultation_executor + reviewing + executor == 0 {
+                self.display.info(
+                    "No additional runtime task session started. Use /tasks to inspect work.",
+                );
+            }
             return Ok(());
         }
 
-        let state = store::read_state().await?;
-        match state.state {
-            TaskState::Complete => {
-                self.display
-                    .info("Task is already complete. Use /task to start a new task.");
-                return Ok(());
-            }
-            TaskState::Reviewing => {
-                self.display.info(
-                    "Execution is done and submission is pending review. Use /review to review it.",
-                );
-                return Ok(());
-            }
-            TaskState::Consultation => {
-                self.ensure_hq_config().await?;
-                let supervisor_id = self.supervisor_agent_id()?;
-                self.shutdown_headless(&supervisor_id).await;
-                self.spawn_headless_supervisor(
-                    &supervisor_id,
-                    agent_manager::consultant_resume_prompt(),
-                )
-                .await?;
-
-                let executor_id = self.executor_agent_id()?;
-                return self
-                    .spawn_headless_executor(
-                        &executor_id,
-                        agent_manager::executor_wait_for_consult_prompt(),
-                    )
-                    .await;
-            }
-            _ => {}
-        }
-
-        self.ensure_hq_config().await?;
-
-        // Use resume prompt if state is AwaitingHuman (executor was relaunched after answer).
-        let prompt = if state.state == TaskState::AwaitingHuman {
-            agent_manager::executor_resume_prompt()
-        } else {
-            agent_manager::executor_prompt()
-        };
-
-        let executor_id = self.executor_agent_id()?;
-        self.spawn_headless_executor(&executor_id, prompt).await
+        self.display
+            .info("No resumable SQLite task found. Use /task or /run to queue work.");
+        Ok(())
     }
 
     async fn review(&mut self) -> Result<()> {
-        let state = store::read_state().await?;
-        if state.state != TaskState::Reviewing {
-            anyhow::bail!(
-                "State is {:?} — /review requires Reviewing. Use /status.",
-                state.state
-            );
-        }
-
-        self.ensure_hq_config().await?;
-        let supervisor_id = self.supervisor_agent_id()?;
-        self.spawn_headless_supervisor(&supervisor_id, agent_manager::reviewer_prompt())
-            .await
-    }
-
-    async fn check(&mut self, force: bool) -> Result<()> {
-        if force {
+        let tasks = crate::project::list_tasks().await?;
+        if tasks
+            .iter()
+            .any(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
+        {
+            self.ensure_hq_config().await?;
             let config = Config::load().await?;
-            if config.checks.commands.is_empty() {
-                self.display.info(
-                    "Checks passed. Warning: no check commands are configured in ferrus.toml.",
-                );
-                return Ok(());
-            }
-
-            let result = runner::run_checks(&config.checks.commands).await?;
-            if result.passed {
+            let max_parallel = config.limits.max_parallel_tasks.max(1);
+            let spawned = self.schedule_reviewing_tasks(&tasks, max_parallel).await?;
+            if spawned == 0 {
                 self.display
-                    .info("All configured checks passed. State was not modified.");
-            } else {
-                let failed = result
-                    .commands
-                    .iter()
-                    .filter(|cmd| !cmd.passed)
-                    .map(|cmd| format!("- `{}`", cmd.command))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.display.error(format!(
-                    "Forced HQ checks failed. State was not modified.\n\nFailed commands:\n{failed}"
-                ));
+                    .info("No reviewer session started. Reviewing task(s) may already be claimed.");
             }
             return Ok(());
         }
 
-        let result = crate::server::tools::check::handler()
-            .await
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        self.display.info(result);
+        anyhow::bail!("No SQLite reviewing task found. Use /status.")
+    }
+
+    async fn check(&mut self, force: bool) -> Result<()> {
+        let _ = force;
+        self.run_hq_checks_without_state().await?;
+        Ok(())
+    }
+
+    async fn run_hq_checks_without_state(&self) -> Result<()> {
+        let config = Config::load().await?;
+        if config.checks.commands.is_empty() {
+            self.display
+                .info("Checks passed. Warning: no check commands are configured in ferrus.toml.");
+            return Ok(());
+        }
+
+        let result = runner::run_checks(&config.checks.commands).await?;
+        if result.passed {
+            self.display
+                .info("All configured checks passed. Task state was not modified.");
+        } else {
+            let failed = result
+                .commands
+                .iter()
+                .filter(|cmd| !cmd.passed)
+                .map(|cmd| format!("- `{}`", cmd.command))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.display.error(format!(
+                "HQ checks failed. Task state was not modified.\n\nFailed commands:\n{failed}"
+            ));
+        }
         Ok(())
     }
 
@@ -848,11 +987,21 @@ impl HqContext {
     }
 
     async fn do_reset(&mut self, prompt: bool) -> Result<()> {
-        let mut state = store::read_state().await?;
-        if prompt && matches!(state.state, TaskState::Executing | TaskState::Reviewing) {
+        let tasks = crate::project::list_tasks().await?;
+        let resettable = tasks
+            .iter()
+            .filter(|task| is_resettable_task_status(&task.status))
+            .cloned()
+            .collect::<Vec<_>>();
+        let running_agents = self
+            .headless
+            .values()
+            .filter(|handle| handle.is_alive())
+            .count();
+        if prompt && (!resettable.is_empty() || running_agents > 0) {
             let reply_rx = self.display.confirm(format!(
-                "Reset while state is {:?} — agents may be running. Continue?",
-                state.state
+                "Reset {task_count} non-terminal task(s) and stop {running_agents} running agent session(s)?",
+                task_count = resettable.len()
             ));
             let confirmed = reply_rx.await.unwrap_or(false);
             if !confirmed {
@@ -870,23 +1019,35 @@ impl HqContext {
         }
         agents::write_agents(&reg).await?;
 
-        store::clear_task().await?;
-        store::clear_submission().await?;
-        store::clear_answer().await?;
-        store::clear_consult_request().await?;
-        store::clear_consult_response().await?;
-        store::clear_question().await?;
-        store::clear_review().await?;
+        for task in &resettable {
+            store::clear_scoped_task_artifacts(&task.path, &format!(".ferrus/runs/{}", task.id))
+                .await?;
+            crate::project::record_task_status_with_origin(
+                &task.id,
+                &task.path,
+                crate::project::TaskStatus::Reset,
+                task.spec_path.as_deref(),
+                task.milestone_id.as_deref(),
+            )
+            .await?;
+        }
+        crate::project::record_runtime_event_best_effort(
+            None,
+            "hq_reset",
+            serde_json::json!({
+                "reset_task_count": resettable.len(),
+                "stopped_agent_count": running_agents,
+            }),
+        )
+        .await;
 
-        state.force_reset();
-        store::write_state(&state).await?;
-
-        self.last_task_state = Some(TaskState::Idle);
         if prompt {
-            self.display
-                .info("State reset to Idle. All task files cleared.");
+            self.display.info(format!(
+                "Runtime reset. {} non-terminal task(s) marked reset.",
+                resettable.len()
+            ));
         } else {
-            tracing::debug!("state reset to Idle; task files cleared");
+            tracing::debug!(reset_task_count = resettable.len(), "runtime reset");
         }
         Ok(())
     }
@@ -922,6 +1083,7 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
         );
+        agent.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
         self.spawn_interactive_command(
             ROLE_SUPERVISOR,
             agent.name(),
@@ -938,12 +1100,125 @@ impl HqContext {
         .await
     }
 
+    async fn spawn_interactive_supervisor_until_task_enqueued(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        existing_task_ids: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .spawn_interactive_supervisor_until_tasks_enqueued(
+                name,
+                prompt,
+                existing_task_ids,
+                1,
+                "Task enqueued — returning to HQ…",
+            )
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn spawn_interactive_supervisor_until_tasks_enqueued(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        existing_task_ids: &HashSet<String>,
+        expected_count: usize,
+        stop_message: &str,
+    ) -> Result<Vec<String>> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let agent = std::sync::Arc::clone(
+            self.supervisor
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
+        );
+        agent.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
+        let mut cmd = Command::from(
+            agent
+                .spawn(AgentRunMode::Interactive {
+                    prompt: Some(prompt),
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to resolve launcher for supervisor agent {}",
+                        agent.name()
+                    )
+                })?,
+        );
+
+        let ack_rx = self.display.suspend();
+        let _ = ack_rx.await;
+        let mut guard = ResumeGuard::new(self.display.clone());
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+
+        let mut child = cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
+        self.mark_agent_running(ROLE_SUPERVISOR, agent.name(), name, child.id())
+            .await?;
+
+        let mut created_task_ids = Vec::new();
+        let mut child_status = None;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    child_status = Some(status.with_context(|| format!("Failed to wait for {program}"))?);
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let task_ids = new_task_ids_since(existing_task_ids).await?;
+                    if task_ids.len() >= expected_count {
+                        created_task_ids = task_ids;
+                        if let Some(status) = child
+                            .try_wait()
+                            .with_context(|| format!("Failed to inspect {program} status"))?
+                        {
+                            child_status = Some(status);
+                            break;
+                        }
+                        self.stop_interactive_child(
+                            &mut child,
+                            stop_message,
+                        )
+                        .await?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
+        guard.resume_now();
+        self.mark_agent_suspended(name).await?;
+        if let Some(status) = child_status
+            && !status.success()
+        {
+            anyhow::bail!(interactive_exit_error(
+                ROLE_SUPERVISOR,
+                agent.name(),
+                status,
+                &stderr
+            ));
+        }
+        Ok(created_task_ids)
+    }
+
     async fn spawn_interactive_executor(&mut self, name: &str, prompt: Option<&str>) -> Result<()> {
         let agent = std::sync::Arc::clone(
             self.executor
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
+        agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
         self.spawn_interactive_command(
             ROLE_EXECUTOR,
             agent.name(),
@@ -982,30 +1257,13 @@ impl HqContext {
     }
 
     async fn task(&mut self, manual: bool, confirm_selected_milestone: bool) -> Result<()> {
-        use std::process::Stdio;
-        use tokio::process::Command;
-
         self.ensure_hq_config().await?;
 
-        let mut state = store::read_state().await?;
-        match state.state {
-            TaskState::Idle => {}
-            TaskState::Complete => {
-                tracing::debug!("previous task complete; resetting to Idle for new task");
-                self.do_reset(false).await?;
-                state = store::read_state().await?;
-            }
-            other => {
-                anyhow::bail!(
-                    "State is {other:?} — /task requires Idle or Complete. Use /reset first if needed."
-                );
-            }
-        }
-
+        let selection = crate::project::read_project_selection().await?;
         let selected = if manual {
             TaskMilestoneSelection::UseFallback
         } else {
-            self.selected_milestone_for_task(&state, confirm_selected_milestone)
+            self.selected_milestone_for_task(&selection, confirm_selected_milestone)
                 .await?
         };
         let selected = match selected {
@@ -1013,16 +1271,6 @@ impl HqContext {
             TaskMilestoneSelection::Use(selected) => Some(selected),
             TaskMilestoneSelection::Stop => return Ok(()),
         };
-        let mut state = store::read_state().await?;
-        if let Some(selected) = selected.as_ref() {
-            state.set_pending_task_origin(
-                Some(selected.spec_path.clone()),
-                Some(selected.milestone.id.clone()),
-            );
-        } else {
-            state.set_pending_task_origin(None, None);
-        }
-        store::write_state(&state).await?;
 
         let supervisor = std::sync::Arc::clone(
             self.supervisor
@@ -1047,141 +1295,571 @@ impl HqContext {
             None => agent_manager::supervisor_task_prompt(),
         };
 
-        let mut cmd = Command::from(
-            supervisor
-                .spawn(AgentRunMode::Interactive {
-                    prompt: Some(prompt),
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to resolve launcher for supervisor agent {}",
-                        supervisor.name()
-                    )
-                })?,
-        );
-
-        let ack_rx = self.display.suspend();
-        let _ = ack_rx.await;
-        let mut resume_guard = ResumeGuard::new(self.display.clone());
-        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
-        let mut child = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("Failed to spawn {program}"))?;
+        let existing_task_ids = crate::project::list_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
         let supervisor_id = self.supervisor_agent_id()?;
-        self.mark_agent_running(
-            ROLE_SUPERVISOR,
-            supervisor.name(),
+        self.spawn_interactive_supervisor_until_task_enqueued(
             &supervisor_id,
-            child.id(),
+            prompt,
+            &existing_task_ids,
         )
         .await?;
 
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
-        loop {
-            tokio::select! {
-                _ = child.wait() => break,
-                _ = ticker.tick() => {
-                    if let Ok(s) = store::read_state().await
-                        && s.state == TaskState::Executing {
-                        self.stop_interactive_child(
-                            &mut child,
-                            "Task created — waiting for supervisor to exit…",
-                        )
-                        .await?;
-                        break;
-                    }
-                }
-            }
-        }
-        resume_guard.resume_now();
-
-        self.mark_agent_suspended(&supervisor_id).await?;
-
-        let new_state = store::read_state().await?;
-        if new_state.state == TaskState::Executing {
-            // Let the state watcher handle Idle -> Executing consistently.
-        } else {
-            let mut state = store::read_state().await?;
-            state.set_pending_task_origin(None, None);
-            store::write_state(&state).await?;
-            self.display.info(format!(
-                "No task created (state is {:?}). Re-run /task when ready.",
-                new_state.state
-            ));
+        let scheduled = self.schedule_queued_tasks().await?;
+        if scheduled == 0 {
+            self.display
+                .info("No queued task started. Use /tasks to inspect pending work.");
         }
         Ok(())
     }
 
+    async fn run_batch_plan(&mut self, limit: Option<usize>) -> Result<()> {
+        if limit == Some(0) {
+            self.display.error("/run --limit must be greater than 0.");
+            return Ok(());
+        }
+
+        let selection = crate::project::read_project_selection().await?;
+        let Some(spec_path) = selection
+            .selected_spec
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            self.display
+                .error("No selected spec. Run /milestones or /spec before /run.");
+            return Ok(());
+        };
+
+        let plan = build_run_plan(spec_path).await?;
+        if plan.eligible.is_empty() {
+            self.display.info_block(run_plan_lines(&plan, 0));
+            return Ok(());
+        }
+
+        let available = plan.eligible.len();
+        let requested = limit.unwrap_or(available);
+        let selected_count = requested.min(available);
+        if let Some(limit) = limit
+            && limit > available
+        {
+            self.display.info(format!(
+                "/run --limit {limit} requested, but only {available} ready milestone(s) are eligible."
+            ));
+            let reply_rx = self
+                .display
+                .confirm_continue(format!("Proceed with {available}?"));
+            if !reply_rx.await.unwrap_or(false) {
+                self.display.muted("Run planning cancelled.");
+                return Ok(());
+            }
+        }
+
+        self.display
+            .info_block(run_plan_lines(&plan, selected_count));
+        self.launch_batch_task_supervisor(&plan, selected_count)
+            .await?;
+        Ok(())
+    }
+
+    async fn launch_batch_task_supervisor(
+        &mut self,
+        plan: &RunPlan,
+        selected_count: usize,
+    ) -> Result<()> {
+        if selected_count == 0 {
+            return Ok(());
+        }
+
+        self.ensure_hq_config().await?;
+        let supervisor = std::sync::Arc::clone(
+            self.supervisor
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
+        );
+        let context = run_plan_prompt_context(plan, selected_count);
+        let prompt = agent_manager::supervisor_batch_task_prompt(&context, selected_count);
+
+        self.display.info(format!(
+            "Spawning supervisor ({}) for batch task preparation…",
+            supervisor.name()
+        ));
+        self.display.tip(
+            "Review each task draft with the supervisor; approved tasks will be queued as pending.",
+        );
+
+        let existing_task_ids = crate::project::list_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
+        let supervisor_id = self.supervisor_agent_id()?;
+        self.spawn_interactive_supervisor_until_tasks_enqueued(
+            &supervisor_id,
+            &prompt,
+            &existing_task_ids,
+            selected_count,
+            "Batch tasks enqueued — returning to HQ…",
+        )
+        .await?;
+        self.display
+            .info("Batch preparation session finished. Use /tasks to inspect queued tasks.");
+        self.schedule_queued_tasks().await?;
+        Ok(())
+    }
+
+    async fn schedule_queued_tasks(&mut self) -> Result<usize> {
+        self.ensure_hq_config().await?;
+        let config = Config::load().await?;
+        let max_parallel = config.limits.max_parallel_tasks.max(1);
+        let tasks = crate::project::list_tasks().await?;
+        self.schedule_queued_tasks_from(tasks, max_parallel, true)
+            .await
+    }
+
+    async fn schedule_reviewing_tasks(
+        &mut self,
+        tasks: &[TaskRecord],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        let reviewing_count = tasks
+            .iter()
+            .filter(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
+            .count();
+        if reviewing_count == 0 {
+            return Ok(0);
+        }
+
+        let running = self.running_supervisor_count();
+        let slots = max_parallel.saturating_sub(running);
+        if slots == 0 {
+            return Ok(0);
+        }
+
+        let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let prompt = agent_manager::reviewer_prompt();
+        let mut spawned = 0usize;
+        let mut spawn_error = None;
+        let mut review_tasks = Vec::new();
+        for task in tasks
+            .iter()
+            .filter(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
+        {
+            let expected_agent_id = self.supervisor_agent_id_for_task(&task.id)?;
+            if task_claim_blocks_spawn(task, &expected_agent_id, now, &live_run_task_ids) {
+                continue;
+            }
+            review_tasks.push(task.clone());
+            if review_tasks.len() == slots {
+                break;
+            }
+        }
+
+        for task in &review_tasks {
+            let name = self.supervisor_agent_id_for_task(&task.id)?;
+            if self
+                .headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+
+            match self
+                .spawn_headless_supervisor_for_task(&name, prompt, &task.id)
+                .await
+            {
+                Ok(()) => {
+                    spawned += 1;
+                }
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = spawn_error {
+            self.display.error(format!(
+                "Could not start more reviewer sessions after starting {spawned} task(s): {err}",
+            ));
+        }
+        Ok(spawned)
+    }
+
+    async fn schedule_consultation_tasks(
+        &mut self,
+        tasks: &[TaskRecord],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        let running = self.running_supervisor_count();
+        let slots = max_parallel.saturating_sub(running);
+        if slots == 0 {
+            return Ok(0);
+        }
+
+        let prompt = agent_manager::consultant_prompt();
+        let mut spawned = 0usize;
+        let mut spawn_error = None;
+        let live_supervisor_task_ids =
+            crate::project::live_active_run_task_ids_for_role(ROLE_SUPERVISOR).await?;
+        let consultation_tasks =
+            actionable_consultation_tasks(tasks, slots, &live_supervisor_task_ids).await?;
+        if consultation_tasks.is_empty() {
+            return Ok(0);
+        }
+
+        for task in &consultation_tasks {
+            let name = self.supervisor_agent_id_for_task(&task.id)?;
+            if self
+                .headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+
+            let workspace = latest_executor_workspace_for_task(&task.id).await?;
+            match self
+                .spawn_headless_supervisor_for_task_with_workspace(
+                    &name, prompt, &task.id, workspace,
+                )
+                .await
+            {
+                Ok(()) => {
+                    spawned += 1;
+                }
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = spawn_error {
+            self.display.error(format!(
+                "Could not start more consultation supervisor sessions after starting {spawned} task(s): {err}",
+            ));
+        }
+        Ok(spawned)
+    }
+
+    async fn schedule_answered_consultation_tasks(
+        &mut self,
+        tasks: &[TaskRecord],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        let max_parallel = executor_parallel_limit(max_parallel).await?;
+        let running = self.occupied_executor_slots().await?;
+        let slots = max_parallel.saturating_sub(running);
+        if slots == 0 {
+            return Ok(0);
+        }
+
+        let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let answered_tasks = answered_consultation_tasks(tasks).await?;
+        let mut spawn_tasks = Vec::new();
+        for task in answered_tasks {
+            let name = self.executor_agent_id_for_task(&task.id)?;
+            if task_claim_blocks_spawn(&task, &name, now, &live_run_task_ids)
+                || self
+                    .headless
+                    .get(&name)
+                    .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+            spawn_tasks.push((task, name));
+            if spawn_tasks.len() == slots {
+                break;
+            }
+        }
+
+        let mut spawned = 0usize;
+        let mut spawn_error = None;
+        for (task, name) in spawn_tasks {
+            let index = u32::try_from(spawned + 1).context("Executor index exceeds u32 range")?;
+            match self
+                .spawn_headless_executor_for_task(
+                    &name,
+                    agent_manager::executor_wait_for_consult_prompt(),
+                    index,
+                    &task.id,
+                )
+                .await
+            {
+                Ok(()) => spawned += 1,
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = spawn_error {
+            self.display.error(format!(
+                "Could not resume more consultation executors after starting {spawned} task(s): {err}",
+            ));
+        }
+        Ok(spawned)
+    }
+
+    async fn schedule_answered_human_tasks(
+        &mut self,
+        waiters: &[crate::project::AnsweredHumanWaiter],
+        max_parallel: usize,
+    ) -> Result<usize> {
+        if waiters.is_empty() {
+            return Ok(0);
+        }
+
+        let live_run_agents = crate::project::live_active_run_agents().await?;
+        let executor_max_parallel = executor_parallel_limit(max_parallel).await?;
+        let mut executor_slots =
+            executor_max_parallel.saturating_sub(self.occupied_executor_slots().await?);
+        let mut supervisor_slots = max_parallel.saturating_sub(self.running_supervisor_count());
+        let mut spawned = 0usize;
+
+        for waiter in waiters {
+            if answered_human_owner_is_live(
+                &waiter.awaiting_human_by,
+                &live_run_agents,
+                self.headless
+                    .get(&waiter.awaiting_human_by)
+                    .is_some_and(agent_manager::HeadlessHandle::is_alive),
+            ) {
+                continue;
+            }
+
+            let slot = if waiter.awaiting_human_by.starts_with(ROLE_EXECUTOR) {
+                &mut executor_slots
+            } else if waiter.awaiting_human_by.starts_with(ROLE_SUPERVISOR) {
+                &mut supervisor_slots
+            } else {
+                tracing::warn!(
+                    task_id = waiter.task_id,
+                    owner = waiter.awaiting_human_by,
+                    "cannot resume answered human question for unknown agent role"
+                );
+                continue;
+            };
+            if *slot == 0 {
+                continue;
+            }
+
+            match self
+                .relaunch_human_answer_waiter(&waiter.awaiting_human_by, &waiter.task_id)
+                .await
+            {
+                Ok(()) => {
+                    *slot -= 1;
+                    spawned += 1;
+                }
+                Err(err) => {
+                    self.display.error(format!(
+                        "Could not resume {} for answered task {}: {err}",
+                        waiter.awaiting_human_by, waiter.task_id
+                    ));
+                }
+            }
+        }
+
+        Ok(spawned)
+    }
+
+    async fn schedule_queued_tasks_from(
+        &mut self,
+        tasks: Vec<TaskRecord>,
+        max_parallel: usize,
+        report_waiting: bool,
+    ) -> Result<usize> {
+        let now = chrono::Utc::now();
+        let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
+        let max_parallel = executor_parallel_limit(max_parallel).await?;
+        let mut ready_tasks = Vec::new();
+        for task in tasks
+            .into_iter()
+            .filter(|task| is_executor_ready_task_status(&task.status))
+        {
+            let expected_agent_id = self.executor_agent_id_for_task(&task.id)?;
+            if !task_claim_blocks_spawn(&task, &expected_agent_id, now, &live_run_task_ids) {
+                ready_tasks.push(task);
+            }
+        }
+        let ready_count = ready_tasks.len();
+        if ready_count == 0 {
+            return Ok(0);
+        }
+
+        let running = self.occupied_executor_slots().await?;
+        let slots = max_parallel.saturating_sub(running);
+        if slots == 0 {
+            if report_waiting {
+                self.display.info(format!(
+                    "{ready_count} executor-ready task(s) waiting; executor parallelism limit is {max_parallel}."
+                ));
+            }
+            return Ok(0);
+        }
+
+        let mut spawned = 0usize;
+        let mut spawn_error = None;
+        let prompt = agent_manager::executor_prompt();
+        let spawn_tasks = select_executor_spawn_tasks(&ready_tasks, slots, |task| {
+            let Ok(name) = self.executor_agent_id_for_task(&task.id) else {
+                return false;
+            };
+            self.headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+        });
+
+        for task in spawn_tasks {
+            if spawned >= slots {
+                break;
+            }
+            let index = u32::try_from(spawned + 1).context("Executor index exceeds u32 range")?;
+            let name = self.executor_agent_id_for_task(&task.id)?;
+            if self
+                .headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                continue;
+            }
+
+            match self
+                .spawn_headless_executor_for_task(&name, prompt, index, &task.id)
+                .await
+            {
+                Ok(()) => {
+                    spawned += 1;
+                }
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = spawn_error {
+            self.display.error(format!(
+                "Could not start more executor sessions after starting {spawned} task(s): {err}",
+            ));
+        }
+        Ok(spawned)
+    }
+
+    async fn occupied_executor_slots(&self) -> Result<usize> {
+        let live_db_task_ids =
+            crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+        Ok(occupied_executor_slots_from_handles(
+            live_db_task_ids,
+            self.headless.iter().filter_map(|(name, handle)| {
+                (name.starts_with(ROLE_EXECUTOR) && handle.is_alive()).then_some(name.as_str())
+            }),
+        ))
+    }
+
+    fn running_supervisor_count(&self) -> usize {
+        self.headless
+            .iter()
+            .filter(|(name, handle)| name.starts_with(ROLE_SUPERVISOR) && handle.is_alive())
+            .count()
+    }
+
+    fn executor_agent_id_for_task(&self, task_id: &str) -> Result<String> {
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?;
+        Ok(format!("{}:{}:{}", ROLE_EXECUTOR, executor.name(), task_id))
+    }
+
+    fn supervisor_agent_id_for_task(&self, task_id: &str) -> Result<String> {
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?;
+        Ok(format!(
+            "{}:{}:{}",
+            ROLE_SUPERVISOR,
+            supervisor.name(),
+            task_id
+        ))
+    }
+
     async fn selected_milestone_for_task(
         &self,
-        state: &StateData,
+        selection: &ProjectSelection,
         confirm: bool,
     ) -> Result<TaskMilestoneSelection> {
-        match specs::resolve_selected(state).await? {
-            SelectedMilestoneState::MissingSelection => Ok(TaskMilestoneSelection::UseFallback),
-            SelectedMilestoneState::SpecMissing(path) => {
-                self.display.error(format!(
-                    "Selected spec no longer exists:\n{path}\n\nRun /milestones to select a valid milestone."
-                ));
-                Ok(TaskMilestoneSelection::Stop)
-            }
-            SelectedMilestoneState::MilestoneMissing(_) => {
-                self.display.error(
-                    "Selected milestone no longer exists in the spec.\nRun /milestones to select a valid milestone.",
-                );
-                Ok(TaskMilestoneSelection::Stop)
-            }
-            SelectedMilestoneState::Found(selected) if selected.milestone.completed => {
-                if !confirm {
-                    return Ok(TaskMilestoneSelection::Use(selected));
-                }
-                self.display.info(format!(
-                    "Selected milestone is already completed:\n{}",
-                    selected.milestone.display_title()
-                ));
-                let reply_rx = self.display.confirm_continue(
-                    "Choose another milestone with /milestones, or continue anyway?",
-                );
-                if reply_rx.await.unwrap_or(false) {
-                    Ok(TaskMilestoneSelection::Use(selected))
-                } else {
-                    self.display.muted("Task cancelled.");
-                    Ok(TaskMilestoneSelection::Stop)
-                }
-            }
-            SelectedMilestoneState::Found(selected) => {
-                if !confirm {
-                    return Ok(TaskMilestoneSelection::Use(selected));
-                }
-                self.display.muted(format!(
-                    "\n  • Using selected milestone\n  ╰─ {} / {}\n",
-                    selected.spec_path,
-                    selected.milestone.display_title()
-                ));
-                let reply_rx = self.display.confirm_yes("Proceed?");
-                if reply_rx.await.unwrap_or(true) {
-                    Ok(TaskMilestoneSelection::Use(selected))
-                } else {
-                    self.display.muted("Task cancelled.");
-                    Ok(TaskMilestoneSelection::Stop)
-                }
-            }
+        let Some(spec_path) = selection
+            .selected_spec
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            return Ok(TaskMilestoneSelection::UseFallback);
+        };
+        if !Path::new(spec_path).exists() {
+            self.display.error(format!(
+                "Selected spec no longer exists:\n{spec_path}\n\nRun /milestones to select a valid spec."
+            ));
+            return Ok(TaskMilestoneSelection::Stop);
+        }
+
+        let plan = build_run_plan(spec_path).await?;
+        let Some(next) = plan.eligible.first() else {
+            self.display.info_block(run_plan_lines(&plan, 0));
+            self.display
+                .muted("No ready milestone is available. Use /task --manual for an ad-hoc task.");
+            return Ok(TaskMilestoneSelection::Stop);
+        };
+        let spec = specs::load_spec(&plan.spec_path).await?;
+        let milestone = spec
+            .milestones
+            .iter()
+            .find(|milestone| milestone.id == next.id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Ready milestone {} disappeared", next.id))?;
+        let selected = SelectedMilestone {
+            spec_path: spec.path.clone(),
+            spec_display: specs::spec_display_name(&spec.path),
+            milestone,
+        };
+
+        if !confirm {
+            return Ok(TaskMilestoneSelection::Use(selected));
+        }
+        self.display.muted(format!(
+            "\n  • Using next ready milestone\n  ╰─ {} / {}\n",
+            selected.spec_path,
+            selected.milestone.display_title()
+        ));
+        let reply_rx = self.display.confirm_yes("Proceed?");
+        if reply_rx.await.unwrap_or(true) {
+            Ok(TaskMilestoneSelection::Use(selected))
+        } else {
+            self.display.muted("Task cancelled.");
+            Ok(TaskMilestoneSelection::Stop)
         }
     }
 
     async fn reset_spec_selection(&mut self) -> Result<()> {
-        let mut state = store::read_state().await?;
-        if state.selected_spec.is_none() && state.selected_milestone.is_none() {
-            self.display
-                .muted("No selected spec or milestone to reset.");
+        let selection = crate::project::read_project_selection().await?;
+        if selection.selected_spec.is_none() {
+            self.display.muted("No selected spec to reset.");
             return Ok(());
         }
 
-        state.clear_selected_spec_and_milestone();
-        store::write_state(&state).await?;
+        crate::project::write_project_selection(&crate::project::ProjectSelection::default())
+            .await?;
 
         self.display
             .muted("Selected spec reset. /task will use manual task definition.");
@@ -1217,42 +1895,17 @@ impl HqContext {
             return Ok(());
         }
 
-        let options = spec
-            .milestones
-            .iter()
-            .map(|milestone| {
-                let check = if milestone.completed { "[x]" } else { "[ ]" };
-                format!(
-                    "{check} {}  ID: {}  Depends on: {}",
-                    milestone.display_title(),
-                    milestone.id,
-                    milestone.depends_on
-                )
-            })
-            .collect();
-        let Some(milestone_idx) = self
+        crate::project::write_project_selection(&crate::project::ProjectSelection {
+            selected_spec: Some(spec.path.clone()),
+        })
+        .await?;
+
+        self.display
+            .muted(format!("\n  • Selected spec\n  ╰─ {}\n", spec.path));
+
+        let reply_rx = self
             .display
-            .select("Select milestone:", options)
-            .await
-            .unwrap_or(None)
-        else {
-            self.display.muted("Milestone selection cancelled.");
-            return Ok(());
-        };
-
-        let milestone = &spec.milestones[milestone_idx];
-        let mut state = store::read_state().await?;
-        state.selected_spec = Some(spec.path.clone());
-        state.selected_milestone = Some(milestone.id.clone());
-        store::write_state(&state).await?;
-
-        self.display.muted(format!(
-            "\n  • Selected milestone\n  ├─ Spec: {}\n  ╰─ Milestone: {}\n",
-            spec.path,
-            milestone.display_title()
-        ));
-
-        let reply_rx = self.display.confirm("Create task from this milestone now?");
+            .confirm("Create task from the next ready milestone now?");
         if reply_rx.await.unwrap_or(false) {
             self.task(false, false).await?;
         }
@@ -1292,6 +1945,7 @@ impl HqContext {
                 })?,
         );
 
+        supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
         let ack_rx = self.display.suspend();
         let _ = ack_rx.await;
         let mut resume_guard = ResumeGuard::new(self.display.clone());
@@ -1299,9 +1953,10 @@ impl HqContext {
         let mut child = cmd
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
         let supervisor_id = self.supervisor_agent_id()?;
         self.mark_agent_running(
             ROLE_SUPERVISOR,
@@ -1312,44 +1967,57 @@ impl HqContext {
         .await?;
 
         let mut created_path = None;
+        let mut child_status = None;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
         loop {
             tokio::select! {
-                _ = child.wait() => break,
+                status = child.wait() => {
+                    child_status = Some(status.with_context(|| format!("Failed to wait for {program}"))?);
+                    break;
+                }
                 _ = ticker.tick() => {
-                    if let Ok(path) = store::read_last_spec_path().await {
-                        let path = path.trim();
-                        if !path.is_empty() {
-                            created_path = Some(path.to_string());
-                            self.stop_interactive_child(
-                                &mut child,
-                                "Spec created — waiting for supervisor to exit…",
-                            )
-                            .await?;
-                            break;
-                        }
+                    if let Ok(Some(path)) = crate::project::read_last_spec_path().await
+                        && !path.is_empty()
+                    {
+                        created_path = Some(path);
+                        self.stop_interactive_child(
+                            &mut child,
+                            "Spec created — waiting for supervisor to exit…",
+                        )
+                        .await?;
+                        break;
                     }
                 }
             }
         }
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
         resume_guard.resume_now();
 
         self.mark_agent_suspended(&supervisor_id).await?;
+        if let Some(status) = child_status
+            && !status.success()
+        {
+            anyhow::bail!(interactive_exit_error(
+                ROLE_SUPERVISOR,
+                supervisor.name(),
+                status,
+                &stderr
+            ));
+        }
 
         if created_path.is_none()
-            && let Ok(path) = store::read_last_spec_path().await
+            && let Ok(Some(path)) = crate::project::read_last_spec_path().await
+            && !path.is_empty()
         {
-            let path = path.trim();
-            if !path.is_empty() {
-                created_path = Some(path.to_string());
-            }
+            created_path = Some(path);
         }
 
         if let Some(path) = created_path {
             self.display
                 .muted(format!("\n  • Specification ready\n  ╰─ {path}\n"));
             self.display
-                .tip("Tip: Use /task to start implementing the selected milestone.");
+                .tip("Tip: Use /task to queue the next ready milestone.");
         } else {
             self.display
                 .info("No specification created. Re-run /spec when ready.");
@@ -1397,56 +2065,99 @@ impl HqContext {
         if response.trim().is_empty() {
             anyhow::bail!("Answer cannot be empty.");
         }
-        let state = store::read_state().await?;
-        if state.state != TaskState::AwaitingHuman {
-            anyhow::bail!(
-                "State is {:?} — not currently waiting for an answer.",
-                state.state
-            );
+        self.answer_scoped_human_question(response).await
+    }
+
+    async fn has_pending_human_question(&self) -> Result<bool> {
+        if self.has_scoped_human_question().await? {
+            return Ok(true);
         }
+        Ok(false)
+    }
 
-        // Write ANSWER.md. If the agent is alive and blocking on /wait_for_answer,
-        // the tool will detect this, restore state, and return the answer automatically.
-        store::write_answer(&response).await?;
-        self.display
-            .info("Answer recorded. Waiting for agent to resume…");
-
-        // Fallback: if the agent has exited, /wait_for_answer will never poll again.
-        // Restore state directly so the user can relaunch the agent manually.
-        let agent_alive = self
-            .executor_agent_id()
-            .ok()
-            .and_then(|id| self.headless.get(&id).map(|h| h.is_alive()))
-            .unwrap_or(false)
-            || self
-                .supervisor_agent_id()
-                .ok()
-                .and_then(|id| self.headless.get(&id).map(|h| h.is_alive()))
-                .unwrap_or(false);
-
-        if !agent_alive {
-            let mut st = store::read_state().await?;
-            if st.state == TaskState::AwaitingHuman {
-                let resumed = st.answer()?;
-                store::write_state(&st).await?;
-                store::clear_question().await?;
-                let relaunch_hint = if resumed == TaskState::Reviewing {
-                    "Use /review to relaunch the reviewer."
-                } else {
-                    "Use /resume to relaunch — it will read ANSWER.md and continue."
-                };
-                self.display.info(format!(
-                    "Agent is not running. State restored to {resumed:?}. {relaunch_hint}"
-                ));
+    async fn has_scoped_human_question(&self) -> Result<bool> {
+        match crate::project::list_human_questions().await {
+            Ok(questions) => Ok(!questions.is_empty()),
+            Err(err) => {
+                tracing::debug!(error = ?err, "failed to list scoped human questions");
+                Ok(false)
             }
         }
+    }
+
+    async fn answer_scoped_human_question(&mut self, response: String) -> Result<()> {
+        self.answer_scoped_human_question_for_task(response, None)
+            .await
+    }
+
+    async fn answer_scoped_human_question_for_task(
+        &mut self,
+        response: String,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        if response.trim().is_empty() {
+            anyhow::bail!("Answer cannot be empty.");
+        }
+        let question =
+            select_human_question(crate::project::list_human_questions().await?, task_id)?;
+
+        crate::project::record_scoped_human_answer(&question, &response).await?;
+        self.display
+            .info(format!("Answer recorded for {}.", question.task_id));
+
+        let owner = crate::project::task_human_question_owner(&question.task_id).await?;
+        let agent_alive = owner
+            .as_deref()
+            .and_then(|agent_id| self.headless.get(agent_id))
+            .is_some_and(agent_manager::HeadlessHandle::is_alive);
+
+        if agent_alive {
+            let owner = owner.as_deref().unwrap_or("agent");
+            self.display.info(format!(
+                "Waiting for {owner} to receive it via /wait_for_answer…"
+            ));
+            return Ok(());
+        }
+
+        let Some(owner) = owner else {
+            self.display
+                .info("No recorded answer waiter found. Use /tasks to inspect the awaiting task.");
+            return Ok(());
+        };
+
+        self.relaunch_human_answer_waiter(&owner, &question.task_id)
+            .await?;
+        self.display.info(format!(
+            "Relaunched {owner} to receive the answer via /wait_for_answer."
+        ));
         Ok(())
     }
 
-    async fn shutdown_headless(&mut self, name: &str) {
-        if let Some(handle) = self.headless.remove(name) {
-            handle.terminate().await;
+    async fn relaunch_human_answer_waiter(&mut self, owner: &str, task_id: &str) -> Result<()> {
+        if owner.starts_with(ROLE_EXECUTOR) {
+            return self
+                .spawn_headless_executor_for_task(
+                    owner,
+                    agent_manager::executor_wait_for_answer_prompt(),
+                    DEFAULT_AGENT_INDEX,
+                    task_id,
+                )
+                .await;
         }
+
+        if owner.starts_with(ROLE_SUPERVISOR) {
+            let workspace = latest_executor_workspace_for_task(task_id).await?;
+            return self
+                .spawn_headless_supervisor_for_task_with_workspace(
+                    owner,
+                    agent_manager::supervisor_wait_for_answer_prompt(),
+                    task_id,
+                    workspace,
+                )
+                .await;
+        }
+
+        anyhow::bail!("Cannot relaunch unknown human answer waiter {owner}");
     }
 
     async fn reap_headless(&mut self, name: &str) {
@@ -1464,7 +2175,7 @@ impl HqContext {
 }
 
 async fn prepare_spec_session_files() -> Result<()> {
-    store::read_state().await.context(
+    crate::project::touch_current_project().await.context(
         "Cannot start /spec because Ferrus is not initialized. Run `ferrus init` first.",
     )?;
 
@@ -1475,14 +2186,124 @@ async fn prepare_spec_session_files() -> Result<()> {
             .context("Failed to write .ferrus/SPEC_TEMPLATE.md")?;
     }
 
-    store::clear_last_spec_path()
+    crate::project::clear_last_spec_path()
         .await
-        .context("Failed to clear .ferrus/LAST_SPEC_PATH")
+        .context("Failed to clear spec handoff metadata")
+}
+
+async fn build_run_plan(spec_path: &str) -> Result<RunPlan> {
+    let spec = specs::load_spec(spec_path).await?;
+    let mut eligible = Vec::new();
+    let mut skipped = Vec::new();
+
+    for item in spec.milestone_plan() {
+        let milestone = item.milestone;
+        match item.readiness {
+            MilestoneReadiness::Done => skipped.push(SkippedRunMilestone {
+                id: milestone.id,
+                marker: milestone.marker,
+                title: milestone.title,
+                reason: "done".to_string(),
+            }),
+            MilestoneReadiness::Pending => skipped.push(SkippedRunMilestone {
+                id: milestone.id,
+                marker: milestone.marker,
+                title: milestone.title,
+                reason: format!("waiting for {}", item.blocked_by.join(", ")),
+            }),
+            MilestoneReadiness::Ready => {
+                if let Some(task) =
+                    crate::project::find_non_terminal_task_by_origin(spec_path, &milestone.id)
+                        .await?
+                {
+                    skipped.push(SkippedRunMilestone {
+                        id: milestone.id,
+                        marker: milestone.marker,
+                        title: milestone.title,
+                        reason: format!("task {} is {}", task.id, task.status),
+                    });
+                } else {
+                    eligible.push(RunPlanMilestone {
+                        id: milestone.id,
+                        marker: milestone.marker,
+                        title: milestone.title,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(RunPlan {
+        spec_path: spec.path,
+        eligible,
+        skipped,
+    })
+}
+
+fn run_plan_lines(plan: &RunPlan, selected_count: usize) -> Vec<String> {
+    let mut lines = vec![
+        "Run plan".to_string(),
+        format!("spec      : {}", plan.spec_path),
+        format!("eligible  : {}", plan.eligible.len()),
+        format!("selected  : {selected_count}"),
+    ];
+
+    if !plan.eligible.is_empty() {
+        lines.push(String::new());
+        lines.push("selected milestones:".to_string());
+        for milestone in plan.eligible.iter().take(selected_count) {
+            lines.push(format!(
+                "  {}  {:<8} {}",
+                milestone.marker, milestone.id, milestone.title
+            ));
+        }
+    }
+
+    if !plan.skipped.is_empty() {
+        lines.push(String::new());
+        lines.push("skipped milestones:".to_string());
+        for milestone in &plan.skipped {
+            lines.push(format!(
+                "  {}  {:<8} {} ({})",
+                milestone.marker, milestone.id, milestone.title, milestone.reason
+            ));
+        }
+    }
+
+    lines
+}
+
+fn run_plan_prompt_context(plan: &RunPlan, selected_count: usize) -> String {
+    let mut lines = vec![
+        format!("Spec: {}", plan.spec_path),
+        format!("Task count: {selected_count}"),
+        "Milestones:".to_string(),
+    ];
+
+    for milestone in plan.eligible.iter().take(selected_count) {
+        lines.push(format!(
+            "- Milestone ID: {}\n  Marker: {}\n  Title: {}",
+            milestone.id, milestone.marker, milestone.title
+        ));
+    }
+
+    lines.join("\n")
+}
+
+async fn new_task_ids_since(existing_task_ids: &HashSet<String>) -> Result<Vec<String>> {
+    let tasks = crate::project::list_tasks().await?;
+    let mut task_ids = tasks
+        .into_iter()
+        .filter(|task| !existing_task_ids.contains(&task.id))
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    task_ids.sort();
+    Ok(task_ids)
 }
 
 fn selected_milestone_prompt_context(selected: &SelectedMilestone) -> String {
     format!(
-        "Spec: {}\nMilestone: {}\nMilestone ID: {}\nCompleted: {}\nDepends on: {}",
+        "spec_path: {}\nmilestone: {}\nmilestone_id: {}\ncompleted: {}\ndepends_on: {}",
         selected.spec_path,
         selected.milestone.display_title(),
         selected.milestone.id,
@@ -1516,109 +2337,1709 @@ async fn reconcile_agent_pids() {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, PartialEq)]
-pub(crate) enum TransitionAction {
-    SpawnExecutor,
-    SpawnReviewer,
-    SpawnConsultant,
-    KillReviewerSpawnExecutor,
-    TaskComplete,
-    TaskFailed,
-    /// Executor asked a question; display it and wait for user input.
-    PauseForHuman,
-    NoOp,
+#[derive(Debug, Clone)]
+struct ExecutorWorkspace {
+    project_root: PathBuf,
+    workspace_dir: PathBuf,
+    baseline_tree: Option<String>,
 }
 
-#[allow(dead_code)]
-pub(crate) fn transition_action(from: &TaskState, to: &TaskState) -> TransitionAction {
-    use TaskState::*;
-
-    match (from, to) {
-        (Idle, Executing) => TransitionAction::SpawnExecutor,
-        (Executing | Addressing, Reviewing) => TransitionAction::SpawnReviewer,
-        (Executing | Addressing, Consultation) => TransitionAction::SpawnConsultant,
-        (Reviewing, Addressing) => TransitionAction::KillReviewerSpawnExecutor,
-        (Reviewing, Complete) => TransitionAction::TaskComplete,
-        (_, Failed) => TransitionAction::TaskFailed,
-        (Consultation, Executing | Addressing) => TransitionAction::NoOp,
-        // Executor paused to ask the human a question.
-        (Executing | Addressing | Reviewing, AwaitingHuman) => TransitionAction::PauseForHuman,
-        // State restored after human answered:
-        //   - alive path: /wait_for_answer unblocked the still-running executor
-        //   - dead path: answer() in HqContext restored state; user will /execute
-        // Either way, no spawning needed here.
-        _ => TransitionAction::NoOp,
+async fn prepare_executor_workspace(task_id: &str) -> Result<ExecutorWorkspace> {
+    let registration = crate::project::touch_current_project().await?;
+    let project_root = PathBuf::from(&registration.metadata.workspace_dir);
+    if !git_is_work_tree(&project_root).await {
+        return Ok(ExecutorWorkspace {
+            workspace_dir: project_root.clone(),
+            project_root,
+            baseline_tree: None,
+        });
     }
+
+    let workspace_dir = registration.data_dir.join("worktrees").join(task_id);
+    let baseline_path = executor_workspace_baseline_path(&registration.data_dir, task_id);
+    if tokio::fs::try_exists(&workspace_dir).await? {
+        if git_is_work_tree(&workspace_dir).await {
+            copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
+            let mut baseline_tree = read_executor_workspace_baseline_tree(&baseline_path).await?;
+            if baseline_tree.is_none() {
+                let captured = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
+                persist_executor_workspace_baseline(
+                    &project_root,
+                    &registration.data_dir,
+                    &baseline_path,
+                    task_id,
+                    &captured,
+                )
+                .await?;
+                baseline_tree = Some(captured);
+            }
+            if let Some(baseline_tree) = baseline_tree.as_deref() {
+                crate::project::pin_executor_baseline_tree(&project_root, task_id, baseline_tree)
+                    .await?;
+            }
+            return Ok(ExecutorWorkspace {
+                project_root,
+                workspace_dir,
+                baseline_tree,
+            });
+        }
+        anyhow::bail!(
+            "Cannot start isolated executor workspace: {} already exists and is not a git worktree.",
+            workspace_dir.display()
+        );
+    }
+
+    let parent = workspace_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workspace path has no parent"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(&project_root)
+        .args(["worktree", "add"]);
+    if git_has_head(&project_root).await {
+        command.args(["--detach"]).arg(&workspace_dir).arg("HEAD");
+    } else {
+        command.arg("--orphan").arg(&workspace_dir);
+    }
+    let output = command
+        .output()
+        .await
+        .context("Failed to run git worktree add")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to create isolated executor workspace at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
+    let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
+    persist_executor_workspace_baseline(
+        &project_root,
+        &registration.data_dir,
+        &baseline_path,
+        task_id,
+        &baseline_tree,
+    )
+    .await?;
+
+    Ok(ExecutorWorkspace {
+        project_root,
+        workspace_dir,
+        baseline_tree: Some(baseline_tree),
+    })
+}
+
+async fn seed_executor_workspace_from_canonical_changes(
+    project_root: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    if git_has_head(project_root).await {
+        apply_canonical_tracked_diff(project_root, workspace_dir).await?;
+    }
+    copy_canonical_untracked_files(project_root, workspace_dir).await?;
+    copy_canonical_agent_config_files(project_root, workspace_dir).await
+}
+
+fn executor_workspace_baseline_path(data_dir: &Path, task_id: &str) -> PathBuf {
+    data_dir
+        .join("worktrees")
+        .join(".baseline-trees")
+        .join(format!("{task_id}.txt"))
+}
+
+async fn read_executor_workspace_baseline_tree(path: &Path) -> Result<Option<String>> {
+    if !tokio::fs::try_exists(path).await? {
+        return Ok(None);
+    }
+    let value = tokio::fs::read_to_string(path).await.with_context(|| {
+        format!(
+            "Failed to read executor workspace baseline {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+}
+
+async fn write_executor_workspace_baseline_tree(path: &Path, baseline_tree: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    tokio::fs::write(path, format!("{baseline_tree}\n"))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write executor workspace baseline {}",
+                path.display()
+            )
+        })
+}
+
+async fn persist_executor_workspace_baseline(
+    project_root: &Path,
+    data_dir: &Path,
+    path: &Path,
+    task_id: &str,
+    baseline_tree: &str,
+) -> Result<()> {
+    crate::project::pin_executor_baseline_tree(project_root, task_id, baseline_tree).await?;
+    if let Err(err) = write_executor_workspace_baseline_tree(path, baseline_tree).await {
+        let _ = crate::project::remove_executor_baseline(project_root, data_dir, task_id).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .args(["add", "-A", "."])
+        .output()
+        .await
+        .context("Failed to stage executor workspace baseline")?;
+    if !add.status.success() {
+        let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to stage executor workspace baseline at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                add.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .arg("write-tree")
+        .output()
+        .await
+        .context("Failed to capture executor workspace baseline tree")?;
+    if !tree.status.success() {
+        let stderr = String::from_utf8_lossy(&tree.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture executor workspace baseline tree at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                tree.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let mut reset_index = Command::new("git");
+    reset_index.arg("-C").arg(workspace_dir).arg("read-tree");
+    if git_has_head(workspace_dir).await {
+        reset_index.arg("HEAD");
+    } else {
+        reset_index.arg("--empty");
+    }
+    let reset_index = reset_index
+        .output()
+        .await
+        .context("Failed to restore executor workspace index")?;
+    if !reset_index.status.success() {
+        let stderr = String::from_utf8_lossy(&reset_index.stderr)
+            .trim()
+            .to_string();
+        anyhow::bail!(
+            "Failed to restore executor workspace index at {}: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                reset_index.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&tree.stdout).trim().to_string())
+}
+
+async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .await
+        .context("Failed to capture canonical workspace diff")?;
+    if !diff.status.success() {
+        let stderr = String::from_utf8_lossy(&diff.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture canonical workspace diff from {}: {}",
+            project_root.display(),
+            if stderr.is_empty() {
+                diff.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    if diff.stdout.is_empty() {
+        return Ok(());
+    }
+
+    let mut apply = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .args(["apply", "--whitespace=nowarn"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to start git apply for executor workspace {}",
+                workspace_dir.display()
+            )
+        })?;
+    if let Some(mut stdin) = apply.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+
+        stdin
+            .write_all(&diff.stdout)
+            .await
+            .context("Failed to stream canonical workspace diff")?;
+    }
+    let output = apply
+        .wait_with_output()
+        .await
+        .context("Failed to apply canonical workspace diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to seed executor workspace {} with approved canonical changes: {}",
+            workspace_dir.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    let workspace_dir = tokio::fs::canonicalize(workspace_dir)
+        .await
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .await
+        .context("Failed to list canonical untracked files")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to list canonical untracked files from {}: {}",
+            project_root.display(),
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    for relative in output.stdout.split(|byte| *byte == 0) {
+        if relative.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(relative).into_owned());
+        let source = project_root.join(&relative);
+        let canonical_source = tokio::fs::canonicalize(&source)
+            .await
+            .unwrap_or_else(|_| source.clone());
+        if canonical_source.starts_with(&workspace_dir) {
+            continue;
+        }
+        let metadata = tokio::fs::symlink_metadata(&source)
+            .await
+            .with_context(|| format!("Failed to stat {}", source.display()))?;
+        if metadata.is_dir() {
+            continue;
+        }
+        let destination = workspace_dir.join(&relative);
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        tokio::fs::copy(&source, &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy canonical untracked file {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn copy_canonical_agent_config_files(
+    project_root: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    for relative in [
+        ".ferrus/project.toml",
+        ".claude/mcp-supervisor.json",
+        ".claude/mcp-executor.json",
+        ".claude/settings.local.json",
+        ".codex/config.toml",
+        ".qwen/settings.json",
+        "opencode.json",
+    ] {
+        copy_canonical_file_if_present(project_root, workspace_dir, Path::new(relative)).await?;
+    }
+    Ok(())
+}
+
+async fn copy_canonical_file_if_present(
+    project_root: &Path,
+    workspace_dir: &Path,
+    relative: &Path,
+) -> Result<()> {
+    let source = project_root.join(relative);
+    let Ok(metadata) = tokio::fs::symlink_metadata(&source).await else {
+        return Ok(());
+    };
+    if metadata.is_dir() {
+        return Ok(());
+    }
+
+    let destination = workspace_dir.join(relative);
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    tokio::fs::copy(&source, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to copy canonical agent config {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    Ok(())
+}
+
+async fn git_is_work_tree(path: &Path) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .await;
+    matches!(output, Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+async fn git_has_head(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+async fn executor_parallel_limit(configured: usize) -> Result<usize> {
+    let configured = configured.max(1);
+    if configured == 1 {
+        return Ok(1);
+    }
+
+    let registration = crate::project::touch_current_project().await?;
+    let project_root = PathBuf::from(&registration.metadata.workspace_dir);
+    if git_is_work_tree(&project_root).await {
+        Ok(configured)
+    } else {
+        Ok(1)
+    }
+}
+
+fn occupied_executor_slots_from_handles<'a>(
+    mut live_db_task_ids: HashSet<String>,
+    live_headless_names: impl IntoIterator<Item = &'a str>,
+) -> usize {
+    let mut unscoped_live_handles = 0usize;
+    for name in live_headless_names {
+        if let Some(task_id) = task_id_from_scoped_agent_name(name) {
+            live_db_task_ids.insert(task_id.to_string());
+        } else {
+            unscoped_live_handles += 1;
+        }
+    }
+    live_db_task_ids.len() + unscoped_live_handles
+}
+
+fn task_id_from_scoped_agent_name(name: &str) -> Option<&str> {
+    let mut parts = name.splitn(3, ':');
+    let role = parts.next()?;
+    parts.next()?;
+    let task_id = parts.next()?;
+    (role == ROLE_EXECUTOR && task_id.starts_with("t-")).then_some(task_id)
+}
+
+fn answered_human_owner_is_live(
+    owner: &str,
+    live_run_agents: &HashSet<String>,
+    live_headless_owner: bool,
+) -> bool {
+    live_headless_owner || live_run_agents.contains(owner)
+}
+
+fn task_claim_blocks_spawn(
+    task: &TaskRecord,
+    expected_agent_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    live_run_task_ids: &HashSet<String>,
+) -> bool {
+    if live_run_task_ids.contains(task.id.as_str()) {
+        return true;
+    }
+    let Some(claimed_by) = task.claimed_by.as_deref() else {
+        return false;
+    };
+    let lease_active = task
+        .lease_until
+        .as_deref()
+        .and_then(|lease_until| chrono::DateTime::parse_from_rfc3339(lease_until).ok())
+        .is_some_and(|lease_until| lease_until.with_timezone(&chrono::Utc) > now);
+    claimed_by != expected_agent_id && lease_active
+}
+
+fn select_human_question(
+    questions: Vec<crate::project::HumanQuestion>,
+    task_id: Option<&str>,
+) -> Result<crate::project::HumanQuestion> {
+    if let Some(task_id) = task_id {
+        return questions
+            .into_iter()
+            .find(|question| question.task_id == task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task {task_id} is not waiting for a human answer."));
+    }
+
+    questions
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No task is currently waiting for a human answer."))
+}
+
+fn is_resettable_task_status(status: &str) -> bool {
+    status
+        .parse::<crate::project::TaskStatus>()
+        .is_ok_and(crate::project::TaskStatus::is_resettable)
+}
+
+fn is_executor_ready_task_status(status: &str) -> bool {
+    status
+        .parse::<crate::project::TaskStatus>()
+        .is_ok_and(crate::project::TaskStatus::is_executor_ready)
+}
+
+fn select_executor_spawn_tasks<F>(
+    ready_tasks: &[TaskRecord],
+    slots: usize,
+    mut is_live: F,
+) -> Vec<&TaskRecord>
+where
+    F: FnMut(&TaskRecord) -> bool,
+{
+    ready_tasks
+        .iter()
+        .filter(|task| !is_live(task))
+        .take(slots)
+        .collect()
+}
+
+async fn actionable_consultation_tasks(
+    tasks: &[TaskRecord],
+    slots: usize,
+    live_supervisor_task_ids: &HashSet<String>,
+) -> Result<Vec<TaskRecord>> {
+    let mut consultation_tasks = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
+    {
+        if live_supervisor_task_ids.contains(&task.id)
+            || consultation_response_is_ready(&task.id).await?
+        {
+            continue;
+        }
+        consultation_tasks.push(task.clone());
+        if consultation_tasks.len() == slots {
+            break;
+        }
+    }
+    Ok(consultation_tasks)
+}
+
+async fn answered_consultation_tasks(tasks: &[TaskRecord]) -> Result<Vec<TaskRecord>> {
+    let mut answered_tasks = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Consultation.as_str())
+    {
+        if consultation_response_is_ready(&task.id).await? {
+            answered_tasks.push(task.clone());
+        }
+    }
+    Ok(answered_tasks)
+}
+
+async fn consultation_response_is_ready(task_id: &str) -> Result<bool> {
+    match store::read_consult_response_for_run_dir(&scoped_run_dir(task_id)).await {
+        Ok(response) => Ok(!response.trim().is_empty()),
+        Err(err) if is_not_found_error(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn scoped_run_dir(task_id: &str) -> String {
+    format!(".ferrus/runs/{task_id}")
+}
+
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|err| err.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn is_review_or_consultation_task_status(status: &str) -> bool {
+    matches!(
+        status.parse::<crate::project::TaskStatus>().ok(),
+        Some(crate::project::TaskStatus::Reviewing | crate::project::TaskStatus::Consultation)
+    )
+}
+
+fn completed_task_ids(tasks: &[TaskRecord]) -> impl Iterator<Item = String> + '_ {
+    tasks
+        .iter()
+        .filter(|task| task.status == crate::project::TaskStatus::Complete.as_str())
+        .map(|task| task.id.clone())
+}
+
+async fn latest_executor_workspace_for_task(
+    task_id: &str,
+) -> Result<Option<agent_manager::HeadlessWorkspace>> {
+    let Some(run) = crate::project::list_runs(1000)
+        .await?
+        .into_iter()
+        .find(|run| {
+            run.task_id == task_id
+                && run.role == ROLE_EXECUTOR
+                && !run.workspace_path.trim().is_empty()
+        })
+    else {
+        return Ok(None);
+    };
+
+    let workspace_dir = PathBuf::from(run.workspace_path);
+    if !tokio::fs::try_exists(&workspace_dir).await? {
+        tracing::debug!(
+            task_id,
+            workspace = %workspace_dir.display(),
+            "executor workspace no longer exists; consultation will use canonical workspace"
+        );
+        return Ok(None);
+    }
+
+    let registration = crate::project::touch_current_project().await?;
+    Ok(Some(agent_manager::HeadlessWorkspace {
+        workspace_dir,
+        project_root: PathBuf::from(registration.metadata.workspace_dir),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use TaskState::*;
+
+    fn task_record(id: &str, status: crate::project::TaskStatus) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            path: format!(".ferrus/tasks/{id}.md"),
+            spec_path: None,
+            milestone_id: None,
+            status: status.as_str().to_string(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn failed_exit_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(1 << 8)
+    }
+
+    #[cfg(windows)]
+    fn failed_exit_status() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(1)
+    }
 
     #[test]
-    fn idle_to_executing_spawns_executor() {
+    fn interactive_exit_error_names_role_agent_and_status() {
+        let message = interactive_exit_error(
+            ROLE_SUPERVISOR,
+            "codex",
+            failed_exit_status(),
+            "broken config",
+        );
+
+        assert!(message.contains("supervisor agent (codex) exited with"));
+        assert!(message.contains("stderr:\nbroken config"));
+    }
+
+    #[tokio::test]
+    async fn run_plan_selects_ready_milestones_and_skips_existing_tasks() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        let local_ref_toml = toml::to_string_pretty(&local_ref).unwrap();
+        tokio::fs::write(".ferrus/project.toml", local_ref_toml)
+            .await
+            .unwrap();
+        let spec_path = "docs/specs/spec.md";
+        tokio::fs::write(
+            spec_path,
+            "## Milestones\n\
+             - [x] #1.0 Foundation\n\
+               - ID: m1.0\n\
+               - Depends on: none\n\n\
+             - [ ] #1.1 Ready one\n\
+               - ID: m1.1\n\
+               - Depends on: m1.0\n\n\
+             - [ ] #1.2 Already queued\n\
+               - ID: m1.2\n\
+               - Depends on: m1.0\n\n\
+             - [ ] #2.0 Blocked\n\
+               - ID: m2.0\n\
+               - Depends on: m1.1\n",
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status_with_origin(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Pending,
+            Some(spec_path),
+            Some("m1.2"),
+        )
+        .await
+        .unwrap();
+
+        let plan = build_run_plan(spec_path).await.unwrap();
+
+        assert_eq!(plan.eligible.len(), 1);
+        assert_eq!(plan.eligible[0].id, "m1.1");
+        assert!(plan.skipped.iter().any(|milestone| {
+            milestone.id == "m1.2" && milestone.reason == "task t-002 is pending"
+        }));
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|milestone| milestone.id == "m2.0" && milestone.reason == "waiting for m1.1")
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_includes_uncommitted_canonical_changes() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
+        tokio::fs::write("tracked.txt", "base\n").await.unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".gitignore", "tracked.txt"])
+            .status()
+            .unwrap();
+        let commit_status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit_status.success());
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::write("tracked.txt", "base\napproved\n")
+            .await
+            .unwrap();
+        tokio::fs::write("new.txt", "new approved file\n")
+            .await
+            .unwrap();
+
+        let workspace = prepare_executor_workspace("t-001").await.unwrap();
+
+        let tracked_content =
+            tokio::fs::read_to_string(workspace.workspace_dir.join("tracked.txt"))
+                .await
+                .unwrap()
+                .replace("\r\n", "\n");
+        assert_eq!(tracked_content, "base\napproved\n");
         assert_eq!(
-            transition_action(&Idle, &Executing),
-            TransitionAction::SpawnExecutor
+            tokio::fs::read_to_string(workspace.workspace_dir.join("new.txt"))
+                .await
+                .unwrap(),
+            "new approved file\n"
+        );
+        assert!(
+            !workspace
+                .workspace_dir
+                .join("runtime/worktrees/t-001/tracked.txt")
+                .exists()
+        );
+        let baseline_tree = workspace.baseline_tree.as_deref().unwrap();
+        let baseline_ref = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-001"])
+            .output()
+            .unwrap();
+        assert!(baseline_ref.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&baseline_ref.stdout).trim(),
+            baseline_tree
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["gc", "--prune=now"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["cat-file", "-e", &format!("{baseline_tree}^{{tree}}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_falls_back_to_canonical_for_non_git_project() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let workspace = prepare_executor_workspace("t-001").await.unwrap();
+        let canonical_project_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+
+        assert_eq!(workspace.project_root, canonical_project_root);
+        assert_eq!(workspace.workspace_dir, canonical_project_root);
+        assert_eq!(workspace.baseline_tree, None);
+        assert!(!data_dir.join("worktrees/t-001").exists());
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_parallel_limit_caps_non_git_projects() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executor_parallel_limit(4).await.unwrap(), 1);
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_workspace_starts_from_unborn_git_project() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .status()
+            .unwrap();
+        tokio::fs::write(
+            ".gitignore",
+            ".ferrus/\n.codex/config.toml\n.claude/mcp-executor.json\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".codex").await.unwrap();
+        tokio::fs::write(
+            ".codex/config.toml",
+            "[mcp_servers.ferrus-executor]\ncommand = \"ferrus\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".claude").await.unwrap();
+        tokio::fs::write(
+            ".claude/mcp-executor.json",
+            "{\"mcpServers\":{\"ferrus-executor\":{\"command\":\"ferrus\",\"args\":[]}}}",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write("seed.txt", "uncommitted project file\n")
+            .await
+            .unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::create_dir_all(".ferrus").await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let workspace = prepare_executor_workspace("t-unborn").await.unwrap();
+
+        assert!(workspace.baseline_tree.is_some());
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join("seed.txt"))
+                .await
+                .unwrap(),
+            "uncommitted project file\n"
+        );
+        assert!(
+            !workspace
+                .workspace_dir
+                .join("runtime/worktrees/t-unborn/seed.txt")
+                .exists()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".codex/config.toml"))
+                .await
+                .unwrap(),
+            "[mcp_servers.ferrus-executor]\ncommand = \"ferrus\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".claude/mcp-executor.json"))
+                .await
+                .unwrap(),
+            "{\"mcpServers\":{\"ferrus-executor\":{\"command\":\"ferrus\",\"args\":[]}}}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.workspace_dir.join(".ferrus/project.toml"))
+                .await
+                .unwrap(),
+            toml::to_string_pretty(&local_ref).unwrap()
+        );
+        let baseline_tree = workspace.baseline_tree.clone();
+        assert_eq!(
+            tokio::fs::read_to_string(executor_workspace_baseline_path(&data_dir, "t-unborn"))
+                .await
+                .unwrap()
+                .trim(),
+            baseline_tree.as_deref().unwrap()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["update-ref", "-d", "refs/ferrus/baselines/t-unborn"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let resumed_workspace = prepare_executor_workspace("t-unborn").await.unwrap();
+        assert_eq!(resumed_workspace.baseline_tree, baseline_tree);
+        let restored_ref = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-unborn"])
+            .output()
+            .unwrap();
+        assert!(restored_ref.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&restored_ref.stdout).trim(),
+            baseline_tree.as_deref().unwrap()
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_marks_non_terminal_database_tasks_without_state_json() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Pending,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-003",
+            ".ferrus/tasks/t-003.md",
+            crate::project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-001")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-002")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-003")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-001.md", "pending task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-002.md", "executing task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-003.md", "complete task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-001/QUESTION.md", "stale question")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-002/CONSULT_REQUEST.md", "stale consult")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-003/SUBMISSION.md", "complete submission")
+            .await
+            .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+        ctx.do_reset(false).await.unwrap();
+
+        crate::test_support::assert_no_state_json();
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let status = |id: &str| {
+            tasks
+                .iter()
+                .find(|task| task.id == id)
+                .map(|task| task.status.as_str())
+        };
+        assert_eq!(status("t-001"), Some("reset"));
+        assert_eq!(status("t-002"), Some("reset"));
+        assert_eq!(status("t-003"), Some("complete"));
+        assert!(!std::path::Path::new(".ferrus/tasks/t-001.md").exists());
+        assert!(!std::path::Path::new(".ferrus/tasks/t-002.md").exists());
+        assert!(std::path::Path::new(".ferrus/tasks/t-003.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-001").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-002").exists());
+        assert!(std::path::Path::new(".ferrus/runs/t-003/SUBMISSION.md").exists());
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_runtime_schedule_does_not_require_state_json() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+        ctx.seed_completed_task_announcements().await.unwrap();
+
+        ctx.reconcile_runtime_schedule().await.unwrap();
+
+        crate::test_support::assert_no_state_json();
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_runtime_schedule_announces_new_completed_tasks_once() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Pending,
+        )
+        .await
+        .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+        ctx.seed_completed_task_announcements().await.unwrap();
+
+        crate::project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+
+        ctx.reconcile_runtime_schedule().await.unwrap();
+
+        match msg_rx
+            .try_recv()
+            .expect("completion message should be sent")
+        {
+            tui::UiMessage::Success(text) => assert_eq!(text, "Task t-001 completed."),
+            _ => panic!("expected success message"),
+        }
+        assert!(msg_rx.try_recv().is_err());
+
+        ctx.reconcile_runtime_schedule().await.unwrap();
+        assert!(msg_rx.try_recv().is_err());
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn consultation_workspace_uses_latest_executor_task_worktree() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        let workspace_dir = data_dir.join("worktrees").join("t-010");
+        tokio::fs::create_dir_all(&workspace_dir).await.unwrap();
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: Some("git".to_string()),
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-06-14T00:00:00Z".to_string(),
+            last_opened_at: "2026-06-14T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-010",
+            ".ferrus/tasks/t-010.md",
+            crate::project::TaskStatus::Consultation,
+        )
+        .await
+        .unwrap();
+        crate::project::record_run_started_with_workspace(
+            "run-executor-t-010",
+            ROLE_EXECUTOR,
+            "executor:codex:t-010",
+            std::process::id(),
+            workspace_dir.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        crate::project::attach_running_run_to_task(
+            "executor:codex:t-010",
+            "t-010",
+            ".ferrus/tasks/t-010.md",
+        )
+        .await
+        .unwrap();
+
+        let workspace = latest_executor_workspace_for_task("t-010")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(workspace.workspace_dir, workspace_dir);
+        assert_eq!(
+            workspace.project_root,
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn human_answer_for_dead_waiter_is_not_restored_before_delivery() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-011",
+            ".ferrus/tasks/t-011.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task(
+            "t-011",
+            ".ferrus/tasks/t-011.md",
+            "executor:codex:t-011",
+            60,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-011",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:t-011",
+        )
+        .await
+        .unwrap();
+        store::write_question_for_run_dir(".ferrus/runs/t-011", "Which branch?")
+            .await
+            .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = ctx
+            .answer_scoped_human_question("Use the short branch.".to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Executor agent is not configured"));
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-011")
+            .unwrap();
+        assert_eq!(task.status, "awaiting_human");
+        assert_eq!(
+            store::read_answer_for_run_dir(".ferrus/runs/t-011")
+                .await
+                .unwrap(),
+            "Use the short branch."
+        );
+        assert_eq!(
+            store::read_question_for_run_dir(".ferrus/runs/t-011")
+                .await
+                .unwrap(),
+            "Which branch?"
+        );
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn run_plan_prompt_context_uses_selected_prefix_only() {
+        let plan = RunPlan {
+            spec_path: "docs/specs/spec.md".to_string(),
+            eligible: vec![
+                RunPlanMilestone {
+                    id: "m1.0".to_string(),
+                    marker: "#1.0".to_string(),
+                    title: "First task".to_string(),
+                },
+                RunPlanMilestone {
+                    id: "m1.1".to_string(),
+                    marker: "#1.1".to_string(),
+                    title: "Second task".to_string(),
+                },
+            ],
+            skipped: Vec::new(),
+        };
+
+        let context = run_plan_prompt_context(&plan, 1);
+
+        assert!(context.contains("Spec: docs/specs/spec.md"));
+        assert!(context.contains("Task count: 1"));
+        assert!(context.contains("Milestone ID: m1.0"));
+        assert!(!context.contains("Milestone ID: m1.1"));
+    }
+
+    #[test]
+    fn run_plan_lines_do_not_report_batch_launch_as_unwired() {
+        let plan = RunPlan {
+            spec_path: "docs/specs/spec.md".to_string(),
+            eligible: vec![RunPlanMilestone {
+                id: "m1.0".to_string(),
+                marker: "#1.0".to_string(),
+                title: "First task".to_string(),
+            }],
+            skipped: Vec::new(),
+        };
+
+        let lines = run_plan_lines(&plan, 1).join("\n");
+
+        assert!(!lines.contains("not wired"));
+        assert!(lines.contains("selected  : 1"));
+    }
+
+    #[test]
+    fn executor_spawn_selection_skips_live_tasks_before_slot_limit() {
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Pending),
+            task_record("t-002", crate::project::TaskStatus::Pending),
+        ];
+
+        let selected = select_executor_spawn_tasks(&tasks, 1, |task| task.id == "t-001");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "t-002");
+    }
+
+    #[test]
+    fn task_claim_blocks_live_expected_or_active_external_agent() {
+        let now = chrono::Utc::now();
+        let mut task = task_record("t-001", crate::project::TaskStatus::Executing);
+        task.claimed_by = Some("executor:codex:t-001".to_string());
+        task.lease_until = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
+        let mut live_run_task_ids = HashSet::new();
+
+        assert!(!task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:claude-code:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+
+        live_run_task_ids.insert("t-001".to_string());
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+
+        task.lease_until = Some((now - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:claude-code:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+
+        live_run_task_ids.clear();
+        assert!(!task_claim_blocks_spawn(
+            &task,
+            "executor:claude-code:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+    }
+
+    #[test]
+    fn task_claim_blocks_live_unclaimed_run() {
+        let now = chrono::Utc::now();
+        let task = task_record("t-001", crate::project::TaskStatus::Pending);
+        let live_run_task_ids = HashSet::from(["t-001".to_string()]);
+
+        assert!(task_claim_blocks_spawn(
+            &task,
+            "executor:codex:t-001",
+            now,
+            &live_run_task_ids,
+        ));
+    }
+
+    #[test]
+    fn occupied_executor_slots_merge_live_db_runs_and_headless_handles() {
+        let live_db_task_ids = HashSet::from(["t-001".to_string(), "t-003".to_string()]);
+        let slots = occupied_executor_slots_from_handles(
+            live_db_task_ids,
+            [
+                "executor:codex:t-001",
+                "executor:codex:t-002",
+                "executor:codex:1",
+            ],
+        );
+
+        assert_eq!(slots, 4);
+        assert_eq!(
+            task_id_from_scoped_agent_name("executor:codex:t-004"),
+            Some("t-004")
+        );
+        assert_eq!(task_id_from_scoped_agent_name("executor:codex:1"), None);
+        assert_eq!(
+            task_id_from_scoped_agent_name("supervisor:codex:t-004"),
+            None
         );
     }
 
     #[test]
-    fn executing_to_reviewing_spawns_reviewer() {
-        assert_eq!(
-            transition_action(&Executing, &Reviewing),
-            TransitionAction::SpawnReviewer
-        );
+    fn answered_human_resume_only_blocks_live_question_owner() {
+        let live_run_agents = HashSet::from(["executor:codex:t-001".to_string()]);
+
+        assert!(!answered_human_owner_is_live(
+            "supervisor:codex:t-001",
+            &live_run_agents,
+            false,
+        ));
+        assert!(answered_human_owner_is_live(
+            "executor:codex:t-001",
+            &live_run_agents,
+            false,
+        ));
+        assert!(answered_human_owner_is_live(
+            "supervisor:codex:t-001",
+            &HashSet::new(),
+            true,
+        ));
     }
 
     #[test]
-    fn reviewing_to_addressing_kills_reviewer_spawns_executor() {
-        assert_eq!(
-            transition_action(&Reviewing, &Addressing),
-            TransitionAction::KillReviewerSpawnExecutor
-        );
+    fn human_question_selection_uses_fifo_or_presented_task_id() {
+        let question = |task_id: &str| crate::project::HumanQuestion {
+            task_id: task_id.to_string(),
+            task_path: format!(".ferrus/tasks/{task_id}.md"),
+            run_dir: format!(".ferrus/runs/{task_id}"),
+            question: format!("Question for {task_id}"),
+        };
+        let questions = vec![question("t-001"), question("t-002")];
+
+        let selected = select_human_question(questions.clone(), None).unwrap();
+        assert_eq!(selected.task_id, "t-001");
+
+        let selected = select_human_question(questions, Some("t-002")).unwrap();
+        assert_eq!(selected.task_id, "t-002");
     }
 
-    #[test]
-    fn reviewing_to_complete() {
+    #[tokio::test]
+    async fn consultation_selection_skips_existing_responses_and_live_supervisors() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-001", "existing answer")
+            .await
+            .unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-003", "")
+            .await
+            .unwrap();
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Consultation),
+            task_record("t-002", crate::project::TaskStatus::Consultation),
+            task_record("t-003", crate::project::TaskStatus::Consultation),
+        ];
+
+        let mut live_supervisor_task_ids = HashSet::new();
+        live_supervisor_task_ids.insert("t-002".to_string());
+        let selected = actionable_consultation_tasks(&tasks, 2, &live_supervisor_task_ids)
+            .await
+            .unwrap();
+
         assert_eq!(
-            transition_action(&Reviewing, &Complete),
-            TransitionAction::TaskComplete
+            selected
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t-003"]
         );
+        std::env::set_current_dir(previous).unwrap();
     }
 
-    #[test]
-    fn any_to_failed() {
-        assert_eq!(
-            transition_action(&Executing, &Failed),
-            TransitionAction::TaskFailed
-        );
-    }
+    #[tokio::test]
+    async fn answered_consultation_selection_returns_tasks_with_existing_response() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        store::write_consult_response_for_run_dir(".ferrus/runs/t-002", "existing answer")
+            .await
+            .unwrap();
+        let tasks = vec![
+            task_record("t-001", crate::project::TaskStatus::Consultation),
+            task_record("t-002", crate::project::TaskStatus::Consultation),
+            task_record("t-003", crate::project::TaskStatus::Executing),
+        ];
 
-    #[test]
-    fn executing_to_addressing_is_noop() {
-        assert_eq!(
-            transition_action(&Executing, &Addressing),
-            TransitionAction::NoOp
-        );
-    }
+        let selected = answered_consultation_tasks(&tasks).await.unwrap();
 
-    #[test]
-    fn executing_to_consultation_spawns_consultant() {
-        assert_eq!(
-            transition_action(&Executing, &Consultation),
-            TransitionAction::SpawnConsultant
-        );
-    }
-
-    #[test]
-    fn consultation_to_executing_is_noop() {
-        assert_eq!(
-            transition_action(&Consultation, &Executing),
-            TransitionAction::NoOp
-        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "t-002");
+        std::env::set_current_dir(previous).unwrap();
     }
 
     #[cfg(unix)]
@@ -1628,45 +4049,240 @@ mod tests {
         assert!(!platform::pid_is_alive(999999));
     }
 
-    #[test]
-    fn executing_to_awaiting_human_pauses() {
+    #[tokio::test]
+    async fn plain_input_answers_first_scoped_human_question() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/tasks")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/runs/t-007")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join(".ferrus/projects/test-project");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-007",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:7",
+        )
+        .await
+        .unwrap();
+        store::write_question_for_run_dir(".ferrus/runs/t-007", "Need human input")
+            .await
+            .unwrap();
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = dispatch("Use option A", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        crate::test_support::assert_no_state_json();
+        assert!(error.contains("Executor agent is not configured"));
         assert_eq!(
-            transition_action(&Executing, &AwaitingHuman),
-            TransitionAction::PauseForHuman
+            store::read_answer_for_run_dir(".ferrus/runs/t-007")
+                .await
+                .unwrap(),
+            "Use option A"
         );
+        assert_eq!(
+            store::read_question_for_run_dir(".ferrus/runs/t-007")
+                .await
+                .unwrap(),
+            "Need human input"
+        );
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+        assert_eq!(task.status, "awaiting_human");
+
+        std::env::set_current_dir(previous).unwrap();
     }
 
-    #[test]
-    fn addressing_to_awaiting_human_pauses() {
+    #[tokio::test]
+    async fn queued_human_answers_follow_fifo_and_preserve_presented_task() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        for task_id in ["t-021", "t-022"] {
+            crate::project::record_task_status(
+                task_id,
+                &format!(".ferrus/tasks/{task_id}.md"),
+                crate::project::TaskStatus::Executing,
+            )
+            .await
+            .unwrap();
+            crate::project::record_task_human_question_requested(
+                task_id,
+                crate::project::TaskStatus::Executing,
+                &format!("executor:codex:{task_id}"),
+            )
+            .await
+            .unwrap();
+            store::write_question_for_run_dir(
+                &format!(".ferrus/runs/{task_id}"),
+                &format!("Question for {task_id}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = dispatch("First answer", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Executor agent is not configured"));
         assert_eq!(
-            transition_action(&Addressing, &AwaitingHuman),
-            TransitionAction::PauseForHuman
+            store::read_answer_for_run_dir(".ferrus/runs/t-021")
+                .await
+                .unwrap(),
+            "First answer"
         );
+        assert!(!std::path::Path::new(".ferrus/runs/t-022/ANSWER.md").exists());
+        let questions = crate::project::list_human_questions().await.unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].task_id, "t-022");
+
+        let error =
+            dispatch_with_human_question_target("Stale answer", Some("t-021"), false, &mut ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("Task t-021 is not waiting"));
+        assert!(!std::path::Path::new(".ferrus/runs/t-022/ANSWER.md").exists());
+
+        let error = dispatch_with_human_question_target(
+            "Use option B\n\n- preserve formatting",
+            Some("t-022"),
+            false,
+            &mut ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Executor agent is not configured"));
+        assert_eq!(
+            store::read_answer_for_run_dir(".ferrus/runs/t-022")
+                .await
+                .unwrap(),
+            "Use option B\n\n- preserve formatting"
+        );
+
+        std::env::set_current_dir(previous).unwrap();
     }
 
-    #[test]
-    fn fixing_to_awaiting_human_pauses() {
-        assert_eq!(
-            transition_action(&Addressing, &AwaitingHuman),
-            TransitionAction::PauseForHuman
-        );
-    }
+    #[tokio::test]
+    async fn plain_input_answers_scoped_human_question_without_state_json() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/tasks")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/runs/t-009")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
 
-    #[test]
-    fn reviewing_to_awaiting_human_pauses() {
-        assert_eq!(
-            transition_action(&Reviewing, &AwaitingHuman),
-            TransitionAction::PauseForHuman
-        );
-    }
+        let data_dir = dir.path().join(".ferrus/projects/test-project");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_status(
+            "t-009",
+            ".ferrus/tasks/t-009.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::record_task_human_question_requested(
+            "t-009",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:9",
+        )
+        .await
+        .unwrap();
+        store::write_question_for_run_dir(".ferrus/runs/t-009", "Need scoped input")
+            .await
+            .unwrap();
 
-    #[test]
-    fn awaiting_human_to_executing_is_noop() {
-        // Executor resumes via /wait_for_answer (alive) or is relaunched by answer()
-        // (dead). Either way, HQ doesn't spawn again from this transition.
+        let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = HqContext::new(state_rx, Display(msg_tx), false);
+
+        let error = dispatch("Use scoped answer", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Executor agent is not configured"));
         assert_eq!(
-            transition_action(&AwaitingHuman, &Executing),
-            TransitionAction::NoOp
+            store::read_answer_for_run_dir(".ferrus/runs/t-009")
+                .await
+                .unwrap(),
+            "Use scoped answer"
         );
+        assert_eq!(
+            store::read_question_for_run_dir(".ferrus/runs/t-009")
+                .await
+                .unwrap(),
+            "Need scoped input"
+        );
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-009")
+            .unwrap();
+        assert_eq!(task.status, "awaiting_human");
+        crate::test_support::assert_no_state_json();
+
+        std::env::set_current_dir(previous).unwrap();
     }
 }

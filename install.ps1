@@ -153,6 +153,7 @@ function Verify-ArchiveLayout {
 
 function Install-Binary {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $HOME ".ferrus\projects") | Out-Null
     Expand-Archive -Path (Join-Path $TempDir $Archive) -DestinationPath $TempDir -Force
 
     $binPath = Join-Path $TempDir "ferrus-$Target\ferrus.exe"

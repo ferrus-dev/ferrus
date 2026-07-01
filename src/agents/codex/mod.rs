@@ -5,11 +5,13 @@
 
 use super::{
     AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent, normalized_model,
+    validate_toml_mcp_server,
 };
-use crate::agent_id::{DEFAULT_AGENT_INDEX, ROLE_EXECUTOR, ROLE_SUPERVISOR, mcp_server_name};
+use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR, legacy_mcp_server_name, mcp_server_name};
 use anyhow::Result;
 #[cfg(windows)]
 use anyhow::anyhow;
+use std::collections::BTreeSet;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::process::Command;
@@ -59,16 +61,24 @@ impl SupervisorAgent for Supervisor {
     }
 
     /// Builds the Codex command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
-        codex_command(mode, self.model(), ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command> {
+        codex_command(mode, self.model(), ROLE_SUPERVISOR, index)
     }
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 
+    fn version_command(&self) -> Result<Command> {
+        codex_version_command()
+    }
+
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         codex_headless_prompt_transport()
+    }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
     }
 }
 
@@ -79,16 +89,24 @@ impl ExecutorAgent for Executor {
     }
 
     /// Builds the Codex command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
-        codex_command(mode, self.model(), ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command> {
+        codex_command(mode, self.model(), ROLE_EXECUTOR, index)
     }
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 
+    fn version_command(&self) -> Result<Command> {
+        codex_version_command()
+    }
+
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         codex_headless_prompt_transport()
+    }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
     }
 }
 
@@ -132,16 +150,119 @@ fn codex_command(
     Ok(cmd)
 }
 
-fn apply_opposite_role_mcp_override(command: &mut Command, role: &str, index: u32) {
+fn codex_version_command() -> Result<Command> {
+    #[cfg(windows)]
+    let mut cmd = windows_codex_command()?;
+    #[cfg(not(windows))]
+    let mut cmd = Command::new(EXECUTABLE);
+    cmd.arg("--version");
+    Ok(cmd)
+}
+
+fn apply_opposite_role_mcp_override(command: &mut Command, role: &str, _index: u32) {
+    let config_paths = codex_config_paths();
+    apply_opposite_role_mcp_override_with_paths(command, role, &config_paths);
+}
+
+fn apply_opposite_role_mcp_override_with_paths(
+    command: &mut Command,
+    role: &str,
+    config_paths: &[std::path::PathBuf],
+) {
     let opposite_role = match role {
         ROLE_SUPERVISOR => ROLE_EXECUTOR,
         ROLE_EXECUTOR => ROLE_SUPERVISOR,
         _ => return,
     };
-    let opposite_server = mcp_server_name(opposite_role, index);
-    command
-        .arg("--config")
-        .arg(format!("mcp_servers.{opposite_server}.enabled=false"));
+    let opposite_server = mcp_server_name(opposite_role);
+    if codex_mcp_server_configured_in_paths(&opposite_server, config_paths) {
+        command
+            .arg("--config")
+            .arg(format!("mcp_servers.{opposite_server}.enabled=false"));
+    }
+    for legacy_opposite_server in
+        codex_legacy_mcp_servers_configured_in_paths(opposite_role, config_paths)
+    {
+        command.arg("--config").arg(format!(
+            "mcp_servers.{legacy_opposite_server}.enabled=false"
+        ));
+    }
+}
+
+fn codex_mcp_server_configured_in_paths(server: &str, paths: &[std::path::PathBuf]) -> bool {
+    paths
+        .iter()
+        .any(|path| toml_config_has_mcp_server(path, server))
+}
+
+fn codex_legacy_mcp_servers_configured_in_paths(
+    role: &str,
+    paths: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut servers = BTreeSet::new();
+    for path in paths {
+        servers.extend(toml_config_legacy_mcp_servers_for_role(path, role));
+    }
+    servers.into_iter().collect()
+}
+
+fn toml_config_legacy_mcp_servers_for_role(path: &std::path::Path, role: &str) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = content.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(servers) = root.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    servers
+        .keys()
+        .filter(|server| is_legacy_mcp_server_for_role(server, role))
+        .cloned()
+        .collect()
+}
+
+fn is_legacy_mcp_server_for_role(server: &str, role: &str) -> bool {
+    let prefix = format!("ferrus-{role}-");
+    server
+        .strip_prefix(&prefix)
+        .is_some_and(|index| !index.is_empty() && index.parse::<u32>().is_ok())
+}
+
+fn codex_config_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
+        paths.push(home.join("config.toml"));
+    } else if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".codex").join("config.toml"));
+    }
+    paths.push(std::path::PathBuf::from(".codex").join("config.toml"));
+    paths
+}
+
+fn toml_config_has_mcp_server(path: &std::path::Path, server: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = content.parse::<toml::Table>() else {
+        return false;
+    };
+    root.get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|servers| servers.contains_key(server))
+}
+
+fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
+    let path = std::path::Path::new(".codex/config.toml");
+    let primary = mcp_server_name(role);
+    match validate_toml_mcp_server(path, &primary) {
+        Ok(()) => Ok(()),
+        Err(primary_err) => {
+            let legacy = legacy_mcp_server_name(role, index);
+            validate_toml_mcp_server(path, &legacy).map_err(|_| primary_err)
+        }
+    }
 }
 
 fn codex_headless_prompt_transport() -> HeadlessPromptTransport {
@@ -280,23 +401,21 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "wait_for_consult",
             "wait_for_answer",
             "ask_human",
-            "answer",
             "status",
             "reset",
             "heartbeat",
         ],
         ROLE_SUPERVISOR => &[
-            "create_task",
+            "enqueue_task",
             "create_spec",
             "wait_for_review",
             "review_pending",
             "approve",
             "reject",
+            "wait_for_consultation",
             "respond_consult",
             "ask_human",
-            "answer",
-            "status",
-            "reset",
+            "wait_for_answer",
             "heartbeat",
         ],
         _ => &[],
@@ -380,84 +499,149 @@ mod tests {
             program.ends_with(expected_node),
             "expected launcher program ending with {expected_node}, got {program}"
         );
-        assert_eq!(
-            args.len(),
-            4,
-            "expected codex.js + role override + --version args"
-        );
+        assert_eq!(args.len(), 2, "expected codex.js + --version args");
         assert!(
             args[0].ends_with("node_modules\\@openai\\codex\\bin\\codex.js"),
             "expected first arg to be codex.js path, got {}",
             args[0]
         );
-        assert_eq!(args[1], "--config");
-        assert_eq!(args[2], "mcp_servers.ferrus-executor-1.enabled=false");
-        assert_eq!(args[3], "--version");
+        assert_eq!(args[1], "--version");
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    }
+
+    fn assert_no_opposite_disable_for_missing_server(args: &[String], opposite_role: &str) {
+        let server = mcp_server_name(opposite_role);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == &format!("mcp_servers.{server}.enabled=false")),
+            "missing opposite role should not be disabled through a synthetic MCP entry: {args:?}"
+        );
     }
 
     #[test]
     fn codex_supervisor_builds_interactive_command() {
         let agent = Supervisor::new(None);
         #[cfg(not(windows))]
-        let expected_program = EXECUTABLE;
-        #[cfg(not(windows))]
-        let expected_args: &[&str] = &[
-            "plan",
-            "--config",
-            "mcp_servers.ferrus-executor-1.enabled=false",
-        ];
-        #[cfg(windows)]
-        assert_windows_program_and_args(
-            agent.spawn(AgentRunMode::Interactive {
-                prompt: Some("plan"),
-            }),
-            &[
-                "plan",
-                "--config",
-                "mcp_servers.ferrus-executor-1.enabled=false",
-            ],
-        );
-        #[cfg(not(windows))]
-        assert_program_and_args(
-            agent
+        {
+            let command = agent
                 .spawn(AgentRunMode::Interactive {
                     prompt: Some("plan"),
                 })
-                .unwrap(),
-            expected_program,
-            expected_args,
-        );
+                .unwrap();
+            assert_eq!(command.get_program().to_string_lossy(), EXECUTABLE);
+            let args = command_args(&command);
+            assert_eq!(args.first().map(String::as_str), Some("plan"));
+        }
+        #[cfg(windows)]
+        if let Ok(command) = agent.spawn(AgentRunMode::Interactive {
+            prompt: Some("plan"),
+        }) {
+            let args = command_args(&command);
+            assert!(args.iter().any(|arg| arg == "plan"));
+        }
     }
 
     #[test]
     fn codex_executor_builds_headless_command() {
         let agent = Executor::new(None);
         #[cfg(not(windows))]
-        let expected_program = EXECUTABLE;
-        #[cfg(not(windows))]
-        let expected: &[&str] = &[
-            "exec",
-            "run",
-            "--config",
-            "mcp_servers.ferrus-supervisor-1.enabled=false",
-        ];
+        {
+            let command = agent
+                .spawn(AgentRunMode::Headless { prompt: "run" })
+                .unwrap();
+            assert_eq!(command.get_program().to_string_lossy(), EXECUTABLE);
+            let args = command_args(&command);
+            assert_eq!(&args[..2], ["exec", "run"]);
+        }
         #[cfg(windows)]
         assert_windows_program_and_args(
             agent.spawn(AgentRunMode::Headless { prompt: "run" }),
-            &[
-                "exec",
-                "-",
-                "--config",
-                "mcp_servers.ferrus-supervisor-1.enabled=false",
-            ],
+            &["exec", "-"],
         );
-        #[cfg(not(windows))]
-        assert_program_and_args(
-            agent
-                .spawn(AgentRunMode::Headless { prompt: "run" })
-                .unwrap(),
-            expected_program,
-            expected,
+    }
+
+    #[test]
+    fn codex_does_not_disable_missing_opposite_role() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut command = Command::new("codex");
+        apply_opposite_role_mcp_override_with_paths(
+            &mut command,
+            ROLE_EXECUTOR,
+            &[dir.path().join("config.toml")],
+        );
+        let args = command_args(&command);
+        assert_no_opposite_disable_for_missing_server(&args, ROLE_SUPERVISOR);
+    }
+
+    #[test]
+    fn codex_disables_configured_opposite_role_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[mcp_servers.ferrus-supervisor]\ncommand = \"ferrus\"\nargs = []\n",
+        )
+        .unwrap();
+        let mut command = Command::new("codex");
+        apply_opposite_role_mcp_override_with_paths(&mut command, ROLE_EXECUTOR, &[config_path]);
+        let args = command_args(&command);
+        assert!(
+            args.iter()
+                .any(|arg| arg == "mcp_servers.ferrus-supervisor.enabled=false"),
+            "expected configured opposite role to be disabled in {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "mcp_servers.ferrus-supervisor-1.enabled=false"),
+            "missing legacy opposite role should not be synthesized in {args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_disables_all_configured_legacy_opposite_role_servers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.ferrus-supervisor-1]
+command = "ferrus"
+args = []
+
+[mcp_servers.ferrus-supervisor-3]
+command = "ferrus"
+args = []
+
+[mcp_servers.ferrus-executor-1]
+command = "ferrus"
+args = []
+"#,
+        )
+        .unwrap();
+        let mut command = Command::new("codex");
+        apply_opposite_role_mcp_override_with_paths(&mut command, ROLE_EXECUTOR, &[config_path]);
+        let args = command_args(&command);
+
+        for server in ["ferrus-supervisor-1", "ferrus-supervisor-3"] {
+            assert!(
+                args.iter()
+                    .any(|arg| arg == &format!("mcp_servers.{server}.enabled=false")),
+                "expected configured legacy opposite role server {server} to be disabled in {args:?}"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "mcp_servers.ferrus-executor-1.enabled=false"),
+            "same-role legacy server should stay enabled in {args:?}"
         );
     }
 
@@ -465,35 +649,18 @@ mod tests {
     fn codex_model_override_is_part_of_spawned_command() {
         let agent = Executor::new(Some("gpt-5.4"));
         #[cfg(not(windows))]
-        let expected_program = EXECUTABLE;
-        #[cfg(not(windows))]
-        let expected: &[&str] = &[
-            "exec",
-            "--model",
-            "gpt-5.4",
-            "run",
-            "--config",
-            "mcp_servers.ferrus-supervisor-1.enabled=false",
-        ];
+        {
+            let command = agent
+                .spawn(AgentRunMode::Headless { prompt: "run" })
+                .unwrap();
+            assert_eq!(command.get_program().to_string_lossy(), EXECUTABLE);
+            let args = command_args(&command);
+            assert_eq!(&args[..4], ["exec", "--model", "gpt-5.4", "run"]);
+        }
         #[cfg(windows)]
         assert_windows_program_and_args(
             agent.spawn(AgentRunMode::Headless { prompt: "run" }),
-            &[
-                "exec",
-                "--model",
-                "gpt-5.4",
-                "-",
-                "--config",
-                "mcp_servers.ferrus-supervisor-1.enabled=false",
-            ],
-        );
-        #[cfg(not(windows))]
-        assert_program_and_args(
-            agent
-                .spawn(AgentRunMode::Headless { prompt: "run" })
-                .unwrap(),
-            expected_program,
-            expected,
+            &["exec", "--model", "gpt-5.4", "-"],
         );
     }
 
@@ -505,18 +672,10 @@ mod tests {
         assert!(!entry.command.is_empty());
         assert_eq!(
             entry.args,
-            vec![
-                "serve",
-                "--role",
-                "supervisor",
-                "--agent-name",
-                "codex",
-                "--agent-index",
-                "1",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["serve", "--role", "supervisor", "--agent-name", "codex",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(entry.model.as_deref(), Some("gpt-5.4"));
     }
@@ -527,20 +686,73 @@ mod tests {
         assert!(!entry.command.is_empty());
         assert_eq!(
             entry.args,
-            vec![
-                "serve",
-                "--role",
-                "executor",
-                "--agent-name",
-                "codex",
-                "--agent-index",
-                "3",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["serve", "--role", "executor", "--agent-name", "codex",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(entry.model, None);
+    }
+
+    #[test]
+    fn codex_interactive_preflight_reports_missing_config() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let agent = Supervisor::new(None);
+
+        let err = agent
+            .validate_interactive_launch(ROLE_SUPERVISOR, 1)
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("Invalid MCP configuration"));
+        assert!(message.contains(".codex/config.toml"));
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn codex_interactive_preflight_reports_missing_role_server() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".codex").unwrap();
+        std::fs::write(
+            ".codex/config.toml",
+            "[mcp_servers.ferrus-executor-1]\ncommand = \"ferrus\"\nargs = []\n",
+        )
+        .unwrap();
+        let agent = Supervisor::new(None);
+
+        let err = agent
+            .validate_interactive_launch(ROLE_SUPERVISOR, 1)
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("MCP server `ferrus-supervisor` not found"));
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn codex_interactive_preflight_accepts_registered_role_server() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".codex").unwrap();
+        std::fs::write(
+            ".codex/config.toml",
+            "[mcp_servers.ferrus-supervisor]\ncommand = \"ferrus\"\nargs = []\n",
+        )
+        .unwrap();
+        let agent = Supervisor::new(None);
+
+        agent
+            .validate_interactive_launch(ROLE_SUPERVISOR, 1)
+            .unwrap();
+        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]
@@ -558,44 +770,40 @@ mod tests {
         let mut entry = toml::Table::new();
         apply_tool_approval_overrides("supervisor", &mut entry);
         let tools = entry.get("tools").and_then(toml::Value::as_table).unwrap();
-        assert!(tools.contains_key("create_task"));
+        assert!(tools.contains_key("enqueue_task"));
         assert!(tools.contains_key("create_spec"));
+        assert!(tools.contains_key("wait_for_consultation"));
+        assert!(tools.contains_key("heartbeat"));
+        assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
+    }
+
+    #[test]
+    fn codex_tool_approval_sets_match_role_needs() {
+        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 10);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 11);
     }
 
     #[test]
     fn codex_headless_prompt_preserves_newlines() {
         let agent = Executor::new(None);
         #[cfg(not(windows))]
-        let expected_program = EXECUTABLE;
-        #[cfg(not(windows))]
-        let expected: &[&str] = &[
-            "exec",
-            "line one\n\nline two",
-            "--config",
-            "mcp_servers.ferrus-supervisor-1.enabled=false",
-        ];
+        {
+            let command = agent
+                .spawn(AgentRunMode::Headless {
+                    prompt: "line one\n\nline two",
+                })
+                .unwrap();
+            assert_eq!(command.get_program().to_string_lossy(), EXECUTABLE);
+            let args = command_args(&command);
+            assert_eq!(&args[..2], ["exec", "line one\n\nline two"]);
+        }
         #[cfg(windows)]
         assert_windows_program_and_args(
             agent.spawn(AgentRunMode::Headless {
                 prompt: "line one\n\nline two",
             }),
-            &[
-                "exec",
-                "-",
-                "--config",
-                "mcp_servers.ferrus-supervisor-1.enabled=false",
-            ],
-        );
-        #[cfg(not(windows))]
-        assert_program_and_args(
-            agent
-                .spawn(AgentRunMode::Headless {
-                    prompt: "line one\n\nline two",
-                })
-                .unwrap(),
-            expected_program,
-            expected,
+            &["exec", "-"],
         );
     }
 
@@ -613,15 +821,7 @@ mod tests {
     fn codex_version_command_uses_expected_shape() {
         let agent = Supervisor::new(None);
         #[cfg(not(windows))]
-        assert_program_and_args(
-            agent.version_command().unwrap(),
-            EXECUTABLE,
-            &[
-                "--config",
-                "mcp_servers.ferrus-executor-1.enabled=false",
-                "--version",
-            ],
-        );
+        assert_program_and_args(agent.version_command().unwrap(), EXECUTABLE, &["--version"]);
 
         #[cfg(windows)]
         {

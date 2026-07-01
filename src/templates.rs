@@ -44,3 +44,21 @@ Each milestone must declare dependencies:
 ## Risks and Open Questions
 - ...
 "#;
+
+pub const TASK_TEMPLATE: &str = r#"# <Task Title>
+
+## Context
+Relevant repository, feature, spec, milestone, or prior review context.
+
+## Objective
+Describe the concrete outcome the Executor should produce.
+
+## Requirements
+- ...
+
+## Acceptance Criteria
+- ...
+
+## Notes
+Anything the Executor should know before starting.
+"#;

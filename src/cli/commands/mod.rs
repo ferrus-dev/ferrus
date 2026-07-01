@@ -1,3 +1,10 @@
+pub mod doctor;
+pub mod events;
 pub mod init;
+pub mod migrate;
+pub mod projects;
+pub mod recover;
 pub mod register;
+pub mod runs;
 pub mod serve;
+pub mod tasks;

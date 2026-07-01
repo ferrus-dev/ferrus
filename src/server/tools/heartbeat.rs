@@ -1,112 +1,140 @@
 use anyhow::Result;
-use fs2::FileExt;
 use neva::prelude::*;
 use serde_json::json;
 use tracing::info;
 
 use crate::{
     config::Config,
-    state::{machine::TaskState, store},
+    project::{self, LeaseRenewal},
 };
 
 use super::tool_err;
 
-pub const DESCRIPTION: &str = "Renew the lease for the calling agent. Validates that the agent holds the current lease, \
+pub const DESCRIPTION: &str = "Renew the task lease for the calling agent. Validates that the server-scoped agent identity holds a runtime lease, \
      then extends lease_until by ttl_secs and updates last_heartbeat. \
-     Returns a JSON object: {\"status\":\"renewed\", \"claimed_by\":\"...\", \"lease_until\":\"...\"} \
+     Returns a JSON object: {\"status\":\"renewed\", \"task_id\":\"...\", \"task_path\":\"...\", \"claimed_by\":\"...\", \"lease_until\":\"...\"} \
      on success, or {\"status\":\"error\", \"code\":\"...\", \"message\":\"...\"} on failure. \
      Error codes: not_claimed (no active lease), claimed_by_other (different agent holds lease), \
      expired (your lease timed out before renewal), invalid_state (state cannot be leased).";
 
-pub const INPUT_SCHEMA: &str = r#"{
-    "properties": {
-        "agent_id": {
-            "type": "string",
-            "description": "The caller's agent identifier, e.g. \"executor:codex:1\""
-        }
-    },
-    "required": ["agent_id"]
-}"#;
+pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id()).await
+}
 
-const LEASABLE_STATES: &[TaskState] = &[
-    TaskState::Executing,
-    TaskState::Addressing,
-    TaskState::Consultation,
-    TaskState::Reviewing,
-];
-
-pub async fn handler(agent_id: String) -> Result<String, Error> {
-    run(&agent_id).await.map_err(tool_err)
+pub async fn handler_for_agent(agent_id: &str) -> Result<String, Error> {
+    run(agent_id).await.map_err(tool_err)
 }
 
 async fn run(agent_id: &str) -> Result<String> {
     let config = Config::load().await?;
     let ttl_secs = config.lease.ttl_secs;
 
-    // Acquire lock for the full read-validate-write cycle.
-    let lock_file = store::open_lock_file()?;
-    let lock_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-        lock_file.lock_exclusive().map_err(anyhow::Error::from)?;
-        Ok(lock_file)
-    })
-    .await??;
+    let db_renewal = project::renew_claimed_task_lease(agent_id, ttl_secs).await;
 
-    let mut state = store::read_state().await?;
-
-    // Step 1: identity check (ignoring expiry) — determines not_claimed vs claimed_by_other.
-    let identity_match = state.claimed_by.as_deref() == Some(agent_id);
-    if !identity_match {
-        drop(lock_file);
-        return Ok(if state.claimed_by.is_none() {
-            json!({
-                "status": "error",
-                "code": "not_claimed",
-                "message": "No active lease exists"
+    match db_renewal {
+        Ok(LeaseRenewal::Renewed {
+            task_id,
+            task_path,
+            claimed_by,
+            lease_until,
+        }) => {
+            info!(agent_id, task_id, "Lease renewed");
+            Ok(json!({
+                "status": "renewed",
+                "task_id": task_id,
+                "task_path": task_path,
+                "claimed_by": claimed_by,
+                "lease_until": lease_until,
             })
-        } else {
-            json!({
-                "status": "error",
-                "code": "claimed_by_other",
-                "message": format!("Lease is held by {}", state.claimed_by.as_deref().unwrap_or("unknown"))
-            })
-        }.to_string());
-    }
-
-    // Step 2: expiry check — fires when this agent's lease has already timed out.
-    if state.lease_expired() {
-        drop(lock_file);
-        return Ok(json!({
+            .to_string())
+        }
+        Ok(LeaseRenewal::NotClaimed) => Ok(json!({
+            "status": "error",
+            "code": "not_claimed",
+            "message": "No active lease exists"
+        })
+        .to_string()),
+        Ok(LeaseRenewal::Expired) => Ok(json!({
             "status": "error",
             "code": "expired",
             "message": "Your lease expired before renewal"
         })
-        .to_string());
+        .to_string()),
+        Err(err) => {
+            tracing::warn!(error = ?err, "failed to renew lease in ferrus.db");
+            Ok(json!({
+                "status": "error",
+                "code": "not_claimed",
+                "message": "No active lease exists"
+            })
+            .to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn setup() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/tasks")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        tokio::fs::write(
+            "ferrus.toml",
+            "[checks]\ncommands = []\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+        )
+        .await
+        .unwrap();
+        let data_dir = dir.path().join(".ferrus/projects/test-project");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+        (dir, previous)
     }
 
-    // Step 3: state must be leasable.
-    if !LEASABLE_STATES.contains(&state.state) {
-        drop(lock_file);
-        return Ok(json!({
-            "status": "error",
-            "code": "invalid_state",
-            "message": format!("State {:?} cannot hold a lease", state.state)
-        })
-        .to_string());
+    fn teardown(previous: std::path::PathBuf) {
+        std::env::set_current_dir(previous).unwrap();
     }
 
-    // Renew the lease. `claim_state` mutates `state` in place (sets claimed_by,
-    // lease_until, last_heartbeat on the &mut reference) before writing to disk,
-    // so `state.lease_until` below reflects the renewed value without a second read.
-    store::claim_state(agent_id, ttl_secs, &mut state).await?;
-    drop(lock_file);
+    #[tokio::test]
+    async fn heartbeat_uses_database_context_when_state_json_is_absent() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup().await;
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "executor:codex:7", 60)
+            .await
+            .unwrap();
 
-    let renewed_until = state.lease_until;
-    info!(agent_id, "Lease renewed");
+        let response: serde_json::Value =
+            serde_json::from_str(&run("executor:codex:7").await.unwrap()).unwrap();
 
-    Ok(json!({
-        "status": "renewed",
-        "claimed_by": agent_id,
-        "lease_until": renewed_until,
-    })
-    .to_string())
+        assert_eq!(response["status"], "renewed");
+        assert_eq!(response["task_id"], "t-007");
+        crate::test_support::assert_no_state_json();
+        let tasks = crate::project::list_tasks().await.unwrap();
+        let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+        assert_eq!(task.claimed_by.as_deref(), Some("executor:codex:7"));
+        assert!(task.lease_until.is_some());
+        assert!(task.last_heartbeat.is_some());
+
+        teardown(previous);
+    }
 }

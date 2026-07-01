@@ -5,6 +5,8 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod goose;
+pub(crate) mod opencode;
 pub(crate) mod qwen;
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +14,8 @@ use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+
+use crate::agent_id::DEFAULT_AGENT_INDEX;
 
 /// Describes one MCP server entry for a spawned Ferrus agent.
 ///
@@ -57,7 +61,12 @@ pub trait SupervisorAgent: Send + Sync {
     ///
     /// Returns an error when Ferrus cannot resolve the launcher command for
     /// the selected backend and mode.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command>;
+    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+        self.spawn_with_index(mode, DEFAULT_AGENT_INDEX)
+    }
+
+    /// Builds the command used for a specific role-scoped MCP server index.
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command>;
 
     /// Builds a command that returns the backend version string.
     ///
@@ -95,6 +104,12 @@ pub trait SupervisorAgent: Send + Sync {
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         HeadlessPromptTransport::Argv
     }
+
+    /// Validates backend-specific files/settings needed before HQ leaves the dashboard
+    /// for an interactive session.
+    fn validate_interactive_launch(&self, _role: &str, _index: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Behavior required from an executor-capable agent implementation.
@@ -111,7 +126,12 @@ pub trait ExecutorAgent: Send + Sync {
     ///
     /// Returns an error when Ferrus cannot resolve the launcher command for
     /// the selected backend and mode.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command>;
+    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+        self.spawn_with_index(mode, DEFAULT_AGENT_INDEX)
+    }
+
+    /// Builds the command used for a specific role-scoped MCP server index.
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command>;
 
     /// Builds a command that returns the backend version string.
     ///
@@ -145,6 +165,12 @@ pub trait ExecutorAgent: Send + Sync {
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         HeadlessPromptTransport::Argv
     }
+
+    /// Validates backend-specific files/settings needed before HQ leaves the dashboard
+    /// for an interactive session.
+    fn validate_interactive_launch(&self, _role: &str, _index: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Parses a configured supervisor agent name into its concrete implementation.
@@ -163,9 +189,11 @@ pub fn parse_supervisor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Supervisor::new(model))),
+        goose::NAME => Ok(Arc::new(goose::Supervisor::new(model))),
+        opencode::NAME => Ok(Arc::new(opencode::Supervisor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Supervisor::new(model))),
         other => bail!(
-            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"qwen-code\"."
+            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
@@ -186,14 +214,16 @@ pub fn parse_executor_agent(
             crate::config::load_claude_mcp_isolation(),
         ))),
         codex::NAME => Ok(Arc::new(codex::Executor::new(model))),
+        goose::NAME => Ok(Arc::new(goose::Executor::new(model))),
+        opencode::NAME => Ok(Arc::new(opencode::Executor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Executor::new(model))),
         other => bail!(
-            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"qwen-code\"."
+            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
         ),
     }
 }
 
-fn current_exe_string() -> Result<String> {
+pub(crate) fn current_exe_string() -> Result<String> {
     // Persist the exact executable path so generated MCP configs keep working
     // even when Ferrus is launched outside of PATH-based resolution.
     Ok(std::env::current_exe()
@@ -202,17 +232,16 @@ fn current_exe_string() -> Result<String> {
         .into_owned())
 }
 
-fn serve_args(role: &str, agent_name: &str, index: u32) -> Vec<String> {
+pub(crate) fn serve_args(role: &str, agent_name: &str, _index: u32) -> Vec<String> {
     // Ferrus reconnects to agents through `ferrus serve`, so every backend uses
-    // the same argument shape with role and agent identity baked in.
+    // the same role-level argument shape. Concrete agent/task/run identity is
+    // supplied at runtime through FERRUS_* environment variables.
     vec![
         "serve".to_string(),
         "--role".to_string(),
         role.to_string(),
         "--agent-name".to_string(),
         agent_name.to_string(),
-        "--agent-index".to_string(),
-        index.to_string(),
     ]
 }
 
@@ -249,6 +278,85 @@ pub(crate) async fn allow_mcp_server_tools_in_json_settings(
     tokio::fs::write(path, content).await?;
     if added {
         println!("Allowed {permission} in {}", path.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn invalid_mcp_config(message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("Invalid MCP configuration:\n{message}")
+}
+
+pub(crate) fn absolute_display_path(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    }
+}
+
+pub(crate) fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn absolute_display_path_string(path: &Path) -> String {
+    display_path(&absolute_display_path(path))
+}
+
+pub(crate) fn ensure_mcp_config_file_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!(invalid_mcp_config(format!(
+            "MCP config file not found: {}",
+            absolute_display_path_string(path)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_json_mcp_server(path: &Path, key: &str) -> Result<()> {
+    ensure_mcp_config_file_exists(path)?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", display_path(path)))?;
+    let root: Value = serde_json::from_str(&content).map_err(|err| {
+        invalid_mcp_config(format!("Failed to parse {}: {err}", display_path(path)))
+    })?;
+    let servers = root
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid_mcp_config(format!(
+                "{} mcpServers is not an object",
+                display_path(path)
+            ))
+        })?;
+    if !servers.contains_key(key) {
+        bail!(invalid_mcp_config(format!(
+            "MCP server `{key}` not found in {}",
+            display_path(path)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_toml_mcp_server(path: &Path, key: &str) -> Result<()> {
+    ensure_mcp_config_file_exists(path)?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", display_path(path)))?;
+    let root: toml::Value = toml::from_str(&content).map_err(|err| {
+        invalid_mcp_config(format!("Failed to parse {}: {err}", display_path(path)))
+    })?;
+    let servers = root
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            invalid_mcp_config(format!("{} mcp_servers is not a table", display_path(path)))
+        })?;
+    if !servers.contains_key(key) {
+        bail!(invalid_mcp_config(format!(
+            "MCP server `{key}` not found in {}",
+            display_path(path)
+        )));
     }
     Ok(())
 }
@@ -319,6 +427,8 @@ mod tests {
         assert!(err.contains("Unknown supervisor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("goose"));
+        assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }
 
@@ -331,6 +441,8 @@ mod tests {
         assert!(err.contains("Unknown executor agent 'unknown'"));
         assert!(err.contains("claude-code"));
         assert!(err.contains("codex"));
+        assert!(err.contains("goose"));
+        assert!(err.contains("opencode"));
         assert!(err.contains("qwen-code"));
     }
 
@@ -348,8 +460,8 @@ mod tests {
     #[test]
     fn mcp_permission_uses_mcp_server_wildcard() {
         assert_eq!(
-            mcp_server_tools_permission("ferrus-supervisor-1"),
-            "mcp__ferrus-supervisor-1__*"
+            mcp_server_tools_permission("ferrus-supervisor"),
+            "mcp__ferrus-supervisor__*"
         );
     }
 
@@ -363,14 +475,14 @@ mod tests {
 
         let added = add_json_allow_permission(
             &mut root,
-            "mcp__ferrus-executor-1__*",
+            "mcp__ferrus-executor__*",
             Path::new(".claude/settings.local.json"),
         )
         .unwrap();
         assert!(added);
         assert_eq!(
             root["permissions"]["allow"],
-            serde_json::json!(["Bash(cargo test)", "mcp__ferrus-executor-1__*"])
+            serde_json::json!(["Bash(cargo test)", "mcp__ferrus-executor__*"])
         );
     }
 
@@ -378,20 +490,20 @@ mod tests {
     fn add_json_allow_permission_is_idempotent() {
         let mut root = serde_json::json!({
             "permissions": {
-                "allow": ["mcp__ferrus-supervisor-1__*"]
+                "allow": ["mcp__ferrus-supervisor__*"]
             }
         });
 
         let added = add_json_allow_permission(
             &mut root,
-            "mcp__ferrus-supervisor-1__*",
+            "mcp__ferrus-supervisor__*",
             Path::new(".qwen/settings.json"),
         )
         .unwrap();
         assert!(!added);
         assert_eq!(
             root["permissions"]["allow"],
-            serde_json::json!(["mcp__ferrus-supervisor-1__*"])
+            serde_json::json!(["mcp__ferrus-supervisor__*"])
         );
     }
 }

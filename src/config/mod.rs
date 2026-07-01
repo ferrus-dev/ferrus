@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agents::{ExecutorAgent, SupervisorAgent, parse_executor_agent, parse_supervisor_agent};
@@ -38,6 +39,17 @@ pub struct LimitsConfig {
     /// returns timeout so the agent can poll again.
     #[serde(default = "default_wait_timeout_secs")]
     pub wait_timeout_secs: u64,
+    /// Maximum number of executor sessions HQ may run at the same time.
+    #[serde(default = "default_max_parallel_tasks")]
+    pub max_parallel_tasks: usize,
+    /// Maximum number of executor sessions HQ will dispatch for a single task
+    /// within one work phase before giving up and marking it Failed. A session
+    /// that hits its turn limit and exits without submitting is respawned; this
+    /// bounds that respawn loop so a task that never reaches review cannot churn
+    /// forever. The counter resets when a new work phase begins (a fresh
+    /// rejection back to Addressing).
+    #[serde(default = "default_max_executor_dispatches")]
+    pub max_executor_dispatches: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +99,8 @@ struct RawConfig {
 #[serde(untagged)]
 enum RawHqConfig {
     Nested {
-        supervisor: HqAgentConfig,
-        executor: HqAgentConfig,
+        supervisor: Option<HqAgentConfig>,
+        executor: Option<HqAgentConfig>,
     },
     Flat {
         supervisor: String,
@@ -118,7 +130,7 @@ impl TryFrom<RawConfig> for Config {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawConfig) -> Result<Self> {
-        let hq = raw.hq.map(HqConfig::try_from).transpose()?;
+        let hq = raw.hq.map(hq_config_from_raw).transpose()?.flatten();
         Ok(Self {
             checks: raw.checks,
             limits: raw.limits,
@@ -129,35 +141,46 @@ impl TryFrom<RawConfig> for Config {
     }
 }
 
+fn hq_config_from_raw(raw: RawHqConfig) -> Result<Option<HqConfig>> {
+    let Some((supervisor, executor)) = hq_agents_from_raw(raw) else {
+        return Ok(None);
+    };
+    parse_supervisor_agent(&supervisor.agent, supervisor.model.as_deref())?;
+    parse_executor_agent(&executor.agent, executor.model.as_deref())?;
+    Ok(Some(HqConfig {
+        supervisor,
+        executor,
+    }))
+}
+
+fn hq_agents_from_raw(raw: RawHqConfig) -> Option<(HqAgentConfig, HqAgentConfig)> {
+    match raw {
+        RawHqConfig::Nested {
+            supervisor,
+            executor,
+        } => Some((supervisor?, executor?)),
+        RawHqConfig::Flat {
+            supervisor,
+            executor,
+        } => Some((
+            HqAgentConfig {
+                agent: supervisor,
+                model: None,
+            },
+            HqAgentConfig {
+                agent: executor,
+                model: None,
+            },
+        )),
+    }
+}
+
 impl TryFrom<RawHqConfig> for HqConfig {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawHqConfig) -> Result<Self> {
-        let (supervisor, executor) = match raw {
-            RawHqConfig::Nested {
-                supervisor,
-                executor,
-            } => (supervisor, executor),
-            RawHqConfig::Flat {
-                supervisor,
-                executor,
-            } => (
-                HqAgentConfig {
-                    agent: supervisor,
-                    model: None,
-                },
-                HqAgentConfig {
-                    agent: executor,
-                    model: None,
-                },
-            ),
-        };
-
-        parse_supervisor_agent(&supervisor.agent, supervisor.model.as_deref())?;
-        parse_executor_agent(&executor.agent, executor.model.as_deref())?;
-        Ok(Self {
-            supervisor,
-            executor,
+        hq_config_from_raw(raw)?.ok_or_else(|| {
+            anyhow::anyhow!("ferrus.toml [hq] must configure both supervisor and executor")
         })
     }
 }
@@ -206,6 +229,12 @@ const fn default_max_feedback_lines() -> usize {
 const fn default_wait_timeout_secs() -> u64 {
     60
 }
+const fn default_max_parallel_tasks() -> usize {
+    1
+}
+const fn default_max_executor_dispatches() -> u32 {
+    6
+}
 const fn default_ttl_secs() -> u64 {
     90
 }
@@ -218,9 +247,14 @@ fn default_spec_directory() -> String {
 
 impl Config {
     pub async fn load() -> Result<Self> {
-        let contents = tokio::fs::read_to_string("ferrus.toml")
+        Self::load_from(Path::new(".")).await
+    }
+
+    pub async fn load_from(project_root: &Path) -> Result<Self> {
+        let path = project_root.join("ferrus.toml");
+        let contents = tokio::fs::read_to_string(&path)
             .await
-            .context("ferrus.toml not found — run `ferrus init` first")?;
+            .with_context(|| format!("{} not found — run `ferrus init` first", path.display()))?;
         Self::from_toml(&contents)
     }
 
@@ -281,10 +315,10 @@ fn update_hq_agent_config_in_contents(
     if !hq.contains_key(table_name) {
         hq[table_name] = Item::Table(Table::new());
     }
-    if !hq.contains_key(HqRole::Supervisor.table_name()) {
+    if flat_supervisor.is_some() && !hq.contains_key(HqRole::Supervisor.table_name()) {
         hq[HqRole::Supervisor.table_name()] = Item::Table(Table::new());
     }
-    if !hq.contains_key(HqRole::Executor.table_name()) {
+    if flat_executor.is_some() && !hq.contains_key(HqRole::Executor.table_name()) {
         hq[HqRole::Executor.table_name()] = Item::Table(Table::new());
     }
     if let Some(supervisor) = flat_supervisor {
@@ -366,6 +400,8 @@ commands = ["cargo test"]
         assert_eq!(config.limits.max_review_cycles, 3);
         assert_eq!(config.limits.max_feedback_lines, 30);
         assert_eq!(config.limits.wait_timeout_secs, 60);
+        assert_eq!(config.limits.max_parallel_tasks, 1);
+        assert_eq!(config.limits.max_executor_dispatches, 6);
     }
 
     #[test]
@@ -379,6 +415,7 @@ max_check_retries = 7
 max_review_cycles = 4
 max_feedback_lines = 12
 wait_timeout_secs = 900
+max_parallel_tasks = 3
 
 [lease]
 ttl_secs = 120
@@ -400,6 +437,7 @@ directory = "docs/feature-specs"
         assert_eq!(config.limits.max_review_cycles, 4);
         assert_eq!(config.limits.max_feedback_lines, 12);
         assert_eq!(config.limits.wait_timeout_secs, 900);
+        assert_eq!(config.limits.max_parallel_tasks, 3);
         assert_eq!(config.lease.ttl_secs, 120);
         assert_eq!(config.lease.heartbeat_interval_secs, 45);
         assert_eq!(config.spec.directory, "docs/feature-specs");
@@ -420,6 +458,13 @@ directory = "docs/feature-specs"
     #[test]
     fn hq_config_absent_gives_none() {
         let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n";
+        let config = Config::from_toml(toml).unwrap();
+        assert!(config.hq.is_none());
+    }
+
+    #[test]
+    fn partial_nested_hq_config_gives_none() {
+        let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n[hq.supervisor]\nagent = \"claude-code\"\n";
         let config = Config::from_toml(toml).unwrap();
         assert!(config.hq.is_none());
     }
@@ -478,6 +523,27 @@ directory = "docs/feature-specs"
         assert_eq!(hq.supervisor.model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(hq.executor.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(hq.supervisor.agent, "claude-code");
+    }
+
+    #[test]
+    fn update_hq_agent_config_one_sided_does_not_create_empty_opposite_table() {
+        let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n";
+        let updated =
+            update_hq_agent_config_in_contents(toml, HqRole::Supervisor, Some("claude-code"), None)
+                .unwrap();
+
+        assert!(updated.contains("[hq.supervisor]"));
+        assert!(!updated.contains("[hq.executor]"));
+        let config = Config::from_toml(&updated).unwrap();
+        assert!(config.hq.is_none());
+
+        let completed =
+            update_hq_agent_config_in_contents(&updated, HqRole::Executor, Some("codex"), None)
+                .unwrap();
+        let config = Config::from_toml(&completed).unwrap();
+        let hq = config.hq.unwrap();
+        assert_eq!(hq.supervisor.agent, "claude-code");
+        assert_eq!(hq.executor.agent, "codex");
     }
 
     #[test]

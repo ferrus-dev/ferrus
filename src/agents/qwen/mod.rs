@@ -5,8 +5,9 @@
 
 use super::{
     AgentRunMode, ExecutorAgent, SupervisorAgent, allow_mcp_server_tools_in_json_settings,
-    normalized_model,
+    normalized_model, validate_json_mcp_server,
 };
+use crate::agent_id::{legacy_mcp_server_name, mcp_server_name};
 use anyhow::Result;
 use std::process::Command;
 
@@ -50,12 +51,16 @@ impl SupervisorAgent for Supervisor {
     }
 
     /// Builds the Qwen command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, _index: u32) -> Result<Command> {
         Ok(qwen_command(mode, self.model()))
     }
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
     }
 }
 
@@ -66,12 +71,16 @@ impl ExecutorAgent for Executor {
     }
 
     /// Builds the Qwen command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, _index: u32) -> Result<Command> {
         Ok(qwen_command(mode, self.model()))
     }
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
     }
 }
 
@@ -98,6 +107,18 @@ fn qwen_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
 pub(crate) async fn allow_mcp_server_tools(server_key: &str) -> Result<()> {
     allow_mcp_server_tools_in_json_settings(std::path::Path::new(".qwen/settings.json"), server_key)
         .await
+}
+
+fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
+    let path = std::path::Path::new(".qwen/settings.json");
+    let primary = mcp_server_name(role);
+    match validate_json_mcp_server(path, &primary) {
+        Ok(()) => Ok(()),
+        Err(primary_err) => {
+            let legacy = legacy_mcp_server_name(role, index);
+            validate_json_mcp_server(path, &legacy).map_err(|_| primary_err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,18 +172,10 @@ mod tests {
         assert!(!entry.command.is_empty());
         assert_eq!(
             entry.args,
-            vec![
-                "serve",
-                "--role",
-                "supervisor",
-                "--agent-name",
-                "qwen-code",
-                "--agent-index",
-                "2",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["serve", "--role", "supervisor", "--agent-name", "qwen-code",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(entry.model.as_deref(), Some("qwen3-coder-plus"));
     }
@@ -173,19 +186,50 @@ mod tests {
         assert!(!entry.command.is_empty());
         assert_eq!(
             entry.args,
-            vec![
-                "serve",
-                "--role",
-                "executor",
-                "--agent-name",
-                "qwen-code",
-                "--agent-index",
-                "4",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["serve", "--role", "executor", "--agent-name", "qwen-code",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(entry.model, None);
+    }
+
+    #[test]
+    fn qwen_interactive_preflight_reports_missing_role_server() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".qwen").unwrap();
+        std::fs::write(".qwen/settings.json", r#"{"mcpServers":{}}"#).unwrap();
+        let agent = Executor::new(None);
+
+        let err = agent
+            .validate_interactive_launch(crate::agent_id::ROLE_EXECUTOR, 1)
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("MCP server `ferrus-executor` not found"));
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn qwen_interactive_preflight_accepts_registered_role_server() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".qwen").unwrap();
+        std::fs::write(
+            ".qwen/settings.json",
+            r#"{"mcpServers":{"ferrus-executor":{"command":"ferrus","args":[]}}}"#,
+        )
+        .unwrap();
+        let agent = Executor::new(None);
+
+        agent
+            .validate_interactive_launch(crate::agent_id::ROLE_EXECUTOR, 1)
+            .unwrap();
+        std::env::set_current_dir(previous).unwrap();
     }
 }

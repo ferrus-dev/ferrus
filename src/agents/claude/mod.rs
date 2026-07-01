@@ -5,9 +5,9 @@
 
 use super::{
     AgentRunMode, ExecutorAgent, SupervisorAgent, allow_mcp_server_tools_in_json_settings,
-    normalized_model,
+    normalized_model, validate_json_mcp_server,
 };
-use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR};
+use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR, legacy_mcp_server_name, mcp_server_name};
 use crate::config::ClaudeMcpIsolation;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ impl SupervisorAgent for Supervisor {
     }
 
     /// Builds the Claude command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, _index: u32) -> Result<Command> {
         Ok(claude_command(
             ROLE_SUPERVISOR,
             mode,
@@ -69,6 +69,10 @@ impl SupervisorAgent for Supervisor {
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
+    }
 }
 
 impl ExecutorAgent for Executor {
@@ -78,7 +82,7 @@ impl ExecutorAgent for Executor {
     }
 
     /// Builds the Claude command used by Ferrus HQ or an interactive user.
-    fn spawn(&self, mode: AgentRunMode<'_>) -> Result<Command> {
+    fn spawn_with_index(&self, mode: AgentRunMode<'_>, _index: u32) -> Result<Command> {
         Ok(claude_command(
             ROLE_EXECUTOR,
             mode,
@@ -89,6 +93,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
+        validate_interactive_launch(role, index)
     }
 }
 
@@ -111,7 +119,7 @@ fn claude_command(
     match mode {
         AgentRunMode::Interactive { prompt } => {
             if let Some(prompt) = prompt {
-                cmd.arg(prompt);
+                cmd.arg("--").arg(prompt);
             }
         }
         AgentRunMode::Headless { prompt } => {
@@ -135,6 +143,18 @@ pub(crate) fn claude_role_mcp_config_path(role: &str) -> PathBuf {
     Path::new(".claude").join(format!("mcp-{role}.json"))
 }
 
+fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
+    let path = claude_role_mcp_config_path(role);
+    let primary = mcp_server_name(role);
+    match validate_json_mcp_server(&path, &primary) {
+        Ok(()) => Ok(()),
+        Err(primary_err) => {
+            let legacy = legacy_mcp_server_name(role, index);
+            validate_json_mcp_server(&path, &legacy).map_err(|_| primary_err)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +173,7 @@ mod tests {
                 })
                 .unwrap(),
             "claude",
-            &["--mcp-config", &role_config, "plan"],
+            &["--mcp-config", &role_config, "--", "plan"],
         );
     }
 
@@ -243,8 +263,6 @@ mod tests {
                 "supervisor",
                 "--agent-name",
                 "claude-code",
-                "--agent-index",
-                "2",
             ]
             .into_iter()
             .map(String::from)
@@ -261,19 +279,49 @@ mod tests {
         assert!(!entry.command.is_empty());
         assert_eq!(
             entry.args,
-            vec![
-                "serve",
-                "--role",
-                "executor",
-                "--agent-name",
-                "claude-code",
-                "--agent-index",
-                "4",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["serve", "--role", "executor", "--agent-name", "claude-code",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(entry.model, None);
+    }
+
+    #[test]
+    fn claude_interactive_preflight_reports_missing_role_config() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let agent = Supervisor::new(None, ClaudeMcpIsolation::MergeUser);
+
+        let err = agent
+            .validate_interactive_launch(ROLE_SUPERVISOR, 1)
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("Invalid MCP configuration"));
+        assert!(message.contains(".claude/mcp-supervisor.json"));
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn claude_interactive_preflight_accepts_registered_role_server() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".claude").unwrap();
+        std::fs::write(
+            ".claude/mcp-supervisor.json",
+            r#"{"mcpServers":{"ferrus-supervisor":{"command":"ferrus","args":[]}}}"#,
+        )
+        .unwrap();
+        let agent = Supervisor::new(None, ClaudeMcpIsolation::MergeUser);
+
+        agent
+            .validate_interactive_launch(ROLE_SUPERVISOR, 1)
+            .unwrap();
+        std::env::set_current_dir(previous).unwrap();
     }
 }
