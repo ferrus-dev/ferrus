@@ -47,7 +47,7 @@ impl TaskStatus {
     }
 
     pub const fn is_resettable(self) -> bool {
-        !matches!(self, Self::Reset | Self::Complete)
+        !matches!(self, Self::Unknown | Self::Reset | Self::Complete)
     }
 
     pub const fn is_terminal(self) -> bool {
@@ -95,5 +95,10 @@ mod tests {
     fn complete_and_reset_tasks_are_not_resettable() {
         assert!(!TaskStatus::Complete.is_resettable());
         assert!(!TaskStatus::Reset.is_resettable());
+    }
+
+    #[test]
+    fn unknown_tasks_are_not_resettable() {
+        assert!(!TaskStatus::Unknown.is_resettable());
     }
 }

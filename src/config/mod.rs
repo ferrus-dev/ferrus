@@ -99,8 +99,8 @@ struct RawConfig {
 #[serde(untagged)]
 enum RawHqConfig {
     Nested {
-        supervisor: HqAgentConfig,
-        executor: HqAgentConfig,
+        supervisor: Option<HqAgentConfig>,
+        executor: Option<HqAgentConfig>,
     },
     Flat {
         supervisor: String,
@@ -130,7 +130,7 @@ impl TryFrom<RawConfig> for Config {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawConfig) -> Result<Self> {
-        let hq = raw.hq.map(HqConfig::try_from).transpose()?;
+        let hq = raw.hq.map(hq_config_from_raw).transpose()?.flatten();
         Ok(Self {
             checks: raw.checks,
             limits: raw.limits,
@@ -141,35 +141,46 @@ impl TryFrom<RawConfig> for Config {
     }
 }
 
+fn hq_config_from_raw(raw: RawHqConfig) -> Result<Option<HqConfig>> {
+    let Some((supervisor, executor)) = hq_agents_from_raw(raw) else {
+        return Ok(None);
+    };
+    parse_supervisor_agent(&supervisor.agent, supervisor.model.as_deref())?;
+    parse_executor_agent(&executor.agent, executor.model.as_deref())?;
+    Ok(Some(HqConfig {
+        supervisor,
+        executor,
+    }))
+}
+
+fn hq_agents_from_raw(raw: RawHqConfig) -> Option<(HqAgentConfig, HqAgentConfig)> {
+    match raw {
+        RawHqConfig::Nested {
+            supervisor,
+            executor,
+        } => Some((supervisor?, executor?)),
+        RawHqConfig::Flat {
+            supervisor,
+            executor,
+        } => Some((
+            HqAgentConfig {
+                agent: supervisor,
+                model: None,
+            },
+            HqAgentConfig {
+                agent: executor,
+                model: None,
+            },
+        )),
+    }
+}
+
 impl TryFrom<RawHqConfig> for HqConfig {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawHqConfig) -> Result<Self> {
-        let (supervisor, executor) = match raw {
-            RawHqConfig::Nested {
-                supervisor,
-                executor,
-            } => (supervisor, executor),
-            RawHqConfig::Flat {
-                supervisor,
-                executor,
-            } => (
-                HqAgentConfig {
-                    agent: supervisor,
-                    model: None,
-                },
-                HqAgentConfig {
-                    agent: executor,
-                    model: None,
-                },
-            ),
-        };
-
-        parse_supervisor_agent(&supervisor.agent, supervisor.model.as_deref())?;
-        parse_executor_agent(&executor.agent, executor.model.as_deref())?;
-        Ok(Self {
-            supervisor,
-            executor,
+        hq_config_from_raw(raw)?.ok_or_else(|| {
+            anyhow::anyhow!("ferrus.toml [hq] must configure both supervisor and executor")
         })
     }
 }
@@ -304,10 +315,10 @@ fn update_hq_agent_config_in_contents(
     if !hq.contains_key(table_name) {
         hq[table_name] = Item::Table(Table::new());
     }
-    if !hq.contains_key(HqRole::Supervisor.table_name()) {
+    if flat_supervisor.is_some() && !hq.contains_key(HqRole::Supervisor.table_name()) {
         hq[HqRole::Supervisor.table_name()] = Item::Table(Table::new());
     }
-    if !hq.contains_key(HqRole::Executor.table_name()) {
+    if flat_executor.is_some() && !hq.contains_key(HqRole::Executor.table_name()) {
         hq[HqRole::Executor.table_name()] = Item::Table(Table::new());
     }
     if let Some(supervisor) = flat_supervisor {
@@ -452,6 +463,13 @@ directory = "docs/feature-specs"
     }
 
     #[test]
+    fn partial_nested_hq_config_gives_none() {
+        let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n[hq.supervisor]\nagent = \"claude-code\"\n";
+        let config = Config::from_toml(toml).unwrap();
+        assert!(config.hq.is_none());
+    }
+
+    #[test]
     fn hq_config_parses_when_present() {
         let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n[hq.supervisor]\nagent = \"claude-code\"\nmodel = \"\"\n[hq.executor]\nagent = \"codex\"\nmodel = \"gpt-5.4\"\n";
         let config = Config::from_toml(toml).unwrap();
@@ -505,6 +523,27 @@ directory = "docs/feature-specs"
         assert_eq!(hq.supervisor.model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(hq.executor.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(hq.supervisor.agent, "claude-code");
+    }
+
+    #[test]
+    fn update_hq_agent_config_one_sided_does_not_create_empty_opposite_table() {
+        let toml = "[checks]\ncommands = [\"cargo test\"]\n[limits]\n";
+        let updated =
+            update_hq_agent_config_in_contents(toml, HqRole::Supervisor, Some("claude-code"), None)
+                .unwrap();
+
+        assert!(updated.contains("[hq.supervisor]"));
+        assert!(!updated.contains("[hq.executor]"));
+        let config = Config::from_toml(&updated).unwrap();
+        assert!(config.hq.is_none());
+
+        let completed =
+            update_hq_agent_config_in_contents(&updated, HqRole::Executor, Some("codex"), None)
+                .unwrap();
+        let config = Config::from_toml(&completed).unwrap();
+        let hq = config.hq.unwrap();
+        assert_eq!(hq.supervisor.agent, "claude-code");
+        assert_eq!(hq.executor.agent, "codex");
     }
 
     #[test]
