@@ -1527,16 +1527,9 @@ fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> Vec<Dashboa
         return lines;
     }
 
-    let mut activity = app
-        .messages
-        .iter()
-        .rev()
-        .take(remaining)
-        .cloned()
-        .collect::<Vec<_>>();
-    activity.reverse();
+    let activity_blocks = recent_transcript_blocks(&app.messages, remaining);
 
-    if activity.is_empty() {
+    if activity_blocks.is_empty() {
         lines.extend(runtime_task_activity_lines(app, width, remaining));
         let remaining = max_lines.saturating_sub(lines.len());
         lines.extend(app.runtime_runs.iter().take(remaining).map(|run| {
@@ -1555,25 +1548,71 @@ fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> Vec<Dashboa
             ))
         }));
     } else {
-        for line in activity {
-            if !line.continuation {
+        let rendered_block_lines = activity_blocks.iter().map(Vec::len).sum::<usize>()
+            + activity_blocks.len().saturating_sub(1);
+        let include_leading_gap = lines.len() + rendered_block_lines < max_lines;
+
+        for (block_idx, block) in activity_blocks.into_iter().enumerate() {
+            if block_idx > 0 || include_leading_gap {
                 push_activity_gap(&mut lines);
                 if lines.len() >= max_lines {
                     break;
                 }
             }
-            lines.push(DashboardLine::new(StyledLine::plain(
-                truncate_to_width(&format!("  {}", activity_text(&line)), width),
-                transcript_color(line.kind),
-            )));
-            if lines.len() >= max_lines {
-                break;
+            for line in block {
+                lines.push(DashboardLine::new(StyledLine::plain(
+                    truncate_to_width(&format!("  {}", activity_text(&line)), width),
+                    transcript_color(line.kind),
+                )));
+                if lines.len() >= max_lines {
+                    break;
+                }
             }
         }
     }
 
     lines.truncate(max_lines);
     lines
+}
+
+fn recent_transcript_blocks(
+    messages: &[TranscriptLine],
+    max_lines: usize,
+) -> Vec<Vec<TranscriptLine>> {
+    if max_lines == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    for line in messages {
+        if !line.continuation && !current.is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push(line.clone());
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    let mut selected = Vec::new();
+    let mut remaining = max_lines;
+    for block in blocks.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+
+        let gap_before_newer_block = usize::from(!selected.is_empty());
+        if remaining <= gap_before_newer_block {
+            break;
+        }
+
+        let take = block.len().min(remaining - gap_before_newer_block);
+        selected.push(block.into_iter().take(take).collect::<Vec<_>>());
+        remaining -= gap_before_newer_block + take;
+    }
+    selected.reverse();
+    selected
 }
 
 fn runtime_task_activity_lines(app: &App, width: usize, max_lines: usize) -> Vec<DashboardLine> {
@@ -3263,6 +3302,51 @@ mod tui_tests {
         assert_eq!(detail_idx, first_idx + 1);
         assert_eq!(rendered[first_idx - 1], "");
         assert_eq!(rendered[second_idx - 1], "");
+    }
+
+    #[test]
+    fn activity_area_keeps_latest_multiline_message_start_when_tight() {
+        let mut app = App::new();
+        app.messages.extend(split_transcript(
+            "  • Started supervisor:codex:t-006…\n  ╰─ Logs: .ferrus/logs/supervisor.log",
+            TranscriptKind::Muted,
+        ));
+
+        let rendered = activity_area_lines(&app, 120, 1)
+            .into_iter()
+            .map(|line| {
+                line.line
+                    .segments
+                    .into_iter()
+                    .map(|segment| segment.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("Started supervisor:codex:t-006"));
+    }
+
+    #[test]
+    fn activity_area_does_not_spend_only_line_on_gap() {
+        let mut app = App::new();
+        app.messages.extend(split_transcript(
+            "Task t-006 completed.",
+            TranscriptKind::Success,
+        ));
+
+        let rendered = activity_area_lines(&app, 120, 1)
+            .into_iter()
+            .map(|line| {
+                line.line
+                    .segments
+                    .into_iter()
+                    .map(|segment| segment.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["  Task t-006 completed."]);
     }
 
     fn char_before_last_border(text: &str) -> Option<char> {
