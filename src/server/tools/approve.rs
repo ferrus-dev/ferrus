@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use neva::prelude::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -255,6 +256,10 @@ struct CanonicalApprovalLock {
     path: PathBuf,
 }
 
+struct CanonicalApprovalLockGuard {
+    _file: std::fs::File,
+}
+
 impl Drop for CanonicalApprovalLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -281,6 +286,7 @@ async fn acquire_canonical_approval_lock_at(
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
+    let _guard = acquire_canonical_approval_lock_guard(lock_path)?;
     loop {
         match try_create_canonical_approval_lock(lock_path, task_id).await {
             Ok(Some(lock)) => return Ok(lock),
@@ -293,6 +299,33 @@ async fn acquire_canonical_approval_lock_at(
             Err(err) => return Err(err),
         }
     }
+}
+
+fn acquire_canonical_approval_lock_guard(lock_path: &Path) -> Result<CanonicalApprovalLockGuard> {
+    let guard_path = canonical_approval_lock_guard_path(lock_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&guard_path)
+        .with_context(|| {
+            format!(
+                "Failed to open canonical approval lock guard {}",
+                guard_path.display()
+            )
+        })?;
+    file.lock_exclusive().with_context(|| {
+        format!(
+            "Failed to acquire canonical approval lock guard {}",
+            guard_path.display()
+        )
+    })?;
+    Ok(CanonicalApprovalLockGuard { _file: file })
+}
+
+fn canonical_approval_lock_guard_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name(".canonical-approval.lock.guard")
 }
 
 async fn try_create_canonical_approval_lock(
@@ -616,10 +649,47 @@ mod tests {
                     .file_name()
                     .to_string_lossy()
                     .starts_with(".canonical-approval.lock.")
+                    && entry.file_name().to_string_lossy().ends_with(".tmp")
             })
             .count();
         assert_eq!(temp_files, 0);
         drop(lock);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_approval_lock_stale_recovery_admits_one_owner_at_a_time() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("canonical-approval.lock");
+        tokio::fs::write(&lock_path, "pid=2147483647\ntask_id=t-old\n")
+            .await
+            .unwrap();
+
+        let first = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+            .await
+            .unwrap();
+        let second_path = lock_path.clone();
+        let second =
+            tokio::spawn(
+                async move { acquire_canonical_approval_lock_at(&second_path, "t-008").await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "second owner entered while first approval lock was still held"
+        );
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert!(contents.contains("task_id=t-007"));
+
+        drop(first);
+        let second_lock = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        assert!(contents.contains("task_id=t-008"));
+        drop(second_lock);
     }
 
     #[tokio::test]
