@@ -2210,7 +2210,7 @@ fn task_counts_line(app: &App) -> String {
             &["executing", "addressing", "reviewing", "consultation"]
         ),
         count_tasks(app, &["awaiting_human"]),
-        count_tasks(app, &["idle"]),
+        count_milestones(app, MilestoneReadiness::Pending),
         count_tasks(app, &["complete"])
     )
 }
@@ -2219,6 +2219,14 @@ fn count_tasks(app: &App, statuses: &[&str]) -> usize {
     app.runtime_tasks
         .iter()
         .filter(|task| statuses.contains(&task.status.as_str()))
+        .count()
+}
+
+fn count_milestones(app: &App, readiness: MilestoneReadiness) -> usize {
+    app.status
+        .selected_milestones
+        .iter()
+        .filter(|milestone| milestone.readiness == readiness)
         .count()
 }
 
@@ -3052,6 +3060,30 @@ mod tui_tests {
         assert_eq!(char_before_last_border(rendered[2]), Some(' '));
         assert_eq!(char_before_last_border(rendered[3]), Some(' '));
         assert_eq!(char_before_last_border(rendered[4]), Some(' '));
+    }
+
+    #[test]
+    fn task_counts_line_uses_pending_milestones() {
+        let mut app = App::new();
+        app.status.selected_milestones = vec![
+            MilestoneSnapshot {
+                marker: "#1.0".into(),
+                title: "Pending".into(),
+                completed: false,
+                readiness: MilestoneReadiness::Pending,
+            },
+            MilestoneSnapshot {
+                marker: "#1.1".into(),
+                title: "Also pending".into(),
+                completed: false,
+                readiness: MilestoneReadiness::Pending,
+            },
+        ];
+
+        assert_eq!(
+            task_counts_line(&app),
+            "tasks:       0 running  0 waiting  2 pending  0 done"
+        );
     }
 
     #[test]
