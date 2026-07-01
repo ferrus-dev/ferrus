@@ -1,7 +1,7 @@
 use anyhow::Result;
 use neva::prelude::*;
 
-use crate::{project, state::store};
+use crate::project;
 
 use super::tool_err;
 
@@ -29,8 +29,7 @@ async fn run(response: String) -> Result<String> {
     }
 
     if let Some(question) = project::list_human_questions().await?.into_iter().next() {
-        store::write_answer_for_run_dir(&question.run_dir, &response).await?;
-        project::record_task_human_answer(&question.task_id).await?;
+        project::record_scoped_human_answer(&question, &response).await?;
         return Ok(format!(
             "Response recorded for `{}` in `{}/ANSWER.md`. The waiting agent can call /wait_for_answer and continue.",
             question.task_id, question.run_dir
@@ -43,6 +42,7 @@ async fn run(response: String) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::store;
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, std::path::PathBuf) {

@@ -1774,6 +1774,44 @@ pub async fn record_task_human_answer(task_id: &str) -> Result<()> {
     .await?
 }
 
+pub async fn record_scoped_human_answer(question: &HumanQuestion, response: &str) -> Result<()> {
+    record_task_human_answer(&question.task_id).await?;
+    if let Err(err) =
+        crate::state::store::write_answer_for_run_dir(&question.run_dir, response).await
+    {
+        if let Err(rollback_err) = clear_task_human_answer_recorded(&question.task_id).await {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to roll back recorded human answer for {}: {rollback_err}",
+                    question.task_id
+                )
+            });
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn clear_task_human_answer_recorded(task_id: &str) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            r#"
+            UPDATE tasks
+            SET human_answer_recorded = 0
+            WHERE id = ?1 AND status = ?2
+            "#,
+            params![task_id, TaskStatus::AwaitingHuman.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
 pub async fn task_human_question_owner(task_id: &str) -> Result<Option<String>> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
@@ -4986,6 +5024,42 @@ mod tests {
         let waiters = list_answered_human_waiters().await.unwrap();
         assert_eq!(waiters.len(), 2);
         assert_eq!(waiters[1].task_id, "t-002");
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn record_scoped_human_answer_rolls_back_flag_when_file_write_fails() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_human_question_requested(
+            "t-001",
+            crate::project::TaskStatus::Executing,
+            "executor:codex:t-001",
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(".ferrus/runs").unwrap();
+        tokio::fs::write(".ferrus/runs/t-001", "not a directory")
+            .await
+            .unwrap();
+
+        let question = HumanQuestion {
+            task_id: "t-001".to_string(),
+            task_path: ".ferrus/tasks/t-001.md".to_string(),
+            run_dir: ".ferrus/runs/t-001".to_string(),
+            question: "Which path?".to_string(),
+        };
+        let error = record_scoped_human_answer(&question, "Use the stable path.")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(".ferrus/runs/t-001"));
+        let questions = list_human_questions().await.unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].task_id, "t-001");
+        assert!(list_answered_human_waiters().await.unwrap().is_empty());
 
         teardown(previous);
     }

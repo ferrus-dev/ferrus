@@ -2101,8 +2101,7 @@ impl HqContext {
         let question =
             select_human_question(crate::project::list_human_questions().await?, task_id)?;
 
-        store::write_answer_for_run_dir(&question.run_dir, &response).await?;
-        crate::project::record_task_human_answer(&question.task_id).await?;
+        crate::project::record_scoped_human_answer(&question, &response).await?;
         self.display
             .info(format!("Answer recorded for {}.", question.task_id));
 
