@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     platform,
-    project::{RunRecord, TaskRecord},
+    project::{RunRecord, TaskRecord, TaskStatus},
 };
 
 use super::state_watcher::{WatchedMilestone, WatchedState};
@@ -1527,16 +1527,9 @@ fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> Vec<Dashboa
         return lines;
     }
 
-    let mut activity = app
-        .messages
-        .iter()
-        .rev()
-        .take(remaining)
-        .cloned()
-        .collect::<Vec<_>>();
-    activity.reverse();
+    let activity_blocks = recent_transcript_blocks(&app.messages, remaining);
 
-    if activity.is_empty() {
+    if activity_blocks.is_empty() {
         lines.extend(runtime_task_activity_lines(app, width, remaining));
         let remaining = max_lines.saturating_sub(lines.len());
         lines.extend(app.runtime_runs.iter().take(remaining).map(|run| {
@@ -1555,25 +1548,71 @@ fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> Vec<Dashboa
             ))
         }));
     } else {
-        for line in activity {
-            if !line.continuation {
+        let rendered_block_lines = activity_blocks.iter().map(Vec::len).sum::<usize>()
+            + activity_blocks.len().saturating_sub(1);
+        let include_leading_gap = lines.len() + rendered_block_lines < max_lines;
+
+        for (block_idx, block) in activity_blocks.into_iter().enumerate() {
+            if block_idx > 0 || include_leading_gap {
                 push_activity_gap(&mut lines);
                 if lines.len() >= max_lines {
                     break;
                 }
             }
-            lines.push(DashboardLine::new(StyledLine::plain(
-                truncate_to_width(&format!("  {}", activity_text(&line)), width),
-                transcript_color(line.kind),
-            )));
-            if lines.len() >= max_lines {
-                break;
+            for line in block {
+                lines.push(DashboardLine::new(StyledLine::plain(
+                    truncate_to_width(&format!("  {}", activity_text(&line)), width),
+                    transcript_color(line.kind),
+                )));
+                if lines.len() >= max_lines {
+                    break;
+                }
             }
         }
     }
 
     lines.truncate(max_lines);
     lines
+}
+
+fn recent_transcript_blocks(
+    messages: &[TranscriptLine],
+    max_lines: usize,
+) -> Vec<Vec<TranscriptLine>> {
+    if max_lines == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    for line in messages {
+        if !line.continuation && !current.is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push(line.clone());
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    let mut selected = Vec::new();
+    let mut remaining = max_lines;
+    for block in blocks.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+
+        let gap_before_newer_block = usize::from(!selected.is_empty());
+        if remaining <= gap_before_newer_block {
+            break;
+        }
+
+        let take = block.len().min(remaining - gap_before_newer_block);
+        selected.push(block.into_iter().take(take).collect::<Vec<_>>());
+        remaining -= gap_before_newer_block + take;
+    }
+    selected.reverse();
+    selected
 }
 
 fn runtime_task_activity_lines(app: &App, width: usize, max_lines: usize) -> Vec<DashboardLine> {
@@ -1747,13 +1786,19 @@ fn footer_line(app: &App, width: usize) -> StyledLine {
     }
 
     let footer = format!(
-        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} done",
+        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} pending  •  {} done",
         count_tasks(
             app,
-            &["executing", "addressing", "reviewing", "consultation"]
+            &[
+                TaskStatus::Executing,
+                TaskStatus::Addressing,
+                TaskStatus::Reviewing,
+                TaskStatus::Consultation,
+            ],
         ),
-        count_tasks(app, &["awaiting_human"]),
-        count_tasks(app, &["complete"])
+        count_tasks(app, &[TaskStatus::AwaitingHuman]),
+        count_milestones(app, MilestoneReadiness::Pending),
+        count_tasks(app, &[TaskStatus::Complete])
     );
     footer_with_debug(&footer, Color::DarkGrey, false, app.debug, width)
 }
@@ -2204,21 +2249,38 @@ fn section_title(title: &str) -> String {
 
 fn task_counts_line(app: &App) -> String {
     format!(
-        "tasks:       {} running  {} waiting  {} pending  {} done",
+        "tasks:       {} running  {} waiting  {} queued  {} done",
         count_tasks(
             app,
-            &["executing", "addressing", "reviewing", "consultation"]
+            &[
+                TaskStatus::Executing,
+                TaskStatus::Addressing,
+                TaskStatus::Reviewing,
+                TaskStatus::Consultation,
+            ],
         ),
-        count_tasks(app, &["awaiting_human"]),
-        count_tasks(app, &["idle"]),
-        count_tasks(app, &["complete"])
+        count_tasks(app, &[TaskStatus::AwaitingHuman]),
+        count_tasks(app, &[TaskStatus::Pending]),
+        count_tasks(app, &[TaskStatus::Complete])
     )
 }
 
-fn count_tasks(app: &App, statuses: &[&str]) -> usize {
+fn count_tasks(app: &App, statuses: &[TaskStatus]) -> usize {
     app.runtime_tasks
         .iter()
-        .filter(|task| statuses.contains(&task.status.as_str()))
+        .filter(|task| {
+            task.status
+                .parse::<TaskStatus>()
+                .is_ok_and(|status| statuses.contains(&status))
+        })
+        .count()
+}
+
+fn count_milestones(app: &App, readiness: MilestoneReadiness) -> usize {
+    app.status
+        .selected_milestones
+        .iter()
+        .filter(|milestone| milestone.readiness == readiness)
         .count()
 }
 
@@ -2979,6 +3041,25 @@ mod tui_tests {
     }
 
     #[test]
+    fn footer_line_shows_pending_milestones_between_waiting_and_done() {
+        let mut app = App::new();
+        app.status.selected_milestones = vec![MilestoneSnapshot {
+            marker: "#1.0".into(),
+            title: "Pending".into(),
+            completed: false,
+            readiness: MilestoneReadiness::Pending,
+        }];
+
+        let rendered = footer_line(&app, 120)
+            .segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+
+        assert!(rendered.contains("0 waiting  •  1 pending  •  0 done"));
+    }
+
+    #[test]
     fn project_milestone_frame_uses_header_inset() {
         let app = App::new();
         let width = 120;
@@ -3052,6 +3133,30 @@ mod tui_tests {
         assert_eq!(char_before_last_border(rendered[2]), Some(' '));
         assert_eq!(char_before_last_border(rendered[3]), Some(' '));
         assert_eq!(char_before_last_border(rendered[4]), Some(' '));
+    }
+
+    #[test]
+    fn task_counts_line_shows_queued_runtime_tasks() {
+        let mut app = App::new();
+        app.runtime_tasks = vec![TaskRecord {
+            id: "t-001".into(),
+            path: ".ferrus/tasks/t-001.md".into(),
+            spec_path: None,
+            milestone_id: None,
+            status: TaskStatus::Pending.as_str().into(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        }];
+
+        assert_eq!(
+            task_counts_line(&app),
+            "tasks:       0 running  0 waiting  1 queued  0 done"
+        );
     }
 
     #[test]
@@ -3231,6 +3336,51 @@ mod tui_tests {
         assert_eq!(detail_idx, first_idx + 1);
         assert_eq!(rendered[first_idx - 1], "");
         assert_eq!(rendered[second_idx - 1], "");
+    }
+
+    #[test]
+    fn activity_area_keeps_latest_multiline_message_start_when_tight() {
+        let mut app = App::new();
+        app.messages.extend(split_transcript(
+            "  • Started supervisor:codex:t-006…\n  ╰─ Logs: .ferrus/logs/supervisor.log",
+            TranscriptKind::Muted,
+        ));
+
+        let rendered = activity_area_lines(&app, 120, 1)
+            .into_iter()
+            .map(|line| {
+                line.line
+                    .segments
+                    .into_iter()
+                    .map(|segment| segment.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("Started supervisor:codex:t-006"));
+    }
+
+    #[test]
+    fn activity_area_does_not_spend_only_line_on_gap() {
+        let mut app = App::new();
+        app.messages.extend(split_transcript(
+            "Task t-006 completed.",
+            TranscriptKind::Success,
+        ));
+
+        let rendered = activity_area_lines(&app, 120, 1)
+            .into_iter()
+            .map(|line| {
+                line.line
+                    .segments
+                    .into_iter()
+                    .map(|segment| segment.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["  Task t-006 completed."]);
     }
 
     fn char_before_last_border(text: &str) -> Option<char> {
