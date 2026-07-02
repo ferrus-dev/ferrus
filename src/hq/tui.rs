@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     platform,
-    project::{RunRecord, TaskRecord},
+    project::{RunRecord, TaskRecord, TaskStatus},
 };
 
 use super::state_watcher::{WatchedMilestone, WatchedState};
@@ -1786,13 +1786,19 @@ fn footer_line(app: &App, width: usize) -> StyledLine {
     }
 
     let footer = format!(
-        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} done",
+        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} pending  •  {} done",
         count_tasks(
             app,
-            &["executing", "addressing", "reviewing", "consultation"]
+            &[
+                TaskStatus::Executing,
+                TaskStatus::Addressing,
+                TaskStatus::Reviewing,
+                TaskStatus::Consultation,
+            ],
         ),
-        count_tasks(app, &["awaiting_human"]),
-        count_tasks(app, &["complete"])
+        count_tasks(app, &[TaskStatus::AwaitingHuman]),
+        count_milestones(app, MilestoneReadiness::Pending),
+        count_tasks(app, &[TaskStatus::Complete])
     );
     footer_with_debug(&footer, Color::DarkGrey, false, app.debug, width)
 }
@@ -2243,21 +2249,30 @@ fn section_title(title: &str) -> String {
 
 fn task_counts_line(app: &App) -> String {
     format!(
-        "tasks:       {} running  {} waiting  {} pending  {} done",
+        "tasks:       {} running  {} waiting  {} queued  {} done",
         count_tasks(
             app,
-            &["executing", "addressing", "reviewing", "consultation"]
+            &[
+                TaskStatus::Executing,
+                TaskStatus::Addressing,
+                TaskStatus::Reviewing,
+                TaskStatus::Consultation,
+            ],
         ),
-        count_tasks(app, &["awaiting_human"]),
-        count_milestones(app, MilestoneReadiness::Pending),
-        count_tasks(app, &["complete"])
+        count_tasks(app, &[TaskStatus::AwaitingHuman]),
+        count_tasks(app, &[TaskStatus::Pending]),
+        count_tasks(app, &[TaskStatus::Complete])
     )
 }
 
-fn count_tasks(app: &App, statuses: &[&str]) -> usize {
+fn count_tasks(app: &App, statuses: &[TaskStatus]) -> usize {
     app.runtime_tasks
         .iter()
-        .filter(|task| statuses.contains(&task.status.as_str()))
+        .filter(|task| {
+            task.status
+                .parse::<TaskStatus>()
+                .is_ok_and(|status| statuses.contains(&status))
+        })
         .count()
 }
 
@@ -3026,6 +3041,25 @@ mod tui_tests {
     }
 
     #[test]
+    fn footer_line_shows_pending_milestones_between_waiting_and_done() {
+        let mut app = App::new();
+        app.status.selected_milestones = vec![MilestoneSnapshot {
+            marker: "#1.0".into(),
+            title: "Pending".into(),
+            completed: false,
+            readiness: MilestoneReadiness::Pending,
+        }];
+
+        let rendered = footer_line(&app, 120)
+            .segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<String>();
+
+        assert!(rendered.contains("0 waiting  •  1 pending  •  0 done"));
+    }
+
+    #[test]
     fn project_milestone_frame_uses_header_inset() {
         let app = App::new();
         let width = 120;
@@ -3102,26 +3136,26 @@ mod tui_tests {
     }
 
     #[test]
-    fn task_counts_line_uses_pending_milestones() {
+    fn task_counts_line_shows_queued_runtime_tasks() {
         let mut app = App::new();
-        app.status.selected_milestones = vec![
-            MilestoneSnapshot {
-                marker: "#1.0".into(),
-                title: "Pending".into(),
-                completed: false,
-                readiness: MilestoneReadiness::Pending,
-            },
-            MilestoneSnapshot {
-                marker: "#1.1".into(),
-                title: "Also pending".into(),
-                completed: false,
-                readiness: MilestoneReadiness::Pending,
-            },
-        ];
+        app.runtime_tasks = vec![TaskRecord {
+            id: "t-001".into(),
+            path: ".ferrus/tasks/t-001.md".into(),
+            spec_path: None,
+            milestone_id: None,
+            status: TaskStatus::Pending.as_str().into(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        }];
 
         assert_eq!(
             task_counts_line(&app),
-            "tasks:       0 running  0 waiting  2 pending  0 done"
+            "tasks:       0 running  0 waiting  1 queued  0 done"
         );
     }
 
