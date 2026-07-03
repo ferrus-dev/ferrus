@@ -11,6 +11,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Console::{
     FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -23,10 +26,28 @@ use windows_sys::Win32::System::Threading::{
 
 // Win32 SYNCHRONIZE access right used for WaitForSingleObject on process handles.
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const INFINITE_TIMEOUT: u32 = 0xFFFF_FFFF;
 
 pub(crate) fn set_serve_process_name() {}
 
-pub(crate) fn install_serve_parent_lifecycle_hooks() {}
+pub(crate) fn install_serve_parent_lifecycle_hooks() {
+    let Some((parent_pid, parent_handle)) = open_parent_process_handle(std::process::id()) else {
+        return;
+    };
+
+    let spawn_result = std::thread::Builder::new()
+        .name("ferrus-parent-watch".to_string())
+        .spawn(move || {
+            let wait_result = parent_handle.wait();
+            if wait_result == WAIT_OBJECT_0 {
+                std::process::exit(0);
+            }
+        });
+
+    if spawn_result.is_err() {
+        tracing::debug!(parent_pid, "failed to spawn serve parent watcher thread");
+    }
+}
 
 pub(crate) fn configure_headless_command(command: &mut StdCommand) {
     let _ = command;
@@ -39,6 +60,25 @@ pub(crate) struct HeadlessProcessGuard(HANDLE);
 unsafe impl Send for HeadlessProcessGuard {}
 
 impl Drop for HeadlessProcessGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+struct ParentProcessHandle(HANDLE);
+
+// SAFETY: the watcher thread only waits on and closes its owned process handle.
+unsafe impl Send for ParentProcessHandle {}
+
+impl ParentProcessHandle {
+    fn wait(&self) -> u32 {
+        unsafe { WaitForSingleObject(self.0, INFINITE_TIMEOUT) }
+    }
+}
+
+impl Drop for ParentProcessHandle {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.0);
@@ -141,6 +181,42 @@ fn with_process_handle<T>(pid: u32, access: u32, f: impl FnOnce(HANDLE) -> T) ->
         let _ = CloseHandle(handle);
     }
     Some(result)
+}
+
+fn open_parent_process_handle(pid: u32) -> Option<(u32, ParentProcessHandle)> {
+    let parent_pid = parent_process_id(pid)?;
+    let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, parent_pid) };
+    if handle.is_null() {
+        return None;
+    }
+    Some((parent_pid, ParentProcessHandle(handle)))
+}
+
+fn parent_process_id(pid: u32) -> Option<u32> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    let mut found = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) != 0 };
+    while has_entry {
+        if entry.th32ProcessID == pid {
+            found = Some(entry.th32ParentProcessID);
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) != 0 };
+    }
+
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    found.filter(|parent_pid| *parent_pid != 0)
 }
 
 fn create_kill_on_close_job() -> Result<HANDLE> {
