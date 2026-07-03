@@ -1084,6 +1084,7 @@ struct StyledSegment {
     text: String,
     color: Color,
     bold: bool,
+    link: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1098,6 +1099,7 @@ impl StyledLine {
                 text: text.into(),
                 color,
                 bold: false,
+                link: None,
             }],
         }
     }
@@ -1108,6 +1110,7 @@ impl StyledLine {
                 text: text.into(),
                 color,
                 bold: true,
+                link: None,
             }],
         }
     }
@@ -1291,6 +1294,7 @@ fn header_lines(app: &App, width: usize) -> Vec<DashboardLine> {
                     text: format!("{}{logo}", " ".repeat(HEADER_INSET)),
                     color: orange(),
                     bold: true,
+                    link: None,
                 }],
             },
             LineStyle::Logo,
@@ -1317,6 +1321,7 @@ fn tip_line(width: usize) -> StyledLine {
             text: " ".repeat(TIP_INSET.min(width)),
             color: Color::DarkGrey,
             bold: false,
+            link: None,
         }],
     };
     let mut remaining = width.saturating_sub(TIP_INSET);
@@ -1331,6 +1336,7 @@ fn tip_line(width: usize) -> StyledLine {
                 text: " ".to_string(),
                 color: Color::DarkGrey,
                 bold: false,
+                link: None,
             });
             remaining = remaining.saturating_sub(1);
         }
@@ -1350,6 +1356,7 @@ fn tip_line(width: usize) -> StyledLine {
             text,
             color,
             bold: false,
+            link: None,
         });
         saw_word = true;
     }
@@ -1560,10 +1567,7 @@ fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> Vec<Dashboa
                 }
             }
             for line in block {
-                lines.push(DashboardLine::new(StyledLine::plain(
-                    truncate_to_width(&format!("  {}", activity_text(&line)), width),
-                    transcript_color(line.kind),
-                )));
+                lines.push(DashboardLine::new(transcript_activity_line(&line, width)));
                 if lines.len() >= max_lines {
                     break;
                 }
@@ -1786,7 +1790,7 @@ fn footer_line(app: &App, width: usize) -> StyledLine {
     }
 
     let footer = format!(
-        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} pending  •  {} done",
+        "Tab complete  •  ↑/↓ history  •  Ctrl+L refresh  •  {} running  •  {} waiting  •  {} pending  •  {} ready  •  {} done",
         count_tasks(
             app,
             &[
@@ -1798,6 +1802,7 @@ fn footer_line(app: &App, width: usize) -> StyledLine {
         ),
         count_tasks(app, &[TaskStatus::AwaitingHuman]),
         count_milestones(app, MilestoneReadiness::Pending),
+        count_milestones(app, MilestoneReadiness::Ready),
         count_tasks(app, &[TaskStatus::Complete])
     );
     footer_with_debug(&footer, Color::DarkGrey, false, app.debug, width)
@@ -1816,6 +1821,7 @@ fn footer_with_debug(
                 text: truncate_to_width(left, width),
                 color: left_color,
                 bold: left_bold,
+                link: None,
             }],
         };
     }
@@ -1837,16 +1843,19 @@ fn footer_with_debug(
                 text: left,
                 color: left_color,
                 bold: left_bold,
+                link: None,
             },
             StyledSegment {
                 text: " ".repeat(spacing),
                 color: Color::DarkGrey,
                 bold: false,
+                link: None,
             },
             StyledSegment {
                 text: indicator.to_string(),
                 color: Color::DarkBlue,
                 bold: true,
+                link: None,
             },
         ],
     }
@@ -1862,6 +1871,9 @@ fn print_styled_line(stdout: &mut Stdout, line: &StyledLine, width: usize) -> Re
         if text.is_empty() {
             continue;
         }
+        if let Some(link) = segment.link.as_deref() {
+            queue!(stdout, Print(format!("\x1b]8;;{link}\x1b\\")))?;
+        }
         let styled = style(text.clone()).with(segment.color);
         if segment.bold {
             queue!(
@@ -1870,6 +1882,9 @@ fn print_styled_line(stdout: &mut Stdout, line: &StyledLine, width: usize) -> Re
             )?;
         } else {
             queue!(stdout, PrintStyledContent(styled))?;
+        }
+        if segment.link.is_some() {
+            queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
         }
         remaining = remaining.saturating_sub(display_width(&text));
     }
@@ -2195,11 +2210,13 @@ fn render_prompt_with_prefix(app: &App, width: usize, prefix: &str) -> Dashboard
                         text: line_prefix,
                         color: orange(),
                         bold: true,
+                        link: None,
                     },
                     StyledSegment {
                         text: line,
                         color: Color::White,
                         bold: false,
+                        link: None,
                     },
                 ],
             }
@@ -2308,9 +2325,88 @@ fn activity_text(line: &TranscriptLine) -> String {
         TranscriptKind::Muted if !line.text.chars().next().is_some_and(char::is_whitespace) => {
             format!("  {}", line.text)
         }
+        TranscriptKind::Success if !line.continuation => format!("• {}", line.text),
         TranscriptKind::Error if !line.continuation => format!("! {}", line.text),
         _ => line.text.clone(),
     }
+}
+
+fn transcript_activity_line(line: &TranscriptLine, width: usize) -> StyledLine {
+    let text = format!("  {}", activity_text(line));
+    let color = transcript_color(line.kind);
+    log_path_line(&text, color, width)
+        .unwrap_or_else(|| StyledLine::plain(truncate_to_width(&text, width), color))
+}
+
+fn log_path_line(text: &str, color: Color, width: usize) -> Option<StyledLine> {
+    let (prefix, path) = split_log_path(text)?;
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    let prefix = truncate_to_width(prefix, width);
+    let remaining = width.saturating_sub(display_width(&prefix));
+    let path_text = truncate_to_width(path, remaining);
+    if path_text.is_empty() {
+        return Some(StyledLine::plain(prefix, color));
+    }
+
+    Some(StyledLine {
+        segments: vec![
+            StyledSegment {
+                text: prefix,
+                color,
+                bold: false,
+                link: None,
+            },
+            StyledSegment {
+                text: path_text,
+                color,
+                bold: false,
+                link: Some(file_url_for_path(Path::new(path.trim()))),
+            },
+        ],
+    })
+}
+
+fn split_log_path(text: &str) -> Option<(&str, &str)> {
+    ["Logs: ", "tail logs: ", "tail -f "]
+        .iter()
+        .filter_map(|marker| {
+            text.rsplit_once(marker)
+                .map(|(prefix, path)| (prefix, *marker, path))
+        })
+        .max_by_key(|(prefix, marker, _)| prefix.len() + marker.len())
+        .map(|(prefix, marker, path)| (&text[..prefix.len() + marker.len()], path))
+}
+
+fn file_url_for_path(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let display = absolute.to_string_lossy().replace('\\', "/");
+    if display.starts_with('/') {
+        format!("file://{}", percent_encode_uri_path(&display))
+    } else {
+        format!("file:///{}", percent_encode_uri_path(&display))
+    }
+}
+
+fn percent_encode_uri_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(*byte as char)
+            }
+            byte => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn transcript_color(kind: TranscriptKind) -> Color {
@@ -3041,14 +3137,22 @@ mod tui_tests {
     }
 
     #[test]
-    fn footer_line_shows_pending_milestones_between_waiting_and_done() {
+    fn footer_line_shows_pending_and_ready_milestones_before_done() {
         let mut app = App::new();
-        app.status.selected_milestones = vec![MilestoneSnapshot {
-            marker: "#1.0".into(),
-            title: "Pending".into(),
-            completed: false,
-            readiness: MilestoneReadiness::Pending,
-        }];
+        app.status.selected_milestones = vec![
+            MilestoneSnapshot {
+                marker: "#1.0".into(),
+                title: "Pending".into(),
+                completed: false,
+                readiness: MilestoneReadiness::Pending,
+            },
+            MilestoneSnapshot {
+                marker: "#1.1".into(),
+                title: "Ready".into(),
+                completed: false,
+                readiness: MilestoneReadiness::Ready,
+            },
+        ];
 
         let rendered = footer_line(&app, 120)
             .segments
@@ -3056,7 +3160,7 @@ mod tui_tests {
             .map(|segment| segment.text)
             .collect::<String>();
 
-        assert!(rendered.contains("0 waiting  •  1 pending  •  0 done"));
+        assert!(rendered.contains("0 waiting  •  1 pending  •  1 ready  •  0 done"));
     }
 
     #[test]
@@ -3189,6 +3293,37 @@ mod tui_tests {
             .position(|line| line.contains("status output"))
             .unwrap();
         assert_eq!(rendered[activity_idx - 1], "");
+    }
+
+    #[test]
+    fn success_activity_gets_leading_dot() {
+        let line = TranscriptLine {
+            text: "Task t-001 completed.".into(),
+            kind: TranscriptKind::Success,
+            continuation: false,
+        };
+
+        assert_eq!(activity_text(&line), "• Task t-001 completed.");
+    }
+
+    #[test]
+    fn log_activity_path_is_clickable_file_link() {
+        let line = transcript_activity_line(
+            &TranscriptLine {
+                text: "  ╰─ Logs: .ferrus/logs/executor.log".into(),
+                kind: TranscriptKind::Muted,
+                continuation: true,
+            },
+            120,
+        );
+
+        let link = line
+            .segments
+            .iter()
+            .find_map(|segment| segment.link.as_deref())
+            .expect("log path should be linked");
+        assert!(link.starts_with("file://"));
+        assert!(link.ends_with("/.ferrus/logs/executor.log"));
     }
 
     #[test]
@@ -3380,7 +3515,7 @@ mod tui_tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered, vec!["  Task t-006 completed."]);
+        assert_eq!(rendered, vec!["  • Task t-006 completed."]);
     }
 
     fn char_before_last_border(text: &str) -> Option<char> {
