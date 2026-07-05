@@ -1,8 +1,9 @@
 # Ferrus Milestones
 
-This document captures the intended direction for `ferrus`.
-It is not a date-based roadmap. The goal is to keep the architectural direction clear
-and to make the major dependencies between future milestones explicit.
+This document tracks the current direction for `ferrus` and the status of the
+major roadmap areas. It is not a date-based roadmap.
+
+Last reviewed against the repository: 2026-07-05.
 
 ## Guiding principles
 
@@ -12,64 +13,68 @@ and to make the major dependencies between future milestones explicit.
 - Local-first workflows matter. `ferrus` should work well without mandatory dependence on cloud-only services.
 - The system should get more capable without forcing agents to repeatedly rediscover the same repository context from scratch.
 
+## Status summary
+
+| Area | Status | Notes |
+|---|---|---|
+| Windows support | Mostly implemented | Windows platform hooks, shell execution, installer, Windows CI, and smoke tests exist. Real agent-loop validation and support-policy docs still need tightening. |
+| Storage layer and SQLite backend | Done | SQLite is the runtime source of truth for tasks, runs, events, leases, counters, selected spec state, and recovery. Markdown remains scoped human-readable artifacts. |
+| Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
+| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits and adapters for Codex, Claude Code, Qwen Code, goose, and opencode exist. Capability contracts and native ferrus agents remain future work. |
+| Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, patch application, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
+| Spec closure and project memory | Not started | Planned `/archive-spec` should summarize completed spec work into a durable `## Outcome` section and move raw task/run artifacts out of the checkout. |
+| Repository graph and indexed context | Not started | No reusable repository index or query API exists yet. |
+| Ferrus nano-agent | Not started | Local-model-friendly external adapters exist, but no ferrus-native lightweight agent runtime exists yet. |
+
 ## Milestone 1: Windows Support
+
+Status: mostly implemented.
 
 Goal: make `ferrus` genuinely cross-platform so HQ, state management, agent spawning,
 and checks work reliably on Linux, macOS, and Windows.
 
-Why this belongs early:
+What is implemented:
 
-- it materially expands where `ferrus` can be used;
-- it forces POSIX-specific assumptions out of the core runtime;
-- it prepares the foundation for more advanced orchestration features later.
+- platform-specific process, shell, parent-lifecycle, TUI cleanup, and headless process hooks live under `src/platform/`;
+- Windows uses `cmd /C` for configured checks and Win32 job objects for best-effort headless process cleanup;
+- Windows-specific Codex launcher handling exists for npm-style Codex installations;
+- release metadata includes the Windows target, and `install.ps1` exists;
+- CI runs `fmt`, `clippy`, tests, `cargo build`, `ferrus init`, and `ferrus doctor` on `windows-latest`.
 
-Scope:
+What remains:
 
-- audit and remove platform-specific assumptions around PTY handling, file locking, path handling, and process spawning;
-- normalize shell and check execution for Windows environments;
-- add Windows CI coverage;
-- document the support policy and any known limitations.
-
-Definition of done:
-
-- the main `ferrus` commands work on Windows;
-- the Supervisor-Executor loop runs end-to-end on Windows;
-- CI validates support rather than relying on local assumptions.
+- document the Windows support policy and known limitations;
+- validate the full Supervisor-Executor loop with real supported agent backends on Windows, not only init/doctor smoke tests;
+- tighten Windows process-tree cleanup where backend CLIs spawn children that are not covered by the current root-process fallback;
+- keep backend-specific Windows launch behavior current as agent CLI packaging changes.
 
 ## Milestone 2: Storage Layer and SQLite Backend
+
+Status: done.
 
 Goal: remove the direct coupling between runtime state and markdown/json files by introducing
 a real storage layer, with SQLite as the primary backend for state, tasks, reviews, logs, and history.
 
-Why this should come next:
+What is implemented:
 
-- the current file-based model is excellent for bootstrapping and debugging, but weak for history, concurrency, and queryability;
-- multi-agent orchestration will eventually require stronger consistency and richer state access patterns than ad-hoc files provide.
+- `~/.ferrus/projects/<project-id>/ferrus.db` stores runtime task rows, run rows, events, leases, counters, failure metadata, and project runtime state;
+- `.ferrus/project.toml` points the checkout to the machine-local project registry;
+- `.ferrus/tasks/<task-id>.md` and `.ferrus/runs/<task-id>/` are scoped human-readable artifacts, not the runtime state machine;
+- `ferrus init`, `migrate`, `doctor`, `recover`, `projects list`, `tasks list`, `runs list`, and `events list` operate on the SQLite-backed runtime;
+- MCP tools resolve scoped runtime task context from SQLite and update task rows transactionally;
+- legacy `STATE.json` is only an import source for migration and is removed by migration paths.
 
-Scope:
+What remains:
 
-- introduce a storage abstraction so core logic no longer talks directly to markdown/json files;
-- add SQLite as the main runtime backend;
-- provide a migration path from the current `.ferrus/` layout;
-- preserve human-readable debugging surfaces where they remain useful;
-- lay the groundwork for audit trails, event history, and richer HQ introspection.
-
-Definition of done:
-
-- the core workflow no longer depends directly on markdown/json files;
-- SQLite is the source of truth for runtime state;
-- the transition preserves the current user experience as much as practical.
+- schema versioning and migrations should become explicit before the database grows much further;
+- richer event querying, export, and replay remain future observability work.
 
 ## Milestone 3: Repository Graph and Indexed Context
 
-Goal: build a repository graph during initialization and keep it available as a reusable structured context 
+Status: not started.
+
+Goal: build a repository graph during initialization and keep it available as reusable structured context
 so agents can navigate the codebase faster and spend fewer tokens rediscovering the same information.
-
-Why this matters:
-
-- repeated repository exploration is expensive in both latency and tokens;
-- orchestration gets stronger when agents can start from a shared structural understanding of the codebase;
-- this becomes even more valuable once multiple agents are operating in parallel.
 
 What the repository graph should eventually capture:
 
@@ -79,10 +84,11 @@ What the repository graph should eventually capture:
 - documentation and configuration entry points;
 - a compact representation that can be queried incrementally rather than regenerated from scratch every run.
 
-Open architectural question:
+Open architectural direction:
 
-- this may live before SQLite as a file-backed index, or after SQLite as data stored in the main runtime backend;
-- the more important point is to introduce a stable indexing abstraction rather than tying the feature too tightly to one storage format.
+- add a stable indexing abstraction first, then decide whether the initial backend is SQLite tables, a sidecar file index, or a hybrid;
+- expose context through Ferrus MCP resources/tools instead of embedding index-specific behavior in agent prompts;
+- keep the index optional and rebuildable so `ferrus init` remains lightweight.
 
 Definition of done:
 
@@ -92,96 +98,156 @@ Definition of done:
 
 ## Milestone 4: Multi-Agent Flow
 
+Status: partially implemented.
+
 Goal: move from single-task execution to coordinated parallel work,
 where multiple executors can operate independently and the supervisor manages decomposition and integration.
 
-Target workflow:
+What is implemented:
 
-- the supervisor breaks a large task into multiple work items;
-- executors pick them up in parallel;
-- each executor works in an isolated git worktree or equivalent isolated workspace;
-- after each part passes review, the supervisor integrates the validated outputs into a coherent final result.
+- specs can define stable milestone IDs and dependencies;
+- HQ can select a spec and derive ready milestones deterministically;
+- `/run` and `/run --limit N` ask the supervisor to prepare a fixed batch of milestone-derived queued tasks;
+- `/enqueue_task` creates pending SQLite task rows with optional `spec_path` and `milestone_id`;
+- duplicate active work for the same `(spec_path, milestone_id)` is rejected;
+- HQ schedules pending/executing/addressing tasks up to `limits.max_parallel_tasks`;
+- each task has its own lease, run records, scoped artifacts, and check logs;
+- executor sessions run in managed git worktrees under the project runtime directory;
+- submissions preserve `PATCH.diff`, review context exposes that patch, and approval applies it to the canonical checkout;
+- failed patch application or post-approve checks create scoped `INTEGRATION_ERROR.md`, update SQLite failure state, and are surfaced to review.
 
-Why this depends on earlier milestones:
+What remains:
 
-- multi-agent orchestration needs a stronger storage and coordination model;
-- it benefits from indexed repository context, so each agent does not need to re-explore the whole codebase;
-- merge and integration orchestration become much harder if the runtime still relies on loosely structured local files as the primary state container.
-
-Scope:
-
-- introduce a task graph or equivalent model for dependent and independent work items;
-- support parallel executors;
-- use git worktrees or equivalent isolation for concurrent code changes;
-- add a supervisor-driven integration step after part-level reviews succeed;
-- define conflict handling, retries, ownership, and HQ visibility for parallel execution.
+- introduce a real task graph for dependencies between queued work items, not just spec milestone readiness;
+- define supervisor-owned decomposition contracts for large tasks that are not already represented as spec milestones;
+- make the final integration policy explicit: conflict ownership, retry strategy, ordering, partial failure behavior, and operator visibility;
+- improve dashboard visibility for parallel integration state and blocked dependencies;
+- harden the worktree path for every supported executor backend. `opencode` remains unsuitable for executor worktree isolation because of its own global project binding.
 
 Definition of done:
 
 - one large task can be split and completed by multiple executors in parallel;
 - each part runs through its own review loop;
-- final integration is reproducible and understandable to the operator.
+- final integration is reproducible, understandable to the operator, and covered by documented conflict-handling rules.
 
 ## Milestone 5: Ferrus Nano-Agent
+
+Status: not started.
 
 Goal: add lightweight ferrus-native agents that `ferrus` can manage directly,
 using local or remote LLMs without depending only on external coding agents.
 
-Why this matters:
+What exists today:
 
-- it can reduce cost and latency for smaller or narrower subtasks;
-- it opens the door to more specialized internal agent roles;
-- it gives `ferrus` a path toward a more self-contained orchestration stack;
-- it fits naturally with multi-agent workflows, where not every participant needs to be a heavyweight coding agent.
+- the agent layer is already trait-based (`SupervisorAgent` and `ExecutorAgent`);
+- multiple external backends are supported, including local-model-friendly goose and opencode adapters;
+- goose can be useful with local providers, but it is still an external agent backend, not a ferrus-native nano-agent runtime;
+- opencode is currently reliable for supervisor/reviewer use only, not isolated executor workflows.
 
-Scope:
+What remains:
 
-- define a minimal runtime for ferrus-native agents;
-- support both local and remote model providers;
-- define a capability model for what nano-agents should and should not be trusted to do;
-- integrate them safely into the existing orchestration loop;
-- measure quality, cost, and reliability relative to external agents.
+- define a minimal ferrus-native agent runtime;
+- support local and remote model providers behind a clear provider interface;
+- define a capability model for what nano-agents can read, edit, check, or submit;
+- add evaluation and quality gates for small or specialized tasks;
+- integrate nano-agents as first-class orchestration participants without weakening the existing external-agent loop.
 
 Definition of done:
 
 - `ferrus` can launch its own mini-agents as first-class orchestration participants;
 - there is at least one practical workflow where nano-agents improve cost, speed, or quality.
 
-## Additional milestones worth considering
-
-These are not necessarily standalone roadmap phases, but they strongly support the main milestones above.
+## Supporting Tracks
 
 ### Event log and observability
 
-As `ferrus` moves toward SQLite and multi-agent execution, it will likely need a proper event log:
-state transitions, claims, heartbeats, retries, review outcomes, and integration steps.
-That will make debugging, replay, and HQ visibility much more robust.
+Status: baseline implemented.
+
+`ferrus.db` now records runtime events, and users can inspect tasks, runs, and events from the CLI.
+HQ also has a dashboard foundation that surfaces project state, selected milestones, runtime activity,
+errors, and pending human questions.
+
+Future work should focus on historical analysis rather than basic event capture: replay, export,
+filtering by task/run/spec, richer dashboard timelines, and better diagnostics for integration failures.
 
 ### Pluggable execution and runtime interfaces
 
-The earlier orchestration logic is separated from any one executor implementation,
-the easier it becomes to support nano-agents, multiple model backends, and future execution strategies.
+Status: partially implemented.
+
+The orchestration layer depends on shared supervisor/executor traits instead of one concrete CLI,
+and backend-specific launch/config behavior is isolated in `src/agents/*`.
+
+Future work should make backend capabilities explicit: worktree safety, model/provider metadata,
+tool reliability assumptions, context-window limits, local-model suitability, and whether a backend
+can safely run as executor, reviewer, consultant, or nano-agent provider.
 
 ### Task decomposition and merge policy
 
-Parallelism alone is not enough. Multi-agent flow will depend on good decomposition quality:
-how the supervisor splits work, how contracts between parts are defined, and how final integration happens without chaos.
-This may deserve its own design track rather than living only inside the multi-agent milestone.
+Status: partially implemented.
+
+Spec milestones already provide a coarse decomposition model, and `/run` can turn ready milestones
+into queued tasks. Approval applies each accepted patch into the canonical checkout and records
+recoverable integration errors.
+
+Future work should define decomposition and integration as first-class policies, not just scheduler behavior:
+task contracts, file ownership hints, dependency edges, conflict routing, merge ordering, and how a supervisor
+should re-plan when one parallel branch fails.
+
+### Spec closure and project memory
+
+Status: not started.
+
+Completed specs should leave behind compact project memory instead of forcing future agents to read every raw
+task and run artifact. The proposed HQ command is `/archive-spec`.
+
+The intended workflow:
+
+- require that the selected spec has no non-terminal tasks and all intended milestones are complete;
+- launch the Supervisor in a spec-closure mode that reviews related task descriptions, submissions, reviews,
+  integration errors, and check evidence;
+- append or update a `## Outcome` section in the spec with concise implementation notes, deviations from the
+  original spec, validation evidence, follow-up work, and useful context for future agents;
+- move raw task and run artifacts for that spec out of the checkout after user confirmation;
+- store archive metadata in SQLite so task/run history remains queryable even after files move.
+
+The archive should default to a machine-local directory tree, not a compressed file:
+
+```text
+~/.ferrus/projects/<project-id>/archive/specs/<spec-slug>-<closed-at>/
+  manifest.toml
+  spec.md
+  tasks/
+    <task-id>.md
+  runs/
+    <task-id>/
+      SUBMISSION.md
+      REVIEW.md
+      PATCH.diff
+      INTEGRATION_ERROR.md
+```
+
+This is portable across Windows, macOS, and Linux, easy to inspect by hand, and avoids depending on platform
+archive tools. Compression can be added later as an optional export format, with `.zip` as the most portable
+human-facing option if a single file is needed.
+
+By default, raw artifacts should move to `~/.ferrus/projects/<project-id>/archive/...` rather than stay under
+the repository's `.ferrus/` directory. The repository should keep the spec and its `## Outcome` memory, while
+machine-local runtime history keeps detailed forensic artifacts. A future option can support keeping archives
+inside the repository for teams that explicitly want to version task/run history.
 
 ## Proposed order
 
-1. Windows support
-2. Storage layer + SQLite
-3. Repository graph and indexed context
-4. Event log / observability
-5. Multi-agent flow
-6. Ferrus nano-agent
-
-This is not the only reasonable order, but it reduces the risk that multi-agent and nano-agent work
-will be built on top of a runtime foundation that is still too fragile.
+1. Close the Windows support gap: real agent-loop validation and support documentation.
+2. Add explicit SQLite schema versioning/migrations and richer runtime event queries.
+3. Add `/archive-spec` for spec closure, `## Outcome` project memory, and machine-local task/run archival.
+4. Finish the multi-agent integration policy around task graphs, conflicts, and partial failures.
+5. Build repository graph and indexed context on top of the SQLite/runtime abstractions.
+6. Formalize backend capability metadata for external agents.
+7. Design and prototype ferrus-native nano-agents.
 
 ## Non-goals for now
 
 - turning this roadmap into a date-driven quarterly plan;
 - committing to delivery dates before the core architecture stabilizes;
-- adding major product surface area before strengthening the orchestration core.
+- adding major product surface area before strengthening the orchestration core;
+- replacing useful human-readable task/run artifacts with opaque database-only state.

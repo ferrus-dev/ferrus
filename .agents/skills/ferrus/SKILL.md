@@ -33,6 +33,17 @@ SQLite task rows are the runtime source of truth. Typical statuses are `pending`
 Consultation and human-answer flows store paused status and requester metadata in SQLite, with
 request/response artifacts scoped under `.ferrus/runs/<task-id>/`.
 
+## Specification Memory
+
+Specs may include a `## Outcome` section after their implementation work is complete. Treat this
+section as compact project memory: what was actually delivered, notable deviations from the original
+spec, validation evidence, follow-up work, and context that can help future agents avoid rereading
+raw task/run artifacts.
+
+When drafting, reviewing, or planning from an existing spec, read `## Outcome` if present and use it
+as historical context. Do not invent or update an outcome section unless the active prompt or Ferrus
+tool workflow asks for spec closure or archival work.
+
 ## Per-Task State Machine
 
 The old single global `STATE.json` is gone, but every SQLite task row still follows the same
