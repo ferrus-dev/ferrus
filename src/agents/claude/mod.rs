@@ -4,8 +4,9 @@
 //! the orchestration layer can treat it like any other agent backend.
 
 use super::{
-    AgentRunMode, ExecutorAgent, SupervisorAgent, allow_mcp_server_tools_in_json_settings,
-    normalized_model, validate_json_mcp_server,
+    AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent,
+    allow_mcp_server_tools_in_json_settings, json_config_display_from_paths, normalized_model,
+    validate_json_mcp_server,
 };
 use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR, legacy_mcp_server_name, mcp_server_name};
 use crate::config::ClaudeMcpIsolation;
@@ -70,6 +71,10 @@ impl SupervisorAgent for Supervisor {
         self.model.as_deref()
     }
 
+    fn display_config(&self) -> AgentDisplayConfig {
+        claude_display_config(self.model())
+    }
+
     fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
         validate_interactive_launch(role, index)
     }
@@ -93,6 +98,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        claude_display_config(self.model())
     }
 
     fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
@@ -141,6 +150,25 @@ pub(crate) async fn allow_mcp_server_tools(server_key: &str) -> Result<()> {
 
 pub(crate) fn claude_role_mcp_config_path(role: &str) -> PathBuf {
     Path::new(".claude").join(format!("mcp-{role}.json"))
+}
+
+fn claude_config_paths() -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(".claude").join("settings.local.json"),
+        PathBuf::from(".claude").join("settings.json"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".claude").join("settings.json"));
+    }
+    paths
+}
+
+fn claude_display_config(model: Option<&str>) -> AgentDisplayConfig {
+    AgentDisplayConfig::from_model(model).merge_missing(claude_config_display())
+}
+
+fn claude_config_display() -> AgentDisplayConfig {
+    json_config_display_from_paths(claude_config_paths())
 }
 
 fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
@@ -212,6 +240,33 @@ mod tests {
                 "review",
             ],
         );
+    }
+
+    #[test]
+    fn claude_display_config_preserves_short_model_alias() {
+        let config = claude_display_config(Some("opus"));
+
+        assert_eq!(config.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn claude_display_config_includes_effort_from_settings() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(".claude").unwrap();
+        std::fs::write(
+            ".claude/settings.local.json",
+            r#"{"model":"opus","effortLevel":"high"}"#,
+        )
+        .unwrap();
+
+        let config = claude_display_config(None);
+
+        assert_eq!(config.model.as_deref(), Some("opus"));
+        assert_eq!(config.effort.as_deref(), Some("high"));
+        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]

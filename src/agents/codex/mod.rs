@@ -4,8 +4,8 @@
 //! Ferrus expects for interactive and headless sessions.
 
 use super::{
-    AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent, normalized_model,
-    validate_toml_mcp_server,
+    AgentDisplayConfig, AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent,
+    normalized_model, toml_config_display_from_paths, validate_toml_mcp_server,
 };
 use crate::agent_id::{ROLE_EXECUTOR, ROLE_SUPERVISOR, legacy_mcp_server_name, mcp_server_name};
 use anyhow::Result;
@@ -13,6 +13,8 @@ use anyhow::Result;
 use anyhow::anyhow;
 use std::collections::BTreeSet;
 #[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -69,6 +71,10 @@ impl SupervisorAgent for Supervisor {
         self.model.as_deref()
     }
 
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(codex_config_display())
+    }
+
     fn version_command(&self) -> Result<Command> {
         codex_version_command()
     }
@@ -95,6 +101,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(codex_config_display())
     }
 
     fn version_command(&self) -> Result<Command> {
@@ -239,6 +249,20 @@ fn codex_config_paths() -> Vec<std::path::PathBuf> {
     }
     paths.push(std::path::PathBuf::from(".codex").join("config.toml"));
     paths
+}
+
+fn codex_model_config_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(".codex").join("config.toml")];
+    if let Some(home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
+        paths.push(home.join("config.toml"));
+    } else if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".codex").join("config.toml"));
+    }
+    paths
+}
+
+fn codex_config_display() -> AgentDisplayConfig {
+    toml_config_display_from_paths(codex_model_config_paths())
 }
 
 fn toml_config_has_mcp_server(path: &std::path::Path, server: &str) -> bool {

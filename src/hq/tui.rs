@@ -1369,13 +1369,15 @@ fn version_box_lines(app: &App) -> Vec<String> {
     };
     let body = [
         format!("version:    {}", startup.version),
-        format!(
-            "supervisor: {} {}",
-            startup.supervisor_type, startup.supervisor_version
+        agent_version_line(
+            "supervisor:",
+            &startup.supervisor_type,
+            &startup.supervisor_version,
         ),
-        format!(
-            "executor:   {} {}",
-            startup.executor_type, startup.executor_version
+        agent_version_line(
+            "executor:  ",
+            &startup.executor_type,
+            &startup.executor_version,
         ),
     ];
     let inner = body
@@ -1391,6 +1393,14 @@ fn version_box_lines(app: &App) -> Vec<String> {
     }));
     lines.push(format!("╰{border}╯"));
     lines
+}
+
+fn agent_version_line(label: &str, agent_type: &str, agent_details: &str) -> String {
+    if agent_details.is_empty() {
+        format!("{label} {agent_type}")
+    } else {
+        format!("{label} {agent_type} {agent_details}")
+    }
 }
 
 fn ferrus_logo_lines() -> &'static [&'static str] {

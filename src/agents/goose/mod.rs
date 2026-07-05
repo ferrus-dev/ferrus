@@ -15,10 +15,12 @@
 //! and the run never blocks waiting for confirmation.
 
 use super::{
-    AgentRunMode, ExecutorAgent, SupervisorAgent, current_exe_string, normalized_model, serve_args,
+    AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent, current_exe_string,
+    normalized_model, serve_args,
 };
 use crate::agent_id::{DEFAULT_AGENT_INDEX, ROLE_EXECUTOR, ROLE_SUPERVISOR};
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Stable agent identifier used in Ferrus configuration and error messages.
@@ -82,6 +84,10 @@ impl SupervisorAgent for Supervisor {
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(goose_config_display())
+    }
 }
 
 impl ExecutorAgent for Executor {
@@ -101,6 +107,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(goose_config_display())
     }
 }
 
@@ -212,6 +222,72 @@ fn version_command() -> Command {
     let mut cmd = Command::new(EXECUTABLE);
     cmd.arg("--version");
     cmd
+}
+
+fn goose_config_display() -> AgentDisplayConfig {
+    let env_config = AgentDisplayConfig {
+        model: std::env::var("GOOSE_MODEL")
+            .ok()
+            .and_then(|value| normalized_model(Some(&value))),
+        effort: None,
+    };
+    env_config.merge_missing(goose_config_display_from_paths(goose_config_paths()))
+}
+
+fn goose_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(config_dir) = dirs::config_dir() {
+        paths.push(config_dir.join("goose").join("config.yaml"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".config").join("goose").join("config.yaml"));
+    }
+    paths
+}
+
+fn goose_config_display_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> AgentDisplayConfig {
+    paths
+        .into_iter()
+        .find_map(|path| {
+            let config = goose_config_display_from_path(&path)?;
+            (!config.is_empty()).then_some(config)
+        })
+        .unwrap_or_default()
+}
+
+fn goose_config_display_from_path(path: &Path) -> Option<AgentDisplayConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(goose_display_from_config_lines(content.lines()))
+}
+
+fn goose_display_from_config_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> AgentDisplayConfig {
+    lines
+        .into_iter()
+        .fold(AgentDisplayConfig::default(), |mut config, line| {
+            if config.model.is_none() {
+                config.model = goose_config_value_from_line(line, "GOOSE_MODEL:")
+                    .or_else(|| goose_config_value_from_line(line, "model:"));
+            }
+            if config.effort.is_none() {
+                config.effort = goose_config_value_from_line(line, "GOOSE_REASONING_EFFORT:")
+                    .or_else(|| goose_config_value_from_line(line, "reasoning_effort:"))
+                    .or_else(|| goose_config_value_from_line(line, "effort:"));
+            }
+            config
+        })
+}
+
+fn goose_config_value_from_line(line: &str, key: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return None;
+    }
+    let value = line.strip_prefix(key)?;
+    normalized_model(Some(
+        value.trim().trim_matches(|ch| matches!(ch, '"' | '\'')),
+    ))
 }
 
 #[cfg(test)]
@@ -357,5 +433,19 @@ mod tests {
         let command = Executor::new(None).version_command().unwrap();
         assert_eq!(command.get_program().to_string_lossy(), "goose");
         assert_eq!(args_of(&command), vec!["--version".to_string()]);
+    }
+
+    #[test]
+    fn goose_config_model_reads_goose_model_key() {
+        let config = goose_display_from_config_lines([
+            r#"GOOSE_MODEL: "gpt-oss-120b""#,
+            "GOOSE_REASONING_EFFORT: high",
+        ]);
+        assert_eq!(config.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(config.effort.as_deref(), Some("high"));
+
+        let config =
+            goose_display_from_config_lines(["GOOSE_PROVIDER: openai", "# GOOSE_MODEL: ignored"]);
+        assert!(config.is_empty());
     }
 }
