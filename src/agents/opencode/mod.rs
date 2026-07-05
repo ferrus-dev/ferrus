@@ -7,13 +7,14 @@
 //! reads `AGENTS.md` for repository instructions.
 
 use super::{
-    AgentRunMode, ExecutorAgent, SupervisorAgent, display_path, ensure_mcp_config_file_exists,
-    invalid_mcp_config, normalized_model,
+    AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent, display_path,
+    ensure_mcp_config_file_exists, invalid_mcp_config, json_config_display_from_paths,
+    normalized_model,
 };
 use crate::agent_id::mcp_server_name;
 use anyhow::{Result, bail};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Stable agent identifier used in Ferrus configuration and error messages.
@@ -66,6 +67,10 @@ impl SupervisorAgent for Supervisor {
         self.model.as_deref()
     }
 
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(opencode_config_display())
+    }
+
     fn validate_interactive_launch(&self, role: &str, _index: u32) -> Result<()> {
         validate_interactive_launch(role)
     }
@@ -84,6 +89,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(opencode_config_display())
     }
 
     fn validate_interactive_launch(&self, role: &str, _index: u32) -> Result<()> {
@@ -119,6 +128,22 @@ fn opencode_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
 /// Project-local opencode configuration path.
 pub(crate) fn opencode_config_path() -> &'static Path {
     Path::new(CONFIG_FILE)
+}
+
+fn opencode_config_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(CONFIG_FILE), PathBuf::from("opencode.jsonc")];
+    if let Some(config_dir) = dirs::config_dir() {
+        paths.push(config_dir.join("opencode").join(CONFIG_FILE));
+        paths.push(config_dir.join("opencode").join("opencode.jsonc"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".opencode.json"));
+    }
+    paths
+}
+
+fn opencode_config_display() -> AgentDisplayConfig {
+    json_config_display_from_paths(opencode_config_paths())
 }
 
 fn validate_interactive_launch(role: &str) -> Result<()> {

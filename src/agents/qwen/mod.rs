@@ -4,11 +4,13 @@
 //! the orchestration layer can treat it like any other agent backend.
 
 use super::{
-    AgentRunMode, ExecutorAgent, SupervisorAgent, allow_mcp_server_tools_in_json_settings,
-    normalized_model, validate_json_mcp_server,
+    AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent,
+    allow_mcp_server_tools_in_json_settings, json_config_display_from_paths, normalized_model,
+    validate_json_mcp_server,
 };
 use crate::agent_id::{legacy_mcp_server_name, mcp_server_name};
 use anyhow::Result;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Stable agent identifier used in Ferrus configuration and error messages.
@@ -59,6 +61,10 @@ impl SupervisorAgent for Supervisor {
         self.model.as_deref()
     }
 
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(qwen_config_display())
+    }
+
     fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
         validate_interactive_launch(role, index)
     }
@@ -77,6 +83,10 @@ impl ExecutorAgent for Executor {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn display_config(&self) -> AgentDisplayConfig {
+        AgentDisplayConfig::from_model(self.model()).merge_missing(qwen_config_display())
     }
 
     fn validate_interactive_launch(&self, role: &str, index: u32) -> Result<()> {
@@ -107,6 +117,18 @@ fn qwen_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
 pub(crate) async fn allow_mcp_server_tools(server_key: &str) -> Result<()> {
     allow_mcp_server_tools_in_json_settings(std::path::Path::new(".qwen/settings.json"), server_key)
         .await
+}
+
+fn qwen_config_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(".qwen").join("settings.json")];
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".qwen").join("settings.json"));
+    }
+    paths
+}
+
+fn qwen_config_display() -> AgentDisplayConfig {
+    json_config_display_from_paths(qwen_config_paths())
 }
 
 fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {

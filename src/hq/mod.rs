@@ -14,7 +14,7 @@ use crate::agent_id::{
     DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID, ROLE_EXECUTOR,
     ROLE_SUPERVISOR, agent_id,
 };
-use crate::agents::{AgentRunMode, ExecutorAgent, SupervisorAgent};
+use crate::agents::{AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent};
 use crate::checks::runner;
 use crate::config::{Config, HqConfig, HqRole, update_hq_agent_config};
 use crate::platform;
@@ -56,7 +56,7 @@ pub async fn run(debug: bool) -> Result<()> {
         .as_ref()
         .map(|hq| hq.executor_name().to_string())
         .unwrap_or_default();
-    let (supervisor_version, executor_version) = load_agent_versions(hq_config.as_ref()).await;
+    let (supervisor_version, executor_version) = load_agent_details(hq_config.as_ref()).await;
 
     let display = Display(msg_tx);
     let mut ctx = HqContext::new(state_rx.clone(), display.clone(), debug);
@@ -156,21 +156,29 @@ async fn load_hq_config_from_config() -> Option<HqConfig> {
     Config::load().await.ok().and_then(|cfg| cfg.hq)
 }
 
-async fn load_agent_versions(hq: Option<&HqConfig>) -> (String, String) {
+async fn load_agent_details(hq: Option<&HqConfig>) -> (String, String) {
     let Some(hq) = hq else {
         return (String::new(), String::new());
     };
     let supervisor = match hq.supervisor_agent() {
         Ok(agent) => match agent.version_command() {
-            Ok(command) => load_agent_version_from_version_command(command).await,
-            Err(_) => String::new(),
+            Ok(command) => format_agent_details(
+                agent.name(),
+                &load_agent_version_from_version_command(command).await,
+                agent.display_config(),
+            ),
+            Err(_) => format_agent_details(agent.name(), "", agent.display_config()),
         },
         Err(_) => String::new(),
     };
     let executor = match hq.executor_agent() {
         Ok(agent) => match agent.version_command() {
-            Ok(command) => load_agent_version_from_version_command(command).await,
-            Err(_) => String::new(),
+            Ok(command) => format_agent_details(
+                agent.name(),
+                &load_agent_version_from_version_command(command).await,
+                agent.display_config(),
+            ),
+            Err(_) => format_agent_details(agent.name(), "", agent.display_config()),
         },
         Err(_) => String::new(),
     };
@@ -191,6 +199,63 @@ async fn load_agent_version_from_version_command(command: std::process::Command)
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+fn format_agent_details(agent_name: &str, version: &str, config: AgentDisplayConfig) -> String {
+    let version = normalize_agent_version(agent_name, version);
+    let config = format_agent_display_config(config);
+    match (version.as_deref(), config.as_deref()) {
+        (Some(version), Some(config)) => format!("{version} ({config})"),
+        (Some(version), None) => version.to_string(),
+        (None, Some(config)) => format!("({config})"),
+        (None, None) => String::new(),
+    }
+}
+
+fn format_agent_display_config(config: AgentDisplayConfig) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(model) = config.model {
+        parts.push(model);
+    }
+    if let Some(effort) = config.effort {
+        parts.push(format!("effort: {effort}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn normalize_agent_version(agent_name: &str, version: &str) -> Option<String> {
+    let mut version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+
+    if agent_name == "claude-code" {
+        version = version
+            .strip_suffix(" (Claude Code)")
+            .unwrap_or(version)
+            .trim();
+    }
+
+    let prefixes: &[&str] = match agent_name {
+        "claude-code" => &["claude-code ", "claude "],
+        "codex" => &["codex-cli ", "codex "],
+        "goose" => &["goose "],
+        "opencode" => &["opencode "],
+        "qwen-code" => &["qwen-code ", "qwen "],
+        _ => &[],
+    };
+    for prefix in prefixes {
+        if let Some(stripped) = version.strip_prefix(prefix) {
+            version = stripped.trim();
+            break;
+        }
+    }
+
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -3023,6 +3088,66 @@ mod tests {
 
         assert!(message.contains("supervisor agent (codex) exited with"));
         assert!(message.contains("stderr:\nbroken config"));
+    }
+
+    #[test]
+    fn format_agent_details_normalizes_version_and_appends_model() {
+        assert_eq!(
+            format_agent_details(
+                "claude-code",
+                "2.1.143 (Claude Code)",
+                AgentDisplayConfig {
+                    model: Some("claude-opus-4-6".to_string()),
+                    effort: Some("high".to_string()),
+                }
+            ),
+            "2.1.143 (claude-opus-4-6, effort: high)"
+        );
+        assert_eq!(
+            format_agent_details(
+                "codex",
+                "codex-cli 0.132.0",
+                AgentDisplayConfig {
+                    model: Some("gpt-5.4".to_string()),
+                    effort: None,
+                }
+            ),
+            "0.132.0 (gpt-5.4)"
+        );
+    }
+
+    #[test]
+    fn format_agent_details_omits_missing_parts() {
+        assert_eq!(
+            format_agent_details("opencode", "opencode 0.6.0", AgentDisplayConfig::default()),
+            "0.6.0"
+        );
+        assert_eq!(
+            format_agent_details(
+                "goose",
+                "",
+                AgentDisplayConfig {
+                    model: Some("qwen3-coder".to_string()),
+                    effort: Some("medium".to_string()),
+                }
+            ),
+            "(qwen3-coder, effort: medium)"
+        );
+        assert_eq!(
+            format_agent_details(
+                "claude-code",
+                "",
+                AgentDisplayConfig {
+                    model: None,
+                    effort: Some("high".to_string()),
+                }
+            ),
+            "(effort: high)"
+        );
+        assert_eq!(
+            format_agent_details("qwen-code", "", AgentDisplayConfig::default()),
+            ""
+        );
     }
 
     #[tokio::test]
