@@ -1,5 +1,6 @@
 pub mod answer;
 pub mod approve;
+pub mod archive_spec;
 pub mod ask_human;
 pub mod check;
 pub mod check_gate;
@@ -103,6 +104,7 @@ mod tests {
     fn input_schemas_are_object_schemas() {
         for (name, schema) in [
             ("answer", answer::INPUT_SCHEMA),
+            ("archive_spec", archive_spec::INPUT_SCHEMA),
             ("ask_human", ask_human::INPUT_SCHEMA),
             ("consult", consult::INPUT_SCHEMA),
             ("create_spec", create_spec::INPUT_SCHEMA),

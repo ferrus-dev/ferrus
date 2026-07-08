@@ -39,6 +39,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/milestones", "select current spec"),
     ("/reset-spec", "clear selected spec"),
     ("/spec", "draft and save an approved feature spec"),
+    ("/archive-spec", "archive selected spec artifacts"),
     ("/check", "run the Ferrus check gate from HQ"),
     ("/supervisor", "open an interactive supervisor session"),
     ("/executor", "open an interactive executor session"),

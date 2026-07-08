@@ -110,6 +110,11 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             app.map_tool("create_spec", tools::create_spec::handler)
                 .with_description(tools::create_spec::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_spec::INPUT_SCHEMA));
+            app.map_tool("archive_spec", tools::archive_spec::handler)
+                .with_description(tools::archive_spec::DESCRIPTION)
+                .with_input_schema(|_| {
+                    ToolSchema::from_json_str(tools::archive_spec::INPUT_SCHEMA)
+                });
         }
         app.map_tool("wait_for_review", tools::wait_for_review::handler)
             .with_description(tools::wait_for_review::DESCRIPTION);
@@ -171,7 +176,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
     app.map_prompt("supervisor-review", prompts::supervisor_review)
         .with_description("Supervisor review context: state, task, and submission notes");
 
-    // Shared tools are role-scoped so tools/list fits Neva's 10-item page size.
+    // Shared tools are role-scoped so each agent sees only tools relevant to its role.
     if all_roles || supervisor_role || executor_role {
         app.map_tool("ask_human", tools::ask_human::handler)
             .with_description(tools::ask_human::DESCRIPTION)

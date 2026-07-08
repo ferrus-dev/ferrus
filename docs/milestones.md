@@ -22,7 +22,7 @@ Last reviewed against the repository: 2026-07-05.
 | Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
 | Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits and adapters for Codex, Claude Code, Qwen Code, goose, and opencode exist. Capability contracts and native ferrus agents remain future work. |
 | Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, patch application, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
-| Spec closure and project memory | Not started | Planned `/archive-spec` should summarize completed spec work into a durable `## Outcome` section and move raw task/run artifacts out of the checkout. |
+| Spec closure and project memory | Baseline done | `/archive-spec` summarizes completed spec work into a durable `## Outcome` section and moves raw task/run artifacts into the machine-local project archive. |
 | Repository graph and indexed context | Not started | No reusable repository index or query API exists yet. |
 | Ferrus nano-agent | Not started | Local-model-friendly external adapters exist, but no ferrus-native lightweight agent runtime exists yet. |
 
@@ -71,7 +71,7 @@ What remains:
 
 ## Milestone 3: Repository Graph and Indexed Context
 
-Status: not started.
+Status: baseline implemented.
 
 Goal: build a repository graph during initialization and keep it available as reusable structured context
 so agents can navigate the codebase faster and spend fewer tokens rediscovering the same information.
@@ -198,9 +198,9 @@ should re-plan when one parallel branch fails.
 Status: not started.
 
 Completed specs should leave behind compact project memory instead of forcing future agents to read every raw
-task and run artifact. The proposed HQ command is `/archive-spec`.
+task and run artifact. The HQ command is `/archive-spec`.
 
-The intended workflow:
+Implemented baseline:
 
 - require that the selected spec has no non-terminal tasks and all intended milestones are complete;
 - launch the Supervisor in a spec-closure mode that reviews related task descriptions, submissions, reviews,
@@ -235,13 +235,20 @@ the repository's `.ferrus/` directory. The repository should keep the spec and i
 machine-local runtime history keeps detailed forensic artifacts. A future option can support keeping archives
 inside the repository for teams that explicitly want to version task/run history.
 
+Remaining work:
+
+- add richer archive inspection commands;
+- support optional single-file export, most likely `.zip`;
+- decide whether repo-local archives should be a configurable team workflow;
+- connect `## Outcome` and archive manifests to the future repository context index.
+
 ## Proposed order
 
 1. Close the Windows support gap: real agent-loop validation and support documentation.
 2. Add explicit SQLite schema versioning/migrations and richer runtime event queries.
-3. Add `/archive-spec` for spec closure, `## Outcome` project memory, and machine-local task/run archival.
-4. Finish the multi-agent integration policy around task graphs, conflicts, and partial failures.
-5. Build repository graph and indexed context on top of the SQLite/runtime abstractions.
+3. Finish the multi-agent integration policy around task graphs, conflicts, and partial failures.
+4. Build repository graph and indexed context on top of the SQLite/runtime abstractions, including `## Outcome` memory.
+5. Add archive inspection/export polish for `/archive-spec`.
 6. Formalize backend capability metadata for external agents.
 7. Design and prototype ferrus-native nano-agents.
 

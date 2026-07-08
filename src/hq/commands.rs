@@ -71,6 +71,8 @@ pub enum ShellCommand {
     ResetSpec,
     /// Draft and approve a feature specification with the supervisor.
     Spec,
+    /// Archive completed selected spec artifacts and write an Outcome section.
+    ArchiveSpec,
     /// Open an interactive supervisor session (no initial prompt, no state requirement).
     Supervisor,
     /// Open an interactive executor session (no initial prompt, no state requirement).
@@ -218,6 +220,13 @@ mod tests {
         assert!(matches!(
             parse_command("/review").unwrap(),
             ShellCommand::Review
+        ));
+    }
+    #[test]
+    fn parse_archive_spec() {
+        assert!(matches!(
+            parse_command("/archive-spec").unwrap(),
+            ShellCommand::ArchiveSpec
         ));
     }
     #[test]

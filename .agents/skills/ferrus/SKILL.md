@@ -91,6 +91,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `/task` | Queue one task from the next ready milestone, then run the scheduler |
 | `/task --manual` | Queue one free-form task without spec context |
 | `/spec` | Draft, approve, and save a feature specification |
+| `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
 | `/milestones` | Select the current spec |
 | `/reset-spec` | Clear the selected spec |
 | `/supervisor` | Open an interactive supervisor session (no initial prompt) |
@@ -118,6 +119,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `create_task` | — | Compatibility alias for queued task creation on unfiltered servers |
 | `enqueue_task` | — | Write numbered task artifact and DB `pending` row |
 | `create_spec` | any | Write approved Markdown spec to the configured spec directory |
+| `archive_spec` | any | Write approved `## Outcome` project memory and archive completed spec task/run artifacts |
 | `wait_for_review` | — | Long-poll until state is Reviewing |
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
@@ -126,7 +128,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
 
 `create_task` remains a compatibility tool only on an unfiltered `ferrus serve` instance; role-scoped
-Supervisor sessions use `enqueue_task` so the full tool list fits on one MCP `tools/list` page.
+Supervisor sessions use `enqueue_task` for task creation and `archive_spec` for approved spec closure.
 
 ### Executor
 | Tool | From state | Description |
@@ -224,3 +226,4 @@ project metadata and `ferrus.db`, the runtime source of truth.
 |---|---|
 | `project.toml` | Project metadata and canonical workspace paths |
 | `ferrus.db` | SQLite source of truth for tasks, runs, events, leases, counters, and project runtime state |
+| `archive/specs/<spec-slug>-<closed-at>/` | Machine-local archives for completed spec task/run artifacts |

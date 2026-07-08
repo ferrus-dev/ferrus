@@ -340,6 +340,7 @@ async fn dispatch_with_human_question_target(
                 "  /task --manual     Queue one free-form task without spec context\n",
                 "  /milestones        Select the current spec\n",
                 "  /reset-spec        Clear the selected spec\n",
+                "  /archive-spec     Summarize and archive completed selected spec artifacts\n",
                 "  /spec              Draft, approve, and save a feature specification\n",
                 "  /check             Run the Ferrus check gate deterministically from HQ\n",
                 "  /check --force     Run configured checks from HQ without state requirements\n",
@@ -375,6 +376,7 @@ async fn dispatch_with_human_question_target(
         ShellCommand::Task { manual } => ctx.task(manual, true).await?,
         ShellCommand::Milestones => ctx.milestones().await?,
         ShellCommand::ResetSpec => ctx.reset_spec_selection().await?,
+        ShellCommand::ArchiveSpec => ctx.archive_spec().await?,
         ShellCommand::Spec => ctx.spec().await?,
         ShellCommand::Supervisor => ctx.supervisor_interactive().await?,
         ShellCommand::Executor => ctx.executor_interactive().await?,
@@ -2090,6 +2092,180 @@ impl HqContext {
         Ok(())
     }
 
+    async fn archive_spec(&mut self) -> Result<()> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        self.ensure_hq_config().await?;
+        crate::project::clear_last_spec_archive_path()
+            .await
+            .context("Failed to clear spec archive handoff metadata")?;
+
+        let selection = crate::project::read_project_selection().await?;
+        let Some(spec_path) = selection
+            .selected_spec
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            self.display
+                .error("No selected spec. Run /milestones before /archive-spec.");
+            return Ok(());
+        };
+        if !Path::new(spec_path).exists() {
+            self.display.error(format!(
+                "Selected spec no longer exists:\n{spec_path}\n\nRun /milestones to select a valid spec."
+            ));
+            return Ok(());
+        }
+
+        let spec = specs::load_spec(spec_path).await?;
+        let incomplete = spec
+            .milestones
+            .iter()
+            .filter(|milestone| !milestone.completed)
+            .map(|milestone| format!("{} ({})", milestone.display_title(), milestone.id))
+            .collect::<Vec<_>>();
+        if !incomplete.is_empty() {
+            self.display.error(format!(
+                "Cannot archive selected spec. Incomplete milestone(s): {}",
+                incomplete.join(", ")
+            ));
+            return Ok(());
+        }
+
+        let tasks = crate::project::list_tasks_for_spec(spec_path).await?;
+        if tasks.is_empty() {
+            self.display.error(format!(
+                "No task rows are linked to selected spec:\n{spec_path}"
+            ));
+            return Ok(());
+        }
+        let active = tasks
+            .iter()
+            .filter(|task| {
+                task.status
+                    .parse::<crate::project::TaskStatus>()
+                    .map(|status| !status.is_terminal())
+                    .unwrap_or(true)
+            })
+            .map(|task| format!("{} ({})", task.id, task.status))
+            .collect::<Vec<_>>();
+        if !active.is_empty() {
+            self.display.error(format!(
+                "Cannot archive selected spec. Non-terminal task(s): {}",
+                active.join(", ")
+            ));
+            return Ok(());
+        }
+
+        let supervisor = std::sync::Arc::clone(
+            self.supervisor
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
+        );
+        let context = archive_spec_prompt_context(&spec.path, &tasks);
+        let prompt = agent_manager::supervisor_archive_spec_prompt(&context);
+
+        self.display.info(format!(
+            "Spawning supervisor ({}) for spec archival…",
+            supervisor.name()
+        ));
+        self.display.info(
+            "Review the proposed ## Outcome with the supervisor. Ferrus will archive files only after approval.",
+        );
+
+        supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
+        let mut cmd = Command::from(
+            supervisor
+                .spawn(AgentRunMode::Interactive {
+                    prompt: Some(&prompt),
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to resolve launcher for supervisor agent {}",
+                        supervisor.name()
+                    )
+                })?,
+        );
+
+        let ack_rx = self.display.suspend();
+        let _ = ack_rx.await;
+        let mut resume_guard = ResumeGuard::new(self.display.clone());
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        let mut child = cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
+        let supervisor_id = self.supervisor_agent_id()?;
+        self.mark_agent_running(
+            ROLE_SUPERVISOR,
+            supervisor.name(),
+            &supervisor_id,
+            child.id(),
+        )
+        .await?;
+
+        let mut archive_path = None;
+        let mut child_status = None;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    child_status = Some(status.with_context(|| format!("Failed to wait for {program}"))?);
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if let Ok(Some(path)) = crate::project::read_last_spec_archive_path().await
+                        && !path.is_empty()
+                    {
+                        archive_path = Some(path);
+                        self.stop_interactive_child(
+                            &mut child,
+                            "Spec archived — returning to HQ…",
+                        )
+                        .await?;
+                        break;
+                    }
+                }
+            }
+        }
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
+        resume_guard.resume_now();
+
+        self.mark_agent_suspended(&supervisor_id).await?;
+        if let Some(status) = child_status
+            && !status.success()
+        {
+            anyhow::bail!(interactive_exit_error(
+                ROLE_SUPERVISOR,
+                supervisor.name(),
+                status,
+                &stderr
+            ));
+        }
+
+        if archive_path.is_none()
+            && let Ok(Some(path)) = crate::project::read_last_spec_archive_path().await
+            && !path.is_empty()
+        {
+            archive_path = Some(path);
+        }
+
+        if let Some(path) = archive_path {
+            self.display
+                .muted(format!("\n  • Spec archived\n  ╰─ {path}\n"));
+        } else {
+            self.display
+                .info("No spec archive created. Re-run /archive-spec when ready.");
+        }
+        Ok(())
+    }
+
     async fn supervisor_interactive(&mut self) -> Result<()> {
         self.ensure_hq_config().await?;
         let agent = std::sync::Arc::clone(
@@ -2352,6 +2528,31 @@ fn run_plan_prompt_context(plan: &RunPlan, selected_count: usize) -> String {
         ));
     }
 
+    lines.join("\n")
+}
+
+fn archive_spec_prompt_context(spec_path: &str, tasks: &[TaskRecord]) -> String {
+    let mut lines = vec![
+        format!("Spec path: {spec_path}"),
+        format!("Task count: {}", tasks.len()),
+        "Linked tasks:".to_string(),
+    ];
+
+    for task in tasks {
+        lines.push(format!(
+            "- Task ID: {}\n  Status: {}\n  Milestone ID: {}\n  Task path: {}\n  Run dir: {}",
+            task.id,
+            task.status,
+            task.milestone_id.as_deref().unwrap_or("none"),
+            task.path,
+            crate::project::run_dir_for_task_display(&task.id),
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Review these files as needed, then draft one approved `## Outcome` section.".to_string(),
+    );
     lines.join("\n")
 }
 
