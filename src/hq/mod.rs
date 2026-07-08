@@ -760,7 +760,9 @@ impl HqContext {
         child: &mut tokio::process::Child,
         message: &str,
     ) -> Result<()> {
-        self.display.muted(message);
+        if !message.is_empty() {
+            self.display.muted(message);
+        }
         if tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait())
             .await
             .is_ok()
@@ -2203,13 +2205,10 @@ impl HqContext {
         let context = archive_spec_prompt_context(&spec.path, &tasks);
         let prompt = agent_manager::supervisor_archive_spec_prompt(&context);
 
-        self.display.info(format!(
-            "Spawning supervisor ({}) for spec archival…",
+        self.display.muted(format!(
+            "\n  • Spawning supervisor ({}) for spec archival…\n",
             supervisor.name()
         ));
-        self.display.info(
-            "Review the proposed ## Outcome with the supervisor. Ferrus will archive files only after approval.",
-        );
 
         supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
         let mut cmd = Command::from(
@@ -2259,10 +2258,7 @@ impl HqContext {
                         && !path.is_empty()
                     {
                         archive_path = Some(path);
-                        self.stop_interactive_child(
-                            &mut child,
-                            "Spec archived — returning to HQ…",
-                        )
+                        self.stop_interactive_child(&mut child, "")
                         .await?;
                         break;
                     }
