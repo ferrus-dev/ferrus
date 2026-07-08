@@ -100,7 +100,7 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | `/plan` | Free-form planning session with the supervisor (no task created) |
 | `/task` | Define a task from the selected milestone, then run the executor→review loop automatically |
 | `/task --manual` | Define a free-form task without selected milestone context |
-| `/spec` | Draft, approve, and save a feature specification |
+| `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
 | `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
 | `/milestones` | Select the current spec and milestone |
 | `/reset-spec` | Clear the selected spec and milestone |

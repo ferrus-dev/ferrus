@@ -22,7 +22,7 @@ Last reviewed against the repository: 2026-07-05.
 | Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
 | Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits and adapters for Codex, Claude Code, Qwen Code, goose, and opencode exist. Capability contracts and native ferrus agents remain future work. |
 | Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, patch application, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
-| Spec closure and project memory | Baseline done | `/archive-spec` summarizes completed spec work into a durable `## Outcome` section and moves raw task/run artifacts into the machine-local project archive. |
+| Spec closure and project memory | Baseline done | `/archive-spec` summarizes completed spec work into a durable `## Outcome` section and moves raw task/run artifacts into the machine-local project archive. `/spec` offers this archive step first when the selected spec is already complete. |
 | Repository graph and indexed context | Not started | No reusable repository index or query API exists yet. |
 | Ferrus nano-agent | Not started | Local-model-friendly external adapters exist, but no ferrus-native lightweight agent runtime exists yet. |
 

@@ -300,7 +300,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `/plan` | Free-form planning session with the supervisor (no task created) |
 | `/task` | Queue one task from the next ready milestone, then run the scheduler |
 | `/task --manual` | Queue one free-form task without spec context |
-| `/spec` | Draft, approve, and save a feature specification |
+| `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
 | `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
 | `/milestones` | Select the current spec |
 | `/reset-spec` | Clear the selected spec |
