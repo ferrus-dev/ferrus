@@ -5,6 +5,8 @@ pub const ENV_AGENT_ID: &str = "FERRUS_AGENT_ID";
 pub const ENV_TASK_ID: &str = "FERRUS_TASK_ID";
 #[allow(dead_code)]
 pub const ENV_RUN_ID: &str = "FERRUS_RUN_ID";
+pub const ENV_SUPERVISOR_MODE: &str = "FERRUS_SUPERVISOR_MODE";
+pub const SUPERVISOR_MODE_ARCHIVE: &str = "archive";
 pub const ENV_PROJECT_ROOT: &str = "FERRUS_PROJECT_ROOT";
 pub const ENV_BASELINE_TREE: &str = "FERRUS_BASELINE_TREE";
 

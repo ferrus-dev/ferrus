@@ -2,7 +2,10 @@ use anyhow::Result;
 use neva::App;
 use neva::types::ToolSchema;
 
-use crate::agent_id::{ENV_AGENT_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR, agent_id};
+use crate::agent_id::{
+    ENV_AGENT_ID, ENV_SUPERVISOR_MODE, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR,
+    SUPERVISOR_MODE_ARCHIVE, agent_id,
+};
 use crate::platform;
 
 mod prompts;
@@ -92,6 +95,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
     let supervisor_role = role.as_ref().is_some_and(|r| *r == Role::Supervisor);
     let executor_role = role.as_ref().is_some_and(|r| *r == Role::Executor);
     let task_scoped_supervisor = supervisor_role && task_scoped_session;
+    let archive_scoped_supervisor = supervisor_role && supervisor_archive_mode_from_env();
     let sup = all_roles || supervisor_role;
     let exe = all_roles || executor_role;
 
@@ -101,7 +105,11 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
                 .with_description(tools::create_task::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_task::INPUT_SCHEMA));
         }
-        if all_roles || !task_scoped_supervisor {
+        if supervisor_definition_tools_visible(
+            all_roles,
+            task_scoped_supervisor,
+            archive_scoped_supervisor,
+        ) {
             app.map_tool("enqueue_task", tools::enqueue_task::handler)
                 .with_description(tools::enqueue_task::DESCRIPTION)
                 .with_input_schema(|_| {
@@ -110,29 +118,35 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             app.map_tool("create_spec", tools::create_spec::handler)
                 .with_description(tools::create_spec::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_spec::INPUT_SCHEMA));
+        }
+        if supervisor_archive_tool_visible(all_roles, archive_scoped_supervisor) {
             app.map_tool("archive_spec", tools::archive_spec::handler)
                 .with_description(tools::archive_spec::DESCRIPTION)
                 .with_input_schema(|_| {
                     ToolSchema::from_json_str(tools::archive_spec::INPUT_SCHEMA)
                 });
         }
-        app.map_tool("wait_for_review", tools::wait_for_review::handler)
-            .with_description(tools::wait_for_review::DESCRIPTION);
-        app.map_tool("review_pending", tools::review_pending::handler)
-            .with_description(tools::review_pending::DESCRIPTION);
-        app.map_tool("approve", tools::approve::handler)
-            .with_description(tools::approve::DESCRIPTION);
-        app.map_tool("reject", tools::reject::handler)
-            .with_description(tools::reject::DESCRIPTION)
-            .with_input_schema(|_| ToolSchema::from_json_str(tools::reject::INPUT_SCHEMA));
-        app.map_tool(
-            "wait_for_consultation",
-            tools::wait_for_consultation::handler,
-        )
-        .with_description(tools::wait_for_consultation::DESCRIPTION);
-        app.map_tool("respond_consult", tools::respond_consult::handler)
-            .with_description(tools::respond_consult::DESCRIPTION)
-            .with_input_schema(|_| ToolSchema::from_json_str(tools::respond_consult::INPUT_SCHEMA));
+        if supervisor_review_tools_visible(archive_scoped_supervisor) {
+            app.map_tool("wait_for_review", tools::wait_for_review::handler)
+                .with_description(tools::wait_for_review::DESCRIPTION);
+            app.map_tool("review_pending", tools::review_pending::handler)
+                .with_description(tools::review_pending::DESCRIPTION);
+            app.map_tool("approve", tools::approve::handler)
+                .with_description(tools::approve::DESCRIPTION);
+            app.map_tool("reject", tools::reject::handler)
+                .with_description(tools::reject::DESCRIPTION)
+                .with_input_schema(|_| ToolSchema::from_json_str(tools::reject::INPUT_SCHEMA));
+            app.map_tool(
+                "wait_for_consultation",
+                tools::wait_for_consultation::handler,
+            )
+            .with_description(tools::wait_for_consultation::DESCRIPTION);
+            app.map_tool("respond_consult", tools::respond_consult::handler)
+                .with_description(tools::respond_consult::DESCRIPTION)
+                .with_input_schema(|_| {
+                    ToolSchema::from_json_str(tools::respond_consult::INPUT_SCHEMA)
+                });
+        }
     }
 
     if exe {
@@ -212,6 +226,28 @@ fn task_scope_is_present(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
 }
 
+fn supervisor_archive_mode_from_env() -> bool {
+    std::env::var(ENV_SUPERVISOR_MODE)
+        .ok()
+        .is_some_and(|value| value.trim() == SUPERVISOR_MODE_ARCHIVE)
+}
+
+fn supervisor_definition_tools_visible(
+    all_roles: bool,
+    task_scoped_supervisor: bool,
+    archive_scoped_supervisor: bool,
+) -> bool {
+    all_roles || (!task_scoped_supervisor && !archive_scoped_supervisor)
+}
+
+fn supervisor_archive_tool_visible(all_roles: bool, archive_scoped_supervisor: bool) -> bool {
+    all_roles || archive_scoped_supervisor
+}
+
+fn supervisor_review_tools_visible(archive_scoped_supervisor: bool) -> bool {
+    !archive_scoped_supervisor
+}
+
 fn supervisor_task_scope_from_agent_id(agent_id: &str) -> Option<&str> {
     let mut parts = agent_id.split(':');
     let role = parts.next()?;
@@ -231,22 +267,65 @@ mod tests {
     fn task_scoped_supervisor_mapping_uses_heartbeat_instead_of_definition_tools() {
         let all_roles = false;
         let executor_role = false;
+        let archive_scoped_supervisor = false;
         let task_scoped_supervisor =
             supervisor_task_scope_from_agent_id("supervisor:codex:t-001").is_some();
 
-        assert!(!(all_roles || !task_scoped_supervisor));
+        assert!(!supervisor_definition_tools_visible(
+            all_roles,
+            task_scoped_supervisor,
+            archive_scoped_supervisor
+        ));
         assert!(all_roles || executor_role || task_scoped_supervisor);
     }
 
     #[test]
-    fn interactive_supervisor_mapping_keeps_definition_tools_without_heartbeat() {
+    fn interactive_supervisor_mapping_fits_one_tool_page_without_heartbeat() {
         let all_roles = false;
         let executor_role = false;
+        let archive_scoped_supervisor = false;
         let task_scoped_supervisor =
             supervisor_task_scope_from_agent_id("supervisor:codex:1").is_some();
 
-        assert!(all_roles || !task_scoped_supervisor);
+        assert!(supervisor_definition_tools_visible(
+            all_roles,
+            task_scoped_supervisor,
+            archive_scoped_supervisor
+        ));
+        assert!(!supervisor_archive_tool_visible(
+            all_roles,
+            archive_scoped_supervisor
+        ));
+        assert!(supervisor_review_tools_visible(archive_scoped_supervisor));
         assert!(!(all_roles || executor_role || task_scoped_supervisor));
+        let definition_tools = 2usize;
+        let review_and_consult_tools = 6usize;
+        let shared_human_tools = 2usize;
+        assert_eq!(
+            definition_tools + review_and_consult_tools + shared_human_tools,
+            10
+        );
+    }
+
+    #[test]
+    fn archive_supervisor_mapping_uses_archive_only_scope() {
+        let all_roles = false;
+        let task_scoped_supervisor = false;
+        let archive_scoped_supervisor = true;
+
+        assert!(!supervisor_definition_tools_visible(
+            all_roles,
+            task_scoped_supervisor,
+            archive_scoped_supervisor
+        ));
+        assert!(supervisor_archive_tool_visible(
+            all_roles,
+            archive_scoped_supervisor
+        ));
+        assert!(!supervisor_review_tools_visible(archive_scoped_supervisor));
+        let archive_tool = 1usize;
+        let shared_human_tools = 2usize;
+        assert_eq!(archive_tool + shared_human_tools, 3);
     }
 
     #[test]

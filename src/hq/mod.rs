@@ -11,8 +11,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::agent_id::{
-    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID, ROLE_EXECUTOR,
-    ROLE_SUPERVISOR, agent_id,
+    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_SUPERVISOR_MODE, ENV_TASK_ID,
+    ROLE_EXECUTOR, ROLE_SUPERVISOR, SUPERVISOR_MODE_ARCHIVE, agent_id,
 };
 use crate::agents::{AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent};
 use crate::checks::runner;
@@ -2228,6 +2228,7 @@ impl HqContext {
         let _ = ack_rx.await;
         let mut resume_guard = ResumeGuard::new(self.display.clone());
         let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        cmd.env(ENV_SUPERVISOR_MODE, SUPERVISOR_MODE_ARCHIVE);
         let mut child = cmd
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

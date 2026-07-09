@@ -1111,7 +1111,6 @@ pub async fn archive_completed_spec(spec_path: &str, outcome: &str) -> Result<Sp
                 outcome_for_db,
             ],
         )?;
-        write_last_spec_archive_path_to_database(&transaction, Some(&archive_dir_for_db))?;
         insert_event_in_transaction(
             &transaction,
             None,
@@ -1135,6 +1134,14 @@ pub async fn archive_completed_spec(spec_path: &str, outcome: &str) -> Result<Sp
     let tasks_for_cleanup = tasks.clone();
     tokio::task::spawn_blocking(move || cleanup_checkout_archive_artifacts(&tasks_for_cleanup))
         .await??;
+    let archive_dir_for_handoff = archive_dir_text.clone();
+    let database_path = registration.database_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = open_runtime_database(&database_path)?;
+        write_last_spec_archive_path_to_database(&connection, Some(&archive_dir_for_handoff))?;
+        Ok(())
+    })
+    .await??;
 
     Ok(SpecArchiveResult {
         archive_dir: archive_dir_text,
