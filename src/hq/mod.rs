@@ -2630,8 +2630,8 @@ async fn selected_spec_archive_prompt() -> Result<Option<SpecArchivePrompt>> {
 fn task_has_unarchived_artifacts(task: &TaskRecord) -> bool {
     let task_path = Path::new(&task.path);
     let task_file_in_checkout = task_path.starts_with(".ferrus/tasks") && task_path.exists();
-    let run_dir_in_checkout =
-        Path::new(&crate::project::run_dir_for_task_display(&task.id)).exists();
+    let run_dir_in_checkout = task_path.starts_with(".ferrus/tasks")
+        && Path::new(&crate::project::run_dir_for_task_display(&task.id)).exists();
     task_file_in_checkout || run_dir_in_checkout
 }
 
@@ -4312,6 +4312,12 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-001")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-001/SUBMISSION.md", "stale checkout copy")
+            .await
+            .unwrap();
 
         assert_eq!(selected_spec_archive_prompt().await.unwrap(), None);
         std::env::set_current_dir(previous).unwrap();

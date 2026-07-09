@@ -71,7 +71,7 @@ What remains:
 
 ## Milestone 3: Repository Graph and Indexed Context
 
-Status: baseline implemented.
+Status: not started.
 
 Goal: build a repository graph during initialization and keep it available as reusable structured context
 so agents can navigate the codebase faster and spend fewer tokens rediscovering the same information.
