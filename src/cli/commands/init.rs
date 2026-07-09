@@ -300,7 +300,8 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `/plan` | Free-form planning session with the supervisor (no task created) |
 | `/task` | Queue one task from the next ready milestone, then run the scheduler |
 | `/task --manual` | Queue one free-form task without spec context |
-| `/spec` | Draft, approve, and save a feature specification |
+| `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
+| `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
 | `/milestones` | Select the current spec |
 | `/reset-spec` | Clear the selected spec |
 | `/supervisor` | Open an interactive supervisor session (no initial prompt) |
@@ -328,6 +329,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `create_task` | — | Compatibility alias for queued task creation; prefer `enqueue_task` |
 | `enqueue_task` | — | Write approved numbered task artifact and DB `pending` row |
 | `create_spec` | any | Write approved Markdown spec to the configured spec directory |
+| `archive_spec` | any | Write approved `## Outcome` project memory and archive completed spec task/run artifacts |
 | `wait_for_review` | — | Long-poll until state is Reviewing |
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
@@ -336,7 +338,7 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
 
 `create_task` remains a compatibility tool only on an unfiltered `ferrus serve` instance; role-scoped
-Supervisor sessions use `enqueue_task` so the full tool list fits on one MCP `tools/list` page.
+Supervisor sessions use `enqueue_task` for task creation and `archive_spec` for approved spec closure.
 
 ### Executor
 | Tool | From state | Description |
@@ -443,6 +445,7 @@ gone are marked `interrupted`, leases backed by live runs are preserved, and oth
 |---|---|
 | `project.toml` | Project id, name, workspace path, git metadata, timestamps, version |
 | `ferrus.db` | SQLite database with `tasks`, `runs`, `events`, leases, and `project_runtime_state` |
+| `archive/specs/<spec-slug>-<closed-at>/` | Machine-local archives for completed spec task/run artifacts |
 | `logs/` | Machine-local logs that should not be committed |
 "#;
 

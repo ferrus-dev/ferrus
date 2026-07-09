@@ -100,7 +100,8 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | `/plan` | Free-form planning session with the supervisor (no task created) |
 | `/task` | Define a task from the selected milestone, then run the executor→review loop automatically |
 | `/task --manual` | Define a free-form task without selected milestone context |
-| `/spec` | Draft, approve, and save a feature specification |
+| `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
+| `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
 | `/milestones` | Select the current spec and milestone |
 | `/reset-spec` | Clear the selected spec and milestone |
 | `/check` | Run configured checks from HQ when the current workflow permits; does not mutate task state |
@@ -192,7 +193,7 @@ Starts the agent coordination server on stdio. Agents load this as an MCP server
 
 | `--role` | Tools exposed |
 |---|---|
-| `supervisor` | Definition sessions: `enqueue_task`, `create_spec`; task sessions: `wait_for_review`, `review_pending`, `approve`, `reject`, `wait_for_consultation`, `respond_consult`, `ask_human`, `wait_for_answer`, `heartbeat` |
+| `supervisor` | Definition sessions: `enqueue_task`, `create_spec`, `archive_spec`; task sessions: `wait_for_review`, `review_pending`, `approve`, `reject`, `wait_for_consultation`, `respond_consult`, `ask_human`, `wait_for_answer`, `heartbeat` |
 | `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `ask_human`, `wait_for_answer`, `status`, `reset`, `heartbeat` |
 | *(omitted)* | All tools |
 
@@ -319,6 +320,7 @@ SQLite is the runtime source of truth. `ferrus.db` stores task status, claims an
 |---|---|
 | `project.toml` | Project id, name, workspace path, `.ferrus` path, git metadata, timestamps, schema version |
 | `ferrus.db` | SQLite source of truth for tasks, runs, events, leases, counters, and project runtime state |
+| `archive/specs/<spec-slug>-<closed-at>/` | Machine-local archives for completed spec task/run artifacts, with `manifest.toml`, copied `spec.md`, `tasks/`, and `runs/` |
 | `logs/` | Reserved for machine-local logs that should not be committed |
 
 ---

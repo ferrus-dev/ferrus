@@ -11,8 +11,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::agent_id::{
-    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID, ROLE_EXECUTOR,
-    ROLE_SUPERVISOR, agent_id,
+    DEFAULT_AGENT_INDEX, ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_SUPERVISOR_MODE, ENV_TASK_ID,
+    ROLE_EXECUTOR, ROLE_SUPERVISOR, SUPERVISOR_MODE_ARCHIVE, agent_id,
 };
 use crate::agents::{AgentDisplayConfig, AgentRunMode, ExecutorAgent, SupervisorAgent};
 use crate::checks::runner;
@@ -340,7 +340,8 @@ async fn dispatch_with_human_question_target(
                 "  /task --manual     Queue one free-form task without spec context\n",
                 "  /milestones        Select the current spec\n",
                 "  /reset-spec        Clear the selected spec\n",
-                "  /spec              Draft, approve, and save a feature specification\n",
+                "  /archive-spec      Summarize and archive completed selected spec artifacts\n",
+                "  /spec              Draft, approve, and save a feature specification; offers archive first\n",
                 "  /check             Run the Ferrus check gate deterministically from HQ\n",
                 "  /check --force     Run configured checks from HQ without state requirements\n",
                 "  /supervisor        Open an interactive supervisor session\n",
@@ -375,6 +376,9 @@ async fn dispatch_with_human_question_target(
         ShellCommand::Task { manual } => ctx.task(manual, true).await?,
         ShellCommand::Milestones => ctx.milestones().await?,
         ShellCommand::ResetSpec => ctx.reset_spec_selection().await?,
+        ShellCommand::ArchiveSpec => {
+            let _ = ctx.archive_spec().await?;
+        }
         ShellCommand::Spec => ctx.spec().await?,
         ShellCommand::Supervisor => ctx.supervisor_interactive().await?,
         ShellCommand::Executor => ctx.executor_interactive().await?,
@@ -555,6 +559,12 @@ struct RunPlan {
     spec_path: String,
     eligible: Vec<RunPlanMilestone>,
     skipped: Vec<SkippedRunMilestone>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpecArchivePrompt {
+    spec_path: String,
+    task_count: usize,
 }
 
 impl ModelTarget {
@@ -750,7 +760,9 @@ impl HqContext {
         child: &mut tokio::process::Child,
         message: &str,
     ) -> Result<()> {
-        self.display.muted(message);
+        if !message.is_empty() {
+            self.display.muted(message);
+        }
         if tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait())
             .await
             .is_ok()
@@ -1982,6 +1994,9 @@ impl HqContext {
         use tokio::process::Command;
 
         self.ensure_hq_config().await?;
+        if !self.archive_completed_selected_spec_before_spec().await? {
+            return Ok(());
+        }
         prepare_spec_session_files().await?;
 
         let supervisor = std::sync::Arc::clone(
@@ -2088,6 +2103,201 @@ impl HqContext {
                 .info("No specification created. Re-run /spec when ready.");
         }
         Ok(())
+    }
+
+    async fn archive_completed_selected_spec_before_spec(&mut self) -> Result<bool> {
+        let Some(prompt) = selected_spec_archive_prompt().await? else {
+            return Ok(true);
+        };
+
+        self.display.muted(format!(
+            "\n  • Selected spec is complete\n  ╰─ {} ({} linked task artifacts)\n",
+            prompt.spec_path, prompt.task_count
+        ));
+        let reply_rx = self
+            .display
+            .confirm_yes("Archive it before creating a new spec?");
+        if !reply_rx.await.unwrap_or(true) {
+            return Ok(true);
+        }
+
+        if self.archive_spec().await? {
+            Ok(true)
+        } else {
+            self.display
+                .info("Spec creation cancelled because the selected spec was not archived.");
+            Ok(false)
+        }
+    }
+
+    async fn archive_spec(&mut self) -> Result<bool> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        self.ensure_hq_config().await?;
+        crate::project::clear_last_spec_archive_path()
+            .await
+            .context("Failed to clear spec archive handoff metadata")?;
+
+        let selection = crate::project::read_project_selection().await?;
+        let Some(spec_path) = selection
+            .selected_spec
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            self.display
+                .error("No selected spec. Run /milestones before /archive-spec.");
+            return Ok(false);
+        };
+        if !Path::new(spec_path).exists() {
+            self.display.error(format!(
+                "Selected spec no longer exists:\n{spec_path}\n\nRun /milestones to select a valid spec."
+            ));
+            return Ok(false);
+        }
+
+        let spec = specs::load_spec(spec_path).await?;
+        let incomplete = spec
+            .milestones
+            .iter()
+            .filter(|milestone| !milestone.completed)
+            .map(|milestone| format!("{} ({})", milestone.display_title(), milestone.id))
+            .collect::<Vec<_>>();
+        if !incomplete.is_empty() {
+            self.display.error(format!(
+                "Cannot archive selected spec. Incomplete milestone(s): {}",
+                incomplete.join(", ")
+            ));
+            return Ok(false);
+        }
+
+        let tasks = crate::project::list_tasks_for_spec(spec_path).await?;
+        if tasks.is_empty() {
+            self.display.error(format!(
+                "No task rows are linked to selected spec:\n{spec_path}"
+            ));
+            return Ok(false);
+        }
+        let active = tasks
+            .iter()
+            .filter(|task| {
+                task.status
+                    .parse::<crate::project::TaskStatus>()
+                    .map(|status| !status.is_terminal())
+                    .unwrap_or(true)
+            })
+            .map(|task| format!("{} ({})", task.id, task.status))
+            .collect::<Vec<_>>();
+        if !active.is_empty() {
+            self.display.error(format!(
+                "Cannot archive selected spec. Non-terminal task(s): {}",
+                active.join(", ")
+            ));
+            return Ok(false);
+        }
+
+        let supervisor = std::sync::Arc::clone(
+            self.supervisor
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Supervisor agent is not configured"))?,
+        );
+        let context = archive_spec_prompt_context(&spec.path, &tasks);
+        let prompt = agent_manager::supervisor_archive_spec_prompt(&context);
+
+        self.display.muted(format!(
+            "\n  • Spawning supervisor ({}) for spec archival…\n",
+            supervisor.name()
+        ));
+
+        supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
+        let mut cmd = Command::from(
+            supervisor
+                .spawn(AgentRunMode::Interactive {
+                    prompt: Some(&prompt),
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to resolve launcher for supervisor agent {}",
+                        supervisor.name()
+                    )
+                })?,
+        );
+
+        let ack_rx = self.display.suspend();
+        let _ = ack_rx.await;
+        let mut resume_guard = ResumeGuard::new(self.display.clone());
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        cmd.env(ENV_SUPERVISOR_MODE, SUPERVISOR_MODE_ARCHIVE);
+        let mut child = cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn {program}"))?;
+        let stderr = capture_interactive_stderr(&mut child);
+        let supervisor_id = self.supervisor_agent_id()?;
+        self.mark_agent_running(
+            ROLE_SUPERVISOR,
+            supervisor.name(),
+            &supervisor_id,
+            child.id(),
+        )
+        .await?;
+
+        let mut archive_path = None;
+        let mut child_status = None;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    child_status = Some(status.with_context(|| format!("Failed to wait for {program}"))?);
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if let Ok(Some(path)) = crate::project::read_last_spec_archive_path().await
+                        && !path.is_empty()
+                    {
+                        archive_path = Some(path);
+                        self.stop_interactive_child(&mut child, "")
+                        .await?;
+                        break;
+                    }
+                }
+            }
+        }
+        let stderr = finish_interactive_stderr(stderr).await;
+        clear_primary_screen();
+        resume_guard.resume_now();
+
+        self.mark_agent_suspended(&supervisor_id).await?;
+        if let Some(status) = child_status
+            && !status.success()
+        {
+            anyhow::bail!(interactive_exit_error(
+                ROLE_SUPERVISOR,
+                supervisor.name(),
+                status,
+                &stderr
+            ));
+        }
+
+        if archive_path.is_none()
+            && let Ok(Some(path)) = crate::project::read_last_spec_archive_path().await
+            && !path.is_empty()
+        {
+            archive_path = Some(path);
+        }
+
+        if let Some(path) = archive_path {
+            self.display
+                .muted(format!("\n  • Spec archived\n  ╰─ {path}\n"));
+            Ok(true)
+        } else {
+            self.display
+                .info("No spec archive created. Re-run /archive-spec when ready.");
+            Ok(false)
+        }
     }
 
     async fn supervisor_interactive(&mut self) -> Result<()> {
@@ -2353,6 +2563,77 @@ fn run_plan_prompt_context(plan: &RunPlan, selected_count: usize) -> String {
     }
 
     lines.join("\n")
+}
+
+fn archive_spec_prompt_context(spec_path: &str, tasks: &[TaskRecord]) -> String {
+    let mut lines = vec![
+        format!("Spec path: {spec_path}"),
+        format!("Task count: {}", tasks.len()),
+        "Linked tasks:".to_string(),
+    ];
+
+    for task in tasks {
+        lines.push(format!(
+            "- Task ID: {}\n  Status: {}\n  Milestone ID: {}\n  Task path: {}\n  Run dir: {}",
+            task.id,
+            task.status,
+            task.milestone_id.as_deref().unwrap_or("none"),
+            task.path,
+            crate::project::run_dir_for_task_display(&task.id),
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Review these files as needed, then draft one approved `## Outcome` section.".to_string(),
+    );
+    lines.join("\n")
+}
+
+async fn selected_spec_archive_prompt() -> Result<Option<SpecArchivePrompt>> {
+    let selection = crate::project::read_project_selection().await?;
+    let Some(spec_path) = selection
+        .selected_spec
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !Path::new(spec_path).exists() {
+        return Ok(None);
+    }
+
+    let spec = specs::load_spec(spec_path).await?;
+    if spec.milestones.is_empty() || spec.milestones.iter().any(|milestone| !milestone.completed) {
+        return Ok(None);
+    }
+
+    let tasks = crate::project::list_tasks_for_spec(spec_path).await?;
+    if tasks.is_empty()
+        || tasks.iter().any(|task| {
+            task.status
+                .parse::<crate::project::TaskStatus>()
+                .map(|status| !status.is_terminal())
+                .unwrap_or(true)
+        })
+        || !tasks.iter().any(task_has_unarchived_artifacts)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(SpecArchivePrompt {
+        spec_path: spec.path,
+        task_count: tasks.len(),
+    }))
+}
+
+fn task_has_unarchived_artifacts(task: &TaskRecord) -> bool {
+    let task_path = Path::new(&task.path);
+    let task_file_in_checkout = task_path.starts_with(".ferrus/tasks") && task_path.exists();
+    let run_dir_in_checkout = task_path.starts_with(".ferrus/tasks")
+        && Path::new(&crate::project::run_dir_for_task_display(&task.id)).exists();
+    task_file_in_checkout || run_dir_in_checkout
 }
 
 async fn new_task_ids_since(existing_task_ids: &HashSet<String>) -> Result<Vec<String>> {
@@ -3950,6 +4231,97 @@ mod tests {
         assert!(context.contains("Task count: 1"));
         assert!(context.contains("Milestone ID: m1.0"));
         assert!(!context.contains("Milestone ID: m1.1"));
+    }
+
+    #[tokio::test]
+    async fn selected_spec_archive_prompt_requires_closed_unarchived_spec() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/tasks")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ferrus/runs/t-001")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let data_dir = dir.path().join("runtime");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let local_ref = crate::project::LocalProjectRef {
+            project_id: "test-project".to_string(),
+            name: "test".to_string(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+        };
+        tokio::fs::write(
+            ".ferrus/project.toml",
+            toml::to_string_pretty(&local_ref).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let spec_path = "docs/specs/spec.md";
+        tokio::fs::write(
+            spec_path,
+            "## Milestones\n\
+             - [x] #1.0 Done\n\
+               - ID: m1.0\n\
+               - Depends on: none\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-001.md", "task")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-001/SUBMISSION.md", "done")
+            .await
+            .unwrap();
+        crate::project::write_project_selection(&ProjectSelection {
+            selected_spec: Some(spec_path.to_string()),
+        })
+        .await
+        .unwrap();
+        crate::project::record_task_status_with_origin(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Complete,
+            Some(spec_path),
+            Some("m1.0"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            selected_spec_archive_prompt().await.unwrap(),
+            Some(SpecArchivePrompt {
+                spec_path: spec_path.to_string(),
+                task_count: 1,
+            })
+        );
+
+        tokio::fs::remove_file(".ferrus/tasks/t-001.md")
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(".ferrus/runs/t-001")
+            .await
+            .unwrap();
+        crate::project::record_task_status_with_origin(
+            "t-001",
+            &data_dir
+                .join("archive/specs/spec/tasks/t-001.md")
+                .to_string_lossy(),
+            crate::project::TaskStatus::Complete,
+            Some(spec_path),
+            Some("m1.0"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-001")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-001/SUBMISSION.md", "stale checkout copy")
+            .await
+            .unwrap();
+
+        assert_eq!(selected_spec_archive_prompt().await.unwrap(), None);
+        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]

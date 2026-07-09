@@ -112,6 +112,13 @@ pub struct EventRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecArchiveResult {
+    pub archive_dir: String,
+    pub archived_tasks: usize,
+    pub archived_runs: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskArtifact {
     pub id: String,
@@ -798,6 +805,7 @@ async fn add_recovery_doctor_checks(checks: &mut Vec<DoctorCheck>, database_path
 }
 
 async fn add_runtime_doctor_checks(checks: &mut Vec<DoctorCheck>, database_path: &Path) {
+    let data_dir = database_path.parent().unwrap_or_else(|| Path::new(""));
     let task_rows = match read_task_records_from_database(database_path).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -820,7 +828,7 @@ async fn add_runtime_doctor_checks(checks: &mut Vec<DoctorCheck>, database_path:
             ok: tokio::fs::metadata(&task.path).await.is_ok(),
             message: format!("task artifact exists for {} at {}", task.id, task.path),
         });
-        let run_dir = run_dir_for_task(&task.id);
+        let run_dir = doctor_run_artifact_dir(task, data_dir);
         let run_dir_exists = tokio::fs::metadata(&run_dir)
             .await
             .map(|metadata| metadata.is_dir())
@@ -829,7 +837,8 @@ async fn add_runtime_doctor_checks(checks: &mut Vec<DoctorCheck>, database_path:
             ok: run_dir_exists,
             message: format!(
                 "run artifact directory exists for {} at {}",
-                task.id, run_dir
+                task.id,
+                path_string(&run_dir)
             ),
         });
     }
@@ -840,6 +849,45 @@ fn runtime_artifacts_expected_for_status(status: &str) -> bool {
         status.parse::<TaskStatus>().ok(),
         Some(TaskStatus::Reset | TaskStatus::Unknown)
     )
+}
+
+fn doctor_run_artifact_dir(task: &TaskRecord, data_dir: &Path) -> PathBuf {
+    archived_run_dir_for_task_path(&task.path, &task.id, data_dir)
+        .unwrap_or_else(|| PathBuf::from(run_dir_for_task(&task.id)))
+}
+
+fn task_has_checkout_archive_artifacts(task: &TaskRecord) -> bool {
+    let task_path = Path::new(&task.path);
+    let task_file_in_checkout = checkout_task_artifact_path(task_path) && task_path.exists();
+    let run_dir_in_checkout =
+        checkout_task_artifact_path(task_path) && Path::new(&run_dir_for_task(&task.id)).exists();
+    task_file_in_checkout || run_dir_in_checkout
+}
+
+fn checkout_task_artifact_path(path: &Path) -> bool {
+    path.starts_with(".ferrus/tasks")
+}
+
+fn archived_run_dir_for_task_path(
+    task_path: &str,
+    task_id: &str,
+    data_dir: &Path,
+) -> Option<PathBuf> {
+    let task_path = Path::new(task_path);
+    let archive_specs_dir = data_dir.join("archive").join("specs");
+    if !task_path.is_absolute() || !task_path.starts_with(&archive_specs_dir) {
+        return None;
+    }
+    let expected_file_name = format!("{task_id}.md");
+    if task_path.file_name().and_then(|name| name.to_str()) != Some(expected_file_name.as_str()) {
+        return None;
+    }
+    let tasks_dir = task_path.parent()?;
+    if tasks_dir.file_name().and_then(|name| name.to_str()) != Some("tasks") {
+        return None;
+    }
+    let archive_dir = tasks_dir.parent()?;
+    Some(archive_dir.join("runs").join(task_id))
 }
 
 pub async fn list_registered_projects() -> Result<Vec<ProjectListEntry>> {
@@ -928,6 +976,178 @@ pub async fn list_tasks() -> Result<Vec<TaskRecord>> {
         Ok(tasks)
     })
     .await?
+}
+
+pub async fn list_tasks_for_spec(spec_path: &str) -> Result<Vec<TaskRecord>> {
+    let database_path = current_database_path().await?;
+    let spec_path = spec_path.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Vec<TaskRecord>> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, path, spec_path, milestone_id, status, paused_status, claimed_by,
+                   lease_until, last_heartbeat, check_retries, review_cycles, failure_reason
+            FROM tasks
+            WHERE spec_path = ?1
+            ORDER BY id
+            "#,
+        )?;
+        let rows = statement.query_map([spec_path], task_record_from_row)?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row?);
+        }
+        Ok(tasks)
+    })
+    .await?
+}
+
+pub async fn archive_completed_spec(spec_path: &str, outcome: &str) -> Result<SpecArchiveResult> {
+    let spec_path = normalized_metadata_value(Some(spec_path))
+        .context("Cannot archive spec: spec_path is empty.")?;
+    let outcome = outcome.trim().to_string();
+    if outcome.is_empty() {
+        anyhow::bail!("Cannot archive spec: outcome content is empty.");
+    }
+    if !Path::new(&spec_path).exists() {
+        anyhow::bail!("Cannot archive spec: {spec_path} does not exist.");
+    }
+
+    let spec = crate::specs::load_spec(&spec_path).await?;
+    let incomplete = spec
+        .milestones
+        .iter()
+        .filter(|milestone| !milestone.completed)
+        .map(|milestone| format!("{} ({})", milestone.display_title(), milestone.id))
+        .collect::<Vec<_>>();
+    if !incomplete.is_empty() {
+        anyhow::bail!(
+            "Cannot archive spec: incomplete milestones remain: {}.",
+            incomplete.join(", ")
+        );
+    }
+
+    let tasks = list_tasks_for_spec(&spec_path).await?;
+    if tasks.is_empty() {
+        anyhow::bail!("Cannot archive spec: no task rows are linked to {spec_path}.");
+    }
+    let active = tasks
+        .iter()
+        .filter(|task| {
+            task.status
+                .parse::<TaskStatus>()
+                .map(|status| !status.is_terminal())
+                .unwrap_or(true)
+        })
+        .map(|task| format!("{} ({})", task.id, task.status))
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        anyhow::bail!(
+            "Cannot archive spec: non-terminal tasks remain: {}.",
+            active.join(", ")
+        );
+    }
+    if !tasks.iter().any(task_has_checkout_archive_artifacts) {
+        anyhow::bail!(
+            "Cannot archive spec: no checkout task or run artifacts remain for {spec_path}."
+        );
+    }
+
+    crate::specs::upsert_outcome_section(&spec_path, &outcome).await?;
+
+    let registration = touch_current_project().await?;
+    let closed_at = timestamp();
+    let archive_dir =
+        unique_spec_archive_dir(&registration.data_dir, &spec_path, &closed_at).await?;
+    let archive_dir_for_fs = archive_dir.clone();
+    let spec_path_for_fs = spec_path.clone();
+    let tasks_for_fs = tasks.clone();
+    let manifest = SpecArchiveManifest::new(&spec_path, &closed_at, &tasks);
+
+    let archived = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+        stage_spec_archive_files(
+            &archive_dir_for_fs,
+            &spec_path_for_fs,
+            &tasks_for_fs,
+            &manifest,
+        )
+    })
+    .await??;
+
+    let archive_dir_text = path_string(&archive_dir);
+    let archive_dir_for_db = archive_dir_text.clone();
+    let spec_path_for_db = spec_path.clone();
+    let closed_at_for_db = closed_at.clone();
+    let tasks_for_db = tasks.clone();
+    let outcome_for_db = outcome.clone();
+    let database_path = registration.database_path.clone();
+    let db_result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for task in &tasks_for_db {
+            let archived_task_path = Path::new(&archive_dir_for_db)
+                .join("tasks")
+                .join(format!("{}.md", task.id));
+            if archived_task_path.exists() {
+                transaction.execute(
+                    "UPDATE tasks SET path = ?1 WHERE id = ?2",
+                    params![path_string(&archived_task_path), task.id],
+                )?;
+            }
+        }
+        transaction.execute(
+            r#"
+            INSERT INTO spec_archives (
+                spec_path, archive_dir, closed_at, task_count, run_count, outcome
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                spec_path_for_db,
+                archive_dir_for_db,
+                closed_at_for_db,
+                tasks_for_db.len() as i64,
+                archived.1 as i64,
+                outcome_for_db,
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            None,
+            "spec_archived",
+            &serde_json::json!({
+                "spec_path": spec_path_for_db,
+                "archive_dir": archive_dir_for_db,
+                "task_count": tasks_for_db.len(),
+                "run_count": archived.1,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?;
+    if let Err(err) = db_result {
+        let _ = tokio::fs::remove_dir_all(&archive_dir).await;
+        return Err(err);
+    }
+
+    let tasks_for_cleanup = tasks.clone();
+    tokio::task::spawn_blocking(move || cleanup_checkout_archive_artifacts(&tasks_for_cleanup))
+        .await??;
+    let archive_dir_for_handoff = archive_dir_text.clone();
+    let database_path = registration.database_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = open_runtime_database(&database_path)?;
+        write_last_spec_archive_path_to_database(&connection, Some(&archive_dir_for_handoff))?;
+        Ok(())
+    })
+    .await??;
+
+    Ok(SpecArchiveResult {
+        archive_dir: archive_dir_text,
+        archived_tasks: archived.0,
+        archived_runs: archived.1,
+    })
 }
 
 pub async fn list_human_questions() -> Result<Vec<HumanQuestion>> {
@@ -1193,6 +1413,25 @@ pub async fn clear_last_spec_path() -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let connection = open_runtime_database(&database_path)?;
         write_last_spec_path_to_database(&connection, None)?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn read_last_spec_archive_path() -> Result<Option<String>> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let connection = open_runtime_database(&database_path)?;
+        read_last_spec_archive_path_from_database(&connection)
+    })
+    .await?
+}
+
+pub async fn clear_last_spec_archive_path() -> Result<()> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = open_runtime_database(&database_path)?;
+        write_last_spec_archive_path_to_database(&connection, None)?;
         Ok(())
     })
     .await?
@@ -2480,6 +2719,10 @@ fn run_dir_for_task(task_id: &str) -> String {
     format!(".ferrus/runs/{task_id}")
 }
 
+pub fn run_dir_for_task_display(task_id: &str) -> String {
+    run_dir_for_task(task_id)
+}
+
 fn default_task_path_for_id(task_id: &str) -> String {
     if task_id == CURRENT_TASK_ID {
         CURRENT_TASK_PATH.to_string()
@@ -3494,7 +3737,18 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             row_id INTEGER PRIMARY KEY CHECK (row_id = 1),
             selected_spec TEXT,
             last_spec_path TEXT,
+            last_archive_path TEXT,
             updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS spec_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spec_path TEXT NOT NULL,
+            archive_dir TEXT NOT NULL,
+            closed_at TEXT NOT NULL,
+            task_count INTEGER NOT NULL,
+            run_count INTEGER NOT NULL,
+            outcome TEXT NOT NULL
         );
         "#,
     )?;
@@ -3537,6 +3791,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         connection,
         "project_runtime_state",
         "last_spec_path",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "last_archive_path",
         "TEXT",
     )?;
     migrate_legacy_runtime_metadata(connection)?;
@@ -3631,6 +3891,34 @@ fn write_last_spec_path_to_database(connection: &Connection, path: Option<&str>)
         r#"
         UPDATE project_runtime_state
         SET last_spec_path = ?1, updated_at = ?2
+        WHERE row_id = 1
+        "#,
+        params![normalized_metadata_value(path), timestamp()],
+    )?;
+    Ok(())
+}
+
+fn read_last_spec_archive_path_from_database(connection: &Connection) -> Result<Option<String>> {
+    let value = connection
+        .query_row(
+            "SELECT last_archive_path FROM project_runtime_state WHERE row_id = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(normalize_optional_db_string(value))
+}
+
+fn write_last_spec_archive_path_to_database(
+    connection: &Connection,
+    path: Option<&str>,
+) -> Result<()> {
+    ensure_project_runtime_state_row(connection)?;
+    connection.execute(
+        r#"
+        UPDATE project_runtime_state
+        SET last_archive_path = ?1, updated_at = ?2
         WHERE row_id = 1
         "#,
         params![normalized_metadata_value(path), timestamp()],
@@ -4110,6 +4398,186 @@ async fn copy_if_nonempty(from: &str, to: &str) -> Result<()> {
         .with_context(|| format!("Failed to write {to}"))
 }
 
+#[derive(Debug, Serialize)]
+struct SpecArchiveManifest {
+    spec_path: String,
+    archived_at: String,
+    tasks: Vec<SpecArchiveTaskManifest>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpecArchiveTaskManifest {
+    id: String,
+    status: String,
+    milestone_id: Option<String>,
+    original_task_path: String,
+    archived_task_path: String,
+    original_run_dir: String,
+    archived_run_dir: String,
+}
+
+impl SpecArchiveManifest {
+    fn new(spec_path: &str, archived_at: &str, tasks: &[TaskRecord]) -> Self {
+        let tasks = tasks
+            .iter()
+            .map(|task| SpecArchiveTaskManifest {
+                id: task.id.clone(),
+                status: task.status.clone(),
+                milestone_id: task.milestone_id.clone(),
+                original_task_path: task.path.clone(),
+                archived_task_path: format!("tasks/{}.md", task.id),
+                original_run_dir: run_dir_for_task(&task.id),
+                archived_run_dir: format!("runs/{}", task.id),
+            })
+            .collect();
+        Self {
+            spec_path: spec_path.to_string(),
+            archived_at: archived_at.to_string(),
+            tasks,
+        }
+    }
+}
+
+async fn unique_spec_archive_dir(
+    data_dir: &Path,
+    spec_path: &str,
+    closed_at: &str,
+) -> Result<PathBuf> {
+    let slug = spec_archive_slug(spec_path);
+    let safe_time = closed_at.replace([':', '-'], "").replace('T', "-");
+    let base = data_dir
+        .join("archive")
+        .join("specs")
+        .join(format!("{slug}-{safe_time}"));
+    let mut candidate = base.clone();
+    let mut suffix = 2u32;
+    while tokio::fs::metadata(&candidate).await.is_ok() {
+        candidate = data_dir
+            .join("archive")
+            .join("specs")
+            .join(format!("{slug}-{safe_time}-{suffix}"));
+        suffix += 1;
+    }
+    Ok(candidate)
+}
+
+fn spec_archive_slug(spec_path: &str) -> String {
+    let stem = Path::new(spec_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("spec");
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in stem.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "spec".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn stage_spec_archive_files(
+    archive_dir: &Path,
+    spec_path: &str,
+    tasks: &[TaskRecord],
+    manifest: &SpecArchiveManifest,
+) -> Result<(usize, usize)> {
+    let tasks_dir = archive_dir.join("tasks");
+    let runs_dir = archive_dir.join("runs");
+    std::fs::create_dir_all(&tasks_dir)
+        .with_context(|| format!("Failed to create {}", tasks_dir.display()))?;
+    std::fs::create_dir_all(&runs_dir)
+        .with_context(|| format!("Failed to create {}", runs_dir.display()))?;
+
+    std::fs::copy(spec_path, archive_dir.join("spec.md")).with_context(|| {
+        format!(
+            "Failed to copy spec {} to {}",
+            spec_path,
+            archive_dir.join("spec.md").display()
+        )
+    })?;
+
+    let manifest_text =
+        toml::to_string_pretty(manifest).context("Failed to render archive manifest")?;
+    std::fs::write(archive_dir.join("manifest.toml"), manifest_text).with_context(|| {
+        format!(
+            "Failed to write archive manifest {}",
+            archive_dir.join("manifest.toml").display()
+        )
+    })?;
+
+    let mut archived_tasks = 0usize;
+    let mut archived_runs = 0usize;
+    for task in tasks {
+        let task_path = Path::new(&task.path);
+        if checkout_task_artifact_path(task_path) && task_path.exists() {
+            copy_path_recursive(task_path, &tasks_dir.join(format!("{}.md", task.id)))?;
+            archived_tasks += 1;
+        }
+
+        let run_dir = PathBuf::from(run_dir_for_task(&task.id));
+        if checkout_task_artifact_path(task_path) && run_dir.exists() {
+            copy_path_recursive(&run_dir, &runs_dir.join(&task.id))?;
+            archived_runs += 1;
+        }
+    }
+    Ok((archived_tasks, archived_runs))
+}
+
+fn cleanup_checkout_archive_artifacts(tasks: &[TaskRecord]) -> Result<()> {
+    for task in tasks {
+        let task_path = Path::new(&task.path);
+        if checkout_task_artifact_path(task_path) && task_path.exists() {
+            remove_path_recursive(task_path)?;
+        }
+
+        let run_dir = PathBuf::from(run_dir_for_task(&task.id));
+        if checkout_task_artifact_path(task_path) && run_dir.exists() {
+            remove_path_recursive(&run_dir)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_path_recursive(from: &Path, to: &Path) -> Result<()> {
+    let metadata =
+        std::fs::metadata(from).with_context(|| format!("Failed to inspect {}", from.display()))?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(to)
+            .with_context(|| format!("Failed to create {}", to.display()))?;
+        for entry in
+            std::fs::read_dir(from).with_context(|| format!("Failed to read {}", from.display()))?
+        {
+            let entry = entry?;
+            copy_path_recursive(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)
+            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_path_recursive(path: &Path) -> Result<()> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("Failed to inspect {}", path.display()))?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("Failed to remove {}", path.display()))
+}
+
 async fn read_local_project_ref() -> Result<LocalProjectRef> {
     let path = project_path(LOCAL_PROJECT_TOML);
     let contents = tokio::fs::read_to_string(&path)
@@ -4394,6 +4862,24 @@ mod tests {
         )
         .await
         .unwrap();
+        write_toml(
+            &data_dir.join("project.toml"),
+            &ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: path_string(workspace),
+                ferrus_dir: path_string(&workspace.join(".ferrus")),
+                vcs: None,
+                origin_repo: None,
+                default_branch: None,
+                current_head: None,
+                created_at: timestamp(),
+                last_opened_at: timestamp(),
+                version: PROJECT_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         std::env::set_current_dir(workspace).unwrap();
         initialize_database(&data_dir.join("ferrus.db"))
             .await
@@ -4412,6 +4898,164 @@ mod tests {
 
     fn teardown(previous: PathBuf) {
         std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn archive_staging_copies_before_cleanup() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir_all("docs/specs").unwrap();
+        std::fs::create_dir_all(".ferrus/tasks").unwrap();
+        std::fs::create_dir_all(".ferrus/runs/t-007").unwrap();
+        std::fs::write("docs/specs/spec.md", "# Spec\n").unwrap();
+        std::fs::write(".ferrus/tasks/t-007.md", "task").unwrap();
+        std::fs::write(".ferrus/runs/t-007/SUBMISSION.md", "submission").unwrap();
+        let task = TaskRecord {
+            id: "t-007".to_string(),
+            path: ".ferrus/tasks/t-007.md".to_string(),
+            spec_path: Some("docs/specs/spec.md".to_string()),
+            milestone_id: Some("m1.0".to_string()),
+            status: TaskStatus::Complete.as_str().to_string(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        };
+        let archive_dir = dir.path().join("runtime/archive/specs/spec-archive");
+        let manifest = SpecArchiveManifest::new("docs/specs/spec.md", "now", &[task.clone()]);
+
+        let archived = stage_spec_archive_files(
+            &archive_dir,
+            "docs/specs/spec.md",
+            &[task.clone()],
+            &manifest,
+        )
+        .unwrap();
+
+        assert_eq!(archived, (1, 1));
+        assert!(std::path::Path::new(".ferrus/tasks/t-007.md").exists());
+        assert!(std::path::Path::new(".ferrus/runs/t-007/SUBMISSION.md").exists());
+        assert!(archive_dir.join("tasks/t-007.md").exists());
+        assert!(archive_dir.join("runs/t-007/SUBMISSION.md").exists());
+
+        cleanup_checkout_archive_artifacts(&[task]).unwrap();
+
+        assert!(!std::path::Path::new(".ferrus/tasks/t-007.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-007").exists());
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_completed_spec_writes_outcome_and_moves_artifacts() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (dir, previous) = setup_project().await;
+        record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            crate::project::TaskStatus::Reset,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all("docs/specs").await.unwrap();
+        tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-007")
+            .await
+            .unwrap();
+        let spec_path = "docs/specs/2026-07-05-archive.md";
+        tokio::fs::write(
+            spec_path,
+            "# Archive\n\n## Milestones\n\n- [x] #1.0 Done\n  - ID: m1.0\n  - Depends on: none\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-007.md", "task text")
+            .await
+            .unwrap();
+        tokio::fs::write(".ferrus/runs/t-007/SUBMISSION.md", "submission")
+            .await
+            .unwrap();
+        record_task_status_with_origin(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            TaskStatus::Complete,
+            Some(spec_path),
+            Some("m1.0"),
+        )
+        .await
+        .unwrap();
+
+        let result = archive_completed_spec(spec_path, "Delivered the archive workflow.")
+            .await
+            .unwrap();
+
+        let spec = tokio::fs::read_to_string(spec_path).await.unwrap();
+        assert!(spec.contains("## Outcome"));
+        assert!(spec.contains("Delivered the archive workflow."));
+        assert!(!std::path::Path::new(".ferrus/tasks/t-007.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-007").exists());
+        assert!(
+            std::path::Path::new(&result.archive_dir)
+                .join("manifest.toml")
+                .exists()
+        );
+        assert!(
+            std::path::Path::new(&result.archive_dir)
+                .join("tasks/t-007.md")
+                .exists()
+        );
+        assert!(
+            std::path::Path::new(&result.archive_dir)
+                .join("runs/t-007/SUBMISSION.md")
+                .exists()
+        );
+        let task = list_tasks_for_spec(spec_path)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-007")
+            .unwrap();
+        assert!(task.path.contains("archive"));
+        let archived_task_path = task.path.clone();
+        assert_eq!(
+            read_last_spec_archive_path().await.unwrap().as_deref(),
+            Some(result.archive_dir.as_str())
+        );
+        let database_path = current_database_path().await.unwrap();
+        let mut checks = Vec::new();
+        add_runtime_doctor_checks(&mut checks, &database_path).await;
+        assert!(
+            checks.iter().all(|check| check.ok),
+            "unexpected failed checks: {:?}",
+            checks
+                .iter()
+                .filter(|check| !check.ok)
+                .map(|check| check.message.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let error = archive_completed_spec(spec_path, "Second archive attempt.")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no checkout task or run artifacts remain"));
+        assert!(std::path::Path::new(&archived_task_path).exists());
+        assert!(
+            std::path::Path::new(&result.archive_dir)
+                .join("runs/t-007/SUBMISSION.md")
+                .exists()
+        );
+        assert_eq!(
+            read_last_spec_archive_path().await.unwrap().as_deref(),
+            Some(result.archive_dir.as_str())
+        );
+
+        teardown(previous);
+        drop(dir);
     }
 
     #[tokio::test]

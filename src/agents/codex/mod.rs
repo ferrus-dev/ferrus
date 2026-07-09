@@ -432,6 +432,7 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
         ROLE_SUPERVISOR => &[
             "enqueue_task",
             "create_spec",
+            "archive_spec",
             "wait_for_review",
             "review_pending",
             "approve",
@@ -796,6 +797,7 @@ args = []
         let tools = entry.get("tools").and_then(toml::Value::as_table).unwrap();
         assert!(tools.contains_key("enqueue_task"));
         assert!(tools.contains_key("create_spec"));
+        assert!(tools.contains_key("archive_spec"));
         assert!(tools.contains_key("wait_for_consultation"));
         assert!(tools.contains_key("heartbeat"));
         assert!(!tools.contains_key("create_task"));
@@ -805,7 +807,7 @@ args = []
     #[test]
     fn codex_tool_approval_sets_match_role_needs() {
         assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 10);
-        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 11);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 12);
     }
 
     #[test]

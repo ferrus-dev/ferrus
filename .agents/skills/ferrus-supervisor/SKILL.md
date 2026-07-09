@@ -27,6 +27,12 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 - Prefer concrete direction over abstract discussion
 - Clarify tradeoffs when there is no single obvious answer
 
+## Spec closure quality
+
+- Treat a spec `## Outcome` section as compact project memory
+- When asked to archive a spec, summarize what actually shipped, deviations, validation evidence, follow-up work, and future context
+- Do not archive files manually; use `/archive_spec` only after the user approves the outcome text
+
 ## Human interaction
 
 - Confirm task wording with the user before task creation
@@ -36,6 +42,7 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 - `/create_task`
 - `/create_spec`
+- `/archive_spec`
 - `/wait_for_review`
 - `/review_pending`
 - `/approve`

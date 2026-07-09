@@ -223,6 +223,17 @@ pub async fn complete_milestone(spec_path: &str, milestone_id: &str) -> Result<(
     Ok(())
 }
 
+pub async fn upsert_outcome_section(spec_path: &str, outcome: &str) -> Result<()> {
+    let outcome = normalize_outcome_section(outcome)?;
+    let content = tokio::fs::read_to_string(spec_path)
+        .await
+        .with_context(|| format!("Failed to read spec {spec_path}"))?;
+    let updated = upsert_outcome_section_text(&content, &outcome);
+    tokio::fs::write(spec_path, updated)
+        .await
+        .with_context(|| format!("Failed to write spec {spec_path}"))
+}
+
 pub fn spec_display_name(path: &str) -> String {
     let stem = PathBuf::from(path)
         .file_stem()
@@ -247,6 +258,77 @@ pub fn compact_spec_display_name(name: &str) -> String {
         name.chars().take(keep).collect::<String>(),
         ELLIPSIS
     )
+}
+
+fn normalize_outcome_section(outcome: &str) -> Result<String> {
+    let outcome = outcome.trim();
+    if outcome.is_empty() {
+        anyhow::bail!("Cannot archive spec: outcome content is empty.");
+    }
+    if outcome.starts_with("## Outcome") {
+        Ok(outcome.to_string())
+    } else {
+        Ok(format!("## Outcome\n\n{outcome}"))
+    }
+}
+
+fn upsert_outcome_section_text(content: &str, outcome: &str) -> String {
+    let mut lines = content
+        .split_inclusive('\n')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    let outcome_start = lines
+        .iter()
+        .position(|line| line.trim_end() == "## Outcome");
+    let mut outcome_lines = outcome
+        .trim_end()
+        .lines()
+        .map(|line| format!("{line}\n"))
+        .collect::<Vec<_>>();
+    outcome_lines.push("\n".to_string());
+
+    match outcome_start {
+        Some(start) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(idx, line)| {
+                    let trimmed = line.trim_start();
+                    (trimmed.starts_with("## ") && trimmed.trim_end() != "## Outcome")
+                        .then_some(idx)
+                })
+                .unwrap_or(lines.len());
+            lines.splice(start..end, outcome_lines);
+        }
+        None => {
+            if !lines.last().is_some_and(|line| line.ends_with('\n')) {
+                lines.push("\n".to_string());
+            }
+            if !lines
+                .iter()
+                .rev()
+                .take_while(|line| line.trim().is_empty())
+                .any(|line| line == "\n")
+            {
+                lines.push("\n".to_string());
+            }
+            lines.extend(outcome_lines);
+        }
+    }
+
+    let mut updated = lines.concat();
+    while updated.ends_with("\n\n\n") {
+        updated.pop();
+    }
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated
 }
 
 fn strip_date_prefix(stem: &str) -> Option<&str> {
@@ -389,6 +471,23 @@ mod tests {
             compact_spec_display_name("spec-workflow-with-a-long-title"),
             "spec-workflow-w..."
         );
+    }
+
+    #[test]
+    fn upsert_outcome_section_appends_when_missing() {
+        let updated =
+            upsert_outcome_section_text("# Spec\n\n## Goal\n\nBuild it.\n", "## Outcome\n\nDone.");
+        assert!(updated.contains("## Goal\n\nBuild it.\n\n## Outcome\n\nDone.\n"));
+    }
+
+    #[test]
+    fn upsert_outcome_section_replaces_existing_block() {
+        let updated = upsert_outcome_section_text(
+            "# Spec\n\n## Outcome\n\nOld notes.\n\n## Milestones\n\n- [x] #1.0 Done\n",
+            "## Outcome\n\nNew notes.",
+        );
+        assert!(updated.contains("## Outcome\n\nNew notes.\n\n## Milestones"));
+        assert!(!updated.contains("Old notes"));
     }
 
     #[test]
