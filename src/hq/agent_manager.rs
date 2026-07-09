@@ -804,10 +804,9 @@ fn parse_mcp_tool_status(line: &str) -> Option<(String, ToolCallStatus)> {
         (tool_path, ToolCallStatus::Started)
     } else if let Some(tool_path) = rest.strip_suffix(" (completed)") {
         (tool_path, ToolCallStatus::Completed)
-    } else if let Some(tool_path) = rest.strip_suffix(" (failed)") {
-        (tool_path, ToolCallStatus::Failed)
     } else {
-        return None;
+        let tool_path = rest.strip_suffix(" (failed)")?;
+        (tool_path, ToolCallStatus::Failed)
     };
 
     let tool = tool_path.rsplit('/').next()?.to_string();
