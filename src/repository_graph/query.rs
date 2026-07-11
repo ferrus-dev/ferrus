@@ -327,4 +327,41 @@ mod tests {
         assert!(fields.get("bytes").is_none());
         assert!(fields.get("content").is_none());
     }
+
+    #[test]
+    fn search_request_serialization_matches_v1_fixture() {
+        let request = SearchRequest {
+            scope: QueryScope::v1(
+                repository(),
+                SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
+                budget(),
+            ),
+            text: "RuntimeTaskContext".to_string(),
+            node_kinds: vec!["rust_symbol".to_string()],
+            paths: vec![RepoPath::new("src/project.rs").unwrap()],
+            page: PageRequest { cursor: None },
+        };
+        assert_eq!(
+            serde_json::to_string_pretty(&request).unwrap(),
+            include_str!("fixtures/query_v1_search.json").trim()
+        );
+    }
+
+    #[test]
+    fn error_details_serialize_in_deterministic_key_order() {
+        let error = QueryError {
+            wire_version: QUERY_WIRE_VERSION,
+            code: QueryErrorCode::StaleCursor,
+            message: "cursor no longer matches snapshot".to_string(),
+            retryable: false,
+            details: BTreeMap::from([
+                ("z".to_string(), "last".to_string()),
+                ("a".to_string(), "first".to_string()),
+            ]),
+        };
+        assert_eq!(
+            serde_json::to_string_pretty(&error).unwrap(),
+            include_str!("fixtures/query_v1_error.json").trim()
+        );
+    }
 }

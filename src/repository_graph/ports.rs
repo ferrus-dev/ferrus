@@ -5,6 +5,7 @@ use super::domain::{
     RepositoryRef, SnapshotId, SourceRevision,
 };
 use super::{
+    diagnostics::GraphLifecycleEvent,
     query::{
         ContentRequest, ContentResponse, ContextRequest, ContextResponse, NeighborhoodRequest,
         NeighborhoodResponse, QueryError, SearchRequest, SearchResponse, StatusRequest,
@@ -83,11 +84,4 @@ pub trait EventSink {
     type Error;
 
     fn emit(&self, event: GraphLifecycleEvent<'_>) -> Result<(), Self::Error>;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct GraphLifecycleEvent<'a> {
-    pub build_id: &'a BuildId,
-    pub event_type: &'a str,
-    pub diagnostic_count: usize,
 }

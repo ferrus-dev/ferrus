@@ -320,16 +320,62 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DiagnosticCodeError {
+    #[error("diagnostic code must be 1..=64 lowercase ASCII token characters")]
+    Invalid,
+}
+
+/// A bounded machine-readable code. Free-form source text and secret values
+/// are deliberately not representable as diagnostic messages.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DiagnosticCode(String);
+
+impl DiagnosticCode {
+    pub fn new(value: impl Into<String>) -> Result<Self, DiagnosticCodeError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err(DiagnosticCodeError::Invalid);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DiagnosticCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticLocation {
+    pub path: RepoPath,
+    pub span: Option<SourceSpan>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphDiagnostic {
     pub build_id: BuildId,
     pub snapshot_id: Option<SnapshotId>,
     pub severity: DiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-    pub location: Option<SourceEvidence>,
+    pub code: DiagnosticCode,
+    pub location: Option<DiagnosticLocation>,
     #[serde(default)]
-    pub metadata: BTreeMap<String, GraphValue>,
+    pub metrics: BTreeMap<DiagnosticCode, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,5 +463,32 @@ mod tests {
             "max_duration_ms": 100
         }"#;
         assert!(serde_json::from_str::<QueryBudget>(json).is_err());
+    }
+
+    #[test]
+    fn diagnostic_codes_reject_free_form_text() {
+        assert!(DiagnosticCode::new("extractor_failed").is_ok());
+        for unsafe_value in [
+            "Contains source text",
+            "token=secret",
+            "/absolute/path",
+            "line\nbody",
+        ] {
+            assert!(DiagnosticCode::new(unsafe_value).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnostics_reject_free_form_payload_fields() {
+        let json = serde_json::json!({
+            "build_id": "build-1",
+            "snapshot_id": null,
+            "severity": "error",
+            "code": "extractor_failed",
+            "location": null,
+            "metrics": {},
+            "message": "arbitrary source body"
+        });
+        assert!(serde_json::from_value::<GraphDiagnostic>(json).is_err());
     }
 }

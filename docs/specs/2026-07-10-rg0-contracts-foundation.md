@@ -151,13 +151,17 @@ neighborhood, and context operations, plus a hash-verifying `SnapshotContent` bo
 Implemented in `src/repository_graph/query.rs` and `src/repository_graph/ports.rs`; all graph query requests carry
 explicit result, byte, depth, and duration budgets, while source bytes remain confined to `SnapshotContent`.
 
-- [ ] #0.5 Add graph lifecycle diagnostics and foundation contract tests
+- [x] #0.5 Add graph lifecycle diagnostics and foundation contract tests
 
 ID: rg0.5
 Depends on: rg0.3, rg0.4
 
 Add sidecar health inspection, migration fixtures, atomic-publication failure tests, deterministic serialization
 tests, and tracing/event adapters that never include source bodies.
+
+Implemented in `src/repository_graph/health.rs`, `src/repository_graph/diagnostics.rs`,
+`src/repository_graph/diagnostics_sqlite.rs`, and `src/repository_graph/contracts.rs`, with checked-in schema and
+wire-format fixtures under `src/repository_graph/fixtures/`.
 
 ## Acceptance Criteria
 

@@ -439,4 +439,43 @@ mod tests {
         ));
         assert_eq!(std::fs::read(runtime_path).unwrap(), before);
     }
+
+    #[test]
+    fn supported_schema_fixture_reopens_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SIDECAR_FILE_NAME);
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("new sidecar unexpectedly requires rebuild");
+        };
+        drop(sidecar);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("supported sidecar unexpectedly requires rebuild");
+        };
+        let migration_count: u32 = sidecar
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(migration_count, SIDECAR_SCHEMA_VERSION);
+
+        let mut statement = sidecar
+            .connection()
+            .prepare(
+                "SELECT type || ':' || name FROM sqlite_schema \
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap();
+        let actual = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert_eq!(
+            actual,
+            include_str!("fixtures/schema_v1_objects.txt").trim()
+        );
+    }
 }

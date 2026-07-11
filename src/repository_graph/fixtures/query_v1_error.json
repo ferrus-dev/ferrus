@@ -1,0 +1,10 @@
+{
+  "wire_version": 1,
+  "code": "stale_cursor",
+  "message": "cursor no longer matches snapshot",
+  "retryable": false,
+  "details": {
+    "a": "first",
+    "z": "last"
+  }
+}
