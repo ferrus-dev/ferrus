@@ -4,6 +4,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agents::{ExecutorAgent, SupervisorAgent, parse_executor_agent, parse_supervisor_agent};
+use crate::repository_graph::RepositoryGraphConfig;
 mod claude;
 pub use claude::{
     ClaudeMcpIsolation, ensure_claude_mcp_isolation_default, load_claude_mcp_isolation,
@@ -16,6 +17,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub lease: LeaseConfig,
     pub spec: SpecConfig,
+    pub repository_graph: RepositoryGraphConfig,
     pub hq: Option<HqConfig>,
 }
 
@@ -92,6 +94,8 @@ struct RawConfig {
     #[serde(default)]
     spec: SpecConfig,
     #[serde(default)]
+    repository_graph: RepositoryGraphConfig,
+    #[serde(default)]
     hq: Option<RawHqConfig>,
 }
 
@@ -136,6 +140,7 @@ impl TryFrom<RawConfig> for Config {
             limits: raw.limits,
             lease: raw.lease,
             spec: raw.spec,
+            repository_graph: raw.repository_graph,
             hq,
         })
     }
@@ -384,6 +389,7 @@ commands = ["cargo test"]
         assert_eq!(config.lease.ttl_secs, 90);
         assert_eq!(config.lease.heartbeat_interval_secs, 30);
         assert_eq!(config.spec.directory, "docs/specs");
+        assert_eq!(config.repository_graph, RepositoryGraphConfig::default());
     }
 
     #[test]

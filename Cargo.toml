@@ -43,6 +43,7 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 semver = "1.0.28"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+sha2 = "0.10.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

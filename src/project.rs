@@ -543,6 +543,29 @@ pub async fn canonical_project_root() -> Result<PathBuf> {
         })
 }
 
+/// Resolves the registered machine-local project directory without touching
+/// runtime state or creating any files. Derived sidecars use this registry
+/// boundary instead of inferring identity from the process working directory.
+pub async fn current_project_data_dir() -> Result<PathBuf> {
+    let local_ref = read_local_project_ref()
+        .await
+        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+    validate_project_id(&local_ref.project_id)?;
+    let data_dir = PathBuf::from(&local_ref.data_dir);
+    let metadata_path = data_dir.join("project.toml");
+    let metadata = read_project_metadata_from(&metadata_path)
+        .await
+        .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
+    if metadata.id != local_ref.project_id {
+        anyhow::bail!(
+            "local project_id {} does not match global metadata id {}",
+            local_ref.project_id,
+            metadata.id
+        );
+    }
+    Ok(data_dir)
+}
+
 pub async fn create_pending_task_artifact(
     description: &str,
     spec_path: Option<&str>,

@@ -106,7 +106,7 @@ define normalized semantic versus operational repository-graph configuration.
 
 Normative contract: [Repository Graph Architecture and Identity Contracts](../repository-graph-architecture.md).
 
-- [ ] #0.1 Introduce repository graph domain types and module boundaries
+- [x] #0.1 Introduce repository graph domain types and module boundaries
 
 ID: rg0.1
 Depends on: rg0.0
@@ -114,13 +114,19 @@ Depends on: rg0.0
 Create the dedicated module layout and backend-neutral domain types for nodes, edges, evidence, diagnostics,
 freshness, snapshots, builds, and bounded query requests. Persisted paths must be repository-relative.
 
-- [ ] #0.2 Add the versioned repository graph SQLite sidecar
+Implemented in `src/repository_graph/domain.rs`, `src/repository_graph/ports.rs`, and
+`src/repository_graph/config.rs`.
+
+- [x] #0.2 Add the versioned repository graph SQLite sidecar
 
 ID: rg0.2
 Depends on: rg0.0
 
 Resolve `repo-graph.db` through the existing project registry, add an explicit migration runner and initial
 schema, and report incompatible versions as `requires_rebuild` without modifying `ferrus.db`.
+
+Implemented in `src/repository_graph/sqlite.rs`; the project registry exposes a read-only machine-local data
+directory resolver for sidecars.
 
 - [ ] #0.3 Implement immutable snapshot build and atomic publication primitives
 
