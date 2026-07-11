@@ -1,8 +1,16 @@
 //! Storage-independent extension points for later index and query phases.
 
 use super::domain::{
-    BuildId, GraphDiagnostic, GraphEdge, GraphNode, GraphQueryRequest, GraphSnapshot, RepoPath,
+    BuildId, GraphBuild, GraphDiagnostic, GraphEdge, GraphNode, GraphSnapshot, RepoPath,
     RepositoryRef, SnapshotId, SourceRevision,
+};
+use super::{
+    query::{
+        ContentRequest, ContentResponse, ContextRequest, ContextResponse, NeighborhoodRequest,
+        NeighborhoodResponse, QueryError, SearchRequest, SearchResponse, StatusRequest,
+        StatusResponse,
+    },
+    store::{BuildFailure, PublicationOutcome, PublishRequest, PublishedView},
 };
 
 #[derive(Debug, Clone)]
@@ -43,25 +51,32 @@ pub trait CrossFileResolver {
 pub trait GraphStore {
     type Error;
 
-    fn begin_build(&mut self, revision: &SourceRevision) -> Result<BuildId, Self::Error>;
+    fn start_build(&mut self, build: &GraphBuild) -> Result<(), Self::Error>;
+    fn fail_build(&mut self, failure: &BuildFailure) -> Result<GraphBuild, Self::Error>;
+    fn complete_build(&mut self, snapshot: &GraphSnapshot) -> Result<GraphSnapshot, Self::Error>;
+    fn publish(&mut self, request: &PublishRequest) -> Result<PublicationOutcome, Self::Error>;
+    fn supersede_build(&mut self, build_id: &BuildId) -> Result<GraphBuild, Self::Error>;
+    fn build(&self, id: &BuildId) -> Result<Option<GraphBuild>, Self::Error>;
     fn snapshot(&self, id: &SnapshotId) -> Result<Option<GraphSnapshot>, Self::Error>;
+    fn published_view(
+        &self,
+        repository: &RepositoryRef,
+        name: &super::domain::PublishedViewName,
+    ) -> Result<Option<PublishedView>, Self::Error>;
 }
 
 pub trait GraphQuery {
-    type Error;
-    type Response;
-
-    fn query(&self, request: &GraphQueryRequest) -> Result<Self::Response, Self::Error>;
+    fn status(&self, request: &StatusRequest) -> Result<StatusResponse, QueryError>;
+    fn search(&self, request: &SearchRequest) -> Result<SearchResponse, QueryError>;
+    fn neighborhood(
+        &self,
+        request: &NeighborhoodRequest,
+    ) -> Result<NeighborhoodResponse, QueryError>;
+    fn context(&self, request: &ContextRequest) -> Result<ContextResponse, QueryError>;
 }
 
 pub trait SnapshotContent {
-    type Error;
-
-    fn read_verified(
-        &self,
-        snapshot_id: &SnapshotId,
-        file: &SourceFileDescriptor,
-    ) -> Result<Vec<u8>, Self::Error>;
+    fn read_verified(&self, request: &ContentRequest) -> Result<ContentResponse, QueryError>;
 }
 
 pub trait EventSink {

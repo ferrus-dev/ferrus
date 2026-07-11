@@ -7,7 +7,9 @@
 pub mod config;
 pub mod domain;
 pub mod ports;
+pub mod query;
 pub mod sqlite;
+pub mod store;
 
 pub use config::RepositoryGraphConfig;
 

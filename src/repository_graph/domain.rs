@@ -62,6 +62,8 @@ opaque_id!(SemanticKey, "semantic key");
 opaque_id!(TaskViewId, "task view id");
 opaque_id!(OverlayRevisionId, "overlay revision id");
 opaque_id!(ExtractorId, "extractor id");
+opaque_id!(PublishedViewName, "published view name");
+opaque_id!(PageCursor, "page cursor");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryRef {
@@ -173,6 +175,7 @@ pub struct SourceRevision {
 #[serde(rename_all = "snake_case")]
 pub enum BuildState {
     Building,
+    Complete,
     Published,
     Failed,
     Superseded,
@@ -372,15 +375,6 @@ impl QueryBudget {
             max_duration_ms,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphQueryRequest {
-    pub wire_version: u32,
-    pub repository: RepositoryRef,
-    pub snapshot_id: SnapshotId,
-    pub query: String,
-    pub budget: QueryBudget,
 }
 
 #[cfg(test)]

@@ -128,7 +128,7 @@ schema, and report incompatible versions as `requires_rebuild` without modifying
 Implemented in `src/repository_graph/sqlite.rs`; the project registry exposes a read-only machine-local data
 directory resolver for sidecars.
 
-- [ ] #0.3 Implement immutable snapshot build and atomic publication primitives
+- [x] #0.3 Implement immutable snapshot build and atomic publication primitives
 
 ID: rg0.3
 Depends on: rg0.1, rg0.2
@@ -136,13 +136,20 @@ Depends on: rg0.1, rg0.2
 Implement `GraphStore` lifecycle operations for starting, failing, completing, publishing, reading, and
 superseding snapshots. Partial builds must remain invisible to ordinary queries.
 
-- [ ] #0.4 Define backend-neutral query and content-access contracts
+Implemented in `src/repository_graph/store.rs` with immutable completed snapshots, transactional publication,
+generation-based compare-and-set, and build-attempt ordering that prevents an older build from replacing a newer
+published view.
+
+- [x] #0.4 Define backend-neutral query and content-access contracts
 
 ID: rg0.4
 Depends on: rg0.1
 
 Define versioned request, response, pagination, truncation, error, and freshness envelopes for status, search,
 neighborhood, and context operations, plus a hash-verifying `SnapshotContent` boundary for later snippets.
+
+Implemented in `src/repository_graph/query.rs` and `src/repository_graph/ports.rs`; all graph query requests carry
+explicit result, byte, depth, and duration budgets, while source bytes remain confined to `SnapshotContent`.
 
 - [ ] #0.5 Add graph lifecycle diagnostics and foundation contract tests
 
