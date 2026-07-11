@@ -95,7 +95,7 @@ specification.
 
 ## Milestones
 
-- [ ] #0.0 Define repository graph architecture and identity contracts
+- [x] #0.0 Define repository graph architecture and identity contracts
 
 ID: rg0.0
 Depends on: none
@@ -103,6 +103,8 @@ Depends on: none
 Document the separation between repository graph, task graph, and project memory; define repository, source
 revision, snapshot, build, node, and task-view identities; specify canonical, dirty, and worktree freshness; and
 define normalized semantic versus operational repository-graph configuration.
+
+Normative contract: [Repository Graph Architecture and Identity Contracts](../repository-graph-architecture.md).
 
 - [ ] #0.1 Introduce repository graph domain types and module boundaries
 
