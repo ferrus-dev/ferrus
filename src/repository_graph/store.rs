@@ -253,6 +253,17 @@ impl GraphStore for Sidecar {
             })?;
         let current = load_published_view(&transaction, &request.repository, &request.view_name)?;
 
+        let actual = current.as_ref().map(|view| PublicationVersion {
+            snapshot_id: view.snapshot_id.clone(),
+            generation: view.generation,
+        });
+        if request.expected != actual {
+            return Err(StoreError::PublicationConflict {
+                expected: request.expected.clone(),
+                actual,
+            });
+        }
+
         if let Some(view) = current.as_ref()
             && view.build_id == build.id
             && view.snapshot_id == snapshot.id
@@ -274,17 +285,6 @@ impl GraphStore for Sidecar {
                     current: view.clone(),
                 });
             }
-        }
-
-        let actual = current.as_ref().map(|view| PublicationVersion {
-            snapshot_id: view.snapshot_id.clone(),
-            generation: view.generation,
-        });
-        if request.expected != actual {
-            return Err(StoreError::PublicationConflict {
-                expected: request.expected.clone(),
-                actual,
-            });
         }
 
         let generation = current.as_ref().map_or(1, |view| view.generation + 1);
@@ -859,6 +859,75 @@ mod tests {
                 .build_id,
             first.id
         );
+    }
+
+    #[test]
+    fn no_op_publish_still_enforces_compare_and_set_expectation() {
+        let (_directory, mut sidecar) = sidecar();
+        let build = build(1);
+        sidecar.start_build(&build).unwrap();
+        sidecar.complete_build(&snapshot(&build)).unwrap();
+        let published = match sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: build.id.clone(),
+                expected: None,
+            })
+            .unwrap()
+        {
+            PublicationOutcome::Published { view } => view,
+            PublicationOutcome::Superseded { .. } => unreachable!(),
+        };
+        let actual = PublicationVersion {
+            snapshot_id: published.snapshot_id.clone(),
+            generation: published.generation,
+        };
+
+        let missing_expectation = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: build.id.clone(),
+                expected: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            missing_expectation,
+            StoreError::PublicationConflict {
+                expected: None,
+                actual: Some(ref version),
+            } if version == &actual
+        ));
+
+        let stale_expectation = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: build.id.clone(),
+                expected: Some(PublicationVersion {
+                    snapshot_id: actual.snapshot_id.clone(),
+                    generation: actual.generation - 1,
+                }),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            stale_expectation,
+            StoreError::PublicationConflict {
+                actual: Some(ref version),
+                ..
+            } if version == &actual
+        ));
+
+        let no_op = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: build.id,
+                expected: Some(actual),
+            })
+            .unwrap();
+        assert_eq!(no_op, PublicationOutcome::Published { view: published });
     }
 
     #[test]
