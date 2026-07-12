@@ -6,19 +6,18 @@ use thiserror::Error;
 
 use super::{
     domain::{
-        BuildId, BuildState, Digest, GraphBuild, GraphSnapshot, PublishedViewName, RepositoryId,
-        RepositoryNamespace, RepositoryRef, SnapshotId, SourceRevisionId,
+        BuildId, BuildState, DiagnosticCode, Digest, GraphBuild, GraphSnapshot, PublishedViewName,
+        RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId, SourceRevisionId,
     },
     ports::GraphStore,
     sqlite::Sidecar,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildFailure {
     pub build_id: BuildId,
-    pub code: String,
-    /// Bounded lifecycle metadata only; callers must not include source bodies or secrets.
-    pub message: String,
+    pub code: DiagnosticCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,12 +167,11 @@ impl GraphStore for Sidecar {
         }
         transaction.execute(
             "UPDATE index_builds SET state = 'failed', finished_at = ?2, \
-             failure_code = ?3, failure_message = ?4 WHERE id = ?1",
+             failure_code = ?3, failure_message = NULL WHERE id = ?1",
             params![
                 failure.build_id.as_str(),
                 timestamp(),
-                failure.code,
-                failure.message
+                failure.code.as_str(),
             ],
         )?;
         transaction.commit()?;
@@ -734,11 +732,19 @@ mod tests {
         let result = sidecar
             .fail_build(&BuildFailure {
                 build_id: failed.id.clone(),
-                code: "extractor_failed".to_string(),
-                message: "extractor stopped without source content".to_string(),
+                code: DiagnosticCode::new("extractor_failed").unwrap(),
             })
             .unwrap();
         assert_eq!(result.state, BuildState::Failed);
+        let stored_failure: (String, Option<String>) = sidecar
+            .connection()
+            .query_row(
+                "SELECT failure_code, failure_message FROM index_builds WHERE id = ?1",
+                [failed.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_failure, ("extractor_failed".to_string(), None));
         assert_eq!(
             sidecar
                 .published_view(&repository(), &canonical())
@@ -747,6 +753,22 @@ mod tests {
                 .build_id,
             first.id
         );
+    }
+
+    #[test]
+    fn build_failure_wire_contract_rejects_free_form_details() {
+        let with_message = serde_json::json!({
+            "build_id": "build-1",
+            "code": "extractor_failed",
+            "message": "parser failed near source text /absolute/path token=secret"
+        });
+        assert!(serde_json::from_value::<BuildFailure>(with_message).is_err());
+
+        let invalid_code = serde_json::json!({
+            "build_id": "build-1",
+            "code": "token=secret"
+        });
+        assert!(serde_json::from_value::<BuildFailure>(invalid_code).is_err());
     }
 
     #[test]

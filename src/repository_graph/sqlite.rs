@@ -475,7 +475,9 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v1_objects.txt").trim()
+            include_str!("fixtures/schema_v1_objects.txt")
+                .trim()
+                .replace("\r\n", "\n")
         );
     }
 }

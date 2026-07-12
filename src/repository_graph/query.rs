@@ -343,7 +343,9 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&request).unwrap(),
-            include_str!("fixtures/query_v1_search.json").trim()
+            include_str!("fixtures/query_v1_search.json")
+                .trim()
+                .replace("\r\n", "\n")
         );
     }
 
@@ -361,7 +363,9 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&error).unwrap(),
-            include_str!("fixtures/query_v1_error.json").trim()
+            include_str!("fixtures/query_v1_error.json")
+                .trim()
+                .replace("\r\n", "\n")
         );
     }
 }
