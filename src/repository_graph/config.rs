@@ -43,6 +43,12 @@ pub struct RepositoryGraphConfig {
     pub telemetry: TelemetryConfig,
 }
 
+#[derive(Debug, Deserialize)]
+struct FerrusConfigDocument {
+    #[serde(default)]
+    repository_graph: RepositoryGraphConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceConfig {
@@ -197,6 +203,16 @@ struct EffectiveSourceConfig {
 }
 
 impl RepositoryGraphConfig {
+    /// Parses the optional graph namespace from a complete `ferrus.toml` document.
+    ///
+    /// Core orchestration deliberately ignores this namespace so a newer graph
+    /// schema cannot disable task execution. Graph operations use this strict
+    /// boundary and report unsupported settings when the capability is invoked.
+    pub fn from_ferrus_toml(contents: &str) -> Result<Self, toml::de::Error> {
+        let document: FerrusConfigDocument = toml::from_str(contents)?;
+        Ok(document.repository_graph)
+    }
+
     /// Returns the canonical structural projection used in snapshot identity.
     /// Operational, memory, and future semantic-projection settings are omitted.
     pub fn analysis_config_digest(&self) -> Result<Digest, RepositoryGraphConfigError> {
@@ -390,5 +406,38 @@ include = ["Cargo.toml", "src/**"]
     fn unknown_setting_is_rejected() {
         let error = toml::from_str::<RepositoryGraphConfig>("mystery = true").unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn graph_config_parser_defaults_when_namespace_is_absent() {
+        let config = RepositoryGraphConfig::from_ferrus_toml(
+            r#"
+[checks]
+commands = ["cargo test"]
+
+[limits]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config, RepositoryGraphConfig::default());
+    }
+
+    #[test]
+    fn graph_config_parser_rejects_unknown_graph_settings() {
+        let error = RepositoryGraphConfig::from_ferrus_toml(
+            r#"
+[checks]
+commands = ["cargo test"]
+
+[repository_graph]
+enabled = true
+future_backend = "distributed"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("future_backend"));
     }
 }

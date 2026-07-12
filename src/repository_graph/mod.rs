@@ -17,8 +17,6 @@ pub mod store;
 #[cfg(test)]
 mod contracts;
 
-pub use config::RepositoryGraphConfig;
-
 /// Schema-independent graph model version.
 pub const GRAPH_MODEL_VERSION: u32 = 1;
 /// Version of request/response JSON contracts introduced by this phase.
