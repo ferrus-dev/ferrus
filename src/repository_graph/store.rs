@@ -595,7 +595,6 @@ fn validate_equivalent_snapshot(
 ) -> Result<(), StoreError> {
     if requested.id != existing.id
         || requested.repository != existing.repository
-        || requested.source_revision_id != existing.source_revision_id
         || requested.source_manifest_digest != existing.source_manifest_digest
         || requested.graph_model_version != existing.graph_model_version
         || requested.analysis_config_digest != existing.analysis_config_digest
@@ -1033,6 +1032,48 @@ mod tests {
             sidecar.build(&retry.id).unwrap().unwrap().state,
             BuildState::Building
         );
+    }
+
+    #[test]
+    fn identical_snapshot_is_reused_across_source_revisions() {
+        let (_directory, mut sidecar) = sidecar();
+        let first = build(1);
+        sidecar.start_build(&first).unwrap();
+        let original = sidecar.complete_build(&snapshot(&first)).unwrap();
+
+        let retry = GraphBuild {
+            id: BuildId::new("build-retry").unwrap(),
+            repository: first.repository.clone(),
+            source_revision_id: SourceRevisionId::new("revision-with-identical-tree").unwrap(),
+            prospective_snapshot_id: first.prospective_snapshot_id.clone(),
+            state: BuildState::Building,
+        };
+        sidecar.start_build(&retry).unwrap();
+        let equivalent = GraphSnapshot {
+            source_revision_id: retry.source_revision_id.clone(),
+            completed_by: retry.id.clone(),
+            ..original.clone()
+        };
+
+        assert_eq!(sidecar.complete_build(&equivalent).unwrap(), original);
+        assert_eq!(
+            sidecar.build(&retry.id).unwrap().unwrap().state,
+            BuildState::Complete
+        );
+
+        let PublicationOutcome::Published { view } = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: retry.id.clone(),
+                expected: None,
+            })
+            .unwrap()
+        else {
+            panic!("equivalent snapshot build was unexpectedly superseded");
+        };
+        assert_eq!(view.snapshot_id, first.prospective_snapshot_id);
+        assert_eq!(view.build_id, retry.id);
     }
 
     #[test]
