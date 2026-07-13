@@ -30,37 +30,71 @@ impl Sidecar {
         &mut self,
         diagnostic: &GraphDiagnostic,
     ) -> Result<(), DiagnosticStoreError> {
-        let (path, span_start, span_end) = if let Some(location) = diagnostic.location.as_ref() {
-            let start = location
-                .span
-                .as_ref()
-                .map(|span| i64::try_from(span.start.byte_offset))
-                .transpose()
-                .map_err(|_| DiagnosticStoreError::InvalidSpan)?;
-            let end = location
-                .span
-                .as_ref()
-                .map(|span| i64::try_from(span.end.byte_offset))
-                .transpose()
-                .map_err(|_| DiagnosticStoreError::InvalidSpan)?;
-            (Some(location.path.as_str()), start, end)
-        } else {
-            (None, None, None)
-        };
+        let (path, start_byte, start_line, start_column, end_byte, end_line, end_column) =
+            if let Some(location) = diagnostic.location.as_ref() {
+                let start_byte = location
+                    .span
+                    .as_ref()
+                    .map(|span| i64::try_from(span.start.byte_offset))
+                    .transpose()
+                    .map_err(|_| DiagnosticStoreError::InvalidSpan)?;
+                let end_byte = location
+                    .span
+                    .as_ref()
+                    .map(|span| i64::try_from(span.end.byte_offset))
+                    .transpose()
+                    .map_err(|_| DiagnosticStoreError::InvalidSpan)?;
+                let start_line = location
+                    .span
+                    .as_ref()
+                    .and_then(|span| span.start.line)
+                    .map(i64::from);
+                let start_column = location
+                    .span
+                    .as_ref()
+                    .and_then(|span| span.start.column)
+                    .map(i64::from);
+                let end_line = location
+                    .span
+                    .as_ref()
+                    .and_then(|span| span.end.line)
+                    .map(i64::from);
+                let end_column = location
+                    .span
+                    .as_ref()
+                    .and_then(|span| span.end.column)
+                    .map(i64::from);
+                (
+                    Some(location.path.as_str()),
+                    start_byte,
+                    start_line,
+                    start_column,
+                    end_byte,
+                    end_line,
+                    end_column,
+                )
+            } else {
+                (None, None, None, None, None, None, None)
+            };
         let metrics = serde_json::to_string(&diagnostic.metrics)?;
         self.connection_mut().execute(
             "INSERT INTO diagnostics(\
                 build_id, snapshot_id, severity, code, message, path, span_start_byte, \
-                span_end_byte, metadata_json, created_at\
-             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
+                span_start_line, span_start_column, span_end_byte, span_end_line, \
+                span_end_column, metadata_json, created_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 diagnostic.build_id.as_str(),
                 diagnostic.snapshot_id.as_ref().map(SnapshotId::as_str),
                 severity_name(diagnostic.severity),
                 diagnostic.code.as_str(),
                 path,
-                span_start,
-                span_end,
+                start_byte,
+                start_line,
+                start_column,
+                end_byte,
+                end_line,
+                end_column,
                 metrics,
                 timestamp(),
             ],
@@ -73,7 +107,8 @@ impl Sidecar {
         build_id: &BuildId,
     ) -> Result<Vec<GraphDiagnostic>, DiagnosticStoreError> {
         let mut statement = self.connection().prepare(
-            "SELECT snapshot_id, severity, code, path, span_start_byte, span_end_byte, metadata_json \
+            "SELECT snapshot_id, severity, code, path, span_start_byte, span_start_line, \
+                    span_start_column, span_end_byte, span_end_line, span_end_column, metadata_json \
              FROM diagnostics WHERE build_id = ?1 ORDER BY id",
         )?;
         let rows = statement.query_map([build_id.as_str()], |row| {
@@ -84,7 +119,11 @@ impl Sidecar {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?;
         rows.map(|row| diagnostic_from_row(build_id, row?))
@@ -99,6 +138,10 @@ type DiagnosticRow = (
     Option<String>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
     String,
 );
 
@@ -106,23 +149,27 @@ fn diagnostic_from_row(
     build_id: &BuildId,
     row: DiagnosticRow,
 ) -> Result<GraphDiagnostic, DiagnosticStoreError> {
-    let (snapshot_id, severity, code, path, span_start, span_end, metrics) = row;
-    let span = match (span_start, span_end) {
-        (None, None) => None,
-        (Some(start), Some(end)) if start >= 0 && end >= start => Some(SourceSpan {
-            start: SourcePosition {
-                byte_offset: start as u64,
-                line: None,
-                column: None,
-            },
-            end: SourcePosition {
-                byte_offset: end as u64,
-                line: None,
-                column: None,
-            },
-        }),
-        _ => return Err(DiagnosticStoreError::InvalidSpan),
-    };
+    let (
+        snapshot_id,
+        severity,
+        code,
+        path,
+        start_byte,
+        start_line,
+        start_column,
+        end_byte,
+        end_line,
+        end_column,
+        metrics,
+    ) = row;
+    let span = span_from_row(
+        start_byte,
+        start_line,
+        start_column,
+        end_byte,
+        end_line,
+        end_column,
+    )?;
     let location = match (path, span) {
         (Some(path), span) => Some(DiagnosticLocation {
             path: RepoPath::new(path)
@@ -143,6 +190,49 @@ fn diagnostic_from_row(
             .map_err(|error| DiagnosticStoreError::Corrupt(error.to_string()))?,
         location,
         metrics: serde_json::from_str::<BTreeMap<DiagnosticCode, i64>>(&metrics)?,
+    })
+}
+
+fn span_from_row(
+    start_byte: Option<i64>,
+    start_line: Option<i64>,
+    start_column: Option<i64>,
+    end_byte: Option<i64>,
+    end_line: Option<i64>,
+    end_column: Option<i64>,
+) -> Result<Option<SourceSpan>, DiagnosticStoreError> {
+    match (start_byte, end_byte) {
+        (None, None)
+            if start_line.is_none()
+                && start_column.is_none()
+                && end_line.is_none()
+                && end_column.is_none() =>
+        {
+            Ok(None)
+        }
+        (Some(start_byte), Some(end_byte)) if end_byte >= start_byte => Ok(Some(SourceSpan {
+            start: source_position(start_byte, start_line, start_column)?,
+            end: source_position(end_byte, end_line, end_column)?,
+        })),
+        _ => Err(DiagnosticStoreError::InvalidSpan),
+    }
+}
+
+fn source_position(
+    byte_offset: i64,
+    line: Option<i64>,
+    column: Option<i64>,
+) -> Result<SourcePosition, DiagnosticStoreError> {
+    Ok(SourcePosition {
+        byte_offset: u64::try_from(byte_offset).map_err(|_| DiagnosticStoreError::InvalidSpan)?,
+        line: line
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| DiagnosticStoreError::InvalidSpan)?,
+        column: column
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| DiagnosticStoreError::InvalidSpan)?,
     })
 }
 
@@ -205,7 +295,18 @@ mod tests {
             code: DiagnosticCode::new("path_encoding_unsupported").unwrap(),
             location: Some(DiagnosticLocation {
                 path: RepoPath::new("src/main.rs").unwrap(),
-                span: None,
+                span: Some(SourceSpan {
+                    start: SourcePosition {
+                        byte_offset: 120,
+                        line: Some(7),
+                        column: Some(5),
+                    },
+                    end: SourcePosition {
+                        byte_offset: 168,
+                        line: Some(9),
+                        column: None,
+                    },
+                }),
             }),
             metrics: BTreeMap::from([(DiagnosticCode::new("skipped_files").unwrap(), 1)]),
         };

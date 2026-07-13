@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +52,10 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
         CREATE TABLE schema_migrations (
             version INTEGER PRIMARY KEY CHECK (version > 0),
             applied_at TEXT NOT NULL
@@ -216,7 +217,21 @@ const MIGRATIONS: &[Migration] = &[Migration {
         CREATE INDEX diagnostics_snapshot_idx ON diagnostics(snapshot_id, id)
             WHERE snapshot_id IS NOT NULL;
     "#,
-}];
+    },
+    Migration {
+        version: 2,
+        sql: r#"
+        ALTER TABLE diagnostics ADD COLUMN span_start_line INTEGER
+            CHECK (span_start_line IS NULL OR span_start_line >= 0);
+        ALTER TABLE diagnostics ADD COLUMN span_start_column INTEGER
+            CHECK (span_start_column IS NULL OR span_start_column >= 0);
+        ALTER TABLE diagnostics ADD COLUMN span_end_line INTEGER
+            CHECK (span_end_line IS NULL OR span_end_line >= 0);
+        ALTER TABLE diagnostics ADD COLUMN span_end_column INTEGER
+            CHECK (span_end_column IS NULL OR span_end_column >= 0);
+    "#,
+    },
+];
 
 /// Resolves the sidecar beside `ferrus.db` through the registered project.
 /// This function is read-only and does not create the sidecar or its directory.
@@ -475,7 +490,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v1_objects.txt")
+            include_str!("fixtures/schema_v2_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );
