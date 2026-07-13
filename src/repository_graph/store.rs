@@ -265,7 +265,6 @@ impl GraphStore for Sidecar {
         }
 
         if let Some(view) = current.as_ref()
-            && view.build_id == build.id
             && view.snapshot_id == snapshot.id
         {
             transaction.commit()?;
@@ -1040,6 +1039,19 @@ mod tests {
         let first = build(1);
         sidecar.start_build(&first).unwrap();
         let original = sidecar.complete_build(&snapshot(&first)).unwrap();
+        let PublicationOutcome::Published {
+            view: published_view,
+        } = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: first.id.clone(),
+                expected: None,
+            })
+            .unwrap()
+        else {
+            panic!("initial publication was unexpectedly superseded");
+        };
 
         let retry = GraphBuild {
             id: BuildId::new("build-retry").unwrap(),
@@ -1066,14 +1078,24 @@ mod tests {
                 repository: repository(),
                 view_name: canonical(),
                 build_id: retry.id.clone(),
-                expected: None,
+                expected: Some(PublicationVersion {
+                    snapshot_id: published_view.snapshot_id.clone(),
+                    generation: published_view.generation,
+                }),
             })
             .unwrap()
         else {
             panic!("equivalent snapshot build was unexpectedly superseded");
         };
-        assert_eq!(view.snapshot_id, first.prospective_snapshot_id);
-        assert_eq!(view.build_id, retry.id);
+        assert_eq!(view, published_view);
+        assert_eq!(
+            sidecar.published_view(&repository(), &canonical()).unwrap(),
+            Some(published_view)
+        );
+        assert_eq!(
+            sidecar.build(&retry.id).unwrap().unwrap().state,
+            BuildState::Complete
+        );
     }
 
     #[test]
