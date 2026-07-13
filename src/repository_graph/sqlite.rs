@@ -275,7 +275,10 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
             reason: "file is not a Ferrus repository graph sidecar".to_string(),
         }));
     }
-    if schema_version != SIDECAR_SCHEMA_VERSION {
+    let supported_version = MIGRATIONS
+        .iter()
+        .any(|migration| migration.version == schema_version);
+    if schema_version > SIDECAR_SCHEMA_VERSION || !supported_version {
         return Ok(SidecarStatus::RequiresRebuild(RebuildRequired {
             found_schema_version: schema_version,
             supported_schema_version: SIDECAR_SCHEMA_VERSION,
@@ -313,9 +316,22 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
 
 pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
     let existed = path.exists();
-    if existed && let SidecarStatus::RequiresRebuild(reason) = inspect_at(path)? {
-        return Ok(OpenSidecarResult::RequiresRebuild(reason));
-    }
+    let schema_version = if existed {
+        match inspect_at(path)? {
+            SidecarStatus::Ready { schema_version } => schema_version,
+            SidecarStatus::RequiresRebuild(reason) => {
+                return Ok(OpenSidecarResult::RequiresRebuild(reason));
+            }
+            SidecarStatus::Absent => {
+                anyhow::bail!(
+                    "repository graph sidecar {} disappeared while opening",
+                    path.display()
+                );
+            }
+        }
+    } else {
+        0
+    };
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("repository graph sidecar path has no parent"))?;
@@ -337,8 +353,8 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
-    if !existed {
-        migrate_new_sidecar(&mut connection)?;
+    if schema_version < SIDECAR_SCHEMA_VERSION {
+        migrate_sidecar(&mut connection, schema_version)?;
     }
     Ok(OpenSidecarResult::Ready(Sidecar {
         path: path.to_path_buf(),
@@ -346,10 +362,13 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
     }))
 }
 
-fn migrate_new_sidecar(connection: &mut Connection) -> Result<()> {
+fn migrate_sidecar(connection: &mut Connection, schema_version: u32) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.pragma_update(None, "application_id", SIDECAR_APPLICATION_ID)?;
-    for migration in MIGRATIONS {
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > schema_version)
+    {
         transaction.execute_batch(migration.sql).with_context(|| {
             format!(
                 "Failed to apply repository graph migration {}",
@@ -379,6 +398,32 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_sidecar_at_version(path: &Path, schema_version: u32) {
+        let mut connection = Connection::open(path).unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .pragma_update(None, "application_id", SIDECAR_APPLICATION_ID)
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= schema_version)
+        {
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+                    params![migration.version, timestamp()],
+                )
+                .unwrap();
+            transaction
+                .pragma_update(None, "user_version", migration.version)
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
 
     #[test]
     fn inspection_does_not_create_an_absent_sidecar() {
@@ -413,6 +458,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 8);
+    }
+
+    #[test]
+    fn supported_older_sidecar_is_migrated_before_build_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SIDECAR_FILE_NAME);
+        create_sidecar_at_version(&path, 1);
+
+        assert_eq!(
+            inspect_at(&path).unwrap(),
+            SidecarStatus::Ready { schema_version: 1 }
+        );
+        let before = Connection::open(&path).unwrap();
+        assert_eq!(pragma_u32(&before, "user_version").unwrap(), 1);
+        drop(before);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("supported older sidecar unexpectedly requires rebuild");
+        };
+        assert_eq!(
+            inspect_at(&path).unwrap(),
+            SidecarStatus::Ready {
+                schema_version: SIDECAR_SCHEMA_VERSION
+            }
+        );
+        let migration_count: u32 = sidecar
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(migration_count, SIDECAR_SCHEMA_VERSION);
+        let span_column_count: u32 = sidecar
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('diagnostics') \
+                 WHERE name IN ('span_start_line', 'span_start_column', \
+                                'span_end_line', 'span_end_column')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(span_column_count, 4);
     }
 
     #[test]
