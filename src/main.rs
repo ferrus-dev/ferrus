@@ -7,6 +7,8 @@ mod hq;
 mod legacy_state;
 mod platform;
 mod project;
+#[allow(dead_code)]
+mod repository_graph;
 mod runtime_status;
 mod runtime_table;
 mod server;

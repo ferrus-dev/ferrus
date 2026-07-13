@@ -1,0 +1,29 @@
+{
+  "scope": {
+    "wire_version": 1,
+    "repository": {
+      "namespace": "local:test",
+      "repository_id": "root"
+    },
+    "snapshot": {
+      "type": "published",
+      "value": "canonical"
+    },
+    "budget": {
+      "max_results": 20,
+      "max_bytes": 16384,
+      "max_depth": 2,
+      "max_duration_ms": 500
+    }
+  },
+  "text": "RuntimeTaskContext",
+  "node_kinds": [
+    "rust_symbol"
+  ],
+  "paths": [
+    "src/project.rs"
+  ],
+  "page": {
+    "cursor": null
+  }
+}

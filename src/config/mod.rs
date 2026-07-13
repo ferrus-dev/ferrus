@@ -387,6 +387,27 @@ commands = ["cargo test"]
     }
 
     #[test]
+    fn core_config_ignores_unknown_repository_graph_settings() {
+        let toml = r#"
+[checks]
+commands = ["cargo test"]
+
+[limits]
+
+[repository_graph]
+enabled = true
+future_backend = "distributed"
+
+[repository_graph.future_projection]
+model = "next-generation"
+"#;
+
+        let config = Config::from_toml(toml).unwrap();
+
+        assert_eq!(config.checks.commands, vec!["cargo test"]);
+    }
+
+    #[test]
     fn limits_config_defaults_without_values() {
         let toml = r#"
 [checks]
