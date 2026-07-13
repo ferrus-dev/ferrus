@@ -276,10 +276,17 @@ impl GraphStore for Sidecar {
             let candidate_order = build_order(&transaction, &build.id)?;
             let current_order = build_order(&transaction, &view.build_id)?;
             if candidate_order < current_order {
-                transaction.execute(
-                    "UPDATE index_builds SET state = 'superseded' WHERE id = ?1 AND state = 'building'",
+                let updated = transaction.execute(
+                    "UPDATE index_builds SET state = 'superseded' WHERE id = ?1 \
+                     AND state IN ('building', 'published')",
                     [build.id.as_str()],
                 )?;
+                if updated != 1 {
+                    return Err(StoreError::Corrupt(format!(
+                        "failed to persist superseded state for build {}",
+                        build.id.as_str()
+                    )));
+                }
                 transaction.commit()?;
                 return Ok(PublicationOutcome::Superseded {
                     current: view.clone(),
@@ -814,6 +821,74 @@ mod tests {
         assert_eq!(
             sidecar.published_view(&repository(), &canonical()).unwrap(),
             Some(current)
+        );
+    }
+
+    #[test]
+    fn displaced_published_build_is_persisted_as_superseded_on_retry() {
+        let (_directory, mut sidecar) = sidecar();
+        let older = build(1);
+        sidecar.start_build(&older).unwrap();
+        sidecar.complete_build(&snapshot(&older)).unwrap();
+        let PublicationOutcome::Published { view: older_view } = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: older.id.clone(),
+                expected: None,
+            })
+            .unwrap()
+        else {
+            panic!("initial publication was unexpectedly superseded");
+        };
+
+        let newer = build(2);
+        sidecar.start_build(&newer).unwrap();
+        sidecar.complete_build(&snapshot(&newer)).unwrap();
+        let PublicationOutcome::Published { view: newer_view } = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: newer.id.clone(),
+                expected: Some(PublicationVersion {
+                    snapshot_id: older_view.snapshot_id,
+                    generation: older_view.generation,
+                }),
+            })
+            .unwrap()
+        else {
+            panic!("newer publication was unexpectedly superseded");
+        };
+        assert_eq!(
+            sidecar.build(&older.id).unwrap().unwrap().state,
+            BuildState::Published
+        );
+
+        let outcome = sidecar
+            .publish(&PublishRequest {
+                repository: repository(),
+                view_name: canonical(),
+                build_id: older.id.clone(),
+                expected: Some(PublicationVersion {
+                    snapshot_id: newer_view.snapshot_id.clone(),
+                    generation: newer_view.generation,
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            PublicationOutcome::Superseded {
+                current: newer_view.clone()
+            }
+        );
+        assert_eq!(
+            sidecar.build(&older.id).unwrap().unwrap().state,
+            BuildState::Superseded
+        );
+        assert_eq!(
+            sidecar.published_view(&repository(), &canonical()).unwrap(),
+            Some(newer_view)
         );
     }
 
