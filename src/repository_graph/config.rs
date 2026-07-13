@@ -220,10 +220,8 @@ impl RepositoryGraphConfig {
         let bytes = serde_json::to_vec(&effective)
             .map_err(|error| RepositoryGraphConfigError::Serialization(error.to_string()))?;
         let value = Sha256::digest(bytes);
-        Ok(Digest {
-            algorithm: "sha256".to_string(),
-            value: hex_lower(&value),
-        })
+        Ok(Digest::new("sha256", hex_lower(&value))
+            .expect("sha256 and hex_lower always produce a canonical digest"))
     }
 
     fn effective_semantic_config(

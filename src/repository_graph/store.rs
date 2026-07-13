@@ -211,13 +211,13 @@ impl GraphStore for Sidecar {
                     snapshot.repository.namespace.as_str(),
                     snapshot.repository.repository_id.as_str(),
                     snapshot.source_revision_id.as_str(),
-                    snapshot.source_manifest_digest.algorithm,
-                    snapshot.source_manifest_digest.value,
+                    snapshot.source_manifest_digest.algorithm(),
+                    snapshot.source_manifest_digest.value(),
                     snapshot.graph_model_version,
-                    snapshot.analysis_config_digest.algorithm,
-                    snapshot.analysis_config_digest.value,
-                    snapshot.extractor_set_digest.algorithm,
-                    snapshot.extractor_set_digest.value,
+                    snapshot.analysis_config_digest.algorithm(),
+                    snapshot.analysis_config_digest.value(),
+                    snapshot.extractor_set_digest.algorithm(),
+                    snapshot.extractor_set_digest.value(),
                     snapshot.completed_by.as_str(),
                     timestamp(),
                 ],
@@ -506,19 +506,13 @@ fn load_snapshot(
         },
         source_revision_id: SourceRevisionId::new(revision)
             .map_err(|error| StoreError::Corrupt(error.to_string()))?,
-        source_manifest_digest: Digest {
-            algorithm: manifest_algorithm,
-            value: manifest_value,
-        },
+        source_manifest_digest: Digest::new(manifest_algorithm, manifest_value)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?,
         graph_model_version: model,
-        analysis_config_digest: Digest {
-            algorithm: config_algorithm,
-            value: config_value,
-        },
-        extractor_set_digest: Digest {
-            algorithm: extractor_algorithm,
-            value: extractor_value,
-        },
+        analysis_config_digest: Digest::new(config_algorithm, config_value)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?,
+        extractor_set_digest: Digest::new(extractor_algorithm, extractor_value)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?,
         completed_by: BuildId::new(completed_by)
             .map_err(|error| StoreError::Corrupt(error.to_string()))?,
     }))
@@ -622,10 +616,13 @@ mod tests {
     }
 
     fn digest(value: &str) -> Digest {
-        Digest {
-            algorithm: "sha256".to_string(),
-            value: value.to_string(),
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(value.len() * 2);
+        for byte in value.bytes() {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
         }
+        Digest::new("sha256", encoded).unwrap()
     }
 
     fn build(number: u32) -> GraphBuild {

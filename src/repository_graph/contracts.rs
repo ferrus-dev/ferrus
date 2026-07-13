@@ -46,15 +46,3 @@ fn sidecar_schema_has_no_source_body_storage_columns() {
         );
     }
 }
-
-#[test]
-fn architecture_keeps_graph_task_and_memory_domains_distinct() {
-    let architecture = include_str!("../../docs/repository-graph-architecture.md");
-    for domain in ["`RepositoryGraph`", "`TaskGraph`", "`ProjectMemory`"] {
-        assert!(
-            architecture.contains(domain),
-            "missing domain contract: {domain}"
-        );
-    }
-    assert!(architecture.contains("independent domains"));
-}

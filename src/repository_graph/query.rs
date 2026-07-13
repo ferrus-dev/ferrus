@@ -317,10 +317,7 @@ mod tests {
             node_id: None,
             path: RepoPath::new("src/main.rs").unwrap(),
             span: None,
-            content_identity: Digest {
-                algorithm: "sha256".to_string(),
-                value: "00".to_string(),
-            },
+            content_identity: Digest::new("sha256", "00").unwrap(),
             relevance_reason: "entry point".to_string(),
         })
         .unwrap();

@@ -144,10 +144,69 @@ impl<'de> Deserialize<'de> for RepoPath {
 }
 
 /// Algorithm-tagged digest. The value is lowercase hexadecimal.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DigestError {
+    #[error("digest algorithm must be a non-empty lowercase ASCII token")]
+    InvalidAlgorithm,
+    #[error("digest value must be non-empty lowercase hexadecimal")]
+    InvalidValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Digest {
-    pub algorithm: String,
-    pub value: String,
+    algorithm: String,
+    value: String,
+}
+
+impl Digest {
+    pub fn new(
+        algorithm: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, DigestError> {
+        let algorithm = algorithm.into();
+        if algorithm.is_empty()
+            || !algorithm.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err(DigestError::InvalidAlgorithm);
+        }
+
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DigestError::InvalidValue);
+        }
+
+        Ok(Self { algorithm, value })
+    }
+
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireDigest {
+            algorithm: String,
+            value: String,
+        }
+
+        let digest = WireDigest::deserialize(deserializer)?;
+        Self::new(digest.algorithm, digest.value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +511,28 @@ mod tests {
     fn repository_path_deserialization_enforces_invariants() {
         let error = serde_json::from_str::<RepoPath>(r#""../secret""#).unwrap_err();
         assert!(error.to_string().contains("forbidden component"));
+    }
+
+    #[test]
+    fn digests_accept_only_canonical_algorithm_tags_and_values() {
+        let digest = Digest::new("sha256", "00abcdef").unwrap();
+        assert_eq!(digest.algorithm(), "sha256");
+        assert_eq!(digest.value(), "00abcdef");
+
+        for algorithm in ["", "SHA256", "sha 256", "sha/256"] {
+            assert!(Digest::new(algorithm, "00").is_err());
+        }
+        for value in ["", "AB", "0g", "00-ff"] {
+            assert!(Digest::new("sha256", value).is_err());
+        }
+    }
+
+    #[test]
+    fn digest_deserialization_enforces_canonical_values() {
+        for value in ["", "AB", "0g", "00-ff"] {
+            let json = serde_json::json!({"algorithm": "sha256", "value": value});
+            assert!(serde_json::from_value::<Digest>(json).is_err());
+        }
     }
 
     #[test]
