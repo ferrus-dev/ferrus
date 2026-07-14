@@ -297,11 +297,15 @@ pub enum Confidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePosition {
+    /// Zero-based byte offset in the exact content identified by the evidence digest.
     pub byte_offset: u64,
+    /// One-based human-readable source line when the extractor can provide it.
     pub line: Option<u32>,
+    /// One-based UTF-8 byte column when the extractor can provide it.
     pub column: Option<u32>,
 }
 
+/// A half-open source range: `start` is inclusive and `end` is exclusive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start: SourcePosition,

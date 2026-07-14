@@ -56,9 +56,51 @@ pub struct SourceManifest {
     pub metrics: SourceDiscoveryMetrics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceContent {
     pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for SourceContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceContent")
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Immutable identifiers and hard budgets supplied to every file extractor.
+///
+/// Keeping this context independent from SQLite lets the same deterministic
+/// extractor run locally today and inside a stateless worker later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionContext {
+    pub snapshot_id: SnapshotId,
+    pub build_id: BuildId,
+    pub repository: RepositoryRef,
+    pub max_facts_per_file: u64,
+    pub max_parser_duration_ms: u64,
+    pub max_diagnostics: u64,
+}
+
+/// One immutable, content-verified file presented to an extractor.
+#[derive(Clone, Copy)]
+pub struct FileExtractionInput<'a> {
+    pub context: &'a ExtractionContext,
+    pub file: &'a SourceFileDescriptor,
+    pub content: &'a [u8],
+}
+
+impl std::fmt::Debug for FileExtractionInput<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileExtractionInput")
+            .field("context", self.context)
+            .field("file", self.file)
+            .field("content_bytes", &self.content.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,11 +128,12 @@ pub trait RepositorySource {
     }
 }
 
-pub trait Extractor {
-    type Error;
+pub trait Extractor: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn identity(&self) -> super::domain::ExtractorIdentity;
-    fn extract(&self, file: &SourceFileDescriptor) -> Result<GraphFragment, Self::Error>;
+    fn supports(&self, file: &SourceFileDescriptor) -> bool;
+    fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, Self::Error>;
 }
 
 pub trait CrossFileResolver {
@@ -134,4 +177,47 @@ pub trait EventSink {
     type Error;
 
     fn emit(&self, event: GraphLifecycleEvent<'_>) -> Result<(), Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository_graph::domain::{BuildId, RepositoryId, RepositoryNamespace, SnapshotId};
+
+    #[test]
+    fn extraction_input_debug_output_redacts_verified_content() {
+        let context = ExtractionContext {
+            snapshot_id: SnapshotId::new("snapshot").unwrap(),
+            build_id: BuildId::new("build").unwrap(),
+            repository: RepositoryRef {
+                namespace: RepositoryNamespace::new("local").unwrap(),
+                repository_id: RepositoryId::new("root").unwrap(),
+            },
+            max_facts_per_file: 10,
+            max_parser_duration_ms: 10,
+            max_diagnostics: 10,
+        };
+        let file = SourceFileDescriptor {
+            path: RepoPath::new("src/lib.rs").unwrap(),
+            content_identity: Digest::new("sha256", "00").unwrap(),
+            byte_len: 16,
+            file_mode: SourceFileMode::Regular,
+        };
+        let input = FileExtractionInput {
+            context: &context,
+            file: &file,
+            content: b"TOP_SECRET_VALUE",
+        };
+
+        let debug = format!("{input:?}");
+        assert!(!debug.contains("TOP_SECRET_VALUE"));
+        assert!(debug.contains("content_bytes: 16"));
+
+        let content = SourceContent {
+            bytes: b"TOP_SECRET_VALUE".to_vec(),
+        };
+        let debug = format!("{content:?}");
+        assert!(!debug.contains("TOP_SECRET_VALUE"));
+        assert!(debug.contains("byte_len: 16"));
+    }
 }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod diagnostics;
 mod diagnostics_sqlite;
 pub mod domain;
+pub mod extractors;
 pub mod health;
 pub mod ports;
 pub mod query;

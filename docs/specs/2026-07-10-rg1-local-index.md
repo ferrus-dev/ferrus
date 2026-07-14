@@ -100,7 +100,7 @@ tracking, explicit exclusions, resource limits, and deterministic source-manifes
 Implemented in `src/repository_graph/source/`, with source configuration and adapter contracts in
 `src/repository_graph/config.rs` and `src/repository_graph/ports.rs`.
 
-- [ ] #1.1 Build the generic structural and document extractor
+- [x] #1.1 Build the generic structural and document extractor
 
 ID: rg1.1
 Depends on: rg1.0
@@ -108,7 +108,10 @@ Depends on: rg1.0
 Extract repository, directory, file, document, manifest, configuration, and entry-point facts with containment,
 classification, spans where available, and skip diagnostics.
 
-- [ ] #1.2 Build the Cargo package and dependency extractor
+Implemented in `src/repository_graph/extractors/generic.rs` with deterministic per-file fragments and a
+repository-level root fragment.
+
+- [x] #1.2 Build the Cargo package and dependency extractor
 
 ID: rg1.2
 Depends on: rg1.0
@@ -116,13 +119,18 @@ Depends on: rg1.0
 Parse Cargo workspace and package manifests without executing repository code, and emit package, target,
 entry-point, internal dependency, and external dependency facts.
 
-- [ ] #1.3 Build the Rust syntax extractor
+Implemented in `src/repository_graph/extractors/cargo.rs` with conservative unresolved candidates for later
+cross-file resolution.
+
+- [x] #1.3 Build the Rust syntax extractor
 
 ID: rg1.3
 Depends on: rg1.0
 
 Parse Rust source through the extractor interface and emit module, symbol, declaration, import, re-export,
 containment, signature, visibility, and source-span facts while tolerating incomplete files.
+
+Implemented in `src/repository_graph/extractors/rust.rs` using a resource-bounded Tree-sitter syntax parser.
 
 - [ ] #1.4 Resolve conservative cross-file module and dependency relationships
 
