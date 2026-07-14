@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 3;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 4;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,13 @@ pub struct RebuildRequired {
 
 pub enum OpenSidecarResult {
     Ready(Sidecar),
+    RequiresRebuild(RebuildRequired),
+}
+
+pub enum OpenQuerySidecarResult {
+    Ready(Sidecar),
+    Absent,
+    NeedsMigration { found_schema_version: u32 },
     RequiresRebuild(RebuildRequired),
 }
 
@@ -325,6 +332,22 @@ const MIGRATIONS: &[Migration] = &[
         ) STRICT;
     "#,
     },
+    Migration {
+        version: 4,
+        sql: r#"
+        ALTER TABLE nodes ADD COLUMN normalized_name TEXT;
+        UPDATE nodes
+        SET normalized_name = lower(COALESCE(
+            CASE WHEN json_extract(properties_json, '$.name.type') = 'string'
+                THEN json_extract(properties_json, '$.name.value') END,
+            CASE WHEN json_extract(properties_json, '$.path.type') = 'string'
+                THEN json_extract(properties_json, '$.path.value') END,
+            semantic_key,
+            kind
+        ));
+        CREATE INDEX nodes_normalized_name_idx ON nodes(snapshot_id, normalized_name, id);
+    "#,
+    },
 ];
 
 /// Resolves the sidecar beside `ferrus.db` through the registered project.
@@ -344,6 +367,11 @@ pub async fn inspect_current() -> Result<SidecarStatus> {
 /// that creates and migrates an absent sidecar.
 pub async fn open_current_for_build() -> Result<OpenSidecarResult> {
     open_for_build_at(&current_sidecar_path().await?)
+}
+
+/// Explicit read-only query entrypoint. It never creates or migrates storage.
+pub async fn open_current_for_query() -> Result<OpenQuerySidecarResult> {
+    open_for_query_at(&current_sidecar_path().await?)
 }
 
 pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
@@ -451,6 +479,32 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
         migrate_sidecar(&mut connection, schema_version)?;
     }
     Ok(OpenSidecarResult::Ready(Sidecar {
+        path: path.to_path_buf(),
+        connection,
+    }))
+}
+
+pub fn open_for_query_at(path: &Path) -> Result<OpenQuerySidecarResult> {
+    match inspect_at(path)? {
+        SidecarStatus::Absent => return Ok(OpenQuerySidecarResult::Absent),
+        SidecarStatus::RequiresRebuild(reason) => {
+            return Ok(OpenQuerySidecarResult::RequiresRebuild(reason));
+        }
+        SidecarStatus::Ready { schema_version } if schema_version < SIDECAR_SCHEMA_VERSION => {
+            return Ok(OpenQuerySidecarResult::NeedsMigration {
+                found_schema_version: schema_version,
+            });
+        }
+        SidecarStatus::Ready { .. } => {}
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open repository graph sidecar {}", path.display()))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(OpenQuerySidecarResult::Ready(Sidecar {
         path: path.to_path_buf(),
         connection,
     }))
@@ -613,6 +667,98 @@ mod tests {
     }
 
     #[test]
+    fn query_open_is_read_only_and_never_migrates() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_path = directory.path().join("old.db");
+        create_sidecar_at_version(&old_path, 3);
+        assert!(matches!(
+            open_for_query_at(&old_path).unwrap(),
+            OpenQuerySidecarResult::NeedsMigration {
+                found_schema_version: 3
+            }
+        ));
+        assert_eq!(
+            pragma_u32(&Connection::open(&old_path).unwrap(), "user_version").unwrap(),
+            3
+        );
+
+        let current_path = directory.path().join("current.db");
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&current_path).unwrap() else {
+            panic!("new sidecar unexpectedly requires rebuild");
+        };
+        drop(sidecar);
+        let OpenQuerySidecarResult::Ready(sidecar) = open_for_query_at(&current_path).unwrap()
+        else {
+            panic!("current sidecar was not queryable");
+        };
+        let query_only: u32 = sidecar
+            .connection()
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .unwrap();
+        assert_eq!(query_only, 1);
+        assert!(
+            sidecar
+                .connection()
+                .execute("CREATE TABLE forbidden(value TEXT)", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_backfills_normalized_names_from_tagged_graph_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.db");
+        create_sidecar_at_version(&path, 3);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO index_builds(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    prospective_snapshot_id, state, started_at, finished_at
+                ) VALUES (
+                    'build-1', 'local:test', 'root', 'revision-1',
+                    'snapshot-1', 'building', 'now', 'now'
+                );
+                INSERT INTO snapshots(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    source_manifest_algorithm, source_manifest_digest, graph_model_version,
+                    analysis_config_algorithm, analysis_config_digest,
+                    extractor_set_algorithm, extractor_set_digest,
+                    completed_by_build_id, created_at
+                ) VALUES (
+                    'snapshot-1', 'local:test', 'root', 'revision-1',
+                    'sha256', '00', 1, 'sha256', '00', 'sha256', '00',
+                    'build-1', 'now'
+                );
+                INSERT INTO nodes(
+                    snapshot_id, id, kind, semantic_key, extractor_id, extractor_version,
+                    extractor_contract_version, resolution_state, confidence, properties_json
+                ) VALUES (
+                    'snapshot-1', 'node-1', 'struct', 'rust:struct:path:RuntimeTaskContext',
+                    'builtin.rust-syntax', '1', 2, 'resolved', 'exact',
+                    '{"name":{"type":"string","value":"RuntimeTaskContext"}}'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("v3 sidecar unexpectedly requires rebuild");
+        };
+        let normalized: String = sidecar
+            .connection()
+            .query_row(
+                "SELECT normalized_name FROM nodes WHERE id = 'node-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, "runtimetaskcontext");
+    }
+
+    #[test]
     fn unsupported_version_reports_requires_rebuild_without_mutation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(SIDECAR_FILE_NAME);
@@ -687,7 +833,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v3_objects.txt")
+            include_str!("fixtures/schema_v4_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );

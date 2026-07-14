@@ -5,7 +5,8 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use super::{
     domain::{
         BuildId, BuildState, Confidence, DiagnosticSeverity, EdgeTarget, GraphDiagnostic,
-        GraphEdge, GraphNode, GraphSnapshot, ResolutionState, SourceEvidence, SourceSpan,
+        GraphEdge, GraphNode, GraphSnapshot, GraphValue, ResolutionState, SourceEvidence,
+        SourceSpan,
     },
     ports::{
         FragmentCacheKey, GraphFragment, IndexBuildMetrics, IndexCommit, IndexStore,
@@ -242,10 +243,11 @@ fn insert_nodes(transaction: &Transaction<'_>, nodes: &[GraphNode]) -> Result<()
             snapshot_id, id, kind, semantic_key, extractor_id, extractor_version, \
             extractor_contract_version, resolution_state, confidence, evidence_path, \
             evidence_content_algorithm, evidence_content_digest, span_start_byte, span_end_byte, \
-            properties_json, span_start_line, span_start_column, span_end_line, span_end_column\
+            properties_json, span_start_line, span_start_column, span_end_line, span_end_column, \
+            normalized_name\
          ) VALUES (\
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-            ?16, ?17, ?18, ?19\
+            ?16, ?17, ?18, ?19, ?20\
          )",
     )?;
     for node in nodes {
@@ -270,9 +272,23 @@ fn insert_nodes(transaction: &Transaction<'_>, nodes: &[GraphNode]) -> Result<()
             evidence.start_column,
             evidence.end_line,
             evidence.end_column,
+            normalized_node_name(node),
         ])?;
     }
     Ok(())
+}
+
+fn normalized_node_name(node: &GraphNode) -> String {
+    node.properties
+        .get("name")
+        .or_else(|| node.properties.get("path"))
+        .and_then(|value| match value {
+            GraphValue::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .or_else(|| node.semantic_key.as_ref().map(|key| key.as_str()))
+        .unwrap_or(&node.kind)
+        .to_lowercase()
 }
 
 fn insert_edges(transaction: &Transaction<'_>, edges: &[GraphEdge]) -> Result<(), StoreError> {

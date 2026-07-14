@@ -21,6 +21,9 @@ mcp_isolation = "merge-user"
 ttl_secs = 90              # how long a claimed lease is valid without renewal
 heartbeat_interval_secs = 30 # how often agents should call /heartbeat
 
+[repository_graph]
+enabled = true
+
 [hq.supervisor]
 agent = "claude-code"
 model = ""

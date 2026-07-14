@@ -46,7 +46,7 @@ pub struct IndexRequest {
     pub force_full: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexOutcome {
     pub build_id: BuildId,
     pub snapshot: GraphSnapshot,

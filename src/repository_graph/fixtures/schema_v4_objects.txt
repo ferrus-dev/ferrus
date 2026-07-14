@@ -8,6 +8,7 @@ index:index_builds_repository_state_idx
 index:index_builds_snapshot_idx
 index:nodes_evidence_path_idx
 index:nodes_kind_idx
+index:nodes_normalized_name_idx
 index:nodes_semantic_key_idx
 index:published_views_snapshot_idx
 index:snapshots_identity_idx

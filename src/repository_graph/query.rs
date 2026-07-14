@@ -1,19 +1,20 @@
 //! Versioned, bounded request and response contracts.
 //!
-//! Query execution is intentionally deferred. These DTOs are portable across
-//! the local SQLite and future remote implementations and never carry absolute
-//! workspace paths or backend-specific values.
+//! These DTOs are portable across the local SQLite and future remote
+//! implementations and never carry absolute workspace paths or backend-specific
+//! values.
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::{
     QUERY_WIRE_VERSION,
     domain::{
-        Availability, BuildState, Digest, EdgeId, EdgeTarget, Freshness, NodeId, PageCursor,
-        PublishedViewName, QueryBudget, RepoPath, RepositoryRef, SemanticKey, SnapshotId,
-        SourceSpan,
+        Availability, BuildState, Digest, EdgeId, EdgeTarget, FactProvenance, Freshness, GraphNode,
+        NodeId, PageCursor, PublishedViewName, QueryBudget, RepoPath, RepositoryRef, SemanticKey,
+        SnapshotId, SourceSpan,
     },
 };
 
@@ -65,9 +66,35 @@ pub struct SearchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ShowLookup {
+    Node(NodeId),
+    Symbol(SemanticKey),
+    Path(RepoPath),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowRequest {
+    pub scope: QueryScope,
+    pub lookup: ShowLookup,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    Outgoing,
+    Incoming,
+    #[default]
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeighborhoodRequest {
     pub scope: QueryScope,
     pub roots: Vec<NodeId>,
+    #[serde(default)]
+    pub direction: EdgeDirection,
     #[serde(default)]
     pub edge_kinds: Vec<String>,
     pub page: PageRequest,
@@ -122,6 +149,7 @@ pub struct QueryResponse<T> {
     pub repository: RepositoryRef,
     pub snapshot_id: SnapshotId,
     pub freshness: FreshnessEnvelope,
+    pub diagnostics: DiagnosticSummary,
     pub page: PageInfo,
     pub data: T,
 }
@@ -132,6 +160,7 @@ pub struct StatusData {
     pub build_state: Option<BuildState>,
     pub published_view: Option<PublishedViewName>,
     pub graph_model_version: Option<u32>,
+    pub statistics: Option<SnapshotStatistics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +169,22 @@ pub struct StatusResponse {
     pub repository: RepositoryRef,
     pub snapshot_id: Option<SnapshotId>,
     pub freshness: FreshnessEnvelope,
+    pub diagnostics: DiagnosticSummary,
     pub data: StatusData,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticSummary {
+    pub info: u64,
+    pub warning: u64,
+    pub error: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotStatistics {
+    pub files: u64,
+    pub nodes: u64,
+    pub edges: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,6 +194,7 @@ pub struct SearchHit {
     pub semantic_key: Option<SemanticKey>,
     pub path: Option<RepoPath>,
     pub span: Option<SourceSpan>,
+    pub provenance: FactProvenance,
     pub score: f64,
     #[serde(default)]
     pub matched_fields: Vec<String>,
@@ -162,24 +207,33 @@ pub struct SearchData {
 
 pub type SearchResponse = QueryResponse<SearchData>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowData {
+    pub nodes: Vec<GraphNode>,
+}
+
+pub type ShowResponse = QueryResponse<ShowData>;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeighborhoodNode {
     pub id: NodeId,
     pub kind: String,
     pub semantic_key: Option<SemanticKey>,
     pub path: Option<RepoPath>,
     pub span: Option<SourceSpan>,
+    pub provenance: FactProvenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeighborhoodEdge {
     pub id: EdgeId,
     pub kind: String,
     pub source: NodeId,
     pub target: EdgeTarget,
+    pub provenance: FactProvenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeighborhoodData {
     pub nodes: Vec<NeighborhoodNode>,
     pub edges: Vec<NeighborhoodEdge>,
@@ -218,7 +272,8 @@ pub enum QueryErrorCode {
     ContentUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[error("{message}")]
 pub struct QueryError {
     pub wire_version: u32,
     pub code: QueryErrorCode,

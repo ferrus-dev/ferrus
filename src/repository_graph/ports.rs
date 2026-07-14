@@ -10,8 +10,8 @@ use super::{
     diagnostics::GraphLifecycleEvent,
     query::{
         ContentRequest, ContentResponse, ContextRequest, ContextResponse, NeighborhoodRequest,
-        NeighborhoodResponse, QueryError, SearchRequest, SearchResponse, StatusRequest,
-        StatusResponse,
+        NeighborhoodResponse, QueryError, SearchRequest, SearchResponse, ShowRequest, ShowResponse,
+        StatusRequest, StatusResponse,
     },
     store::{BuildFailure, PublicationOutcome, PublishRequest, PublishedView},
 };
@@ -301,6 +301,7 @@ pub trait IndexStore: GraphStore {
 pub trait GraphQuery {
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, QueryError>;
     fn search(&self, request: &SearchRequest) -> Result<SearchResponse, QueryError>;
+    fn show(&self, request: &ShowRequest) -> Result<ShowResponse, QueryError>;
     fn neighborhood(
         &self,
         request: &NeighborhoodRequest,

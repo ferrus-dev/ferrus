@@ -155,13 +155,17 @@ Implemented in `src/repository_graph/index.rs` and `src/repository_graph/index_s
 fragment cache and build metrics, deterministic snapshot identities, complete-snapshot transactions, source
 revalidation, and compare-and-set publication that preserves the previously published view on failure.
 
-- [ ] #1.6 Add the repository graph CLI and local benchmarks
+- [x] #1.6 Add the repository graph CLI and local benchmarks
 
 ID: rg1.6
 Depends on: rg1.5
 
 Expose index, status, search, show, and neighbors commands; add JSON output, help and user documentation, dogfood
 the index on Ferrus, and record cold-build, no-op update, changed-file update, and query baselines.
+
+Implemented in `src/cli/commands/graph.rs` and `src/repository_graph/query_sqlite.rs`, with indexed and bounded
+SQLite lookup/traversal, human and JSON output, an explicit medium-fixture benchmark harness, Ferrus dogfood
+results in `docs/repository-graph-benchmarks.md`, and user-facing command documentation in `README.md`.
 
 ## Acceptance Criteria
 
