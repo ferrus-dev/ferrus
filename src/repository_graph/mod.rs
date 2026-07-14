@@ -12,6 +12,7 @@ pub mod extractors;
 pub mod health;
 pub mod ports;
 pub mod query;
+pub mod resolution;
 pub mod source;
 pub mod sqlite;
 pub mod store;

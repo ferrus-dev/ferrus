@@ -257,6 +257,7 @@ struct Declaration {
     visibility: String,
     relationship: Option<UnresolvedRelationship>,
     opens_scope: bool,
+    path_override: bool,
 }
 
 #[derive(Debug)]
@@ -331,6 +332,7 @@ fn declaration(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
                 visibility,
                 relationship,
                 opens_scope: false,
+                path_override: false,
             });
         }
         _ => return None,
@@ -357,6 +359,39 @@ fn declaration(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
         visibility: visibility(node, source),
         relationship,
         opens_scope,
+        path_override: kind == "mod_declaration" && has_path_attribute(node, source),
+    })
+}
+
+fn has_path_attribute(node: Node<'_>, source: &[u8]) -> bool {
+    let child_attribute = (0..node.named_child_count()).any(|index| {
+        u32::try_from(index)
+            .ok()
+            .and_then(|index| node.named_child(index))
+            .is_some_and(|child| is_path_attribute(child, source))
+    });
+    if child_attribute {
+        return true;
+    }
+    let mut sibling = node.prev_named_sibling();
+    while let Some(attribute) = sibling.filter(|sibling| sibling.kind() == "attribute_item") {
+        if is_path_attribute(attribute, source) {
+            return true;
+        }
+        sibling = attribute.prev_named_sibling();
+    }
+    false
+}
+
+fn is_path_attribute(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "attribute_item" {
+        return false;
+    }
+    node_text(node, source).is_some_and(|attribute| {
+        let compact = attribute
+            .chars()
+            .filter(|character| !character.is_whitespace());
+        compact.collect::<String>().starts_with("#[path=")
     })
 }
 
@@ -490,6 +525,9 @@ fn build_declaration(
             "module_origin".to_string(),
             GraphValue::String("external_declaration".to_string()),
         );
+        if declaration.path_override {
+            properties.insert("path_override".to_string(), GraphValue::Boolean(true));
+        }
     }
     if declaration.kind == "impl" {
         properties.insert(

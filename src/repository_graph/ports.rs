@@ -110,6 +110,41 @@ pub struct GraphFragment {
     pub diagnostics: Vec<GraphDiagnostic>,
 }
 
+/// Hard limits for one deterministic cross-file resolution pass.
+///
+/// The resolver may retain the already-bounded extractor facts regardless of
+/// this budget. `max_relationships` limits only relationships that it resolves
+/// or adds, while the other limits bound diagnostics and wall-clock work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionBudget {
+    pub max_relationships: u64,
+    pub max_duration_ms: u64,
+    pub max_diagnostics: u64,
+}
+
+/// One complete building-snapshot fragment resolved against exactly one
+/// immutable source manifest.
+pub struct CrossFileResolutionInput<'a> {
+    pub context: &'a ExtractionContext,
+    pub manifest: &'a SourceManifest,
+    pub fragment: GraphFragment,
+    pub budget: ResolutionBudget,
+}
+
+impl std::fmt::Debug for CrossFileResolutionInput<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CrossFileResolutionInput")
+            .field("context", self.context)
+            .field("manifest_revision", &self.manifest.revision.id)
+            .field("nodes", &self.fragment.nodes.len())
+            .field("edges", &self.fragment.edges.len())
+            .field("diagnostics", &self.fragment.diagnostics.len())
+            .field("budget", &self.budget)
+            .finish()
+    }
+}
+
 pub trait RepositorySource {
     type Error;
 
@@ -136,10 +171,11 @@ pub trait Extractor: Send + Sync {
     fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, Self::Error>;
 }
 
-pub trait CrossFileResolver {
-    type Error;
+pub trait CrossFileResolver: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
 
-    fn resolve(&self, fragment: GraphFragment) -> Result<GraphFragment, Self::Error>;
+    fn identity(&self) -> super::domain::ExtractorIdentity;
+    fn resolve(&self, input: CrossFileResolutionInput<'_>) -> Result<GraphFragment, Self::Error>;
 }
 
 pub trait GraphStore {

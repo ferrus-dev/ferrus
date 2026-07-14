@@ -20,6 +20,7 @@ pub fn builtin_extractor_identities() -> Vec<ExtractorIdentity> {
         generic::GenericExtractor.identity(),
         cargo::CargoExtractor.identity(),
         rust::RustSyntaxExtractor.identity(),
+        super::resolution::resolver_identity(),
     ]
 }
 
@@ -101,13 +102,13 @@ mod tests {
         let first = builtin_extractor_identities();
         let second = builtin_extractor_identities();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
         let mut ids = first
             .iter()
             .map(|identity| identity.id.as_str())
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 4);
     }
 }

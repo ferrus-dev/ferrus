@@ -132,13 +132,16 @@ containment, signature, visibility, and source-span facts while tolerating incom
 
 Implemented in `src/repository_graph/extractors/rust.rs` using a resource-bounded Tree-sitter syntax parser.
 
-- [ ] #1.4 Resolve conservative cross-file module and dependency relationships
+- [x] #1.4 Resolve conservative cross-file module and dependency relationships
 
 ID: rg1.4
 Depends on: rg1.1, rg1.2, rg1.3
 
 Resolve Cargo package membership, Rust module paths, imports, and re-exports against one source manifest;
 preserve unresolved and external targets explicitly and avoid unsupported semantic claims.
+
+Implemented in `src/repository_graph/resolution.rs` as a storage-independent, resource-bounded pass over one
+immutable source manifest, with conservative Cargo workspace/package/dependency and Rust module/import resolution.
 
 - [ ] #1.5 Implement incremental indexing and snapshot publication
 
