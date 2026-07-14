@@ -11,6 +11,7 @@ pub mod domain;
 pub mod health;
 pub mod ports;
 pub mod query;
+pub mod source;
 pub mod sqlite;
 pub mod store;
 

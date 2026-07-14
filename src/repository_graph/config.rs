@@ -6,7 +6,8 @@ use thiserror::Error;
 
 use super::domain::Digest;
 
-const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
+const SOURCE_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RepositoryGraphConfigError {
@@ -14,6 +15,12 @@ pub enum RepositoryGraphConfigError {
     EmptyPattern,
     #[error("repository graph pattern must be repository-relative: {0}")]
     NonRelativePattern(String),
+    #[error("repository graph sensitive pattern must not be negated: {0}")]
+    NegatedSensitivePattern(String),
+    #[error("repository graph include pattern must not be negated: {0}")]
+    NegatedIncludePattern(String),
+    #[error("repository graph index limit must be greater than zero: {0}")]
+    ZeroIndexLimit(&'static str),
     #[error("failed to serialize effective repository graph configuration: {0}")]
     Serialization(String),
 }
@@ -56,6 +63,8 @@ pub struct SourceConfig {
     pub include: BTreeSet<String>,
     /// Ordered ignore/negation rules. Order is semantically significant.
     pub rules: Vec<String>,
+    /// Paths that may contain credentials or other secrets and are always excluded.
+    pub sensitive: BTreeSet<String>,
     pub include_untracked: bool,
     pub include_generated: bool,
     pub include_vendor: bool,
@@ -65,11 +74,17 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             include: BTreeSet::from(["**/*".to_string()]),
-            rules: vec![
-                ".git/**".to_string(),
-                ".ferrus/**".to_string(),
-                "target/**".to_string(),
-            ],
+            rules: vec![".git/**".to_string(), ".ferrus/**".to_string()],
+            sensitive: BTreeSet::from([
+                "**/.env".to_string(),
+                "**/.env.*".to_string(),
+                "**/*.key".to_string(),
+                "**/*.p12".to_string(),
+                "**/*.pem".to_string(),
+                "**/*.pfx".to_string(),
+                "**/id_ed25519".to_string(),
+                "**/id_rsa".to_string(),
+            ]),
             include_untracked: true,
             include_generated: false,
             include_vendor: false,
@@ -104,16 +119,24 @@ pub enum ConfigScalar {
 #[serde(default, deny_unknown_fields)]
 pub struct IndexLimitsConfig {
     pub max_files: u64,
+    pub max_directories: u64,
     pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
     pub max_facts_per_file: u64,
+    pub max_parser_duration_ms: u64,
+    pub max_diagnostics: u64,
 }
 
 impl Default for IndexLimitsConfig {
     fn default() -> Self {
         Self {
             max_files: 100_000,
+            max_directories: 100_000,
             max_file_bytes: 2 * 1024 * 1024,
+            max_total_bytes: 512 * 1024 * 1024,
             max_facts_per_file: 100_000,
+            max_parser_duration_ms: 2_000,
+            max_diagnostics: 1_000,
         }
     }
 }
@@ -197,9 +220,20 @@ struct EffectiveSemanticConfig {
 struct EffectiveSourceConfig {
     include: BTreeSet<String>,
     rules: Vec<String>,
+    sensitive: BTreeSet<String>,
     include_untracked: bool,
     include_generated: bool,
     include_vendor: bool,
+}
+
+#[derive(Serialize)]
+struct EffectiveSourcePolicy {
+    schema_version: u32,
+    source: EffectiveSourceConfig,
+    max_files: u64,
+    max_directories: u64,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
 }
 
 impl RepositoryGraphConfig {
@@ -224,14 +258,51 @@ impl RepositoryGraphConfig {
             .expect("sha256 and hex_lower always produce a canonical digest"))
     }
 
+    /// Returns the canonical discovery policy included in source-manifest identity.
+    /// Analyzer and parser settings remain separate snapshot inputs.
+    pub fn source_policy_digest(&self) -> Result<Digest, RepositoryGraphConfigError> {
+        self.validate_index_limits()?;
+        let effective = EffectiveSourcePolicy {
+            schema_version: SOURCE_POLICY_SCHEMA_VERSION,
+            source: self.effective_source_config()?,
+            max_files: self.index_limits.max_files,
+            max_directories: self.index_limits.max_directories,
+            max_file_bytes: self.index_limits.max_file_bytes,
+            max_total_bytes: self.index_limits.max_total_bytes,
+        };
+        let bytes = serde_json::to_vec(&effective)
+            .map_err(|error| RepositoryGraphConfigError::Serialization(error.to_string()))?;
+        let value = Sha256::digest(bytes);
+        Ok(Digest::new("sha256", hex_lower(&value))
+            .expect("sha256 and hex_lower always produce a canonical digest"))
+    }
+
     fn effective_semantic_config(
         &self,
     ) -> Result<EffectiveSemanticConfig, RepositoryGraphConfigError> {
+        self.validate_index_limits()?;
+        Ok(EffectiveSemanticConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            source: self.effective_source_config()?,
+            analyzers: self.analyzers.clone(),
+            index_limits: self.index_limits.clone(),
+        })
+    }
+
+    fn effective_source_config(&self) -> Result<EffectiveSourceConfig, RepositoryGraphConfigError> {
         let include = self
             .source
             .include
             .iter()
-            .map(|pattern| normalize_pattern(pattern))
+            .map(|pattern| {
+                let normalized = normalize_pattern(pattern)?;
+                if normalized.starts_with('!') {
+                    return Err(RepositoryGraphConfigError::NegatedIncludePattern(
+                        pattern.clone(),
+                    ));
+                }
+                Ok(normalized)
+            })
             .collect::<Result<BTreeSet<_>, _>>()?;
         let rules = self
             .source
@@ -239,18 +310,48 @@ impl RepositoryGraphConfig {
             .iter()
             .map(|pattern| normalize_pattern(pattern))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(EffectiveSemanticConfig {
-            schema_version: CONFIG_SCHEMA_VERSION,
-            source: EffectiveSourceConfig {
-                include,
-                rules,
-                include_untracked: self.source.include_untracked,
-                include_generated: self.source.include_generated,
-                include_vendor: self.source.include_vendor,
-            },
-            analyzers: self.analyzers.clone(),
-            index_limits: self.index_limits.clone(),
+        let sensitive = self
+            .source
+            .sensitive
+            .iter()
+            .map(|pattern| {
+                let normalized = normalize_pattern(pattern)?;
+                if normalized.starts_with('!') {
+                    return Err(RepositoryGraphConfigError::NegatedSensitivePattern(
+                        pattern.clone(),
+                    ));
+                }
+                Ok(normalized.to_ascii_lowercase())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(EffectiveSourceConfig {
+            include,
+            rules,
+            sensitive,
+            include_untracked: self.source.include_untracked,
+            include_generated: self.source.include_generated,
+            include_vendor: self.source.include_vendor,
         })
+    }
+
+    fn validate_index_limits(&self) -> Result<(), RepositoryGraphConfigError> {
+        for (name, value) in [
+            ("max_files", self.index_limits.max_files),
+            ("max_directories", self.index_limits.max_directories),
+            ("max_file_bytes", self.index_limits.max_file_bytes),
+            ("max_total_bytes", self.index_limits.max_total_bytes),
+            ("max_facts_per_file", self.index_limits.max_facts_per_file),
+            (
+                "max_parser_duration_ms",
+                self.index_limits.max_parser_duration_ms,
+            ),
+            ("max_diagnostics", self.index_limits.max_diagnostics),
+        ] {
+            if value == 0 {
+                return Err(RepositoryGraphConfigError::ZeroIndexLimit(name));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -262,25 +363,29 @@ fn normalize_pattern(pattern: &str) -> Result<String, RepositoryGraphConfigError
     let (negated, body) = pattern
         .strip_prefix('!')
         .map_or((false, pattern), |body| (true, body));
-    let body = body.replace('\\', "/");
+    let body = canonical_pattern_body(body)?;
+    Ok(if negated { format!("!{body}") } else { body })
+}
+
+pub(super) fn canonical_pattern_body(pattern: &str) -> Result<String, RepositoryGraphConfigError> {
+    let body = pattern.trim().replace('\\', "/");
     let body = body.strip_prefix("./").unwrap_or(&body);
+    let body = body.trim_end_matches('/');
     if body.is_empty()
         || body.starts_with('/')
         || body
             .as_bytes()
             .get(1)
             .is_some_and(|separator| *separator == b':')
-        || body.split('/').any(|component| component == "..")
+        || body
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
         return Err(RepositoryGraphConfigError::NonRelativePattern(
             pattern.to_string(),
         ));
     }
-    Ok(if negated {
-        format!("!{body}")
-    } else {
-        body.to_string()
-    })
+    Ok(body.to_string())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -307,7 +412,8 @@ backend = "local"
 
 [source]
 include = ["**/*"]
-rules = [".git/**", ".ferrus/**", "target/**"]
+rules = [".git/**", ".ferrus/**"]
+sensitive = ["**/.env", "**/.env.*", "**/*.key", "**/*.p12", "**/*.pem", "**/*.pfx", "**/id_ed25519", "**/id_rsa"]
 include_untracked = true
 include_generated = false
 include_vendor = false
@@ -318,8 +424,12 @@ settings = {}
 
 [index_limits]
 max_files = 100000
+max_directories = 100000
 max_file_bytes = 2097152
+max_total_bytes = 536870912
 max_facts_per_file = 100000
+max_parser_duration_ms = 2000
+max_diagnostics = 1000
 
 [query_limits]
 max_results = 100
@@ -373,6 +483,21 @@ include = ["Cargo.toml", "src/**"]
     }
 
     #[test]
+    fn equivalent_pattern_spelling_has_one_canonical_digest() {
+        let mut left = RepositoryGraphConfig::default();
+        left.source.include = BTreeSet::from(["./src/**/".to_string()]);
+        left.source.rules = vec!["! ./src/keep.rs/".to_string()];
+        let mut right = RepositoryGraphConfig::default();
+        right.source.include = BTreeSet::from(["src/**".to_string()]);
+        right.source.rules = vec!["!src/keep.rs".to_string()];
+
+        assert_eq!(
+            left.source_policy_digest().unwrap(),
+            right.source_policy_digest().unwrap()
+        );
+    }
+
+    #[test]
     fn operational_and_secret_references_do_not_change_digest() {
         let baseline = RepositoryGraphConfig::default();
         let mut operational = baseline.clone();
@@ -397,6 +522,56 @@ include = ["Cargo.toml", "src/**"]
         assert_ne!(
             left.analysis_config_digest().unwrap(),
             right.analysis_config_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn source_policy_digest_excludes_analyzer_only_changes() {
+        let baseline = RepositoryGraphConfig::default();
+        let mut analyzer_changed = baseline.clone();
+        analyzer_changed
+            .analyzers
+            .enabled
+            .insert("rust-syntax".to_string());
+        assert_eq!(
+            baseline.source_policy_digest().unwrap(),
+            analyzer_changed.source_policy_digest().unwrap()
+        );
+        assert_ne!(
+            baseline.analysis_config_digest().unwrap(),
+            analyzer_changed.analysis_config_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn sensitive_patterns_cannot_be_negated() {
+        let mut config = RepositoryGraphConfig::default();
+        config.source.sensitive.insert("!**/.env".to_string());
+        assert!(matches!(
+            config.analysis_config_digest(),
+            Err(RepositoryGraphConfigError::NegatedSensitivePattern(_))
+        ));
+    }
+
+    #[test]
+    fn include_patterns_cannot_be_negated() {
+        let mut config = RepositoryGraphConfig::default();
+        config.source.include.insert("!target/**".to_string());
+        assert!(matches!(
+            config.analysis_config_digest(),
+            Err(RepositoryGraphConfigError::NegatedIncludePattern(_))
+        ));
+    }
+
+    #[test]
+    fn structural_index_limits_must_be_nonzero() {
+        let mut config = RepositoryGraphConfig::default();
+        config.index_limits.max_total_bytes = 0;
+        assert_eq!(
+            config.analysis_config_digest(),
+            Err(RepositoryGraphConfigError::ZeroIndexLimit(
+                "max_total_bytes"
+            ))
         );
     }
 

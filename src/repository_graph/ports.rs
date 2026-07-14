@@ -1,8 +1,10 @@
 //! Storage-independent extension points for later index and query phases.
 
+use serde::{Deserialize, Serialize};
+
 use super::domain::{
-    BuildId, GraphBuild, GraphDiagnostic, GraphEdge, GraphNode, GraphSnapshot, RepoPath,
-    RepositoryRef, SnapshotId, SourceRevision,
+    BuildId, DiagnosticCode, Digest, GraphBuild, GraphDiagnostic, GraphEdge, GraphNode,
+    GraphSnapshot, RepoPath, RepositoryRef, SnapshotId, SourceRevision,
 };
 use super::{
     diagnostics::GraphLifecycleEvent,
@@ -14,11 +16,49 @@ use super::{
     store::{BuildFailure, PublicationOutcome, PublishRequest, PublishedView},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFileMode {
+    Regular,
+    Executable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFileDescriptor {
     pub path: RepoPath,
     pub content_identity: super::domain::Digest,
     pub byte_len: u64,
+    pub file_mode: SourceFileMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDiagnostic {
+    pub code: DiagnosticCode,
+    pub path: Option<RepoPath>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDiscoveryMetrics {
+    pub candidates: u64,
+    pub directories: u64,
+    pub included: u64,
+    pub skipped: u64,
+    pub total_bytes: u64,
+    pub suppressed_diagnostics: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceManifest {
+    pub revision: SourceRevision,
+    pub extractor_set_digest: Digest,
+    pub files: Vec<SourceFileDescriptor>,
+    pub diagnostics: Vec<SourceDiagnostic>,
+    pub metrics: SourceDiscoveryMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContent {
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,8 +72,18 @@ pub trait RepositorySource {
     type Error;
 
     fn repository(&self) -> &RepositoryRef;
-    fn revision(&self) -> Result<SourceRevision, Self::Error>;
-    fn files(&self) -> Result<Vec<SourceFileDescriptor>, Self::Error>;
+    fn manifest(&self) -> &SourceManifest;
+    fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error>;
+    /// Re-discovers the mutable source and compares all source-identity inputs.
+    fn revalidate(&self) -> Result<bool, Self::Error>;
+
+    fn revision(&self) -> SourceRevision {
+        self.manifest().revision.clone()
+    }
+
+    fn files(&self) -> Vec<SourceFileDescriptor> {
+        self.manifest().files.clone()
+    }
 }
 
 pub trait Extractor {

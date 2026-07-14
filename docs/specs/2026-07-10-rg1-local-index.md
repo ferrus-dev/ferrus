@@ -89,13 +89,16 @@ orchestration loop.
 
 ## Milestones
 
-- [ ] #1.0 Implement repository discovery and deterministic source manifests
+- [x] #1.0 Implement repository discovery and deterministic source manifests
 
 ID: rg1.0
 Depends on: none
 
 Add Git and filesystem source adapters, repository-relative path normalization, content identities, dirty-state
 tracking, explicit exclusions, resource limits, and deterministic source-manifest hashing.
+
+Implemented in `src/repository_graph/source/`, with source configuration and adapter contracts in
+`src/repository_graph/config.rs` and `src/repository_graph/ports.rs`.
 
 - [ ] #1.1 Build the generic structural and document extractor
 
