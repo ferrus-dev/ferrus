@@ -2002,14 +2002,11 @@ bad-mixed-sources = { path = "local", registry = "private", version = "1" }
             serde_json::to_value(&first.edges).unwrap(),
             serde_json::to_value(&second.edges).unwrap()
         );
-        let span = first.nodes[0]
-            .provenance
-            .evidence
-            .as_ref()
-            .unwrap()
-            .span
-            .as_ref()
-            .unwrap();
+        let span = first
+            .nodes
+            .iter()
+            .find_map(|node| node.provenance.evidence.as_ref()?.span.as_ref())
+            .expect("the package declaration has source evidence");
         assert_eq!(span.start.line, Some(2));
         assert_eq!(span.start.column, Some(3));
         assert!(span.end.byte_offset > span.start.byte_offset);

@@ -143,13 +143,17 @@ preserve unresolved and external targets explicitly and avoid unsupported semant
 Implemented in `src/repository_graph/resolution.rs` as a storage-independent, resource-bounded pass over one
 immutable source manifest, with conservative Cargo workspace/package/dependency and Rust module/import resolution.
 
-- [ ] #1.5 Implement incremental indexing and snapshot publication
+- [x] #1.5 Implement incremental indexing and snapshot publication
 
 ID: rg1.5
 Depends on: rg1.4
 
 Coordinate extraction, unchanged-fragment reuse, invalidation, cross-file resolution, manifest revalidation,
 diagnostics, build metrics, and atomic publication of a complete snapshot.
+
+Implemented in `src/repository_graph/index.rs` and `src/repository_graph/index_store.rs`, with a versioned SQLite
+fragment cache and build metrics, deterministic snapshot identities, complete-snapshot transactions, source
+revalidation, and compare-and-set publication that preserves the previously published view on failure.
 
 - [ ] #1.6 Add the repository graph CLI and local benchmarks
 

@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use super::domain::Digest;
 
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 3;
 const SOURCE_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -124,6 +124,8 @@ pub struct IndexLimitsConfig {
     pub max_total_bytes: u64,
     pub max_facts_per_file: u64,
     pub max_parser_duration_ms: u64,
+    pub max_resolved_relationships: u64,
+    pub max_resolver_duration_ms: u64,
     pub max_diagnostics: u64,
 }
 
@@ -136,6 +138,8 @@ impl Default for IndexLimitsConfig {
             max_total_bytes: 512 * 1024 * 1024,
             max_facts_per_file: 100_000,
             max_parser_duration_ms: 2_000,
+            max_resolved_relationships: 1_000_000,
+            max_resolver_duration_ms: 10_000,
             max_diagnostics: 1_000,
         }
     }
@@ -345,6 +349,14 @@ impl RepositoryGraphConfig {
                 "max_parser_duration_ms",
                 self.index_limits.max_parser_duration_ms,
             ),
+            (
+                "max_resolved_relationships",
+                self.index_limits.max_resolved_relationships,
+            ),
+            (
+                "max_resolver_duration_ms",
+                self.index_limits.max_resolver_duration_ms,
+            ),
             ("max_diagnostics", self.index_limits.max_diagnostics),
         ] {
             if value == 0 {
@@ -429,6 +441,8 @@ max_file_bytes = 2097152
 max_total_bytes = 536870912
 max_facts_per_file = 100000
 max_parser_duration_ms = 2000
+max_resolved_relationships = 1000000
+max_resolver_duration_ms = 10000
 max_diagnostics = 1000
 
 [query_limits]

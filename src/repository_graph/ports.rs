@@ -103,11 +103,99 @@ impl std::fmt::Debug for FileExtractionInput<'_> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphFragment {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub diagnostics: Vec<GraphDiagnostic>,
+}
+
+/// Privacy-safe extractor failure used by the object-safe coordinator boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractorFailure {
+    pub extractor: super::domain::ExtractorIdentity,
+    pub code: DiagnosticCode,
+}
+
+impl std::fmt::Display for ExtractorFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "repository graph extractor {} failed with {}",
+            self.extractor.id.as_str(),
+            self.code.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ExtractorFailure {}
+
+/// Object-safe view over heterogeneous extractor implementations.
+pub trait DynExtractor: Send + Sync {
+    fn identity(&self) -> super::domain::ExtractorIdentity;
+    fn supports(&self, file: &SourceFileDescriptor) -> bool;
+    fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, ExtractorFailure>;
+}
+
+impl<T> DynExtractor for T
+where
+    T: Extractor,
+{
+    fn identity(&self) -> super::domain::ExtractorIdentity {
+        Extractor::identity(self)
+    }
+
+    fn supports(&self, file: &SourceFileDescriptor) -> bool {
+        Extractor::supports(self, file)
+    }
+
+    fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, ExtractorFailure> {
+        Extractor::extract(self, input).map_err(|_| ExtractorFailure {
+            extractor: Extractor::identity(self),
+            code: DiagnosticCode::new("extractor.failed")
+                .expect("static extractor failure code is canonical"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentCacheKey {
+    pub repository: RepositoryRef,
+    pub path: RepoPath,
+    pub content_identity: Digest,
+    pub byte_len: u64,
+    pub file_mode: SourceFileMode,
+    pub analysis_config_digest: Digest,
+    pub extractor: super::domain::ExtractorIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedFragment {
+    pub key: FragmentCacheKey,
+    pub fragment: GraphFragment,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexBuildMetrics {
+    pub discovered_files: u64,
+    pub reused_files: u64,
+    pub parsed_files: u64,
+    pub skipped_files: u64,
+    pub failed_files: u64,
+    pub processed_bytes: u64,
+    pub nodes: u64,
+    pub edges: u64,
+    pub diagnostics: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexCommit {
+    pub snapshot: GraphSnapshot,
+    pub files: Vec<SourceFileDescriptor>,
+    pub graph: GraphFragment,
+    pub cache_writes: Vec<CachedFragment>,
+    pub metrics: IndexBuildMetrics,
 }
 
 /// Hard limits for one deterministic cross-file resolution pass.
@@ -193,6 +281,21 @@ pub trait GraphStore {
         repository: &RepositoryRef,
         name: &super::domain::PublishedViewName,
     ) -> Result<Option<PublishedView>, Self::Error>;
+}
+
+/// Persistence operations needed by the indexing coordinator. The DTOs remain
+/// backend-neutral so a remote implementation can preserve the same workflow.
+pub trait IndexStore: GraphStore {
+    fn load_cached_fragment(
+        &mut self,
+        key: &FragmentCacheKey,
+    ) -> Result<Option<GraphFragment>, Self::Error>;
+    fn complete_index(&mut self, commit: &IndexCommit) -> Result<GraphSnapshot, Self::Error>;
+    fn record_build_metrics(
+        &mut self,
+        build_id: &BuildId,
+        metrics: &IndexBuildMetrics,
+    ) -> Result<(), Self::Error>;
 }
 
 pub trait GraphQuery {

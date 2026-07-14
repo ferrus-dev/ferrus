@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 3;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +231,100 @@ const MIGRATIONS: &[Migration] = &[
             CHECK (span_end_column IS NULL OR span_end_column >= 0);
     "#,
     },
+    Migration {
+        version: 3,
+        sql: r#"
+        ALTER TABLE nodes ADD COLUMN span_start_line INTEGER
+            CHECK (span_start_line IS NULL OR span_start_line >= 0);
+        ALTER TABLE nodes ADD COLUMN span_start_column INTEGER
+            CHECK (span_start_column IS NULL OR span_start_column >= 0);
+        ALTER TABLE nodes ADD COLUMN span_end_line INTEGER
+            CHECK (span_end_line IS NULL OR span_end_line >= 0);
+        ALTER TABLE nodes ADD COLUMN span_end_column INTEGER
+            CHECK (span_end_column IS NULL OR span_end_column >= 0);
+
+        ALTER TABLE edges ADD COLUMN span_start_line INTEGER
+            CHECK (span_start_line IS NULL OR span_start_line >= 0);
+        ALTER TABLE edges ADD COLUMN span_start_column INTEGER
+            CHECK (span_start_column IS NULL OR span_start_column >= 0);
+        ALTER TABLE edges ADD COLUMN span_end_line INTEGER
+            CHECK (span_end_line IS NULL OR span_end_line >= 0);
+        ALTER TABLE edges ADD COLUMN span_end_column INTEGER
+            CHECK (span_end_column IS NULL OR span_end_column >= 0);
+
+        ALTER TABLE diagnostics RENAME TO diagnostics_v2;
+        CREATE TABLE diagnostics (
+            id INTEGER PRIMARY KEY,
+            build_id TEXT NOT NULL REFERENCES index_builds(id) ON DELETE CASCADE,
+            snapshot_id TEXT REFERENCES snapshots(id) ON DELETE CASCADE,
+            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+            code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            path TEXT,
+            span_start_byte INTEGER CHECK (span_start_byte IS NULL OR span_start_byte >= 0),
+            span_end_byte INTEGER CHECK (span_end_byte IS NULL OR span_end_byte >= span_start_byte),
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            span_start_line INTEGER CHECK (span_start_line IS NULL OR span_start_line >= 0),
+            span_start_column INTEGER CHECK (span_start_column IS NULL OR span_start_column >= 0),
+            span_end_line INTEGER CHECK (span_end_line IS NULL OR span_end_line >= 0),
+            span_end_column INTEGER CHECK (span_end_column IS NULL OR span_end_column >= 0)
+        ) STRICT;
+        INSERT INTO diagnostics(
+            id, build_id, snapshot_id, severity, code, message, path,
+            span_start_byte, span_end_byte, metadata_json, created_at,
+            span_start_line, span_start_column, span_end_line, span_end_column
+        )
+        SELECT
+            id, build_id, snapshot_id, severity, code, message, path,
+            span_start_byte, span_end_byte, metadata_json, created_at,
+            span_start_line, span_start_column, span_end_line, span_end_column
+        FROM diagnostics_v2;
+        DROP TABLE diagnostics_v2;
+        CREATE INDEX diagnostics_build_idx ON diagnostics(build_id, severity, id);
+        CREATE INDEX diagnostics_snapshot_idx ON diagnostics(snapshot_id, id)
+            WHERE snapshot_id IS NOT NULL;
+
+        CREATE TABLE fragment_cache (
+            repository_namespace TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content_algorithm TEXT NOT NULL,
+            content_digest TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            file_mode INTEGER NOT NULL CHECK (file_mode IN (0, 1)),
+            analysis_config_algorithm TEXT NOT NULL,
+            analysis_config_digest TEXT NOT NULL,
+            extractor_id TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            extractor_contract_version INTEGER NOT NULL CHECK (extractor_contract_version > 0),
+            fragment_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            PRIMARY KEY (
+                repository_namespace, repository_id, path,
+                content_algorithm, content_digest, byte_length, file_mode,
+                analysis_config_algorithm, analysis_config_digest,
+                extractor_id, extractor_version, extractor_contract_version
+            )
+        ) STRICT;
+        CREATE INDEX fragment_cache_last_used_idx ON fragment_cache(last_used_at);
+
+        CREATE TABLE build_metrics (
+            build_id TEXT PRIMARY KEY NOT NULL REFERENCES index_builds(id) ON DELETE CASCADE,
+            discovered_files INTEGER NOT NULL CHECK (discovered_files >= 0),
+            reused_files INTEGER NOT NULL CHECK (reused_files >= 0),
+            parsed_files INTEGER NOT NULL CHECK (parsed_files >= 0),
+            skipped_files INTEGER NOT NULL CHECK (skipped_files >= 0),
+            failed_files INTEGER NOT NULL CHECK (failed_files >= 0),
+            processed_bytes INTEGER NOT NULL CHECK (processed_bytes >= 0),
+            nodes INTEGER NOT NULL CHECK (nodes >= 0),
+            edges INTEGER NOT NULL CHECK (edges >= 0),
+            diagnostics INTEGER NOT NULL CHECK (diagnostics >= 0),
+            duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0)
+        ) STRICT;
+    "#,
+    },
 ];
 
 /// Resolves the sidecar beside `ferrus.db` through the registered project.
@@ -452,12 +546,12 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (\
                  'schema_migrations', 'index_builds', 'snapshots', 'published_views', \
-                 'files', 'nodes', 'edges', 'diagnostics')",
+                 'files', 'nodes', 'edges', 'diagnostics', 'fragment_cache', 'build_metrics')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 8);
+        assert_eq!(table_count, 10);
     }
 
     #[test]
@@ -490,7 +584,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migration_count, SIDECAR_SCHEMA_VERSION);
-        let span_column_count: u32 = sidecar
+        let diagnostic_span_column_count: u32 = sidecar
             .connection()
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('diagnostics') \
@@ -500,7 +594,22 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(span_column_count, 4);
+        assert_eq!(diagnostic_span_column_count, 4);
+        for table in ["nodes", "edges"] {
+            let fact_span_column_count: u32 = sidecar
+                .connection()
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') \
+                         WHERE name IN ('span_start_line', 'span_start_column', \
+                                        'span_end_line', 'span_end_column')"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fact_span_column_count, 4);
+        }
     }
 
     #[test]
@@ -578,7 +687,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v2_objects.txt")
+            include_str!("fixtures/schema_v3_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );

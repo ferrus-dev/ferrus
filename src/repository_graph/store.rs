@@ -72,6 +72,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
+    #[error("repository graph fact serialization failed")]
+    Serialization(#[from] serde_json::Error),
 }
 
 impl Sidecar {
@@ -394,7 +396,10 @@ impl GraphStore for Sidecar {
     }
 }
 
-fn load_build(connection: &Connection, id: &BuildId) -> Result<Option<GraphBuild>, StoreError> {
+pub(super) fn load_build(
+    connection: &Connection,
+    id: &BuildId,
+) -> Result<Option<GraphBuild>, StoreError> {
     let raw = connection
         .query_row(
             "SELECT repository_namespace, repository_id, source_revision_id, \
@@ -457,7 +462,7 @@ fn load_build(connection: &Connection, id: &BuildId) -> Result<Option<GraphBuild
 }
 
 #[allow(clippy::type_complexity)]
-fn load_snapshot(
+pub(super) fn load_snapshot(
     connection: &Connection,
     id: &SnapshotId,
 ) -> Result<Option<GraphSnapshot>, StoreError> {
@@ -572,7 +577,7 @@ fn build_order(connection: &Connection, id: &BuildId) -> Result<i64, StoreError>
         .map_err(StoreError::from)
 }
 
-fn validate_snapshot_for_build(
+pub(super) fn validate_snapshot_for_build(
     snapshot: &GraphSnapshot,
     build: &GraphBuild,
 ) -> Result<(), StoreError> {
@@ -588,7 +593,7 @@ fn validate_snapshot_for_build(
     Ok(())
 }
 
-fn validate_equivalent_snapshot(
+pub(super) fn validate_equivalent_snapshot(
     requested: &GraphSnapshot,
     existing: &GraphSnapshot,
 ) -> Result<(), StoreError> {
@@ -604,7 +609,7 @@ fn validate_equivalent_snapshot(
     Ok(())
 }
 
-fn timestamp() -> String {
+pub(super) fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
