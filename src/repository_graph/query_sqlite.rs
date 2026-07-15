@@ -15,11 +15,11 @@ use super::{
     config::QueryLimitsConfig,
     domain::{
         Availability, Confidence, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
-        FactProvenance, Freshness, GraphEdge, GraphNode, GraphValue, NodeId, PageCursor, RepoPath,
-        RepositoryRef, ResolutionState, SemanticKey, SnapshotId, SourceEvidence, SourcePosition,
-        SourceSpan,
+        FactProvenance, Freshness, GraphEdge, GraphNode, GraphSnapshot, GraphValue, NodeId,
+        PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
+        SourceEvidence, SourcePosition, SourceSpan,
     },
-    ports::GraphQuery,
+    ports::{GraphQuery, SourceManifest},
     query::{
         ContextRequest, ContextResponse, DiagnosticSummary, EdgeDirection, FreshnessEnvelope,
         NeighborhoodData, NeighborhoodEdge, NeighborhoodNode, NeighborhoodRequest,
@@ -87,19 +87,36 @@ impl SearchRows {
 pub struct SqliteGraphQuery<'a> {
     sidecar: &'a Sidecar,
     limits: QueryLimitsConfig,
-    compared_manifest: Option<Digest>,
+    freshness_comparison: Option<FreshnessComparison>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessComparison {
+    source_manifest_digest: Digest,
+    analysis_config_digest: Digest,
+    extractor_set_digest: Digest,
+}
+
+impl FreshnessComparison {
+    pub fn from_manifest(manifest: &SourceManifest) -> Self {
+        Self {
+            source_manifest_digest: manifest.revision.manifest_digest.clone(),
+            analysis_config_digest: manifest.revision.analysis_config_digest.clone(),
+            extractor_set_digest: manifest.extractor_set_digest.clone(),
+        }
+    }
 }
 
 impl<'a> SqliteGraphQuery<'a> {
     pub fn new(
         sidecar: &'a Sidecar,
         limits: QueryLimitsConfig,
-        compared_manifest: Option<Digest>,
+        freshness_comparison: Option<FreshnessComparison>,
     ) -> Self {
         Self {
             sidecar,
             limits,
-            compared_manifest,
+            freshness_comparison,
         }
     }
 
@@ -132,10 +149,7 @@ impl<'a> SqliteGraphQuery<'a> {
         if snapshot.repository != scope.repository {
             return Err(snapshot_not_found_error());
         }
-        let freshness = freshness(
-            &snapshot.source_manifest_digest,
-            self.compared_manifest.as_ref(),
-        );
+        let freshness = freshness(&snapshot, self.freshness_comparison.as_ref());
         Ok(ResolvedScope {
             repository: scope.repository.clone(),
             snapshot,
@@ -385,7 +399,10 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                     snapshot_id: None,
                     freshness: FreshnessEnvelope {
                         freshness: Freshness::NotApplicable,
-                        compared_manifest: self.compared_manifest.clone(),
+                        compared_manifest: self
+                            .freshness_comparison
+                            .as_ref()
+                            .map(|comparison| comparison.source_manifest_digest.clone()),
                         reason_codes: vec!["not_built".to_string()],
                     },
                     diagnostics: DiagnosticSummary::default(),
@@ -768,18 +785,29 @@ fn validate_search_request(request: &SearchRequest) -> Result<(), QueryError> {
     Ok(())
 }
 
-fn freshness(expected: &Digest, actual: Option<&Digest>) -> FreshnessEnvelope {
+fn freshness(expected: &GraphSnapshot, actual: Option<&FreshnessComparison>) -> FreshnessEnvelope {
     match actual {
-        Some(actual) if actual == expected => FreshnessEnvelope {
-            freshness: Freshness::Fresh,
-            compared_manifest: Some(actual.clone()),
-            reason_codes: vec![],
-        },
-        Some(actual) => FreshnessEnvelope {
-            freshness: Freshness::Stale,
-            compared_manifest: Some(actual.clone()),
-            reason_codes: vec!["source_manifest_changed".to_string()],
-        },
+        Some(actual) => {
+            let mut reason_codes = Vec::new();
+            if actual.source_manifest_digest != expected.source_manifest_digest {
+                reason_codes.push("source_manifest_changed".to_string());
+            }
+            if actual.analysis_config_digest != expected.analysis_config_digest {
+                reason_codes.push("analysis_config_changed".to_string());
+            }
+            if actual.extractor_set_digest != expected.extractor_set_digest {
+                reason_codes.push("extractor_set_changed".to_string());
+            }
+            FreshnessEnvelope {
+                freshness: if reason_codes.is_empty() {
+                    Freshness::Fresh
+                } else {
+                    Freshness::Stale
+                },
+                compared_manifest: Some(actual.source_manifest_digest.clone()),
+                reason_codes,
+            }
+        }
         None => FreshnessEnvelope {
             freshness: Freshness::Unknown,
             compared_manifest: None,
@@ -1319,6 +1347,7 @@ mod tests {
         tempfile::TempDir,
         Sidecar,
         RepositoryGraphConfig,
+        FreshnessComparison,
     ) {
         let source_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(source_dir.path().join("src")).unwrap();
@@ -1337,6 +1366,7 @@ mod tests {
         let context =
             SourceDiscoveryContext::from_config(repository(), &config, &identities).unwrap();
         let source = FilesystemRepositorySource::discover(source_dir.path(), context).unwrap();
+        let freshness_comparison = FreshnessComparison::from_manifest(source.manifest());
         let sidecar_dir = tempfile::tempdir().unwrap();
         let OpenSidecarResult::Ready(mut sidecar) =
             open_for_build_at(&sidecar_dir.path().join("repo-graph.db")).unwrap()
@@ -1354,7 +1384,13 @@ mod tests {
                 },
             )
             .unwrap();
-        (source_dir, sidecar_dir, sidecar, config)
+        (
+            source_dir,
+            sidecar_dir,
+            sidecar,
+            config,
+            freshness_comparison,
+        )
     }
 
     fn scope(config: &RepositoryGraphConfig) -> super::super::query::QueryScope {
@@ -1367,15 +1403,11 @@ mod tests {
 
     #[test]
     fn search_show_and_neighborhood_return_evidence_and_provenance() {
-        let (_source, _sidecar_dir, sidecar, config) = indexed_fixture();
-        let snapshot = sidecar
-            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
-            .unwrap()
-            .unwrap();
+        let (_source, _sidecar_dir, sidecar, config, freshness_comparison) = indexed_fixture();
         let query = SqliteGraphQuery::new(
             &sidecar,
             config.query_limits.clone(),
-            Some(snapshot.source_manifest_digest),
+            Some(freshness_comparison),
         );
         let search = query
             .search(&SearchRequest {
@@ -1422,7 +1454,7 @@ mod tests {
 
     #[test]
     fn service_limits_cap_results_and_cursors_are_query_bound() {
-        let (_source, _sidecar_dir, sidecar, mut config) = indexed_fixture();
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
         config.query_limits.max_results = 1;
         let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
         let first = query
@@ -1508,7 +1540,7 @@ mod tests {
 
     #[test]
     fn oversized_first_search_hit_returns_terminal_byte_truncation() {
-        let (_source, _sidecar_dir, sidecar, mut config) = indexed_fixture();
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
         config.query_limits.max_bytes = 1;
         let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
 
@@ -1532,7 +1564,7 @@ mod tests {
 
     #[test]
     fn sqlite_search_execution_observes_an_expired_deadline() {
-        let (_source, _sidecar_dir, sidecar, config) = indexed_fixture();
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
         let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
         let requested_scope = scope(&config);
         let resolved_scope = query.resolve_scope(&requested_scope).unwrap();
@@ -1556,7 +1588,7 @@ mod tests {
 
     #[test]
     fn status_reports_counts_and_missing_show_is_actionable() {
-        let (_source, _sidecar_dir, sidecar, config) = indexed_fixture();
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
         let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
         let status = query
             .status(&StatusRequest {
@@ -1576,5 +1608,44 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, QueryErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn analysis_and_extractor_changes_mark_the_snapshot_stale() {
+        let (_source, _sidecar_dir, sidecar, config, current) = indexed_fixture();
+        let snapshot = sidecar
+            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap();
+        for (comparison, reason) in [
+            (
+                FreshnessComparison {
+                    analysis_config_digest: Digest::new("sha256", "aa").unwrap(),
+                    ..current.clone()
+                },
+                "analysis_config_changed",
+            ),
+            (
+                FreshnessComparison {
+                    extractor_set_digest: Digest::new("sha256", "bb").unwrap(),
+                    ..current.clone()
+                },
+                "extractor_set_changed",
+            ),
+        ] {
+            let status =
+                SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), Some(comparison))
+                    .status(&StatusRequest {
+                        scope: scope(&config),
+                    })
+                    .unwrap();
+
+            assert_eq!(status.freshness.freshness, Freshness::Stale);
+            assert_eq!(
+                status.freshness.compared_manifest.as_ref(),
+                Some(&snapshot.source_manifest_digest)
+            );
+            assert_eq!(status.freshness.reason_codes, vec![reason]);
+        }
     }
 }

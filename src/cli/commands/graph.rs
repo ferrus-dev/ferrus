@@ -27,7 +27,7 @@ use crate::{
             PageRequest, QueryScope, SearchRequest, ShowLookup, ShowRequest, SnapshotSelector,
             StatusData, StatusRequest, StatusResponse,
         },
-        query_sqlite::{SqliteGraphQuery, default_budget},
+        query_sqlite::{FreshnessComparison, SqliteGraphQuery, default_budget},
         source::{LocalRepositorySource, SourceDiscoveryContext},
         sqlite::{
             OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, Sidecar,
@@ -193,13 +193,12 @@ impl LocalGraphContext {
             .context("Failed to discover the canonical repository source")
     }
 
-    fn compared_manifest(&self) -> Result<Option<crate::repository_graph::domain::Digest>> {
+    fn freshness_comparison(&self) -> Result<Option<FreshnessComparison>> {
         if !self.config.enabled {
             return Ok(None);
         }
-        Ok(Some(
-            self.discover()?.manifest().revision.manifest_digest.clone(),
-        ))
+        let source = self.discover()?;
+        Ok(Some(FreshnessComparison::from_manifest(source.manifest())))
     }
 
     fn scope(&self, budget: QueryBudget) -> Result<QueryScope> {
@@ -279,13 +278,13 @@ async fn status(json: bool) -> Result<()> {
     let context = LocalGraphContext::load(false).await?;
     let sidecar_path = sidecar_path().await?;
     let health = inspect_health_at(&sidecar_path)?;
-    let compared_manifest = context.compared_manifest().ok().flatten();
+    let freshness_comparison = context.freshness_comparison().ok().flatten();
     let graph = match open_for_query_at(&sidecar_path)? {
         OpenQuerySidecarResult::Ready(sidecar) => {
             let query = SqliteGraphQuery::new(
                 &sidecar,
                 context.config.query_limits.clone(),
-                compared_manifest,
+                freshness_comparison,
             );
             query.status(&StatusRequest {
                 scope: context.scope(default_budget(&context.config.query_limits)?)?,
@@ -353,7 +352,7 @@ async fn search(
     let query = SqliteGraphQuery::new(
         &sidecar,
         context.config.query_limits.clone(),
-        context.compared_manifest()?,
+        context.freshness_comparison()?,
     );
     let response = query.search(&SearchRequest {
         scope: context.scope(requested_budget(&context.config, limit, None)?)?,
@@ -410,7 +409,7 @@ async fn show(args: ShowArgs) -> Result<()> {
     let query = SqliteGraphQuery::new(
         &sidecar,
         context.config.query_limits.clone(),
-        context.compared_manifest()?,
+        context.freshness_comparison()?,
     );
     let lookup = if let Some(node) = args.node {
         ShowLookup::Node(NodeId::new(node)?)
@@ -473,7 +472,7 @@ async fn neighbors(
     let query = SqliteGraphQuery::new(
         &sidecar,
         context.config.query_limits.clone(),
-        context.compared_manifest()?,
+        context.freshness_comparison()?,
     );
     let response = query.neighborhood(&NeighborhoodRequest {
         scope: context.scope(requested_budget(&context.config, limit, depth)?)?,
