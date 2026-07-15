@@ -3,10 +3,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     num::{NonZeroU32, NonZeroU64},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use rusqlite::{Row, params};
+use rusqlite::{Connection, Error as SqliteError, ErrorCode, Row, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -42,6 +42,47 @@ const EDGE_COLUMNS: &str = "snapshot_id, id, kind, source_node_id, target_node_i
     span_end_column";
 const MAX_FILTERS: usize = 32;
 const MAX_QUERY_TEXT_BYTES: usize = 512;
+const SQLITE_PROGRESS_OPS: i32 = 100;
+
+struct QueryDeadline<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> QueryDeadline<'connection> {
+    fn install(
+        connection: &'connection Connection,
+        started: Instant,
+        budget: Duration,
+    ) -> Result<Self, QueryError> {
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || started.elapsed() >= budget),
+            )
+            .map_err(|_| backend_error())?;
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for QueryDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+struct SearchRows {
+    rows: Vec<(GraphNode, f64)>,
+    deadline_exceeded: bool,
+}
+
+impl SearchRows {
+    fn deadline_exceeded() -> Self {
+        Self {
+            rows: Vec::new(),
+            deadline_exceeded: true,
+        }
+    }
+}
 
 pub struct SqliteGraphQuery<'a> {
     sidecar: &'a Sidecar,
@@ -150,7 +191,8 @@ impl<'a> SqliteGraphQuery<'a> {
         scope: &ResolvedScope,
         request: &SearchRequest,
         offset: u64,
-    ) -> Result<Vec<(GraphNode, f64)>, QueryError> {
+        started: Instant,
+    ) -> Result<SearchRows, QueryError> {
         let text = request.text.trim();
         let normalized = text.to_lowercase();
         let escaped = escape_like(&normalized);
@@ -185,28 +227,50 @@ impl<'a> SqliteGraphQuery<'a> {
         );
         let limit = i64::from(scope.budget.max_results.saturating_add(1));
         let offset = i64::try_from(offset).map_err(|_| stale_cursor_error())?;
-        let mut statement = self
-            .sidecar
-            .connection()
-            .prepare(&sql)
-            .map_err(|_| backend_error())?;
-        let mut rows = statement
-            .query(params![
-                scope.snapshot.id.as_str(),
-                normalized,
-                prefix,
-                contains,
-                kinds,
-                paths,
-                limit,
-                offset,
-            ])
-            .map_err(|_| backend_error())?;
+        let connection = self.sidecar.connection();
+        let _deadline = QueryDeadline::install(
+            connection,
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(SearchRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
+        let mut rows = match statement.query(params![
+            scope.snapshot.id.as_str(),
+            normalized,
+            prefix,
+            contains,
+            kinds,
+            paths,
+            limit,
+            offset,
+        ]) {
+            Ok(rows) => rows,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(SearchRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| backend_error())? {
-            found.push((decode_node(row)?, value(row, 19)?));
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => found.push((decode_node(row)?, value(row, 19)?)),
+                Ok(None) => break,
+                Err(error) if sqlite_deadline_exceeded(&error) => {
+                    return Ok(SearchRows::deadline_exceeded());
+                }
+                Err(_) => return Err(backend_error()),
+            }
         }
-        Ok(found)
+        Ok(SearchRows {
+            rows: found,
+            deadline_exceeded: false,
+        })
     }
 
     fn show_rows(
@@ -368,10 +432,13 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             &scope.snapshot.id,
             &fingerprint,
         )?;
-        let rows = self.search_rows(&scope, request, offset)?;
+        let search_rows = self.search_rows(&scope, request, offset, started)?;
+        let rows = search_rows.rows;
         let mut hits = Vec::new();
         let mut returned_bytes = 0_u64;
-        let mut reason = None;
+        let mut reason = search_rows
+            .deadline_exceeded
+            .then_some(TruncationReason::Duration);
         for (node, score) in rows {
             if hits.len() >= scope.budget.max_results as usize {
                 reason = Some(TruncationReason::Results);
@@ -816,6 +883,10 @@ fn adjacent_node(edge: &GraphEdge, current: &NodeId, direction: EdgeDirection) -
             _ => None,
         },
     }
+}
+
+fn sqlite_deadline_exceeded(error: &SqliteError) -> bool {
+    error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
 }
 
 fn graph_string(value: &GraphValue) -> Option<&str> {
@@ -1457,6 +1528,30 @@ mod tests {
             TruncationReason::Bytes
         );
         assert!(response.page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn sqlite_search_execution_observes_an_expired_deadline() {
+        let (_source, _sidecar_dir, sidecar, config) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let requested_scope = scope(&config);
+        let resolved_scope = query.resolve_scope(&requested_scope).unwrap();
+        let request = SearchRequest {
+            scope: requested_scope,
+            text: "missing-low-selectivity-term".to_string(),
+            node_kinds: vec![],
+            paths: vec![],
+            page: super::super::query::PageRequest { cursor: None },
+        };
+        let started = Instant::now()
+            - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
+
+        let rows = query
+            .search_rows(&resolved_scope, &request, 0, started)
+            .unwrap();
+
+        assert!(rows.deadline_exceeded);
+        assert!(rows.rows.is_empty());
     }
 
     #[test]

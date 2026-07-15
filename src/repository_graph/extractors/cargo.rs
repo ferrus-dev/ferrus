@@ -9,6 +9,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     ops::Range,
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -38,6 +40,48 @@ pub struct CargoExtractor;
 impl CargoExtractor {
     pub fn new() -> Self {
         Self
+    }
+}
+
+enum ParserDeadline<T> {
+    Completed(T),
+    TimedOut,
+    Unavailable,
+}
+
+fn run_parser_with_deadline<T, F>(
+    started: Instant,
+    budget: Duration,
+    parser: F,
+) -> ParserDeadline<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return ParserDeadline::TimedOut;
+    }
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if thread::Builder::new()
+        .name("ferrus-cargo-parser".to_string())
+        .spawn(move || {
+            let _ = sender.send(parser());
+        })
+        .is_err()
+    {
+        return ParserDeadline::Unavailable;
+    }
+
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return ParserDeadline::TimedOut;
+    }
+    match receiver.recv_timeout(remaining) {
+        Ok(parsed) => ParserDeadline::Completed(parsed),
+        Err(RecvTimeoutError::Timeout) => ParserDeadline::TimedOut,
+        Err(RecvTimeoutError::Disconnected) => ParserDeadline::Unavailable,
     }
 }
 
@@ -79,14 +123,26 @@ impl Extractor for CargoExtractor {
         }
 
         let started = Instant::now();
-        let parsed = toml::from_str::<toml::Table>(source);
-        if started.elapsed() >= budget {
-            diagnostics.push("cargo.parser_timeout", None);
-            return Ok(GraphFragment {
-                diagnostics: diagnostics.finish(),
-                ..GraphFragment::default()
-            });
-        }
+        let parser_source = source.to_owned();
+        let parsed = match run_parser_with_deadline(started, budget, move || {
+            toml::from_str::<toml::Table>(&parser_source)
+        }) {
+            ParserDeadline::Completed(parsed) => parsed,
+            ParserDeadline::TimedOut => {
+                diagnostics.push("cargo.parser_timeout", None);
+                return Ok(GraphFragment {
+                    diagnostics: diagnostics.finish(),
+                    ..GraphFragment::default()
+                });
+            }
+            ParserDeadline::Unavailable => {
+                diagnostics.push("cargo.parser_unavailable", None);
+                return Ok(GraphFragment {
+                    diagnostics: diagnostics.finish(),
+                    ..GraphFragment::default()
+                });
+            }
+        };
         let manifest = match parsed {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -1987,6 +2043,21 @@ bad-mixed-sources = { path = "local", registry = "private", version = "1" }
         let diagnostics = diagnostics.finish();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code.as_str(), "cargo.parser_timeout");
+    }
+
+    #[test]
+    fn parser_deadline_stops_waiting_for_a_blocked_worker() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let result =
+            run_parser_with_deadline(Instant::now(), Duration::from_millis(10), move || {
+                release_receiver.recv().unwrap();
+                done_sender.send(()).unwrap();
+            });
+
+        assert!(matches!(result, ParserDeadline::TimedOut));
+        release_sender.send(()).unwrap();
+        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
