@@ -6,27 +6,39 @@ behavior and fact counts before comparing wall-clock values across machines.
 
 ## Reproducing the medium fixture
 
-The ignored test generates a non-Git Cargo repository with 300 Rust modules plus `Cargo.toml` and `src/lib.rs`.
-It measures a cold build, a no-op build, a one-file change, and indexed symbol search:
+The Criterion target in `benches/repository_graph.rs` generates a non-Git Cargo repository with 300 Rust modules
+plus `Cargo.toml` and `src/lib.rs`. It measures a cold build, a no-op build, a one-file change, and indexed symbol
+search using the optimized benchmark profile:
 
 ```sh
-cargo test repository_graph::benchmarks::medium_fixture_baseline -- --ignored --nocapture --test-threads=1
+cargo bench --bench repository_graph
 ```
 
-The harness asserts the important invariants: the no-op build parses zero files, the changed build parses exactly
-one file, every other fragment is reused, and search returns the changed symbol.
+Use `cargo bench --bench repository_graph -- --quick` for a fast smoke run. Criterion setup prepares a fresh
+fixture and sidecar outside each measured indexing iteration, so filesystem generation, source discovery, and any
+prerequisite build are excluded from the reported operation. Before measuring, the harness asserts the important
+invariants: the no-op build parses zero files, the changed build parses exactly one file, every other fragment is
+reused, and search returns the changed symbol.
 
-## Baseline recorded 2026-07-14
+## Criterion baseline recorded 2026-07-15
 
-Environment: macOS arm64, Rust 1.96.0, debug test/build profile. Timings include coordinator and SQLite work but
-exclude compilation.
+Environment: macOS arm64, Rust 1.96.0, optimized benchmark profile, Criterion 0.8.2 `--quick`. Values are Criterion
+point estimates; compilation and per-iteration setup are excluded.
 
 | Corpus / operation | Time | Parsed | Reused | Result size |
 |---|---:|---:|---:|---:|
-| Medium fixture cold build (302 files) | 378 ms | 302 | 0 | 1,816 nodes / 2,115 edges |
-| Medium fixture no-op build | 203 ms | 0 | 302 | same snapshot |
-| Medium fixture one-file change | 293 ms | 1 | 301 | new snapshot |
-| Medium fixture indexed symbol search | 1.12 ms | — | — | 1 hit |
+| Medium fixture cold build (302 files) | 97.0 ms | 302 | 0 | 1,816 nodes / 2,115 edges |
+| Medium fixture no-op build | 49.1 ms | 0 | 302 | same snapshot |
+| Medium fixture one-file change | 84.0 ms | 1 | 301 | new snapshot |
+| Medium fixture indexed symbol search | 238 µs | — | — | 1 hit |
+
+## Ferrus dogfood recorded 2026-07-14
+
+These dogfood timings used the debug CLI build and are retained as functional evidence, not as values to compare
+directly with the Criterion release-profile baseline.
+
+| Corpus / operation | Time | Parsed | Reused | Result size |
+|---|---:|---:|---:|---:|
 | Ferrus dogfood cold build (134 files) | 880 ms | 134 | 0 | 4,015 nodes / 4,803 edges |
 | Ferrus dogfood no-op build | 303 ms | 0 | 134 | same snapshot and publication generation |
 

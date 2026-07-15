@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     domain::Availability,
-    sqlite::{SIDECAR_SCHEMA_VERSION, SidecarStatus, current_sidecar_path, inspect_at},
+    sqlite::{SIDECAR_SCHEMA_VERSION, SidecarStatus, inspect_at},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,11 +78,6 @@ impl SidecarHealth {
             issues: vec![HealthIssueCode::SidecarUnreadable],
         }
     }
-}
-
-/// Resolves and inspects the optional sidecar without creating or migrating it.
-pub async fn inspect_current_health() -> Result<SidecarHealth> {
-    inspect_health_at(&current_sidecar_path().await?)
 }
 
 pub fn inspect_health_at(path: &Path) -> Result<SidecarHealth> {

@@ -350,30 +350,6 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Resolves the sidecar beside `ferrus.db` through the registered project.
-/// This function is read-only and does not create the sidecar or its directory.
-pub async fn current_sidecar_path() -> Result<PathBuf> {
-    Ok(crate::project::current_project_data_dir()
-        .await?
-        .join(SIDECAR_FILE_NAME))
-}
-
-/// Inspects optional graph storage without creating or migrating it.
-pub async fn inspect_current() -> Result<SidecarStatus> {
-    inspect_at(&current_sidecar_path().await?)
-}
-
-/// Explicit write/build entrypoint. This is the only operation in this phase
-/// that creates and migrates an absent sidecar.
-pub async fn open_current_for_build() -> Result<OpenSidecarResult> {
-    open_for_build_at(&current_sidecar_path().await?)
-}
-
-/// Explicit read-only query entrypoint. It never creates or migrates storage.
-pub async fn open_current_for_query() -> Result<OpenQuerySidecarResult> {
-    open_for_query_at(&current_sidecar_path().await?)
-}
-
 pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
     if !path.exists() {
         return Ok(SidecarStatus::Absent);

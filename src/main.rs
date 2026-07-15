@@ -7,8 +7,6 @@ mod hq;
 mod legacy_state;
 mod platform;
 mod project;
-#[allow(dead_code)]
-mod repository_graph;
 mod runtime_status;
 mod runtime_table;
 mod server;
@@ -16,6 +14,8 @@ mod specs;
 mod state;
 mod templates;
 mod update_check;
+
+use ferrus::repository_graph;
 
 #[cfg(test)]
 mod test_support {

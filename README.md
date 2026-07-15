@@ -244,8 +244,8 @@ read-only and reports absent or incompatible storage without creating it.
 Every query reports the snapshot ID, freshness against the current source manifest, diagnostic counts,
 repository-relative evidence spans, provenance, and any truncation. CLI limits are requests: configured
 `[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
-`ferrus.db`; it stores structural facts and content identities, not source bodies. Local benchmark methodology and
-the latest dogfood results are recorded in `docs/repository-graph-benchmarks.md`.
+`ferrus.db`; it stores structural facts and content identities, not source bodies. Local Criterion benchmark
+methodology and the latest dogfood results are recorded in `docs/repository-graph-benchmarks.md`.
 
 ### `ferrus projects list`
 

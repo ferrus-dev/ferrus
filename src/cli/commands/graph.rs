@@ -1,5 +1,6 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,7 +19,7 @@ use crate::{
             Availability, BuildId, EdgeTarget, Freshness, NodeId, PublishedViewName, QueryBudget,
             RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SemanticKey,
         },
-        health::{SidecarHealth, inspect_current_health},
+        health::{SidecarHealth, inspect_health_at},
         index::{IndexCoordinator, IndexOutcome, IndexRequest, active_extractor_identities},
         ports::GraphQuery,
         query::{
@@ -29,8 +30,8 @@ use crate::{
         query_sqlite::{SqliteGraphQuery, default_budget},
         source::{LocalRepositorySource, SourceDiscoveryContext},
         sqlite::{
-            OpenQuerySidecarResult, OpenSidecarResult, Sidecar, open_current_for_build,
-            open_current_for_query,
+            OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, Sidecar,
+            open_for_build_at, open_for_query_at,
         },
     },
 };
@@ -220,7 +221,7 @@ struct IndexOutput {
 async fn index(full: bool, json: bool) -> Result<()> {
     let context = LocalGraphContext::load(true).await?;
     let source = context.discover()?;
-    let mut sidecar = match open_current_for_build().await? {
+    let mut sidecar = match open_for_build_at(&sidecar_path().await?)? {
         OpenSidecarResult::Ready(sidecar) => sidecar,
         OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
             "repository graph storage is incompatible (schema {} vs {}): {}; remove the derived sidecar and retry",
@@ -276,9 +277,10 @@ struct StatusOutput {
 
 async fn status(json: bool) -> Result<()> {
     let context = LocalGraphContext::load(false).await?;
-    let health = inspect_current_health().await?;
+    let sidecar_path = sidecar_path().await?;
+    let health = inspect_health_at(&sidecar_path)?;
     let compared_manifest = context.compared_manifest().ok().flatten();
-    let graph = match open_current_for_query().await? {
+    let graph = match open_for_query_at(&sidecar_path)? {
         OpenQuerySidecarResult::Ready(sidecar) => {
             let query = SqliteGraphQuery::new(
                 &sidecar,
@@ -516,7 +518,7 @@ async fn neighbors(
 }
 
 async fn ready_query_sidecar() -> Result<Sidecar> {
-    match open_current_for_query().await? {
+    match open_for_query_at(&sidecar_path().await?)? {
         OpenQuerySidecarResult::Ready(sidecar) => Ok(sidecar),
         OpenQuerySidecarResult::Absent => {
             anyhow::bail!("repository graph is not built; run ferrus graph index")
@@ -530,6 +532,12 @@ async fn ready_query_sidecar() -> Result<Sidecar> {
             reason.supported_schema_version
         ),
     }
+}
+
+async fn sidecar_path() -> Result<PathBuf> {
+    Ok(project::current_project_data_dir()
+        .await?
+        .join(SIDECAR_FILE_NAME))
 }
 
 fn requested_budget(

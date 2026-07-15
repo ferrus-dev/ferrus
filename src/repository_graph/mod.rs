@@ -4,8 +4,6 @@
 //! state. `ferrus.db` remains the runtime source of truth; the SQLite module
 //! here owns only the deletable `repo-graph.db` sidecar.
 
-#[cfg(test)]
-mod benchmarks;
 pub mod config;
 pub mod diagnostics;
 mod diagnostics_sqlite;

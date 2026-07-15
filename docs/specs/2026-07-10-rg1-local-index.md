@@ -164,8 +164,9 @@ Expose index, status, search, show, and neighbors commands; add JSON output, hel
 the index on Ferrus, and record cold-build, no-op update, changed-file update, and query baselines.
 
 Implemented in `src/cli/commands/graph.rs` and `src/repository_graph/query_sqlite.rs`, with indexed and bounded
-SQLite lookup/traversal, human and JSON output, an explicit medium-fixture benchmark harness, Ferrus dogfood
-results in `docs/repository-graph-benchmarks.md`, and user-facing command documentation in `README.md`.
+SQLite lookup/traversal, human and JSON output, an explicit Criterion medium-fixture harness in
+`benches/repository_graph.rs`, Ferrus dogfood results in `docs/repository-graph-benchmarks.md`, and user-facing
+command documentation in `README.md`.
 
 ## Acceptance Criteria
 
