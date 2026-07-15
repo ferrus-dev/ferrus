@@ -596,7 +596,7 @@ impl ModuleGraph {
             let Some(node) = indexes.nodes.get(&target) else {
                 continue;
             };
-            if node.kind == "mod_declaration" {
+            if matches!(node.kind.as_str(), "mod_declaration" | "impl") {
                 continue;
             }
             if let Some(name) = string_property(node, "name") {
@@ -1880,6 +1880,30 @@ async-trait = "0.1"
                 .diagnostics
                 .iter()
                 .any(|diagnostic| { diagnostic.code.as_str() == "resolution.import_missing" })
+        );
+    }
+
+    #[test]
+    fn resolves_imports_without_treating_impl_blocks_as_named_children() {
+        let fragment = Fixture::new(&[(
+            "src/lib.rs",
+            br#"pub struct Foo;
+impl Foo { pub fn new() -> Self { Self } }
+mod consumer { use crate::Foo; }
+"#,
+        )])
+        .resolve();
+        let foo = node_named(&fragment, "struct", "Foo");
+
+        assert!(fragment.nodes.iter().any(|node| node.kind == "impl"));
+        assert!(fragment.edges.iter().any(|edge| {
+            edge.kind == "imports" && edge.target == EdgeTarget::Node(foo.id.clone())
+        }));
+        assert!(
+            !fragment
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "resolution.import_ambiguous")
         );
     }
 
