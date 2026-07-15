@@ -351,6 +351,8 @@ fn insert_diagnostics(
          ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
     for diagnostic in diagnostics {
+        // Source diagnostics may name paths that were deliberately omitted from
+        // `files` (for example sensitive, binary, symlink, or runtime paths).
         let (path, span) = diagnostic
             .location
             .as_ref()

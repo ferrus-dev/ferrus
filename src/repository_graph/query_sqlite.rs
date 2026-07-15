@@ -8,6 +8,7 @@ use std::{
 
 use rusqlite::{Row, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::{
     QUERY_WIRE_VERSION,
@@ -150,11 +151,7 @@ impl<'a> SqliteGraphQuery<'a> {
         request: &SearchRequest,
         offset: u64,
     ) -> Result<Vec<(GraphNode, f64)>, QueryError> {
-        validate_filters(&request.node_kinds, request.paths.len())?;
         let text = request.text.trim();
-        if text.is_empty() || text.len() > MAX_QUERY_TEXT_BYTES {
-            return Err(invalid_request("search text must contain 1..=512 bytes"));
-        }
         let normalized = text.to_lowercase();
         let escaped = escape_like(&normalized);
         let prefix = format!("{escaped}%");
@@ -363,7 +360,14 @@ impl GraphQuery for SqliteGraphQuery<'_> {
     fn search(&self, request: &SearchRequest) -> Result<SearchResponse, QueryError> {
         let started = Instant::now();
         let scope = self.resolve_scope(&request.scope)?;
-        let offset = decode_cursor(request.page.cursor.as_ref(), "search", &scope.snapshot.id)?;
+        validate_search_request(request)?;
+        let fingerprint = search_cursor_fingerprint(request)?;
+        let offset = decode_cursor(
+            request.page.cursor.as_ref(),
+            "search",
+            &scope.snapshot.id,
+            &fingerprint,
+        )?;
         let rows = self.search_rows(&scope, request, offset)?;
         let mut hits = Vec::new();
         let mut returned_bytes = 0_u64;
@@ -391,7 +395,12 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             hits.len(),
             returned_bytes,
             0,
-            Some(("search", &scope.snapshot.id, offset + hits.len() as u64)),
+            Some((
+                "search",
+                &scope.snapshot.id,
+                &fingerprint,
+                offset + hits.len() as u64,
+            )),
         )?;
         Ok(QueryResponse {
             wire_version: QUERY_WIRE_VERSION,
@@ -407,7 +416,13 @@ impl GraphQuery for SqliteGraphQuery<'_> {
     fn show(&self, request: &ShowRequest) -> Result<ShowResponse, QueryError> {
         let started = Instant::now();
         let scope = self.resolve_scope(&request.scope)?;
-        let offset = decode_cursor(request.page.cursor.as_ref(), "show", &scope.snapshot.id)?;
+        let fingerprint = show_cursor_fingerprint(request)?;
+        let offset = decode_cursor(
+            request.page.cursor.as_ref(),
+            "show",
+            &scope.snapshot.id,
+            &fingerprint,
+        )?;
         let rows = self.show_rows(&scope, request, offset)?;
         if rows.is_empty() && offset == 0 {
             return Err(invalid_request("graph lookup matched no nodes"));
@@ -437,7 +452,12 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             nodes.len(),
             returned_bytes,
             0,
-            Some(("show", &scope.snapshot.id, offset + nodes.len() as u64)),
+            Some((
+                "show",
+                &scope.snapshot.id,
+                &fingerprint,
+                offset + nodes.len() as u64,
+            )),
         )?;
         Ok(QueryResponse {
             wire_version: QUERY_WIRE_VERSION,
@@ -672,6 +692,15 @@ fn validate_filters(filters: &[String], path_count: usize) -> Result<(), QueryEr
     Ok(())
 }
 
+fn validate_search_request(request: &SearchRequest) -> Result<(), QueryError> {
+    validate_filters(&request.node_kinds, request.paths.len())?;
+    let text = request.text.trim();
+    if text.is_empty() || text.len() > MAX_QUERY_TEXT_BYTES {
+        return Err(invalid_request("search text must contain 1..=512 bytes"));
+    }
+    Ok(())
+}
+
 fn freshness(expected: &Digest, actual: Option<&Digest>) -> FreshnessEnvelope {
     match actual {
         Some(actual) if actual == expected => FreshnessEnvelope {
@@ -801,7 +830,7 @@ fn page_info(
     returned_results: usize,
     returned_bytes: u64,
     explored_depth: u32,
-    cursor: Option<(&str, &SnapshotId, u64)>,
+    cursor: Option<(&str, &SnapshotId, &str, u64)>,
 ) -> Result<PageInfo, QueryError> {
     let truncation = reason.map(|reason| Truncation {
         reason,
@@ -810,8 +839,8 @@ fn page_info(
         explored_depth,
     });
     let next_cursor = match (truncation.as_ref(), cursor) {
-        (Some(_), Some((operation, snapshot, offset))) => {
-            Some(encode_cursor(operation, snapshot, offset)?)
+        (Some(_), Some((operation, snapshot, fingerprint, offset))) => {
+            Some(encode_cursor(operation, snapshot, fingerprint, offset)?)
         }
         _ => None,
     };
@@ -826,18 +855,21 @@ struct CursorPayload {
     version: u32,
     operation: String,
     snapshot_id: SnapshotId,
+    query_fingerprint: String,
     offset: u64,
 }
 
 fn encode_cursor(
     operation: &str,
     snapshot: &SnapshotId,
+    query_fingerprint: &str,
     offset: u64,
 ) -> Result<PageCursor, QueryError> {
     let payload = CursorPayload {
-        version: 1,
+        version: 2,
         operation: operation.to_string(),
         snapshot_id: snapshot.clone(),
+        query_fingerprint: query_fingerprint.to_string(),
         offset,
     };
     let bytes = serde_json::to_vec(&payload).map_err(|_| backend_error())?;
@@ -848,6 +880,7 @@ fn decode_cursor(
     cursor: Option<&PageCursor>,
     operation: &str,
     snapshot: &SnapshotId,
+    query_fingerprint: &str,
 ) -> Result<u64, QueryError> {
     let Some(cursor) = cursor else {
         return Ok(0);
@@ -862,10 +895,60 @@ fn decode_cursor(
     let bytes = unhex(encoded).ok_or_else(stale_cursor_error)?;
     let payload: CursorPayload =
         serde_json::from_slice(&bytes).map_err(|_| stale_cursor_error())?;
-    if payload.version != 1 || payload.operation != operation || payload.snapshot_id != *snapshot {
+    if payload.version != 2
+        || payload.operation != operation
+        || payload.snapshot_id != *snapshot
+        || payload.query_fingerprint != query_fingerprint
+    {
         return Err(stale_cursor_error());
     }
     Ok(payload.offset)
+}
+
+#[derive(Serialize)]
+struct SearchCursorParameters<'a> {
+    text: String,
+    node_kinds: Vec<&'a str>,
+    paths: Vec<&'a str>,
+}
+
+fn search_cursor_fingerprint(request: &SearchRequest) -> Result<String, QueryError> {
+    let mut node_kinds = request
+        .node_kinds
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    node_kinds.sort_unstable();
+    node_kinds.dedup();
+    let mut paths = request
+        .paths
+        .iter()
+        .map(RepoPath::as_str)
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    cursor_fingerprint(
+        "search",
+        &SearchCursorParameters {
+            text: request.text.trim().to_lowercase(),
+            node_kinds,
+            paths,
+        },
+    )
+}
+
+fn show_cursor_fingerprint(request: &ShowRequest) -> Result<String, QueryError> {
+    cursor_fingerprint("show", &request.lookup)
+}
+
+fn cursor_fingerprint<T: Serialize>(operation: &str, parameters: &T) -> Result<String, QueryError> {
+    let bytes = serde_json::to_vec(parameters).map_err(|_| backend_error())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrus.repository-graph.cursor-parameters.v1\0");
+    hasher.update(operation.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    Ok(hex(&hasher.finalize()))
 }
 
 fn decode_node(row: &Row<'_>) -> Result<GraphNode, QueryError> {
@@ -1120,7 +1203,8 @@ fn stale_cursor_error() -> QueryError {
     QueryError {
         wire_version: QUERY_WIRE_VERSION,
         code: QueryErrorCode::StaleCursor,
-        message: "repository graph cursor does not match this query snapshot".to_string(),
+        message: "repository graph cursor does not match this query snapshot or parameters"
+            .to_string(),
         retryable: false,
         details: BTreeMap::new(),
     }
@@ -1266,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn service_limits_cap_results_and_cursor_is_snapshot_bound() {
+    fn service_limits_cap_results_and_cursors_are_query_bound() {
         let (_source, _sidecar_dir, sidecar, mut config) = indexed_fixture();
         config.query_limits.max_results = 1;
         let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
@@ -1285,6 +1369,57 @@ mod tests {
             TruncationReason::Results
         );
         assert!(first.page.next_cursor.is_some());
+        let cursor = first.page.next_cursor.unwrap();
+
+        query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "rust".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest {
+                    cursor: Some(cursor.clone()),
+                },
+            })
+            .unwrap();
+
+        for (text, node_kinds, paths) in [
+            ("RuntimeTaskContext", vec![], vec![]),
+            ("rust", vec!["struct".to_string()], vec![]),
+            ("rust", vec![], vec![RepoPath::new("src").unwrap()]),
+        ] {
+            let error = query
+                .search(&SearchRequest {
+                    scope: scope(&config),
+                    text: text.to_string(),
+                    node_kinds,
+                    paths,
+                    page: super::super::query::PageRequest {
+                        cursor: Some(cursor.clone()),
+                    },
+                })
+                .unwrap_err();
+            assert_eq!(error.code, QueryErrorCode::StaleCursor);
+        }
+
+        let shown = query
+            .show(&ShowRequest {
+                scope: scope(&config),
+                lookup: ShowLookup::Path(RepoPath::new("src/lib.rs").unwrap()),
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+        let show_cursor = shown.page.next_cursor.unwrap();
+        let error = query
+            .show(&ShowRequest {
+                scope: scope(&config),
+                lookup: ShowLookup::Path(RepoPath::new("Cargo.toml").unwrap()),
+                page: super::super::query::PageRequest {
+                    cursor: Some(show_cursor),
+                },
+            })
+            .unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::StaleCursor);
 
         let error = query
             .search(&SearchRequest {

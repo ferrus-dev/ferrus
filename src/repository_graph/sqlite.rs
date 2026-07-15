@@ -216,8 +216,7 @@ const MIGRATIONS: &[Migration] = &[
             span_start_byte INTEGER CHECK (span_start_byte IS NULL OR span_start_byte >= 0),
             span_end_byte INTEGER CHECK (span_end_byte IS NULL OR span_end_byte >= span_start_byte),
             metadata_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (snapshot_id, path) REFERENCES files(snapshot_id, path)
+            created_at TEXT NOT NULL
         ) STRICT;
 
         CREATE INDEX diagnostics_build_idx ON diagnostics(build_id, severity, id);

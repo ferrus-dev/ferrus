@@ -729,7 +729,7 @@ mod tests {
     use super::*;
     use crate::repository_graph::{
         config::{AnalyzerSettings, ConfigScalar},
-        domain::{RepositoryId, RepositoryNamespace, RepositoryRef},
+        domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef},
         ports::{RepositorySource, SourceContent},
         source::{FilesystemRepositorySource, SourceDiscoveryContext},
         sqlite::{OpenSidecarResult, Sidecar, open_for_build_at},
@@ -846,6 +846,59 @@ mod tests {
                 .index_build_metrics(&BuildId::new("build-2").unwrap())
                 .unwrap(),
             Some(second.metrics)
+        );
+    }
+
+    #[test]
+    fn skipped_path_diagnostics_publish_without_file_rows() {
+        let repository_dir = tempfile::tempdir().unwrap();
+        fixture_repository(repository_dir.path());
+        write(
+            &repository_dir.path().join(".ferrus/project.toml"),
+            b"project_id='local-only'\n",
+        );
+        let config = RepositoryGraphConfig::default();
+        let source = discover(repository_dir.path(), &config);
+        assert!(
+            source
+                .manifest()
+                .files
+                .iter()
+                .all(|file| file.path.as_str() != ".ferrus")
+        );
+        assert!(source.manifest().diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "runtime_path_excluded"
+                && diagnostic.path.as_ref().map(RepoPath::as_str) == Some(".ferrus")
+        }));
+
+        let (_sidecar_dir, mut sidecar) = sidecar();
+        let outcome = run(&mut sidecar, &source, &config, "build-skipped", false).unwrap();
+        let persisted_path: Option<String> = sidecar
+            .connection()
+            .query_row(
+                "SELECT path FROM diagnostics WHERE snapshot_id = ?1 \
+                 AND code = 'runtime_path_excluded'",
+                [outcome.snapshot.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_path.as_deref(), Some(".ferrus"));
+        let omitted_file_rows: i64 = sidecar
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = '.ferrus'",
+                [outcome.snapshot.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omitted_file_rows, 0);
+        assert_eq!(
+            sidecar
+                .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+                .unwrap()
+                .unwrap()
+                .id,
+            outcome.snapshot.id
         );
     }
 
