@@ -1791,6 +1791,49 @@ use serde::Serialize;
     }
 
     #[test]
+    fn resolves_block_local_imports_from_the_enclosing_module() {
+        let fragment = Fixture::new(&[
+            ("Cargo.toml", b"[package]\nname='app'\nversion='0.1.0'\n"),
+            (
+                "src/lib.rs",
+                b"mod api;\nfn load() { use crate::api::Api; }\n",
+            ),
+            ("src/api.rs", b"pub struct Api;\n"),
+        ])
+        .resolve();
+        let api = node_named(&fragment, "struct", "Api");
+        let load = node_named(&fragment, "function", "load");
+        let import = fragment
+            .nodes
+            .iter()
+            .find(|node| node.kind == "import")
+            .expect("block-local import node");
+
+        let import_edge = fragment
+            .edges
+            .iter()
+            .find(|edge| edge.kind == "imports" && edge.target == EdgeTarget::Node(api.id.clone()))
+            .expect("resolved block-local import edge");
+        assert!(
+            fragment
+                .nodes
+                .iter()
+                .any(|node| node.id == import_edge.source && node.kind == "module")
+        );
+        assert!(fragment.edges.iter().any(|edge| {
+            edge.kind == "contains"
+                && edge.source == load.id
+                && edge.target == EdgeTarget::Node(import.id.clone())
+        }));
+        assert!(
+            !fragment
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code.as_str() == "resolution.import_missing" })
+        );
+    }
+
+    #[test]
     fn resolves_nested_inline_module_layout_and_super_imports() {
         let fragment = Fixture::new(&[
             ("Cargo.toml", b"[package]\nname='app'\nversion='0.1.0'\n"),

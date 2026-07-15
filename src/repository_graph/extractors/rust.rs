@@ -146,8 +146,15 @@ impl Extractor for RustSyntaxExtractor {
         }
 
         let mut stack = Vec::new();
-        let mut timed_out =
-            !push_named_children(&mut stack, root, root_id, vec![root_name], started, budget);
+        let mut timed_out = !push_named_children(
+            &mut stack,
+            root,
+            root_id.clone(),
+            root_id,
+            vec![root_name],
+            started,
+            budget,
+        );
 
         while !timed_out {
             let Some(work) = stack.pop() else {
@@ -165,16 +172,21 @@ impl Extractor for RustSyntaxExtractor {
             }
 
             let mut child_parent = work.parent_id.clone();
+            let mut child_module = work.module_id.clone();
             let mut child_scope = work.scope.clone();
             if let Some(mut declaration) = declaration(work.node, input.content) {
                 if declaration.enforce_source_value_limit() {
                     diagnostics.push("rust.source_value_limit", Some(span(work.node)));
                 }
+                let opens_module = declaration.kind == "module";
                 let built = build_declaration(input, &work, declaration);
                 if !facts.push_declaration(built.node, built.containment, built.relationship) {
                     break;
                 }
-                child_parent = built.id;
+                child_parent = built.id.clone();
+                if opens_module {
+                    child_module = built.id;
+                }
                 if let Some(scope_segment) = built.scope_segment {
                     child_scope.push(scope_segment);
                 }
@@ -188,6 +200,7 @@ impl Extractor for RustSyntaxExtractor {
                 &mut stack,
                 work.node,
                 child_parent,
+                child_module,
                 child_scope,
                 started,
                 budget,
@@ -220,6 +233,7 @@ impl Extractor for RustSyntaxExtractor {
 struct WorkItem<'tree> {
     node: Node<'tree>,
     parent_id: NodeId,
+    module_id: NodeId,
     scope: Vec<String>,
 }
 
@@ -227,6 +241,7 @@ fn push_named_children<'tree>(
     stack: &mut Vec<WorkItem<'tree>>,
     node: Node<'tree>,
     parent_id: NodeId,
+    module_id: NodeId,
     scope: Vec<String>,
     started: Instant,
     budget: Duration,
@@ -242,6 +257,7 @@ fn push_named_children<'tree>(
             stack.push(WorkItem {
                 node: child,
                 parent_id: parent_id.clone(),
+                module_id: module_id.clone(),
                 scope: scope.clone(),
             });
         }
@@ -563,7 +579,7 @@ fn build_declaration(
         graph_edge(
             input,
             relationship.kind,
-            work.parent_id.clone(),
+            work.module_id.clone(),
             EdgeTarget::Unresolved(relationship.target),
             declaration_span,
             ResolutionState::Unresolved,
@@ -930,6 +946,52 @@ pub mod api {
             EdgeTarget::Unresolved("crate::private::Thing".to_string())
         );
         assert!(fragment.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn block_local_import_relationships_use_the_nearest_module() {
+        let fragment = extract(
+            "src/lib.rs",
+            br#"
+mod api { pub struct Api; }
+fn root_scope() { use crate::api::Api; }
+mod nested {
+    fn nested_scope() { use crate::api::Api; }
+}
+"#,
+        );
+        let imports = fragment
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "imports")
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().all(|edge| {
+            fragment
+                .nodes
+                .iter()
+                .any(|node| node.id == edge.source && node.kind == "module")
+        }));
+
+        let import_ids = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "import")
+            .map(|node| &node.id)
+            .collect::<BTreeSet<_>>();
+        let function_ids = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "function")
+            .map(|node| &node.id)
+            .collect::<BTreeSet<_>>();
+        assert!(import_ids.iter().all(|import| {
+            fragment.edges.iter().any(|edge| {
+                edge.kind == "contains"
+                    && function_ids.contains(&edge.source)
+                    && edge.target == EdgeTarget::Node((*import).clone())
+            })
+        }));
     }
 
     #[test]
