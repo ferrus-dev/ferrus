@@ -1,6 +1,6 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -279,35 +279,7 @@ async fn status(json: bool) -> Result<()> {
     let sidecar_path = sidecar_path().await?;
     let health = inspect_health_at(&sidecar_path)?;
     let freshness_comparison = context.freshness_comparison().ok().flatten();
-    let graph = match open_for_query_at(&sidecar_path)? {
-        OpenQuerySidecarResult::Ready(sidecar) => {
-            let query = SqliteGraphQuery::new(
-                &sidecar,
-                context.config.query_limits.clone(),
-                freshness_comparison,
-            );
-            query.status(&StatusRequest {
-                scope: context.scope(default_budget(&context.config.query_limits)?)?,
-            })?
-        }
-        OpenQuerySidecarResult::Absent => unavailable_status(
-            context.repository.clone(),
-            Availability::NotBuilt,
-            "not_built",
-        )?,
-        OpenQuerySidecarResult::NeedsMigration {
-            found_schema_version,
-        } => unavailable_status(
-            context.repository.clone(),
-            Availability::Incompatible,
-            &format!("schema_{found_schema_version}_needs_migration"),
-        )?,
-        OpenQuerySidecarResult::RequiresRebuild(_) => unavailable_status(
-            context.repository.clone(),
-            Availability::Incompatible,
-            "incompatible_schema",
-        )?,
-    };
+    let graph = status_response_at(&context, &sidecar_path, freshness_comparison)?;
     let output = StatusOutput { health, graph };
     if json {
         print_json(&output)?;
@@ -338,6 +310,47 @@ async fn status(json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn status_response_at(
+    context: &LocalGraphContext,
+    sidecar_path: &Path,
+    freshness_comparison: Option<FreshnessComparison>,
+) -> Result<StatusResponse> {
+    match open_for_query_at(sidecar_path) {
+        Ok(OpenQuerySidecarResult::Ready(sidecar)) => {
+            let query = SqliteGraphQuery::new(
+                &sidecar,
+                context.config.query_limits.clone(),
+                freshness_comparison,
+            );
+            Ok(query.status(&StatusRequest {
+                scope: context.scope(default_budget(&context.config.query_limits)?)?,
+            })?)
+        }
+        Ok(OpenQuerySidecarResult::Absent) => unavailable_status(
+            context.repository.clone(),
+            Availability::NotBuilt,
+            "not_built",
+        ),
+        Ok(OpenQuerySidecarResult::NeedsMigration {
+            found_schema_version,
+        }) => unavailable_status(
+            context.repository.clone(),
+            Availability::Incompatible,
+            &format!("schema_{found_schema_version}_needs_migration"),
+        ),
+        Ok(OpenQuerySidecarResult::RequiresRebuild(_)) => unavailable_status(
+            context.repository.clone(),
+            Availability::Incompatible,
+            "incompatible_schema",
+        ),
+        Err(_) => unavailable_status(
+            context.repository.clone(),
+            Availability::Incompatible,
+            "sidecar_unreadable",
+        ),
+    }
 }
 
 async fn search(
@@ -682,5 +695,25 @@ mod tests {
     fn evidence_locations_are_repository_relative() {
         let path = RepoPath::new("src/main.rs").unwrap();
         assert_eq!(evidence_location(Some(&path), None), "src/main.rs");
+    }
+
+    #[test]
+    fn unreadable_sidecar_is_reported_as_incompatible_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join(SIDECAR_FILE_NAME);
+        std::fs::write(&sidecar_path, b"not a sqlite database").unwrap();
+        let context = LocalGraphContext {
+            root: directory.path().to_path_buf(),
+            repository: RepositoryRef {
+                namespace: RepositoryNamespace::new("local:test").unwrap(),
+                repository_id: RepositoryId::new("root").unwrap(),
+            },
+            config: RepositoryGraphConfig::default(),
+        };
+
+        let response = status_response_at(&context, &sidecar_path, None).unwrap();
+
+        assert_eq!(response.data.availability, Availability::Incompatible);
+        assert_eq!(response.freshness.reason_codes, ["sidecar_unreadable"]);
     }
 }

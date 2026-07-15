@@ -338,12 +338,13 @@ impl<'a> SqliteGraphQuery<'a> {
             .transpose()
     }
 
-    fn edges(
+    fn edges<'edge>(
         &self,
         snapshot: &SnapshotId,
         node: &NodeId,
         direction: EdgeDirection,
         kinds: &[String],
+        excluded: impl IntoIterator<Item = &'edge EdgeId>,
         limit: u32,
     ) -> Result<Vec<GraphEdge>, QueryError> {
         let predicate = match direction {
@@ -355,9 +356,20 @@ impl<'a> SqliteGraphQuery<'a> {
             "SELECT {EDGE_COLUMNS} FROM edges \
              WHERE snapshot_id = ?1 AND {predicate} \
                AND (?3 = '[]' OR kind IN (SELECT value FROM json_each(?3))) \
-             ORDER BY id LIMIT ?4"
+               AND NOT EXISTS (\
+                   SELECT 1 FROM json_each(?4) AS seen_edge \
+                   WHERE seen_edge.value = edges.id\
+               ) \
+             ORDER BY id LIMIT ?5"
         );
         let kinds = serde_json::to_string(kinds).map_err(|_| backend_error())?;
+        let excluded = serde_json::to_string(
+            &excluded
+                .into_iter()
+                .map(|edge| edge.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| backend_error())?;
         let mut statement = self
             .sidecar
             .connection()
@@ -368,6 +380,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 snapshot.as_str(),
                 node.as_str(),
                 kinds,
+                excluded,
                 i64::from(limit.saturating_add(1)),
             ])
             .map_err(|_| backend_error())?;
@@ -613,6 +626,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                         &current,
                         request.direction,
                         &request.edge_kinds,
+                        std::iter::empty::<&EdgeId>(),
                         1,
                     )?
                     .is_empty()
@@ -634,6 +648,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 &current,
                 request.direction,
                 &request.edge_kinds,
+                edges.keys(),
                 remaining,
             )? {
                 if edges.contains_key(&edge.id) {
@@ -1560,6 +1575,48 @@ mod tests {
             TruncationReason::Bytes
         );
         assert!(response.page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn edge_limit_is_applied_after_seen_edges_are_excluded() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let (snapshot, node): (String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT edges.snapshot_id, nodes.id \
+                 FROM nodes \
+                 JOIN edges ON edges.snapshot_id = nodes.snapshot_id \
+                   AND (edges.source_node_id = nodes.id OR edges.target_node_id = nodes.id) \
+                 GROUP BY edges.snapshot_id, nodes.id \
+                 HAVING COUNT(*) >= 2 \
+                 ORDER BY nodes.id \
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let snapshot = SnapshotId::new(snapshot).unwrap();
+        let node = NodeId::new(node).unwrap();
+        let all = query
+            .edges(
+                &snapshot,
+                &node,
+                EdgeDirection::Both,
+                &[],
+                std::iter::empty::<&EdgeId>(),
+                16,
+            )
+            .unwrap();
+        assert!(all.len() >= 2);
+        let seen = [all[0].id.clone()];
+
+        let unseen = query
+            .edges(&snapshot, &node, EdgeDirection::Both, &[], seen.iter(), 1)
+            .unwrap();
+
+        assert_eq!(unseen.first().map(|edge| &edge.id), Some(&all[1].id));
+        assert!(unseen.iter().all(|edge| edge.id != seen[0]));
     }
 
     #[test]
