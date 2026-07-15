@@ -971,7 +971,7 @@ fn dependency_aliases(
             result
                 .entry(owner.clone())
                 .or_default()
-                .entry(normalize_identifier(alias))
+                .entry(normalize_crate_name(alias))
                 .or_default()
                 .push(target.clone());
         }
@@ -1566,6 +1566,10 @@ fn normalize_identifier(value: &str) -> String {
     value.strip_prefix("r#").unwrap_or(value).to_string()
 }
 
+fn normalize_crate_name(value: &str) -> String {
+    normalize_identifier(value).replace('-', "_")
+}
+
 fn escape_component(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1788,6 +1792,52 @@ use serde::Serialize;
         }));
         assert!(fragment.edges.iter().all(|edge| edge.kind != "calls"));
         assert!(fragment.edges.iter().all(|edge| edge.kind != "implements"));
+    }
+
+    #[test]
+    fn resolves_hyphenated_dependency_aliases_with_rust_crate_names() {
+        let fragment = Fixture::new(&[
+            (
+                "Cargo.toml",
+                br#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+internal-dep = { path = "internal-dep" }
+async-trait = "0.1"
+"#,
+            ),
+            (
+                "internal-dep/Cargo.toml",
+                b"[package]\nname='internal-dep'\nversion='0.1.0'\n",
+            ),
+            (
+                "src/lib.rs",
+                b"use internal_dep::Thing;\nuse async_trait::async_trait;\n",
+            ),
+            ("internal-dep/src/lib.rs", b"pub struct Thing;\n"),
+        ])
+        .resolve();
+        let thing = node_named(&fragment, "struct", "Thing");
+
+        assert!(fragment.edges.iter().any(|edge| {
+            edge.kind == "imports" && edge.target == EdgeTarget::Node(thing.id.clone())
+        }));
+        assert!(fragment.edges.iter().any(|edge| {
+            edge.kind == "imports"
+                && matches!(
+                    &edge.target,
+                    EdgeTarget::External(path)
+                        if path == "rust-path:async_trait::async_trait"
+                )
+        }));
+        assert!(
+            !fragment
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "resolution.import_missing")
+        );
     }
 
     #[test]

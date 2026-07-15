@@ -838,8 +838,8 @@ fn page_info(
         returned_bytes,
         explored_depth,
     });
-    let next_cursor = match (truncation.as_ref(), cursor) {
-        (Some(_), Some((operation, snapshot, fingerprint, offset))) => {
+    let next_cursor = match (truncation.as_ref(), cursor, returned_results) {
+        (Some(_), Some((operation, snapshot, fingerprint, offset)), 1..) => {
             Some(encode_cursor(operation, snapshot, fingerprint, offset)?)
         }
         _ => None,
@@ -1433,6 +1433,30 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, QueryErrorCode::StaleCursor);
+    }
+
+    #[test]
+    fn oversized_first_search_hit_returns_terminal_byte_truncation() {
+        let (_source, _sidecar_dir, sidecar, mut config) = indexed_fixture();
+        config.query_limits.max_bytes = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+
+        let response = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+
+        assert!(response.data.hits.is_empty());
+        assert_eq!(
+            response.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Bytes
+        );
+        assert!(response.page.next_cursor.is_none());
     }
 
     #[test]
