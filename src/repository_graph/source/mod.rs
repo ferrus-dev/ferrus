@@ -1213,6 +1213,13 @@ impl SourcePolicy {
         if !self.include_generated && is_generated(path) {
             return Some("generated_path_excluded");
         }
+        if !self
+            .include
+            .iter()
+            .any(|pattern| glob_may_match_descendant(pattern, path.as_str()))
+        {
+            return Some("path_not_included");
+        }
         if self.has_negated_rules {
             return None;
         }
@@ -1263,6 +1270,40 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
             .any(|component| component_matches(pattern_components[0], component));
     }
     components_match(&pattern_components, &path_components)
+}
+
+fn glob_may_match_descendant(pattern: &str, directory: &str) -> bool {
+    let pattern_components = pattern.split('/').collect::<Vec<_>>();
+    if pattern_components.len() == 1 {
+        return true;
+    }
+    let directory_components = directory.split('/').collect::<Vec<_>>();
+    let mut reachable = BTreeSet::from([(0_usize, 0_usize)]);
+    let mut visited = BTreeSet::new();
+    while let Some(state) = reachable.pop_first() {
+        if !visited.insert(state) {
+            continue;
+        }
+        let (pattern_index, directory_index) = state;
+        if directory_index == directory_components.len() && pattern_index < pattern_components.len()
+        {
+            return true;
+        }
+        let Some(component) = pattern_components.get(pattern_index) else {
+            continue;
+        };
+        if *component == "**" {
+            reachable.insert((pattern_index + 1, directory_index));
+            if directory_index < directory_components.len() {
+                reachable.insert((pattern_index, directory_index + 1));
+            }
+        } else if let Some(directory_component) = directory_components.get(directory_index)
+            && component_matches(component, directory_component)
+        {
+            reachable.insert((pattern_index + 1, directory_index + 1));
+        }
+    }
+    false
 }
 
 fn sensitive_glob_matches(pattern: &str, path: &str) -> bool {
@@ -1344,6 +1385,23 @@ mod tests {
         assert!(glob_matches("**/.env", ".env"));
         assert!(glob_matches("**/.env", "nested/.env"));
         assert!(!glob_matches("src/**", "Cargo.toml"));
+    }
+
+    #[test]
+    fn include_globs_identify_only_directories_with_possible_descendants() {
+        assert!(glob_may_match_descendant("src/**", "src"));
+        assert!(glob_may_match_descendant("src/**", "src/nested"));
+        assert!(!glob_may_match_descendant("src/**", "docs"));
+        assert!(glob_may_match_descendant(
+            "crates/*/Cargo.toml",
+            "crates/example"
+        ));
+        assert!(!glob_may_match_descendant(
+            "crates/*/Cargo.toml",
+            "crates/example/nested"
+        ));
+        assert!(glob_may_match_descendant("Cargo.toml", "any/nesting"));
+        assert!(glob_may_match_descendant("**/src/**", "docs"));
     }
 
     #[test]

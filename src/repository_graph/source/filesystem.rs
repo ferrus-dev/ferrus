@@ -691,6 +691,47 @@ mod tests {
     }
 
     #[test]
+    fn include_filters_prune_unmatchable_trees_before_hard_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        fs::create_dir_all(directory.path().join("docs/one/two/three")).unwrap();
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            b"pub struct Included;\n",
+        )
+        .unwrap();
+        for index in 0..4 {
+            fs::write(
+                directory.path().join(format!("docs/one/file-{index}.md")),
+                b"excluded\n",
+            )
+            .unwrap();
+        }
+        let mut config = RepositoryGraphConfig::default();
+        config.source.include = BTreeSet::from(["src/**".to_string()]);
+        config.index_limits.max_files = 1;
+        config.index_limits.max_directories = 2;
+
+        let source = FilesystemRepositorySource::discover(directory.path(), context(&config))
+            .expect("unmatchable trees must not consume discovery limits");
+        assert_eq!(
+            source
+                .manifest()
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
+        assert_eq!(source.manifest().metrics.candidates, 1);
+        assert_eq!(source.manifest().metrics.directories, 2);
+        assert!(source.manifest().diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "path_not_included"
+                && diagnostic.path.as_ref().map(RepoPath::as_str) == Some("docs")
+        }));
+    }
+
+    #[test]
     fn per_file_and_diagnostic_limits_produce_bounded_skips() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("large.txt"), b"too large").unwrap();

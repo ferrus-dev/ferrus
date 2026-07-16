@@ -267,29 +267,58 @@ where
             }
         }
 
-        let publication = self
-            .store
-            .publish(&PublishRequest {
-                repository: manifest.revision.repository.clone(),
-                view_name: request.view_name,
-                build_id: build.id.clone(),
-                expected,
-            })
-            .map_err(|_| {
+        let publication = self.store.publish(&PublishRequest {
+            repository: manifest.revision.repository.clone(),
+            view_name: request.view_name.clone(),
+            build_id: build.id.clone(),
+            expected: expected.clone(),
+        });
+        let (publication, build_needs_supersede) = match publication {
+            Ok(PublicationOutcome::Published { view }) => {
+                let build_needs_supersede = view.build_id != build.id;
+                (
+                    PublicationOutcome::Published { view },
+                    build_needs_supersede,
+                )
+            }
+            Ok(outcome @ PublicationOutcome::Superseded { .. }) => (outcome, false),
+            Err(_) => {
                 self.emit(
                     LifecycleEventKind::PublicationConflict,
                     &build,
                     Some(&completed.id),
                     &prepared.metrics,
                 );
-                IndexError::Publication
-            })?;
+                let current = self
+                    .store
+                    .published_view(&manifest.revision.repository, &request.view_name)
+                    .map_err(|_| IndexError::Publication)?;
+                let Some(current) = current else {
+                    return Err(IndexError::Publication);
+                };
+                let current_version = PublicationVersion {
+                    snapshot_id: current.snapshot_id.clone(),
+                    generation: current.generation,
+                };
+                if current.build_id == build.id {
+                    (PublicationOutcome::Published { view: current }, false)
+                } else if expected.as_ref() != Some(&current_version) {
+                    (PublicationOutcome::Superseded { current }, true)
+                } else {
+                    return Err(IndexError::Publication);
+                }
+            }
+        };
         let publication_is_other_build = match &publication {
             PublicationOutcome::Published { view } => view.build_id != build.id,
             PublicationOutcome::Superseded { .. } => true,
         };
         if publication_is_other_build {
-            let _ = self.store.supersede_build(&build.id);
+            if build_needs_supersede {
+                self.store
+                    .supersede_build(&build.id)
+                    .map_err(|_| IndexError::Publication)?;
+            }
             self.emit(
                 LifecycleEventKind::BuildSuperseded,
                 &build,
@@ -727,12 +756,19 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, fs, path::Path};
+    use std::{
+        cell::Cell,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::*;
     use crate::repository_graph::{
         config::{AnalyzerSettings, ConfigScalar},
-        domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId},
+        domain::{
+            Digest, RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId,
+            SourceRevisionId,
+        },
         ports::{GraphQuery, RepositorySource, SourceContent},
         query::{QueryScope, SnapshotSelector, StatusRequest, StatusResponse},
         query_sqlite::{SqliteGraphQuery, default_budget},
@@ -903,6 +939,43 @@ mod tests {
                 .index_build_metrics(&BuildId::new("build-2").unwrap())
                 .unwrap(),
             Some(second.metrics)
+        );
+    }
+
+    #[test]
+    fn overlapping_publication_supersedes_the_completed_loser() {
+        let repository_dir = tempfile::tempdir().unwrap();
+        fixture_repository(repository_dir.path());
+        let config = RepositoryGraphConfig::default();
+        let (_sidecar_dir, mut sidecar) = sidecar();
+        let source = PublishingRaceSource {
+            inner: discover(repository_dir.path(), &config),
+            sidecar_path: sidecar.path().to_path_buf(),
+            revalidations: Cell::new(0),
+        };
+
+        let outcome = run(&mut sidecar, &source, &config, "build-loser", false).unwrap();
+        assert!(matches!(
+            outcome.publication,
+            PublicationOutcome::Superseded { ref current }
+                if current.build_id.as_str() == "build-winner"
+        ));
+        assert_eq!(
+            sidecar
+                .build(&BuildId::new("build-loser").unwrap())
+                .unwrap()
+                .unwrap()
+                .state,
+            BuildState::Superseded
+        );
+        assert_eq!(
+            sidecar
+                .published_view(&repository(), &PublishedViewName::new("canonical").unwrap())
+                .unwrap()
+                .unwrap()
+                .build_id
+                .as_str(),
+            "build-winner"
         );
     }
 
@@ -1230,6 +1303,12 @@ mod tests {
         revalidations: Cell<u32>,
     }
 
+    struct PublishingRaceSource {
+        inner: FilesystemRepositorySource,
+        sidecar_path: PathBuf,
+        revalidations: Cell<u32>,
+    }
+
     struct FailingReadSource(FilesystemRepositorySource);
 
     impl RepositorySource for FailingReadSource {
@@ -1274,6 +1353,68 @@ mod tests {
             let call = self.revalidations.get();
             self.revalidations.set(call + 1);
             Ok(call == 0)
+        }
+    }
+
+    impl RepositorySource for PublishingRaceSource {
+        type Error = SourceError;
+
+        fn repository(&self) -> &RepositoryRef {
+            self.inner.repository()
+        }
+
+        fn manifest(&self) -> &SourceManifest {
+            self.inner.manifest()
+        }
+
+        fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error> {
+            self.inner.read_verified(file)
+        }
+
+        fn revalidate(&self) -> Result<bool, Self::Error> {
+            let call = self.revalidations.get();
+            self.revalidations.set(call + 1);
+            if call == 1 {
+                let OpenSidecarResult::Ready(mut sidecar) =
+                    open_for_build_at(&self.sidecar_path).unwrap()
+                else {
+                    panic!("current sidecar unexpectedly requires rebuild");
+                };
+                let winner = GraphBuild {
+                    id: BuildId::new("build-winner").unwrap(),
+                    repository: self.inner.manifest().revision.repository.clone(),
+                    source_revision_id: SourceRevisionId::new("revision-winner").unwrap(),
+                    prospective_snapshot_id: SnapshotId::new("snapshot:winner").unwrap(),
+                    state: BuildState::Building,
+                };
+                sidecar.start_build(&winner).unwrap();
+                sidecar
+                    .complete_build(&GraphSnapshot {
+                        id: winner.prospective_snapshot_id.clone(),
+                        repository: winner.repository.clone(),
+                        source_revision_id: winner.source_revision_id.clone(),
+                        source_manifest_digest: Digest::new("sha256", "00").unwrap(),
+                        graph_model_version: GRAPH_MODEL_VERSION,
+                        analysis_config_digest: self
+                            .inner
+                            .manifest()
+                            .revision
+                            .analysis_config_digest
+                            .clone(),
+                        extractor_set_digest: self.inner.manifest().extractor_set_digest.clone(),
+                        completed_by: winner.id.clone(),
+                    })
+                    .unwrap();
+                sidecar
+                    .publish(&PublishRequest {
+                        repository: winner.repository,
+                        view_name: PublishedViewName::new("canonical").unwrap(),
+                        build_id: winner.id,
+                        expected: None,
+                    })
+                    .unwrap();
+            }
+            Ok(true)
         }
     }
 }
