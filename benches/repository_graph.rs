@@ -7,7 +7,7 @@ use ferrus::repository_graph::{
     index::{IndexCoordinator, IndexOutcome, IndexRequest, active_extractor_identities},
     ports::GraphQuery,
     query::{PageRequest, QueryScope, SearchRequest, SnapshotSelector},
-    query_sqlite::{SqliteGraphQuery, default_budget},
+    query_sqlite::{FreshnessComparison, SqliteGraphQuery, default_budget},
     source::{FilesystemRepositorySource, SourceDiscoveryContext},
     sqlite::{OpenSidecarResult, Sidecar, open_for_build_at},
 };
@@ -132,7 +132,7 @@ fn verify_invariants() {
 
     fixture.change_one_file();
     let source = fixture.discover();
-    let compared_manifest = source.manifest().revision.manifest_digest.clone();
+    let freshness_comparison = FreshnessComparison::from_manifest(source.manifest());
     let changed = fixture.index(&source, "verify-changed");
     assert_eq!(
         changed.metrics.reused_files,
@@ -143,7 +143,7 @@ fn verify_invariants() {
     let query = SqliteGraphQuery::new(
         &fixture.sidecar,
         fixture.config.query_limits.clone(),
-        Some(compared_manifest),
+        Some(freshness_comparison),
     );
     let search = query.search(&search_request(&fixture)).unwrap();
     assert!(!search.data.hits.is_empty());
@@ -208,11 +208,11 @@ fn repository_graph_benchmarks(criterion: &mut Criterion) {
     indexing.finish();
 
     let (search_fixture, search_source) = prepare_noop();
-    let compared_manifest = search_source.manifest().revision.manifest_digest.clone();
+    let freshness_comparison = FreshnessComparison::from_manifest(search_source.manifest());
     let query = SqliteGraphQuery::new(
         &search_fixture.sidecar,
         search_fixture.config.query_limits.clone(),
-        Some(compared_manifest),
+        Some(freshness_comparison),
     );
     let request = search_request(&search_fixture);
     let mut querying = criterion.benchmark_group("repository_graph/query");
