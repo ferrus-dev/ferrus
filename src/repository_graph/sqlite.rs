@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 4;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 5;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +347,17 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX nodes_normalized_name_idx ON nodes(snapshot_id, normalized_name, id);
     "#,
     },
+    Migration {
+        version: 5,
+        sql: r#"
+        CREATE TABLE snapshot_diagnostic_sets (
+            snapshot_id TEXT PRIMARY KEY NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            build_id TEXT NOT NULL REFERENCES index_builds(id)
+        ) STRICT;
+        INSERT INTO snapshot_diagnostic_sets(snapshot_id, build_id)
+        SELECT id, completed_by_build_id FROM snapshots;
+    "#,
+    },
 ];
 
 pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
@@ -575,12 +586,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (\
                  'schema_migrations', 'index_builds', 'snapshots', 'published_views', \
-                 'files', 'nodes', 'edges', 'diagnostics', 'fragment_cache', 'build_metrics')",
+                 'files', 'nodes', 'edges', 'diagnostics', 'fragment_cache', 'build_metrics', \
+                 'snapshot_diagnostic_sets')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 10);
+        assert_eq!(table_count, 11);
     }
 
     #[test]
@@ -734,6 +746,52 @@ mod tests {
     }
 
     #[test]
+    fn migration_backfills_snapshot_diagnostic_sets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v4.db");
+        create_sidecar_at_version(&path, 4);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO index_builds(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    prospective_snapshot_id, state, started_at, finished_at
+                ) VALUES (
+                    'build-1', 'local:test', 'root', 'revision-1',
+                    'snapshot-1', 'published', 'now', 'now'
+                );
+                INSERT INTO snapshots(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    source_manifest_algorithm, source_manifest_digest, graph_model_version,
+                    analysis_config_algorithm, analysis_config_digest,
+                    extractor_set_algorithm, extractor_set_digest,
+                    completed_by_build_id, created_at
+                ) VALUES (
+                    'snapshot-1', 'local:test', 'root', 'revision-1',
+                    'sha256', '00', 1, 'sha256', '00', 'sha256', '00',
+                    'build-1', 'now'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("v4 sidecar unexpectedly requires rebuild");
+        };
+        let diagnostic_build: String = sidecar
+            .connection()
+            .query_row(
+                "SELECT build_id FROM snapshot_diagnostic_sets WHERE snapshot_id = 'snapshot-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(diagnostic_build, "build-1");
+    }
+
+    #[test]
     fn unsupported_version_reports_requires_rebuild_without_mutation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(SIDECAR_FILE_NAME);
@@ -808,7 +866,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v4_objects.txt")
+            include_str!("fixtures/schema_v5_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );

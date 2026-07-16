@@ -10,7 +10,7 @@ pub mod rust;
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    domain::{EdgeId, EdgeTarget, ExtractorIdentity, NodeId, SnapshotId},
+    domain::{EdgeId, EdgeTarget, ExtractorIdentity, NodeId},
     ports::Extractor,
 };
 
@@ -25,7 +25,6 @@ pub fn builtin_extractor_identities() -> Vec<ExtractorIdentity> {
 }
 
 pub(crate) fn deterministic_node_id(
-    _snapshot_id: &SnapshotId,
     extractor: &ExtractorIdentity,
     kind: &str,
     local_key: &str,
@@ -38,7 +37,6 @@ pub(crate) fn deterministic_node_id(
 }
 
 pub(crate) fn deterministic_edge_id(
-    _snapshot_id: &SnapshotId,
     extractor: &ExtractorIdentity,
     kind: &str,
     source: &NodeId,
@@ -91,25 +89,16 @@ mod tests {
     }
 
     #[test]
-    fn fact_ids_are_stable_across_snapshot_rebasing() {
+    fn fact_ids_are_stable_without_snapshot_context() {
         let identity = generic::GenericExtractor.identity();
-        let first = SnapshotId::new("snapshot-one").unwrap();
-        let second = SnapshotId::new("snapshot-two").unwrap();
-        let first_node = deterministic_node_id(&first, &identity, "file", "src/lib.rs");
-        let second_node = deterministic_node_id(&second, &identity, "file", "src/lib.rs");
+        let first_node = deterministic_node_id(&identity, "file", "src/lib.rs");
+        let second_node = deterministic_node_id(&identity, "file", "src/lib.rs");
         assert_eq!(first_node, second_node);
 
         let target = EdgeTarget::Node(first_node.clone());
         assert_eq!(
-            deterministic_edge_id(&first, &identity, "contains", &first_node, &target, "root"),
-            deterministic_edge_id(
-                &second,
-                &identity,
-                "contains",
-                &second_node,
-                &target,
-                "root"
-            )
+            deterministic_edge_id(&identity, "contains", &first_node, &target, "root"),
+            deterministic_edge_id(&identity, "contains", &second_node, &target, "root")
         );
     }
 

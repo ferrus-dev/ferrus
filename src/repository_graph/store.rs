@@ -227,6 +227,11 @@ impl GraphStore for Sidecar {
             snapshot.clone()
         };
         transaction.execute(
+            "INSERT INTO snapshot_diagnostic_sets(snapshot_id, build_id) VALUES (?1, ?2) \
+             ON CONFLICT(snapshot_id) DO UPDATE SET build_id = excluded.build_id",
+            params![snapshot.id.as_str(), snapshot.completed_by.as_str()],
+        )?;
+        transaction.execute(
             "UPDATE index_builds SET finished_at = ?2 WHERE id = ?1",
             params![build.id.as_str(), timestamp()],
         )?;

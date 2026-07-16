@@ -588,6 +588,9 @@ fn fact_provenance_is_valid(
 }
 
 fn rebase_fragment(mut fragment: GraphFragment, context: &ExtractionContext) -> GraphFragment {
+    // Fact IDs are canonical extractor-local identities. Snapshot scope lives in
+    // the separate `snapshot_id` field (and in SQLite's composite keys), so a
+    // cached fragment must only rebind that scope and its build diagnostics.
     for node in &mut fragment.nodes {
         node.snapshot_id = context.snapshot_id.clone();
     }
@@ -729,8 +732,10 @@ mod tests {
     use super::*;
     use crate::repository_graph::{
         config::{AnalyzerSettings, ConfigScalar},
-        domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef},
-        ports::{RepositorySource, SourceContent},
+        domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId},
+        ports::{GraphQuery, RepositorySource, SourceContent},
+        query::{QueryScope, SnapshotSelector, StatusRequest, StatusResponse},
+        query_sqlite::{SqliteGraphQuery, default_budget},
         source::{FilesystemRepositorySource, SourceDiscoveryContext},
         sqlite::{OpenSidecarResult, Sidecar, open_for_build_at},
     };
@@ -792,6 +797,58 @@ mod tests {
                 force_full,
             },
         )
+    }
+
+    fn status(sidecar: &Sidecar, config: &RepositoryGraphConfig) -> StatusResponse {
+        let query = SqliteGraphQuery::new(sidecar, config.query_limits.clone(), None);
+        query
+            .status(&StatusRequest {
+                scope: QueryScope::v1(
+                    repository(),
+                    SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
+                    default_budget(&config.query_limits).unwrap(),
+                ),
+            })
+            .unwrap()
+    }
+
+    type NodeIdentity = (String, String);
+    type EdgeIdentity = (String, String, String, Option<String>, Option<String>);
+
+    fn fact_identities(
+        sidecar: &Sidecar,
+        snapshot: &SnapshotId,
+    ) -> (Vec<NodeIdentity>, Vec<EdgeIdentity>) {
+        let mut nodes = sidecar
+            .connection()
+            .prepare("SELECT id, kind FROM nodes WHERE snapshot_id = ?1 ORDER BY id")
+            .unwrap();
+        let nodes = nodes
+            .query_map([snapshot.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut edges = sidecar
+            .connection()
+            .prepare(
+                "SELECT id, kind, source_node_id, target_node_id, external_target \
+                 FROM edges WHERE snapshot_id = ?1 ORDER BY id",
+            )
+            .unwrap();
+        let edges = edges
+            .query_map([snapshot.as_str()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (nodes, edges)
     }
 
     #[test]
@@ -903,6 +960,54 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_snapshot_refreshes_diagnostics_without_discarding_build_history() {
+        let repository_dir = tempfile::tempdir().unwrap();
+        fixture_repository(repository_dir.path());
+        let config = RepositoryGraphConfig::default();
+        let (_sidecar_dir, mut sidecar) = sidecar();
+
+        let first_source = discover(repository_dir.path(), &config);
+        let first = run(&mut sidecar, &first_source, &config, "build-1", false).unwrap();
+        let first_warning_count = status(&sidecar, &config).diagnostics.warning;
+
+        write(
+            &repository_dir.path().join(".ferrus/project.toml"),
+            b"project_id='local-only'\n",
+        );
+        let second_source = discover(repository_dir.path(), &config);
+        let second = run(&mut sidecar, &second_source, &config, "build-2", false).unwrap();
+        assert_eq!(second.snapshot.id, first.snapshot.id);
+        assert!(second.reused_existing_snapshot);
+        assert_eq!(
+            status(&sidecar, &config).diagnostics.warning,
+            first_warning_count + 1
+        );
+        assert!(
+            sidecar
+                .diagnostics_for_build(&BuildId::new("build-2").unwrap())
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "runtime_path_excluded")
+        );
+
+        fs::remove_dir_all(repository_dir.path().join(".ferrus")).unwrap();
+        let third_source = discover(repository_dir.path(), &config);
+        let third = run(&mut sidecar, &third_source, &config, "build-3", false).unwrap();
+        assert_eq!(third.snapshot.id, first.snapshot.id);
+        assert_eq!(
+            status(&sidecar, &config).diagnostics.warning,
+            first_warning_count
+        );
+        assert!(
+            sidecar
+                .diagnostics_for_build(&BuildId::new("build-2").unwrap())
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "runtime_path_excluded")
+        );
+    }
+
+    #[test]
     fn add_change_delete_and_rename_rebuild_only_affected_fragments() {
         let repository_dir = tempfile::tempdir().unwrap();
         fixture_repository(repository_dir.path());
@@ -959,6 +1064,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model_imports, 1);
+
+        let (_full_sidecar_dir, mut full_sidecar) = self::sidecar();
+        let full_source = discover(repository_dir.path(), &config);
+        let full = run(&mut full_sidecar, &full_source, &config, "build-full", true).unwrap();
+        assert_eq!(full.snapshot.id, second.snapshot.id);
+        assert_eq!(
+            fact_identities(&sidecar, &second.snapshot.id),
+            fact_identities(&full_sidecar, &full.snapshot.id)
+        );
     }
 
     #[test]

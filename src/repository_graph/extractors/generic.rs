@@ -67,12 +67,7 @@ impl GenericExtractor {
             context.repository.namespace.as_str(),
             context.repository.repository_id.as_str()
         );
-        let repository_id = deterministic_node_id(
-            &context.snapshot_id,
-            &identity,
-            REPOSITORY_KIND,
-            &repository_key,
-        );
+        let repository_id = deterministic_node_id(&identity, REPOSITORY_KIND, &repository_key);
         let mut repository_properties = BTreeMap::new();
         repository_properties.insert(
             "namespace".to_string(),
@@ -109,8 +104,7 @@ impl GenericExtractor {
         }
 
         let root_key = directory_key(".");
-        let root_id =
-            deterministic_node_id(&context.snapshot_id, &identity, DIRECTORY_KIND, &root_key);
+        let root_id = deterministic_node_id(&identity, DIRECTORY_KIND, &root_key);
         let root = graph_node(
             context,
             &identity,
@@ -144,12 +138,7 @@ impl GenericExtractor {
         let mut builder = FragmentBuilder::new(input.context, Some(input.file.path.clone()));
 
         let root_key = directory_key(".");
-        let mut parent_id = deterministic_node_id(
-            &input.context.snapshot_id,
-            &identity,
-            DIRECTORY_KIND,
-            &root_key,
-        );
+        let mut parent_id = deterministic_node_id(&identity, DIRECTORY_KIND, &root_key);
         let root = graph_node(
             input.context,
             &identity,
@@ -165,8 +154,7 @@ impl GenericExtractor {
 
         for directory in ancestor_directories(input.file.path.as_str()) {
             let key = directory_key(directory);
-            let directory_id =
-                deterministic_node_id(&input.context.snapshot_id, &identity, DIRECTORY_KIND, &key);
+            let directory_id = deterministic_node_id(&identity, DIRECTORY_KIND, &key);
             let node = graph_node(
                 input.context,
                 &identity,
@@ -195,8 +183,7 @@ impl GenericExtractor {
         }
 
         let file_key = file_key(input.file.path.as_str());
-        let file_id =
-            deterministic_node_id(&input.context.snapshot_id, &identity, FILE_KIND, &file_key);
+        let file_id = deterministic_node_id(&identity, FILE_KIND, &file_key);
         let mut file_properties = BTreeMap::new();
         file_properties.insert(
             "path".to_string(),
@@ -255,12 +242,7 @@ impl GenericExtractor {
                 input.file.path.as_str(),
                 classification.value
             );
-            let classified_id = deterministic_node_id(
-                &input.context.snapshot_id,
-                &identity,
-                classification.kind,
-                &local_key,
-            );
+            let classified_id = deterministic_node_id(&identity, classification.kind, &local_key);
             let node = graph_node(
                 input.context,
                 &identity,
@@ -526,14 +508,7 @@ fn graph_edge(
     local_key: &str,
     evidence: Option<SourceEvidence>,
 ) -> GraphEdge {
-    let id = deterministic_edge_id(
-        &context.snapshot_id,
-        identity,
-        kind,
-        &source,
-        &target,
-        local_key,
-    );
+    let id = deterministic_edge_id(identity, kind, &source, &target, local_key);
     GraphEdge {
         snapshot_id: context.snapshot_id.clone(),
         id,

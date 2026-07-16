@@ -1367,7 +1367,6 @@ fn resolved_edge(original: &GraphEdge, target: EdgeTarget, confidence: Confidenc
         EdgeTarget::Unresolved(_) => ResolutionState::Unresolved,
     };
     let id = deterministic_edge_id(
-        &original.snapshot_id,
         &resolver_identity(),
         &original.kind,
         &original.source,
@@ -1400,14 +1399,7 @@ fn new_edge(
     evidence: Option<SourceEvidence>,
     confidence: Confidence,
 ) -> GraphEdge {
-    let id = deterministic_edge_id(
-        &input.context.snapshot_id,
-        &resolver_identity(),
-        kind,
-        &source,
-        &target,
-        local_key,
-    );
+    let id = deterministic_edge_id(&resolver_identity(), kind, &source, &target, local_key);
     GraphEdge {
         snapshot_id: input.context.snapshot_id.clone(),
         id,

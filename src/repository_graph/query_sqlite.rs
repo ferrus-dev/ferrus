@@ -173,7 +173,11 @@ impl<'a> SqliteGraphQuery<'a> {
                     SUM(CASE WHEN severity = 'info' THEN 1 ELSE 0 END), \
                     SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END), \
                     SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END) \
-                 FROM diagnostics WHERE snapshot_id = ?1",
+                 FROM diagnostics AS diagnostic \
+                 JOIN snapshot_diagnostic_sets AS current \
+                   ON current.snapshot_id = diagnostic.snapshot_id \
+                  AND current.build_id = diagnostic.build_id \
+                 WHERE diagnostic.snapshot_id = ?1",
                 [snapshot.as_str()],
                 |row| {
                     Ok(DiagnosticSummary {

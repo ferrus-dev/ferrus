@@ -22,4 +22,5 @@ table:index_builds
 table:nodes
 table:published_views
 table:schema_migrations
+table:snapshot_diagnostic_sets
 table:snapshots

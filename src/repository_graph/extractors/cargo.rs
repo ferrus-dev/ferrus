@@ -1181,12 +1181,7 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         }
         let properties = self.bounded_properties(properties);
         let identity = extractor_identity();
-        let id = deterministic_node_id(
-            &self.input.context.snapshot_id,
-            &identity,
-            kind,
-            semantic_key,
-        );
+        let id = deterministic_node_id(&identity, kind, semantic_key);
         if self.node_ids.contains(&id) {
             return Some(id);
         }
@@ -1233,14 +1228,7 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         }
         let properties = self.bounded_properties(properties);
         let identity = extractor_identity();
-        let id = deterministic_edge_id(
-            &self.input.context.snapshot_id,
-            &identity,
-            kind,
-            source,
-            &target,
-            local_key,
-        );
+        let id = deterministic_edge_id(&identity, kind, source, &target, local_key);
         if self.edge_ids.contains(&id) {
             return;
         }

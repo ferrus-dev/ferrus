@@ -104,9 +104,9 @@ impl IndexStore for Sidecar {
             insert_files(&transaction, &commit.snapshot, &commit.files)?;
             insert_nodes(&transaction, &commit.graph.nodes)?;
             insert_edges(&transaction, &commit.graph.edges)?;
-            insert_diagnostics(&transaction, &commit.graph.diagnostics)?;
             commit.snapshot.clone()
         };
+        replace_snapshot_diagnostics(&transaction, &commit.snapshot, &commit.graph.diagnostics)?;
         for cached in &commit.cache_writes {
             upsert_cached_fragment(&transaction, &cached.key, &cached.fragment)?;
         }
@@ -376,6 +376,30 @@ fn insert_diagnostics(
             timestamp(),
         ])?;
     }
+    Ok(())
+}
+
+fn replace_snapshot_diagnostics(
+    transaction: &Transaction<'_>,
+    snapshot: &GraphSnapshot,
+    diagnostics: &[GraphDiagnostic],
+) -> Result<(), StoreError> {
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.build_id != snapshot.completed_by
+            || diagnostic.snapshot_id.as_ref() != Some(&snapshot.id)
+    }) {
+        return Err(StoreError::IdentityMismatch("snapshot diagnostics"));
+    }
+    transaction.execute(
+        "DELETE FROM diagnostics WHERE build_id = ?1 AND snapshot_id = ?2",
+        params![snapshot.completed_by.as_str(), snapshot.id.as_str()],
+    )?;
+    insert_diagnostics(transaction, diagnostics)?;
+    transaction.execute(
+        "INSERT INTO snapshot_diagnostic_sets(snapshot_id, build_id) VALUES (?1, ?2) \
+         ON CONFLICT(snapshot_id) DO UPDATE SET build_id = excluded.build_id",
+        params![snapshot.id.as_str(), snapshot.completed_by.as_str()],
+    )?;
     Ok(())
 }
 

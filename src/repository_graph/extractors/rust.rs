@@ -622,7 +622,6 @@ fn graph_edge(
     resolution: ResolutionState,
 ) -> GraphEdge {
     let id = deterministic_edge_id(
-        &input.context.snapshot_id,
         &extractor_identity(),
         kind,
         &source,
@@ -671,7 +670,6 @@ fn extractor_identity() -> ExtractorIdentity {
 
 fn node_id(input: FileExtractionInput<'_>, kind: &str, start: usize, end: usize) -> NodeId {
     deterministic_node_id(
-        &input.context.snapshot_id,
         &extractor_identity(),
         kind,
         &format!("{}:{start}:{end}", input.file.path.as_str()),
