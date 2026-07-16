@@ -473,12 +473,27 @@ fn windows_final_path(file: &File) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-16 final path"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_paths_equal(expected: &Path, actual: &str) -> bool {
+    fn strip_prefix_ignore_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+        let candidate = path.get(..prefix.len())?;
+        if candidate.eq_ignore_ascii_case(prefix) {
+            path.get(prefix.len()..)
+        } else {
+            None
+        }
+    }
+
     fn normalize(path: &str) -> String {
-        path.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+        let path = path.replace('/', "\\");
+        let path = if let Some(path) = strip_prefix_ignore_ascii_case(&path, r"\\?\UNC\") {
+            format!(r"\\{path}")
+        } else if let Some(path) = strip_prefix_ignore_ascii_case(&path, r"\\?\") {
+            path.to_string()
+        } else {
+            path
+        };
+        path.trim_end_matches('\\').to_ascii_lowercase()
     }
 
     normalize(&expected.to_string_lossy()) == normalize(actual)
@@ -1380,6 +1395,17 @@ mod tests {
         ] {
             assert!(windows_path_key(&RepoPath::new(path).unwrap()).is_none());
         }
+    }
+
+    #[test]
+    fn windows_final_path_prefixes_compare_with_canonical_paths() {
+        assert!(windows_paths_equal(Path::new(r"C:\repo"), r"\\?\C:\repo"));
+        assert!(windows_paths_equal(
+            Path::new(r"\\server\share\repo"),
+            r"\\?\UNC\server\share\repo"
+        ));
+        assert!(windows_paths_equal(Path::new("C:/Repo/"), r"\\?\c:\repo"));
+        assert!(!windows_paths_equal(Path::new(r"C:\repo"), r"\\?\C:\other"));
     }
 
     #[test]
