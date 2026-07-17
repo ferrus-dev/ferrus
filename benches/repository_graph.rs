@@ -1,9 +1,10 @@
 use std::{hint::black_box, path::Path, time::Duration};
 
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group};
 use ferrus::repository_graph::{
     config::RepositoryGraphConfig,
     domain::{BuildId, PublishedViewName, RepositoryId, RepositoryNamespace, RepositoryRef},
+    extractors::cargo::run_parser_worker_if_requested,
     index::{IndexCoordinator, IndexOutcome, IndexRequest, active_extractor_identities},
     ports::GraphQuery,
     query::{PageRequest, QueryScope, SearchRequest, SnapshotSelector},
@@ -223,4 +224,11 @@ fn repository_graph_benchmarks(criterion: &mut Criterion) {
 }
 
 criterion_group!(benches, repository_graph_benchmarks);
-criterion_main!(benches);
+
+fn main() {
+    if run_parser_worker_if_requested().expect("Cargo parser worker protocol failed") {
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

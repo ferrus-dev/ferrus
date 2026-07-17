@@ -8,11 +8,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    ffi::OsStr,
+    io::{self, Read, Write},
     ops::Range,
-    sync::mpsc::{self, RecvTimeoutError},
-    thread,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use serde::{Deserialize, Serialize};
 
 use super::{deterministic_edge_id, deterministic_node_id};
 use crate::repository_graph::{
@@ -32,6 +36,8 @@ const MAX_SEMANTIC_KEY_BYTES: usize = 16 * 1024;
 const MAX_PROPERTY_STRING_BYTES: usize = 4 * 1024;
 const MAX_PROPERTY_LIST_ITEMS: usize = 256;
 const MAX_PROPERTY_LIST_BYTES: usize = 32 * 1024;
+const PARSER_WORKER_ARGUMENT: &str = "__ferrus-cargo-parser";
+const PARSER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Stateless Cargo manifest extractor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,46 +49,190 @@ impl CargoExtractor {
     }
 }
 
-enum ParserDeadline<T> {
-    Completed(T),
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ParserOutput {
+    Parsed { manifest: toml::Table },
+    Malformed { span: Option<ParserSpan> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ParserSpan {
+    start: usize,
+    end: usize,
+}
+
+impl ParserSpan {
+    fn into_range(self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
+enum ParserDeadline {
+    Completed(ParserOutput),
     TimedOut,
     Unavailable,
 }
 
-fn run_parser_with_deadline<T, F>(
-    started: Instant,
-    budget: Duration,
-    parser: F,
-) -> ParserDeadline<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let remaining = budget.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
+enum ChildDeadline {
+    Exited(ExitStatus),
+    TimedOut,
+    Unavailable,
+}
+
+fn parse_manifest(source: &str) -> ParserOutput {
+    match toml::from_str::<toml::Table>(source) {
+        Ok(manifest) => ParserOutput::Parsed { manifest },
+        Err(error) => ParserOutput::Malformed {
+            span: error.span().map(|span| ParserSpan {
+                start: span.start,
+                end: span.end,
+            }),
+        },
+    }
+}
+
+/// Runs the isolated Cargo parser protocol before the public CLI is initialized.
+///
+/// This is an internal entry point used only by parser subprocesses spawned by
+/// [`CargoExtractor`]. It is public so the `ferrus` binary can dispatch into
+/// the library without exposing a user-facing CLI command.
+#[doc(hidden)]
+pub fn run_parser_worker_if_requested() -> io::Result<bool> {
+    if std::env::args_os().nth(1).as_deref() != Some(OsStr::new(PARSER_WORKER_ARGUMENT)) {
+        return Ok(false);
+    }
+
+    let mut source = String::new();
+    io::stdin().read_to_string(&mut source)?;
+    let output = parse_manifest(&source);
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, &output).map_err(io::Error::other)?;
+    stdout.flush()?;
+    Ok(true)
+}
+
+fn run_parser_with_deadline(started: Instant, budget: Duration, source: String) -> ParserDeadline {
+    if budget.saturating_sub(started.elapsed()).is_zero() {
         return ParserDeadline::TimedOut;
     }
 
-    let (sender, receiver) = mpsc::sync_channel(1);
-    if thread::Builder::new()
-        .name("ferrus-cargo-parser".to_string())
-        .spawn(move || {
-            let _ = sender.send(parser());
-        })
-        .is_err()
+    if cfg!(test) {
+        let output = parse_manifest(&source);
+        return if started.elapsed() >= budget {
+            ParserDeadline::TimedOut
+        } else {
+            ParserDeadline::Completed(output)
+        };
+    }
+
+    run_parser_process(started, budget, source)
+}
+
+fn run_parser_process(started: Instant, budget: Duration, source: String) -> ParserDeadline {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(_) => return ParserDeadline::Unavailable,
+    };
+    let mut child = match Command::new(executable)
+        .arg(PARSER_WORKER_ARGUMENT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
+        Ok(child) => child,
+        Err(_) => return ParserDeadline::Unavailable,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_and_reap(&mut child);
         return ParserDeadline::Unavailable;
-    }
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_and_reap(&mut child);
+        return ParserDeadline::Unavailable;
+    };
+    let writer = match thread::Builder::new()
+        .name("ferrus-cargo-parser-input".to_string())
+        .spawn(move || stdin.write_all(source.as_bytes()))
+    {
+        Ok(writer) => writer,
+        Err(_) => {
+            terminate_and_reap(&mut child);
+            return ParserDeadline::Unavailable;
+        }
+    };
+    let reader = match thread::Builder::new()
+        .name("ferrus-cargo-parser-output".to_string())
+        .spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output)?;
+            Ok(output)
+        }) {
+        Ok(reader) => reader,
+        Err(_) => {
+            terminate_and_reap(&mut child);
+            let _ = writer.join();
+            return ParserDeadline::Unavailable;
+        }
+    };
 
-    let remaining = budget.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        return ParserDeadline::TimedOut;
+    let status = wait_for_child(&mut child, started, budget);
+    let output = finish_parser_io(writer, reader);
+    match status {
+        ChildDeadline::TimedOut => ParserDeadline::TimedOut,
+        ChildDeadline::Unavailable => ParserDeadline::Unavailable,
+        ChildDeadline::Exited(status) => {
+            if !status.success() || started.elapsed() >= budget {
+                return if started.elapsed() >= budget {
+                    ParserDeadline::TimedOut
+                } else {
+                    ParserDeadline::Unavailable
+                };
+            }
+            let Some(output) = output else {
+                return ParserDeadline::Unavailable;
+            };
+            match serde_json::from_slice(&output) {
+                Ok(parsed) if started.elapsed() < budget => ParserDeadline::Completed(parsed),
+                Ok(_) => ParserDeadline::TimedOut,
+                Err(_) => ParserDeadline::Unavailable,
+            }
+        }
     }
-    match receiver.recv_timeout(remaining) {
-        Ok(parsed) => ParserDeadline::Completed(parsed),
-        Err(RecvTimeoutError::Timeout) => ParserDeadline::TimedOut,
-        Err(RecvTimeoutError::Disconnected) => ParserDeadline::Unavailable,
+}
+
+fn wait_for_child(child: &mut Child, started: Instant, budget: Duration) -> ChildDeadline {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return ChildDeadline::Exited(status),
+            Ok(None) => {}
+            Err(_) => {
+                terminate_and_reap(child);
+                return ChildDeadline::Unavailable;
+            }
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            terminate_and_reap(child);
+            return ChildDeadline::TimedOut;
+        }
+        thread::sleep(remaining.min(PARSER_WAIT_POLL_INTERVAL));
     }
+}
+
+fn terminate_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn finish_parser_io(
+    writer: JoinHandle<io::Result<()>>,
+    reader: JoinHandle<io::Result<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    writer.join().ok()?.ok()?;
+    reader.join().ok()?.ok()
 }
 
 impl Extractor for CargoExtractor {
@@ -123,11 +273,19 @@ impl Extractor for CargoExtractor {
         }
 
         let started = Instant::now();
-        let parser_source = source.to_owned();
-        let parsed = match run_parser_with_deadline(started, budget, move || {
-            toml::from_str::<toml::Table>(&parser_source)
-        }) {
-            ParserDeadline::Completed(parsed) => parsed,
+        let parsed = match run_parser_with_deadline(started, budget, source.to_owned()) {
+            ParserDeadline::Completed(ParserOutput::Parsed { manifest }) => manifest,
+            ParserDeadline::Completed(ParserOutput::Malformed { span }) => {
+                diagnostics.push(
+                    "cargo.malformed_manifest",
+                    span.map(ParserSpan::into_range)
+                        .map(|range| spans.span(range)),
+                );
+                return Ok(GraphFragment {
+                    diagnostics: diagnostics.finish(),
+                    ..GraphFragment::default()
+                });
+            }
             ParserDeadline::TimedOut => {
                 diagnostics.push("cargo.parser_timeout", None);
                 return Ok(GraphFragment {
@@ -143,21 +301,8 @@ impl Extractor for CargoExtractor {
                 });
             }
         };
-        let manifest = match parsed {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                diagnostics.push(
-                    "cargo.malformed_manifest",
-                    error.span().map(|range| spans.span(range)),
-                );
-                return Ok(GraphFragment {
-                    diagnostics: diagnostics.finish(),
-                    ..GraphFragment::default()
-                });
-            }
-        };
         let mut facts = FactBuffer::new(input, &mut diagnostics, started, budget);
-        extract_manifest(&manifest, &spans, &mut facts);
+        extract_manifest(&parsed, &spans, &mut facts);
         facts.finish();
 
         Ok(GraphFragment {
@@ -2034,18 +2179,50 @@ bad-mixed-sources = { path = "local", registry = "private", version = "1" }
     }
 
     #[test]
-    fn parser_deadline_stops_waiting_for_a_blocked_worker() {
-        let (release_sender, release_receiver) = mpsc::channel();
-        let (done_sender, done_receiver) = mpsc::channel();
-        let result =
-            run_parser_with_deadline(Instant::now(), Duration::from_millis(10), move || {
-                release_receiver.recv().unwrap();
-                done_sender.send(()).unwrap();
-            });
+    fn parser_deadline_kills_and_reaps_a_blocked_worker_process() {
+        const CHILD_TEST: &str =
+            "repository_graph::extractors::cargo::tests::parser_deadline_blocked_child";
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env("FERRUS_CARGO_PARSER_BLOCK_TEST", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
 
-        assert!(matches!(result, ParserDeadline::TimedOut));
-        release_sender.send(()).unwrap();
-        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let result = wait_for_child(&mut child, started, Duration::from_millis(50));
+
+        assert!(matches!(result, ChildDeadline::TimedOut));
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parser_deadline_blocked_child() {
+        if std::env::var_os("FERRUS_CARGO_PARSER_BLOCK_TEST").is_some() {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn parser_worker_protocol_preserves_manifest_values_and_error_spans() {
+        let ParserOutput::Parsed { manifest } = parse_manifest("date = 2026-07-17\ninteger = 7\n")
+        else {
+            panic!("valid manifest was rejected");
+        };
+        let wire = serde_json::to_vec(&ParserOutput::Parsed { manifest }).unwrap();
+        let ParserOutput::Parsed { manifest } = serde_json::from_slice(&wire).unwrap() else {
+            panic!("valid parser response changed variants");
+        };
+        assert!(manifest["date"].is_datetime());
+        assert_eq!(manifest["integer"].as_integer(), Some(7));
+
+        let ParserOutput::Malformed { span } = parse_manifest("[package\n") else {
+            panic!("invalid manifest was accepted");
+        };
+        assert!(span.is_some());
     }
 
     #[test]

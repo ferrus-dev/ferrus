@@ -49,6 +49,9 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if repository_graph::extractors::cargo::run_parser_worker_if_requested()? {
+        return Ok(());
+    }
     let args = cli::Cli::parse();
     let debug = args.debug_enabled();
 
