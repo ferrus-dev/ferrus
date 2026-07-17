@@ -384,6 +384,7 @@ impl<'a> SqliteGraphQuery<'a> {
         scope: &ResolvedScope,
         request: &ShowRequest,
         offset: u64,
+        started: Instant,
     ) -> Result<Vec<GraphNode>, QueryError> {
         let (predicate, lookup) = match &request.lookup {
             ShowLookup::Node(id) => ("id = ?2", id.as_str()),
@@ -394,11 +395,13 @@ impl<'a> SqliteGraphQuery<'a> {
             "SELECT {NODE_COLUMNS} FROM nodes WHERE snapshot_id = ?1 AND {predicate} \
              ORDER BY kind, semantic_key, id LIMIT ?3 OFFSET ?4"
         );
-        let mut statement = self
-            .sidecar
-            .connection()
-            .prepare(&sql)
-            .map_err(|_| backend_error())?;
+        let connection = self.sidecar.connection();
+        let _deadline = QueryDeadline::install(
+            connection,
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
+        let mut statement = connection.prepare(&sql).map_err(sqlite_query_error)?;
         let mut rows = statement
             .query(params![
                 scope.snapshot.id.as_str(),
@@ -406,9 +409,9 @@ impl<'a> SqliteGraphQuery<'a> {
                 i64::from(scope.budget.max_results.saturating_add(1)),
                 i64::try_from(offset).map_err(|_| stale_cursor_error())?,
             ])
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| backend_error())? {
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
             found.push(decode_node(row)?);
         }
         Ok(found)
@@ -558,7 +561,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             &scope.snapshot.id,
             &fingerprint,
         )?;
-        let rows = self.show_rows(&scope, request, offset)?;
+        let rows = self.show_rows(&scope, request, offset, started)?;
         if rows.is_empty() && offset == 0 {
             return Err(invalid_request("graph lookup matched no nodes"));
         }
@@ -1752,6 +1755,32 @@ mod tests {
 
         assert!(rows.deadline_exceeded);
         assert!(rows.rows.is_empty());
+    }
+
+    #[test]
+    fn sqlite_show_execution_observes_an_expired_deadline() {
+        let source = (0..300)
+            .map(|index| format!("pub struct Type{index};\n"))
+            .collect::<String>();
+        let extra_files = [("src/many.rs", source.as_str())];
+        let (_source, _sidecar_dir, sidecar, config, _comparison) =
+            indexed_fixture_with_extra_files(&extra_files);
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let requested_scope = scope(&config);
+        let resolved_scope = query.resolve_scope(&requested_scope).unwrap();
+        let request = ShowRequest {
+            scope: requested_scope,
+            lookup: ShowLookup::Path(RepoPath::new("src/many.rs").unwrap()),
+            page: super::super::query::PageRequest { cursor: None },
+        };
+        let started = Instant::now()
+            - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
+
+        let error = query
+            .show_rows(&resolved_scope, &request, 0, started)
+            .unwrap_err();
+
+        assert_eq!(error.code, QueryErrorCode::BudgetExceeded);
     }
 
     #[test]
