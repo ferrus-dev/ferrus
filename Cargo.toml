@@ -42,17 +42,25 @@ dirs = "6.0.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 semver = "1.0.28"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "hooks"] }
 sha2 = "0.10.9"
+tree-sitter = "=0.26.11"
+tree-sitter-rust = "=0.24.2"
 
 [target.'cfg(unix)'.dependencies]
+errno = "0.3.14"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "repository_graph"
+harness = false
 
 [profile.dist]
 inherits = "release"

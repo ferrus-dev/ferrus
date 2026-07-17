@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 5;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,13 @@ pub struct RebuildRequired {
 
 pub enum OpenSidecarResult {
     Ready(Sidecar),
+    RequiresRebuild(RebuildRequired),
+}
+
+pub enum OpenQuerySidecarResult {
+    Ready(Sidecar),
+    Absent,
+    NeedsMigration { found_schema_version: u32 },
     RequiresRebuild(RebuildRequired),
 }
 
@@ -209,8 +216,7 @@ const MIGRATIONS: &[Migration] = &[
             span_start_byte INTEGER CHECK (span_start_byte IS NULL OR span_start_byte >= 0),
             span_end_byte INTEGER CHECK (span_end_byte IS NULL OR span_end_byte >= span_start_byte),
             metadata_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (snapshot_id, path) REFERENCES files(snapshot_id, path)
+            created_at TEXT NOT NULL
         ) STRICT;
 
         CREATE INDEX diagnostics_build_idx ON diagnostics(build_id, severity, id);
@@ -231,26 +237,128 @@ const MIGRATIONS: &[Migration] = &[
             CHECK (span_end_column IS NULL OR span_end_column >= 0);
     "#,
     },
+    Migration {
+        version: 3,
+        sql: r#"
+        ALTER TABLE nodes ADD COLUMN span_start_line INTEGER
+            CHECK (span_start_line IS NULL OR span_start_line >= 0);
+        ALTER TABLE nodes ADD COLUMN span_start_column INTEGER
+            CHECK (span_start_column IS NULL OR span_start_column >= 0);
+        ALTER TABLE nodes ADD COLUMN span_end_line INTEGER
+            CHECK (span_end_line IS NULL OR span_end_line >= 0);
+        ALTER TABLE nodes ADD COLUMN span_end_column INTEGER
+            CHECK (span_end_column IS NULL OR span_end_column >= 0);
+
+        ALTER TABLE edges ADD COLUMN span_start_line INTEGER
+            CHECK (span_start_line IS NULL OR span_start_line >= 0);
+        ALTER TABLE edges ADD COLUMN span_start_column INTEGER
+            CHECK (span_start_column IS NULL OR span_start_column >= 0);
+        ALTER TABLE edges ADD COLUMN span_end_line INTEGER
+            CHECK (span_end_line IS NULL OR span_end_line >= 0);
+        ALTER TABLE edges ADD COLUMN span_end_column INTEGER
+            CHECK (span_end_column IS NULL OR span_end_column >= 0);
+
+        ALTER TABLE diagnostics RENAME TO diagnostics_v2;
+        CREATE TABLE diagnostics (
+            id INTEGER PRIMARY KEY,
+            build_id TEXT NOT NULL REFERENCES index_builds(id) ON DELETE CASCADE,
+            snapshot_id TEXT REFERENCES snapshots(id) ON DELETE CASCADE,
+            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+            code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            path TEXT,
+            span_start_byte INTEGER CHECK (span_start_byte IS NULL OR span_start_byte >= 0),
+            span_end_byte INTEGER CHECK (span_end_byte IS NULL OR span_end_byte >= span_start_byte),
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            span_start_line INTEGER CHECK (span_start_line IS NULL OR span_start_line >= 0),
+            span_start_column INTEGER CHECK (span_start_column IS NULL OR span_start_column >= 0),
+            span_end_line INTEGER CHECK (span_end_line IS NULL OR span_end_line >= 0),
+            span_end_column INTEGER CHECK (span_end_column IS NULL OR span_end_column >= 0)
+        ) STRICT;
+        INSERT INTO diagnostics(
+            id, build_id, snapshot_id, severity, code, message, path,
+            span_start_byte, span_end_byte, metadata_json, created_at,
+            span_start_line, span_start_column, span_end_line, span_end_column
+        )
+        SELECT
+            id, build_id, snapshot_id, severity, code, message, path,
+            span_start_byte, span_end_byte, metadata_json, created_at,
+            span_start_line, span_start_column, span_end_line, span_end_column
+        FROM diagnostics_v2;
+        DROP TABLE diagnostics_v2;
+        CREATE INDEX diagnostics_build_idx ON diagnostics(build_id, severity, id);
+        CREATE INDEX diagnostics_snapshot_idx ON diagnostics(snapshot_id, id)
+            WHERE snapshot_id IS NOT NULL;
+
+        CREATE TABLE fragment_cache (
+            repository_namespace TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content_algorithm TEXT NOT NULL,
+            content_digest TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            file_mode INTEGER NOT NULL CHECK (file_mode IN (0, 1)),
+            analysis_config_algorithm TEXT NOT NULL,
+            analysis_config_digest TEXT NOT NULL,
+            extractor_id TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            extractor_contract_version INTEGER NOT NULL CHECK (extractor_contract_version > 0),
+            fragment_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            PRIMARY KEY (
+                repository_namespace, repository_id, path,
+                content_algorithm, content_digest, byte_length, file_mode,
+                analysis_config_algorithm, analysis_config_digest,
+                extractor_id, extractor_version, extractor_contract_version
+            )
+        ) STRICT;
+        CREATE INDEX fragment_cache_last_used_idx ON fragment_cache(last_used_at);
+
+        CREATE TABLE build_metrics (
+            build_id TEXT PRIMARY KEY NOT NULL REFERENCES index_builds(id) ON DELETE CASCADE,
+            discovered_files INTEGER NOT NULL CHECK (discovered_files >= 0),
+            reused_files INTEGER NOT NULL CHECK (reused_files >= 0),
+            parsed_files INTEGER NOT NULL CHECK (parsed_files >= 0),
+            skipped_files INTEGER NOT NULL CHECK (skipped_files >= 0),
+            failed_files INTEGER NOT NULL CHECK (failed_files >= 0),
+            processed_bytes INTEGER NOT NULL CHECK (processed_bytes >= 0),
+            nodes INTEGER NOT NULL CHECK (nodes >= 0),
+            edges INTEGER NOT NULL CHECK (edges >= 0),
+            diagnostics INTEGER NOT NULL CHECK (diagnostics >= 0),
+            duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0)
+        ) STRICT;
+    "#,
+    },
+    Migration {
+        version: 4,
+        sql: r#"
+        ALTER TABLE nodes ADD COLUMN normalized_name TEXT;
+        UPDATE nodes
+        SET normalized_name = lower(COALESCE(
+            CASE WHEN json_extract(properties_json, '$.name.type') = 'string'
+                THEN json_extract(properties_json, '$.name.value') END,
+            CASE WHEN json_extract(properties_json, '$.path.type') = 'string'
+                THEN json_extract(properties_json, '$.path.value') END,
+            semantic_key,
+            kind
+        ));
+        CREATE INDEX nodes_normalized_name_idx ON nodes(snapshot_id, normalized_name, id);
+    "#,
+    },
+    Migration {
+        version: 5,
+        sql: r#"
+        CREATE TABLE snapshot_diagnostic_sets (
+            snapshot_id TEXT PRIMARY KEY NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            build_id TEXT NOT NULL REFERENCES index_builds(id)
+        ) STRICT;
+        INSERT INTO snapshot_diagnostic_sets(snapshot_id, build_id)
+        SELECT id, completed_by_build_id FROM snapshots;
+    "#,
+    },
 ];
-
-/// Resolves the sidecar beside `ferrus.db` through the registered project.
-/// This function is read-only and does not create the sidecar or its directory.
-pub async fn current_sidecar_path() -> Result<PathBuf> {
-    Ok(crate::project::current_project_data_dir()
-        .await?
-        .join(SIDECAR_FILE_NAME))
-}
-
-/// Inspects optional graph storage without creating or migrating it.
-pub async fn inspect_current() -> Result<SidecarStatus> {
-    inspect_at(&current_sidecar_path().await?)
-}
-
-/// Explicit write/build entrypoint. This is the only operation in this phase
-/// that creates and migrates an absent sidecar.
-pub async fn open_current_for_build() -> Result<OpenSidecarResult> {
-    open_for_build_at(&current_sidecar_path().await?)
-}
 
 pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
     if !path.exists() {
@@ -362,6 +470,32 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
     }))
 }
 
+pub fn open_for_query_at(path: &Path) -> Result<OpenQuerySidecarResult> {
+    match inspect_at(path)? {
+        SidecarStatus::Absent => return Ok(OpenQuerySidecarResult::Absent),
+        SidecarStatus::RequiresRebuild(reason) => {
+            return Ok(OpenQuerySidecarResult::RequiresRebuild(reason));
+        }
+        SidecarStatus::Ready { schema_version } if schema_version < SIDECAR_SCHEMA_VERSION => {
+            return Ok(OpenQuerySidecarResult::NeedsMigration {
+                found_schema_version: schema_version,
+            });
+        }
+        SidecarStatus::Ready { .. } => {}
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open repository graph sidecar {}", path.display()))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(OpenQuerySidecarResult::Ready(Sidecar {
+        path: path.to_path_buf(),
+        connection,
+    }))
+}
+
 fn migrate_sidecar(connection: &mut Connection, schema_version: u32) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.pragma_update(None, "application_id", SIDECAR_APPLICATION_ID)?;
@@ -452,12 +586,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (\
                  'schema_migrations', 'index_builds', 'snapshots', 'published_views', \
-                 'files', 'nodes', 'edges', 'diagnostics')",
+                 'files', 'nodes', 'edges', 'diagnostics', 'fragment_cache', 'build_metrics', \
+                 'snapshot_diagnostic_sets')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 8);
+        assert_eq!(table_count, 11);
     }
 
     #[test]
@@ -490,7 +625,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migration_count, SIDECAR_SCHEMA_VERSION);
-        let span_column_count: u32 = sidecar
+        let diagnostic_span_column_count: u32 = sidecar
             .connection()
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('diagnostics') \
@@ -500,7 +635,160 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(span_column_count, 4);
+        assert_eq!(diagnostic_span_column_count, 4);
+        for table in ["nodes", "edges"] {
+            let fact_span_column_count: u32 = sidecar
+                .connection()
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') \
+                         WHERE name IN ('span_start_line', 'span_start_column', \
+                                        'span_end_line', 'span_end_column')"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fact_span_column_count, 4);
+        }
+    }
+
+    #[test]
+    fn query_open_is_read_only_and_never_migrates() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_path = directory.path().join("old.db");
+        create_sidecar_at_version(&old_path, 3);
+        assert!(matches!(
+            open_for_query_at(&old_path).unwrap(),
+            OpenQuerySidecarResult::NeedsMigration {
+                found_schema_version: 3
+            }
+        ));
+        assert_eq!(
+            pragma_u32(&Connection::open(&old_path).unwrap(), "user_version").unwrap(),
+            3
+        );
+
+        let current_path = directory.path().join("current.db");
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&current_path).unwrap() else {
+            panic!("new sidecar unexpectedly requires rebuild");
+        };
+        drop(sidecar);
+        let OpenQuerySidecarResult::Ready(sidecar) = open_for_query_at(&current_path).unwrap()
+        else {
+            panic!("current sidecar was not queryable");
+        };
+        let query_only: u32 = sidecar
+            .connection()
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .unwrap();
+        assert_eq!(query_only, 1);
+        assert!(
+            sidecar
+                .connection()
+                .execute("CREATE TABLE forbidden(value TEXT)", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_backfills_normalized_names_from_tagged_graph_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.db");
+        create_sidecar_at_version(&path, 3);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO index_builds(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    prospective_snapshot_id, state, started_at, finished_at
+                ) VALUES (
+                    'build-1', 'local:test', 'root', 'revision-1',
+                    'snapshot-1', 'building', 'now', 'now'
+                );
+                INSERT INTO snapshots(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    source_manifest_algorithm, source_manifest_digest, graph_model_version,
+                    analysis_config_algorithm, analysis_config_digest,
+                    extractor_set_algorithm, extractor_set_digest,
+                    completed_by_build_id, created_at
+                ) VALUES (
+                    'snapshot-1', 'local:test', 'root', 'revision-1',
+                    'sha256', '00', 1, 'sha256', '00', 'sha256', '00',
+                    'build-1', 'now'
+                );
+                INSERT INTO nodes(
+                    snapshot_id, id, kind, semantic_key, extractor_id, extractor_version,
+                    extractor_contract_version, resolution_state, confidence, properties_json
+                ) VALUES (
+                    'snapshot-1', 'node-1', 'struct', 'rust:struct:path:RuntimeTaskContext',
+                    'builtin.rust-syntax', '1', 2, 'resolved', 'exact',
+                    '{"name":{"type":"string","value":"RuntimeTaskContext"}}'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("v3 sidecar unexpectedly requires rebuild");
+        };
+        let normalized: String = sidecar
+            .connection()
+            .query_row(
+                "SELECT normalized_name FROM nodes WHERE id = 'node-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, "runtimetaskcontext");
+    }
+
+    #[test]
+    fn migration_backfills_snapshot_diagnostic_sets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v4.db");
+        create_sidecar_at_version(&path, 4);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO index_builds(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    prospective_snapshot_id, state, started_at, finished_at
+                ) VALUES (
+                    'build-1', 'local:test', 'root', 'revision-1',
+                    'snapshot-1', 'published', 'now', 'now'
+                );
+                INSERT INTO snapshots(
+                    id, repository_namespace, repository_id, source_revision_id,
+                    source_manifest_algorithm, source_manifest_digest, graph_model_version,
+                    analysis_config_algorithm, analysis_config_digest,
+                    extractor_set_algorithm, extractor_set_digest,
+                    completed_by_build_id, created_at
+                ) VALUES (
+                    'snapshot-1', 'local:test', 'root', 'revision-1',
+                    'sha256', '00', 1, 'sha256', '00', 'sha256', '00',
+                    'build-1', 'now'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let OpenSidecarResult::Ready(sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("v4 sidecar unexpectedly requires rebuild");
+        };
+        let diagnostic_build: String = sidecar
+            .connection()
+            .query_row(
+                "SELECT build_id FROM snapshot_diagnostic_sets WHERE snapshot_id = 'snapshot-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(diagnostic_build, "build-1");
     }
 
     #[test]
@@ -578,7 +866,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v2_objects.txt")
+            include_str!("fixtures/schema_v5_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );

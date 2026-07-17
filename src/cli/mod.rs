@@ -89,6 +89,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::events::EventsCommand,
     },
+    /// Build and inspect the optional local repository graph
+    Graph {
+        #[command(subcommand)]
+        command: commands::graph::GraphCommand,
+    },
 }
 
 impl Cli {
@@ -129,7 +134,97 @@ impl Cli {
             Some(Commands::Tasks { command }) => commands::tasks::run(command).await,
             Some(Commands::Runs { command }) => commands::runs::run(command).await,
             Some(Commands::Events { command }) => commands::events::run(command).await,
+            Some(Commands::Graph { command }) => commands::graph::run(command).await,
             None => crate::hq::run(debug).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::commands::graph::{Direction, GraphCommand};
+
+    #[test]
+    fn graph_search_surface_parses_scriptable_filters() {
+        let cli = Cli::try_parse_from([
+            "ferrus",
+            "graph",
+            "search",
+            "RuntimeTaskContext",
+            "--kind",
+            "struct",
+            "--path",
+            "src",
+            "--limit",
+            "20",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Commands::Graph {
+            command:
+                GraphCommand::Search {
+                    query,
+                    kinds,
+                    path,
+                    limit,
+                    json,
+                },
+        }) = cli.command
+        else {
+            panic!("graph search did not parse");
+        };
+        assert_eq!(query, "RuntimeTaskContext");
+        assert_eq!(kinds, ["struct"]);
+        assert_eq!(path.as_deref(), Some("src"));
+        assert_eq!(limit, Some(20));
+        assert!(json);
+    }
+
+    #[test]
+    fn graph_neighbors_surface_parses_direction_and_budgets() {
+        let cli = Cli::try_parse_from([
+            "ferrus",
+            "graph",
+            "neighbors",
+            "node:1",
+            "--direction",
+            "incoming",
+            "--depth",
+            "2",
+            "--limit",
+            "9",
+        ])
+        .unwrap();
+        let Some(Commands::Graph {
+            command:
+                GraphCommand::Neighbors {
+                    direction,
+                    depth,
+                    limit,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("graph neighbors did not parse");
+        };
+        assert!(matches!(direction, Direction::Incoming));
+        assert_eq!(depth, Some(2));
+        assert_eq!(limit, Some(9));
+    }
+
+    #[test]
+    fn graph_show_json_is_not_part_of_the_lookup_exclusion_group() {
+        assert!(
+            Cli::try_parse_from([
+                "ferrus",
+                "graph",
+                "show",
+                "--symbol",
+                "rust:struct:src/lib.rs:Thing",
+                "--json",
+            ])
+            .is_ok()
+        );
     }
 }

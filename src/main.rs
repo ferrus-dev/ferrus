@@ -7,8 +7,6 @@ mod hq;
 mod legacy_state;
 mod platform;
 mod project;
-#[allow(dead_code)]
-mod repository_graph;
 mod runtime_status;
 mod runtime_table;
 mod server;
@@ -16,6 +14,8 @@ mod specs;
 mod state;
 mod templates;
 mod update_check;
+
+use ferrus::repository_graph;
 
 #[cfg(test)]
 mod test_support {
@@ -49,6 +49,9 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if repository_graph::extractors::cargo::run_parser_worker_if_requested()? {
+        return Ok(());
+    }
     let args = cli::Cli::parse();
     let debug = args.debug_enabled();
 

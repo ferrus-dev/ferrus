@@ -566,6 +566,21 @@ pub async fn current_project_data_dir() -> Result<PathBuf> {
     Ok(data_dir)
 }
 
+/// Returns the opaque machine-local project id used as the local repository
+/// authority without mutating runtime state.
+pub async fn current_project_id() -> Result<String> {
+    let local_ref = read_local_project_ref()
+        .await
+        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+    validate_project_id(&local_ref.project_id)?;
+    let data_dir = current_project_data_dir().await?;
+    let metadata = read_project_metadata_from(&data_dir.join("project.toml")).await?;
+    if metadata.id != local_ref.project_id {
+        anyhow::bail!("local and registered project identities do not match");
+    }
+    Ok(local_ref.project_id)
+}
+
 pub async fn create_pending_task_artifact(
     description: &str,
     spec_path: Option<&str>,

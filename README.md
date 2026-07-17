@@ -215,6 +215,38 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 
 Checks that `.ferrus/project.toml`, global project metadata, task/run artifacts, and the `ferrus.db` schema agree with the current workspace. It also reports interrupted runs and expired leases that can be fixed with `ferrus recover`.
 
+### `ferrus graph`
+
+The optional local repository graph indexes generic files/documents, Cargo metadata, and Rust syntax without
+running repository code. Enable it explicitly in `ferrus.toml`:
+
+```toml
+[repository_graph]
+enabled = true
+```
+
+Indexing is never part of `ferrus init`; run it when wanted:
+
+```sh
+ferrus graph index [--full] [--json]
+ferrus graph status [--json]
+ferrus graph search RuntimeTaskContext --kind struct --path src [--limit 20] [--json]
+ferrus graph show --node <node-id> [--json]
+ferrus graph show --symbol <semantic-key> [--json]
+ferrus graph show --path src/project.rs [--json]
+ferrus graph neighbors <node-id> --direction both --depth 2 --limit 50 [--kind contains] [--json]
+```
+
+`index` reuses unchanged per-file fragments by default; `--full` bypasses that cache. Completed snapshots are
+immutable and published atomically, so a failed or stale build leaves the previous graph queryable. `status` is
+read-only and reports absent or incompatible storage without creating it.
+
+Every query reports the snapshot ID, freshness against the current source manifest, diagnostic counts,
+repository-relative evidence spans, provenance, and any truncation. CLI limits are requests: configured
+`[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
+`ferrus.db`; it stores structural facts and content identities, not source bodies. Local Criterion benchmark
+methodology and the latest dogfood results are recorded in `docs/repository-graph-benchmarks.md`.
+
 ### `ferrus projects list`
 
 Lists projects registered under `~/.ferrus/projects`, including project id, name, database presence, last opened timestamp, workspace path, and data directory.
