@@ -55,7 +55,15 @@ not know it.
 
 Context requests use one or more typed node, semantic-key, or path seeds plus an explicit direction, edge-kind
 filter, and unresolved/external inclusion policy. Context items carry fact provenance and typed selection reasons.
-Ranking and assembly are implemented in RG2.2, but must preserve this request and response contract.
+Seed resolution is exact and may produce multiple nodes for a shared semantic key or evidence path; a missing seed
+is an invalid request rather than a guessed match. Expansion is cycle-safe and deduplicates nodes reached through
+multiple relationships while retaining their distinct selection reasons. Nodes without source evidence may guide
+traversal but are not emitted as context items.
+
+Context ranking is deterministic: best selection reason, expansion depth, evidence path and start offset, node
+kind, semantic key, then opaque node ID. Selection priority is exact seed, containment, declaration, resolved
+dependency, documentation, configuration, then other relationships. Local assembly additionally has a bounded
+candidate/edge safety cap; exhausting it returns `capability` truncation rather than silently dropping facts.
 
 ## Diagnostics, pagination, and budgets
 

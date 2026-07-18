@@ -1,7 +1,7 @@
 //! Bounded read-only SQLite implementation of the portable graph query contract.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::{NonZeroU32, NonZeroU64},
     time::{Duration, Instant},
 };
@@ -22,8 +22,9 @@ use super::{
     },
     ports::{GraphQuery, SourceManifest},
     query::{
-        ContextRequest, ContextResponse, DiagnosticSummary, DiagnosticsEnvelope, EdgeDirection,
-        FreshnessEnvelope, NeighborhoodData, NeighborhoodEdge, NeighborhoodNode,
+        ContextData, ContextItem, ContextRequest, ContextResponse, ContextSeed,
+        ContextSelectionKind, ContextSelectionReason, DiagnosticSummary, DiagnosticsEnvelope,
+        EdgeDirection, FreshnessEnvelope, NeighborhoodData, NeighborhoodEdge, NeighborhoodNode,
         NeighborhoodRequest, NeighborhoodResponse, PageInfo, QueryDiagnostic, QueryError,
         QueryErrorCode, QueryResponse, RetrievalAction, SearchData, SearchHit, SearchMatchKind,
         SearchRequest, SearchResponse, ShowData, ShowLookup, ShowRequest, ShowResponse,
@@ -45,6 +46,7 @@ const EDGE_COLUMNS: &str = "snapshot_id, id, kind, source_node_id, target_node_i
     span_end_column";
 const MAX_FILTERS: usize = 32;
 const MAX_QUERY_TEXT_BYTES: usize = 512;
+const MAX_CONTEXT_CANDIDATES: usize = 4_096;
 const SQLITE_PROGRESS_OPS: i32 = 100;
 
 struct QueryDeadline<'connection> {
@@ -81,6 +83,18 @@ struct SearchRows {
 struct NodeRows {
     rows: Vec<GraphNode>,
     deadline_exceeded: bool,
+}
+
+struct ContextCandidate {
+    node: GraphNode,
+    depth: u32,
+    selection_reasons: Vec<ContextSelectionReason>,
+}
+
+struct ContextAssembly {
+    candidates: Vec<ContextCandidate>,
+    explored_depth: u32,
+    truncation: Option<TruncationReason>,
 }
 
 #[derive(Serialize)]
@@ -700,6 +714,198 @@ impl<'a> SqliteGraphQuery<'a> {
         }
         Ok(found)
     }
+
+    fn context_seed_nodes(
+        &self,
+        snapshot: &SnapshotId,
+        seed: &ContextSeed,
+    ) -> Result<Vec<GraphNode>, QueryError> {
+        if let ContextSeed::Node(id) = seed {
+            return Ok(self.node(snapshot, id)?.into_iter().collect());
+        }
+        let (predicate, value) = match seed {
+            ContextSeed::Symbol(key) => ("semantic_key = ?2", key.as_str()),
+            ContextSeed::Path(path) => ("evidence_path = ?2", path.as_str()),
+            ContextSeed::Node(_) => unreachable!("node seeds return above"),
+        };
+        let sql = format!(
+            "SELECT {NODE_COLUMNS} FROM nodes WHERE snapshot_id = ?1 AND {predicate} \
+             ORDER BY kind, COALESCE(semantic_key, ''), id LIMIT ?3"
+        );
+        let mut statement = self
+            .sidecar
+            .connection()
+            .prepare(&sql)
+            .map_err(sqlite_query_error)?;
+        let mut rows = statement
+            .query(params![
+                snapshot.as_str(),
+                value,
+                i64::try_from(MAX_CONTEXT_CANDIDATES + 1).expect("context cap fits in i64"),
+            ])
+            .map_err(sqlite_query_error)?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
+            found.push(decode_node(row)?);
+        }
+        Ok(found)
+    }
+
+    fn assemble_context(
+        &self,
+        scope: &ResolvedScope,
+        request: &ContextRequest,
+        started: Instant,
+    ) -> Result<ContextAssembly, QueryError> {
+        let mut candidates = BTreeMap::<NodeId, ContextCandidate>::new();
+        let mut frontier = Vec::new();
+        let mut truncation = None;
+
+        let mut seeds = request
+            .seeds
+            .iter()
+            .map(|seed| Ok((context_seed_key(seed)?, seed)))
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        seeds.sort_by(|left, right| left.0.cmp(&right.0));
+        seeds.dedup_by(|left, right| left.0 == right.0);
+        for (_, seed) in seeds {
+            let mut nodes = match self.context_seed_nodes(&scope.snapshot.id, seed) {
+                Ok(nodes) => nodes,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    set_context_truncation(&mut truncation, TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if nodes.is_empty() {
+                return Err(invalid_request("context seed matched no nodes"));
+            }
+            if nodes.len() > MAX_CONTEXT_CANDIDATES {
+                nodes.truncate(MAX_CONTEXT_CANDIDATES);
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+            }
+            for node in nodes {
+                let id = node.id.clone();
+                if !candidates.contains_key(&id) && candidates.len() >= MAX_CONTEXT_CANDIDATES {
+                    set_context_truncation(&mut truncation, TruncationReason::Capability);
+                    break;
+                }
+                let is_new = insert_context_candidate(
+                    &mut candidates,
+                    node,
+                    0,
+                    ContextSelectionReason {
+                        kind: ContextSelectionKind::ExactSeed,
+                        via_node: None,
+                        via_edge: None,
+                    },
+                );
+                if is_new {
+                    frontier.push(id);
+                }
+            }
+        }
+
+        frontier.sort();
+        let mut frontier = frontier
+            .into_iter()
+            .map(|node| (node, 0_u32))
+            .collect::<VecDeque<_>>();
+        let mut seen_edges = BTreeSet::<EdgeId>::new();
+        let mut explored_depth = 0_u32;
+
+        'walk: while let Some((current, depth)) = frontier.pop_front() {
+            explored_depth = explored_depth.max(depth);
+            if started.elapsed().as_millis() >= u128::from(scope.budget.max_duration_ms) {
+                set_context_truncation(&mut truncation, TruncationReason::Duration);
+                break;
+            }
+            let remaining_edges = MAX_CONTEXT_CANDIDATES.saturating_sub(seen_edges.len());
+            if remaining_edges == 0 {
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+                break;
+            }
+            let mut edges = match self.edges(
+                &scope.snapshot.id,
+                &current,
+                request.policy.direction,
+                &request.policy.edge_kinds,
+                seen_edges.iter(),
+                u32::try_from(remaining_edges).expect("context cap fits in u32"),
+            ) {
+                Ok(edges) => edges,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    set_context_truncation(&mut truncation, TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if edges.len() > remaining_edges {
+                edges.truncate(remaining_edges);
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+            }
+            if depth >= scope.budget.max_depth {
+                if edges
+                    .iter()
+                    .any(|edge| context_edge_allowed(edge, request) && edge_targets_node(edge))
+                {
+                    set_context_truncation(&mut truncation, TruncationReason::Depth);
+                }
+                continue;
+            }
+
+            for edge in edges {
+                seen_edges.insert(edge.id.clone());
+                if !context_edge_allowed(&edge, request) {
+                    continue;
+                }
+                let Some(next_id) = adjacent_node(&edge, &current, request.policy.direction) else {
+                    continue;
+                };
+                let next = match self.node(&scope.snapshot.id, &next_id) {
+                    Ok(Some(node)) => node,
+                    Ok(None) => return Err(backend_error()),
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        set_context_truncation(&mut truncation, TruncationReason::Duration);
+                        break 'walk;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !context_node_allowed(&next, request) {
+                    continue;
+                }
+                let next_depth = depth.saturating_add(1);
+                let reason = ContextSelectionReason {
+                    kind: context_selection_kind(&edge, &current, &next),
+                    via_node: Some(current.clone()),
+                    via_edge: Some(edge.id.clone()),
+                };
+                if !candidates.contains_key(&next_id) && candidates.len() >= MAX_CONTEXT_CANDIDATES
+                {
+                    set_context_truncation(&mut truncation, TruncationReason::Capability);
+                    break 'walk;
+                }
+                let is_new = insert_context_candidate(&mut candidates, next, next_depth, reason);
+                if is_new {
+                    frontier.push_back((next_id, next_depth));
+                }
+            }
+        }
+
+        let mut candidates = candidates
+            .into_values()
+            .filter(|candidate| candidate.node.provenance.evidence.is_some())
+            .collect::<Vec<_>>();
+        for candidate in &mut candidates {
+            sort_context_reasons(&mut candidate.selection_reasons);
+        }
+        candidates.sort_by(context_candidate_order);
+        Ok(ContextAssembly {
+            candidates,
+            explored_depth,
+            truncation,
+        })
+    }
 }
 
 impl GraphQuery for SqliteGraphQuery<'_> {
@@ -1022,10 +1228,95 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         })
     }
 
-    fn context(&self, _request: &ContextRequest) -> Result<ContextResponse, QueryError> {
-        Err(invalid_request(
-            "ranked repository context is not available until repository graph phase 2",
-        ))
+    fn context(&self, request: &ContextRequest) -> Result<ContextResponse, QueryError> {
+        let started = Instant::now();
+        let scope = self.resolve_scope(&request.scope)?;
+        if request.seeds.is_empty() || request.seeds.len() > MAX_FILTERS {
+            return Err(invalid_request("context requires 1..=32 seeds"));
+        }
+        validate_filters(&request.policy.edge_kinds, 0)?;
+        let fingerprint = context_cursor_fingerprint(request)?;
+        let offset = decode_cursor(
+            request.page.cursor.as_ref(),
+            "context",
+            &scope.snapshot.id,
+            &fingerprint,
+        )?;
+        let deadline = QueryDeadline::install(
+            self.sidecar.connection(),
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
+        let assembly = self.assemble_context(&scope, request, started)?;
+        drop(deadline);
+
+        let offset = usize::try_from(offset).map_err(|_| stale_cursor_error())?;
+        if offset > assembly.candidates.len() {
+            return Err(stale_cursor_error());
+        }
+        let mut candidates = assembly.candidates.into_iter().skip(offset).peekable();
+        let mut items = Vec::new();
+        let mut returned_bytes = 0_u64;
+        let mut reason = None;
+        for candidate in candidates.by_ref() {
+            if items.len() >= scope.budget.max_results as usize {
+                reason = Some(TruncationReason::Results);
+                break;
+            }
+            if started.elapsed().as_millis() >= u128::from(scope.budget.max_duration_ms) {
+                reason = Some(TruncationReason::Duration);
+                break;
+            }
+            let item = context_item(candidate);
+            let bytes = serialized_len(&item)?;
+            if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
+                reason = Some(TruncationReason::Bytes);
+                break;
+            }
+            returned_bytes = returned_bytes.saturating_add(bytes);
+            items.push(item);
+        }
+        let has_more_candidates = candidates.peek().is_some()
+            || matches!(
+                reason,
+                Some(TruncationReason::Results | TruncationReason::Bytes)
+            );
+        if reason.is_none() {
+            reason = assembly.truncation;
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
+        }
+        let cursor = (has_more_candidates
+            && matches!(
+                reason,
+                Some(TruncationReason::Results | TruncationReason::Bytes)
+            ))
+        .then_some((
+            "context",
+            &scope.snapshot.id,
+            fingerprint.as_str(),
+            u64::try_from(offset + items.len()).unwrap_or(u64::MAX),
+        ));
+        let page = page_info(
+            reason,
+            items.len(),
+            returned_bytes,
+            assembly.explored_depth,
+            cursor,
+        )?;
+        Ok(QueryResponse {
+            wire_version: QUERY_WIRE_VERSION,
+            repository: scope.repository,
+            snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            freshness: scope.freshness,
+            diagnostics,
+            page,
+            data: ContextData { items },
+        })
     }
 }
 
@@ -1286,6 +1577,223 @@ fn search_match_kind(rank: i64) -> Result<SearchMatchKind, QueryError> {
     }
 }
 
+fn insert_context_candidate(
+    candidates: &mut BTreeMap<NodeId, ContextCandidate>,
+    node: GraphNode,
+    depth: u32,
+    reason: ContextSelectionReason,
+) -> bool {
+    match candidates.entry(node.id.clone()) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let candidate = entry.get_mut();
+            candidate.depth = candidate.depth.min(depth);
+            if !candidate.selection_reasons.contains(&reason) {
+                candidate.selection_reasons.push(reason);
+            }
+            false
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(ContextCandidate {
+                node,
+                depth,
+                selection_reasons: vec![reason],
+            });
+            true
+        }
+    }
+}
+
+fn context_edge_allowed(edge: &GraphEdge, request: &ContextRequest) -> bool {
+    match edge.provenance.resolution {
+        ResolutionState::Resolved => true,
+        ResolutionState::Unresolved => request.policy.include_unresolved,
+        ResolutionState::External => request.policy.include_external,
+    }
+}
+
+fn context_node_allowed(node: &GraphNode, request: &ContextRequest) -> bool {
+    match node.provenance.resolution {
+        ResolutionState::Resolved => true,
+        ResolutionState::Unresolved => request.policy.include_unresolved,
+        ResolutionState::External => request.policy.include_external,
+    }
+}
+
+fn edge_targets_node(edge: &GraphEdge) -> bool {
+    matches!(edge.target, EdgeTarget::Node(_))
+}
+
+fn context_selection_kind(
+    edge: &GraphEdge,
+    current: &NodeId,
+    next: &GraphNode,
+) -> ContextSelectionKind {
+    if edge.provenance.resolution == ResolutionState::Resolved
+        && matches!(edge.kind.as_str(), "imports" | "re_exports" | "depends_on")
+    {
+        return ContextSelectionKind::ResolvedDependency;
+    }
+    if next.kind == "document" {
+        return ContextSelectionKind::Documentation;
+    }
+    if matches!(
+        next.kind.as_str(),
+        "manifest"
+            | "configuration"
+            | "entry_point"
+            | "cargo_workspace"
+            | "cargo_package"
+            | "cargo_target"
+            | "dependency"
+    ) {
+        return ContextSelectionKind::Configuration;
+    }
+    if edge.kind == "declares_module"
+        || edge.kind == "contains" && edge.source == *current && is_declaration_node(next)
+    {
+        return ContextSelectionKind::Declaration;
+    }
+    if edge.kind == "contains" {
+        return ContextSelectionKind::Containment;
+    }
+    ContextSelectionKind::Relationship
+}
+
+fn is_declaration_node(node: &GraphNode) -> bool {
+    matches!(
+        node.kind.as_str(),
+        "module"
+            | "mod_declaration"
+            | "struct"
+            | "enum"
+            | "union"
+            | "trait"
+            | "impl"
+            | "function"
+            | "type_alias"
+            | "const"
+            | "static"
+            | "macro"
+    )
+}
+
+fn context_selection_rank(kind: ContextSelectionKind) -> u8 {
+    match kind {
+        ContextSelectionKind::ExactSeed => 0,
+        ContextSelectionKind::Containment => 1,
+        ContextSelectionKind::Declaration => 2,
+        ContextSelectionKind::ResolvedDependency => 3,
+        ContextSelectionKind::Documentation => 4,
+        ContextSelectionKind::Configuration => 5,
+        ContextSelectionKind::Relationship => 6,
+    }
+}
+
+fn sort_context_reasons(reasons: &mut Vec<ContextSelectionReason>) {
+    reasons.sort_by(|left, right| {
+        context_selection_rank(left.kind)
+            .cmp(&context_selection_rank(right.kind))
+            .then_with(|| {
+                left.via_node
+                    .as_ref()
+                    .map(NodeId::as_str)
+                    .cmp(&right.via_node.as_ref().map(NodeId::as_str))
+            })
+            .then_with(|| {
+                left.via_edge
+                    .as_ref()
+                    .map(EdgeId::as_str)
+                    .cmp(&right.via_edge.as_ref().map(EdgeId::as_str))
+            })
+    });
+    reasons.dedup();
+}
+
+fn context_candidate_order(
+    left: &ContextCandidate,
+    right: &ContextCandidate,
+) -> std::cmp::Ordering {
+    let left_evidence = left
+        .node
+        .provenance
+        .evidence
+        .as_ref()
+        .expect("context candidates without evidence are filtered before sorting");
+    let right_evidence = right
+        .node
+        .provenance
+        .evidence
+        .as_ref()
+        .expect("context candidates without evidence are filtered before sorting");
+    let left_rank = left
+        .selection_reasons
+        .iter()
+        .map(|reason| context_selection_rank(reason.kind))
+        .min()
+        .unwrap_or(u8::MAX);
+    let right_rank = right
+        .selection_reasons
+        .iter()
+        .map(|reason| context_selection_rank(reason.kind))
+        .min()
+        .unwrap_or(u8::MAX);
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| left.depth.cmp(&right.depth))
+        .then_with(|| left_evidence.path.cmp(&right_evidence.path))
+        .then_with(|| {
+            left_evidence
+                .span
+                .as_ref()
+                .map(|span| span.start.byte_offset)
+                .unwrap_or(u64::MAX)
+                .cmp(
+                    &right_evidence
+                        .span
+                        .as_ref()
+                        .map(|span| span.start.byte_offset)
+                        .unwrap_or(u64::MAX),
+                )
+        })
+        .then_with(|| left.node.kind.cmp(&right.node.kind))
+        .then_with(|| left.node.semantic_key.cmp(&right.node.semantic_key))
+        .then_with(|| left.node.id.cmp(&right.node.id))
+}
+
+fn context_item(candidate: ContextCandidate) -> ContextItem {
+    let evidence = candidate
+        .node
+        .provenance
+        .evidence
+        .clone()
+        .expect("context candidates without evidence are filtered before materialization");
+    ContextItem {
+        node_id: candidate.node.id,
+        kind: candidate.node.kind,
+        semantic_key: candidate.node.semantic_key,
+        path: evidence.path,
+        span: evidence.span,
+        content_identity: evidence.content_identity,
+        provenance: candidate.node.provenance,
+        selection_reasons: candidate.selection_reasons,
+    }
+}
+
+fn set_context_truncation(current: &mut Option<TruncationReason>, next: TruncationReason) {
+    fn priority(reason: TruncationReason) -> u8 {
+        match reason {
+            TruncationReason::Duration => 0,
+            TruncationReason::Capability => 1,
+            TruncationReason::Depth => 2,
+            TruncationReason::Bytes => 3,
+            TruncationReason::Results => 4,
+        }
+    }
+    if current.is_none_or(|reason| priority(next) < priority(reason)) {
+        *current = Some(next);
+    }
+}
+
 fn neighborhood_node(node: GraphNode) -> NeighborhoodNode {
     let path = node
         .provenance
@@ -1475,6 +1983,47 @@ fn search_cursor_fingerprint(request: &SearchRequest) -> Result<String, QueryErr
 
 fn show_cursor_fingerprint(request: &ShowRequest) -> Result<String, QueryError> {
     cursor_fingerprint("show", &request.lookup)
+}
+
+#[derive(Serialize)]
+struct ContextCursorParameters<'a> {
+    seeds: Vec<String>,
+    direction: EdgeDirection,
+    edge_kinds: Vec<&'a str>,
+    include_unresolved: bool,
+    include_external: bool,
+}
+
+fn context_cursor_fingerprint(request: &ContextRequest) -> Result<String, QueryError> {
+    let mut seeds = request
+        .seeds
+        .iter()
+        .map(context_seed_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    seeds.sort_unstable();
+    seeds.dedup();
+    let mut edge_kinds = request
+        .policy
+        .edge_kinds
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    edge_kinds.sort_unstable();
+    edge_kinds.dedup();
+    cursor_fingerprint(
+        "context",
+        &ContextCursorParameters {
+            seeds,
+            direction: request.policy.direction,
+            edge_kinds,
+            include_unresolved: request.policy.include_unresolved,
+            include_external: request.policy.include_external,
+        },
+    )
+}
+
+fn context_seed_key(seed: &ContextSeed) -> Result<String, QueryError> {
+    serde_json::to_string(seed).map_err(|_| backend_error())
 }
 
 fn cursor_fingerprint<T: Serialize>(operation: &str, parameters: &T) -> Result<String, QueryError> {
@@ -1908,6 +2457,383 @@ mod tests {
             SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
             default_budget(&config.query_limits).unwrap(),
         )
+    }
+
+    fn context_request(config: &RepositoryGraphConfig, seed: ContextSeed) -> ContextRequest {
+        ContextRequest {
+            scope: scope(config),
+            seeds: vec![seed],
+            policy: super::super::query::ContextPolicy {
+                direction: EdgeDirection::Both,
+                edge_kinds: vec![],
+                include_unresolved: false,
+                include_external: false,
+            },
+            page: super::super::query::PageRequest { cursor: None },
+        }
+    }
+
+    fn fixture_symbol(query: &SqliteGraphQuery<'_>, config: &RepositoryGraphConfig) -> SemanticKey {
+        query
+            .search(&SearchRequest {
+                scope: scope(config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec!["struct".to_string()],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap()
+            .data
+            .hits
+            .into_iter()
+            .find_map(|hit| hit.semantic_key)
+            .unwrap()
+    }
+
+    #[test]
+    fn context_resolves_seeds_ranks_deduplicates_and_preserves_evidence() {
+        let (_source, _sidecar_dir, sidecar, config, comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), Some(comparison));
+        let symbol = ContextSeed::Symbol(fixture_symbol(&query, &config));
+        let request = context_request(&config, symbol.clone());
+
+        let first = query.context(&request).unwrap();
+        let second = query.context(&request).unwrap();
+
+        assert!(!first.data.items.is_empty());
+        assert_eq!(
+            first.data.items[0].selection_reasons[0].kind,
+            ContextSelectionKind::ExactSeed
+        );
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        let mut node_ids = BTreeSet::new();
+        let mut selection_kinds = BTreeSet::new();
+        for item in &first.data.items {
+            assert!(node_ids.insert(item.node_id.clone()));
+            let evidence = item.provenance.evidence.as_ref().unwrap();
+            assert_eq!(item.path, evidence.path);
+            assert_eq!(item.span, evidence.span);
+            assert_eq!(item.content_identity, evidence.content_identity);
+            let mut reasons = item.selection_reasons.clone();
+            sort_context_reasons(&mut reasons);
+            reasons.dedup();
+            assert_eq!(item.selection_reasons, reasons);
+            selection_kinds.extend(
+                item.selection_reasons
+                    .iter()
+                    .map(|reason| context_selection_rank(reason.kind)),
+            );
+        }
+        assert!(
+            selection_kinds.contains(&context_selection_rank(ContextSelectionKind::Containment))
+        );
+        assert!(
+            selection_kinds.contains(&context_selection_rank(ContextSelectionKind::Declaration))
+        );
+
+        let mut ordered = context_request(&config, symbol.clone());
+        ordered
+            .seeds
+            .push(ContextSeed::Path(RepoPath::new("src/lib.rs").unwrap()));
+        let mut reversed = ordered.clone();
+        reversed.seeds.reverse();
+        assert_eq!(
+            serde_json::to_value(query.context(&ordered).unwrap()).unwrap(),
+            serde_json::to_value(query.context(&reversed).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn context_pagination_is_snapshot_and_parameter_bound() {
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
+        config.query_limits.max_results = 2;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+
+        let first = query.context(&request).unwrap();
+        assert_eq!(first.data.items.len(), 2);
+        assert_eq!(
+            first.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Results
+        );
+        request.page.cursor = first.page.next_cursor.clone();
+        let second = query.context(&request).unwrap();
+        assert!(first.data.items.iter().all(|left| {
+            second
+                .data
+                .items
+                .iter()
+                .all(|right| left.node_id != right.node_id)
+        }));
+
+        request.policy.direction = EdgeDirection::Outgoing;
+        let error = query.context(&request).unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::StaleCursor);
+    }
+
+    #[test]
+    fn context_depth_and_byte_budgets_return_terminal_truncation() {
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
+        config.query_limits.max_depth = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let seed = ContextSeed::Symbol(fixture_symbol(&query, &config));
+
+        let depth = query
+            .context(&context_request(&config, seed.clone()))
+            .unwrap();
+        assert_eq!(
+            depth.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Depth
+        );
+        assert!(depth.page.next_cursor.is_none());
+
+        config.query_limits.max_bytes = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let bytes = query.context(&context_request(&config, seed)).unwrap();
+        assert!(bytes.data.items.is_empty());
+        assert_eq!(
+            bytes.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Bytes
+        );
+        assert!(bytes.page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn context_rejects_empty_and_missing_seeds() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(
+            &config,
+            ContextSeed::Node(NodeId::new("node:missing").unwrap()),
+        );
+        assert_eq!(
+            query.context(&request).unwrap_err().code,
+            QueryErrorCode::InvalidRequest
+        );
+        request.seeds.clear();
+        assert_eq!(
+            query.context(&request).unwrap_err().code,
+            QueryErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn context_policy_controls_unresolved_and_external_candidates() {
+        for (resolution, include_unresolved, include_external) in
+            [("unresolved", true, false), ("external", false, true)]
+        {
+            let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+            let (file, classified, edge): (String, String, String) = sidecar
+                .connection()
+                .query_row(
+                    "SELECT edge.source_node_id, edge.target_node_id, edge.id \
+                     FROM edges AS edge \
+                     JOIN nodes AS source ON source.snapshot_id = edge.snapshot_id \
+                                         AND source.id = edge.source_node_id \
+                     JOIN nodes AS target ON target.snapshot_id = edge.snapshot_id \
+                                         AND target.id = edge.target_node_id \
+                     WHERE edge.kind = 'classified_as' \
+                       AND source.kind = 'file' \
+                       AND source.evidence_path = 'Cargo.toml' \
+                       AND target.kind = 'configuration' \
+                     LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            sidecar
+                .connection()
+                .execute(
+                    "UPDATE nodes SET resolution_state = ?1 WHERE id = ?2",
+                    params![resolution, classified],
+                )
+                .unwrap();
+            sidecar
+                .connection()
+                .execute(
+                    "UPDATE edges SET resolution_state = ?1 WHERE id = ?2",
+                    params![resolution, edge],
+                )
+                .unwrap();
+            let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+            let mut request =
+                context_request(&config, ContextSeed::Node(NodeId::new(file).unwrap()));
+            request.policy.direction = EdgeDirection::Outgoing;
+            request.policy.edge_kinds = vec!["classified_as".to_string()];
+
+            let excluded = query.context(&request).unwrap();
+            assert!(
+                excluded
+                    .data
+                    .items
+                    .iter()
+                    .all(|item| item.node_id.as_str() != classified)
+            );
+
+            request.policy.include_unresolved = include_unresolved;
+            request.policy.include_external = include_external;
+            let included = query.context(&request).unwrap();
+            let classified_item = included
+                .data
+                .items
+                .iter()
+                .find(|item| item.node_id.as_str() == classified)
+                .unwrap();
+            assert!(
+                classified_item
+                    .selection_reasons
+                    .iter()
+                    .any(|reason| reason.kind == ContextSelectionKind::Configuration)
+            );
+        }
+    }
+
+    #[test]
+    fn context_classifies_documentation_facts_ahead_of_generic_relationships() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) =
+            indexed_fixture_with_extra_files(&[("README.md", "# Fixture\n")]);
+        let (file, document): (String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT edge.source_node_id, edge.target_node_id \
+                 FROM edges AS edge \
+                 JOIN nodes AS source ON source.snapshot_id = edge.snapshot_id \
+                                     AND source.id = edge.source_node_id \
+                 JOIN nodes AS target ON target.snapshot_id = edge.snapshot_id \
+                                     AND target.id = edge.target_node_id \
+                 WHERE edge.kind = 'classified_as' \
+                   AND source.evidence_path = 'README.md' \
+                   AND target.kind = 'document' \
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(&config, ContextSeed::Node(NodeId::new(file).unwrap()));
+        request.policy.direction = EdgeDirection::Outgoing;
+        request.policy.edge_kinds = vec!["classified_as".to_string()];
+
+        let response = query.context(&request).unwrap();
+        let item = response
+            .data
+            .items
+            .iter()
+            .find(|item| item.node_id.as_str() == document)
+            .unwrap();
+
+        assert!(
+            item.selection_reasons
+                .iter()
+                .any(|reason| reason.kind == ContextSelectionKind::Documentation)
+        );
+    }
+
+    #[test]
+    fn context_labels_resolved_import_targets_as_dependencies() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) =
+            indexed_fixture_with_extra_files(&[
+                (
+                    "src/lib.rs",
+                    "pub mod api;\nuse crate::api::Api;\npub fn make() -> Api { Api }\n",
+                ),
+                ("src/api.rs", "pub struct Api;\n"),
+            ]);
+        let (source, target): (String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT source_node_id, target_node_id FROM edges \
+                 WHERE kind = 'imports' AND target_node_id IS NOT NULL \
+                 ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(&config, ContextSeed::Node(NodeId::new(source).unwrap()));
+        request.policy.direction = EdgeDirection::Outgoing;
+        request.policy.edge_kinds = vec!["imports".to_string()];
+
+        let response = query.context(&request).unwrap();
+        let target = response
+            .data
+            .items
+            .iter()
+            .find(|item| item.node_id.as_str() == target)
+            .unwrap();
+
+        assert!(
+            target
+                .selection_reasons
+                .iter()
+                .any(|reason| reason.kind == ContextSelectionKind::ResolvedDependency)
+        );
+        assert_eq!(target.provenance.resolution, ResolutionState::Resolved);
+    }
+
+    #[test]
+    fn context_assembly_observes_an_expired_deadline() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+        let resolved = query.resolve_scope(&request.scope).unwrap();
+        let started = Instant::now()
+            - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
+        let deadline = QueryDeadline::install(
+            sidecar.connection(),
+            started,
+            Duration::from_millis(config.query_limits.max_duration_ms),
+        )
+        .unwrap();
+
+        let assembly = query
+            .assemble_context(&resolved, &request, started)
+            .unwrap();
+        drop(deadline);
+
+        assert_eq!(assembly.truncation, Some(TruncationReason::Duration));
+    }
+
+    #[test]
+    fn context_returns_bounded_snapshot_diagnostics() {
+        let (_source, _sidecar_dir, mut sidecar, mut config, _comparison) = indexed_fixture();
+        let snapshot = sidecar
+            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap();
+        for code in ["context.a", "context.b"] {
+            sidecar
+                .record_diagnostic(&GraphDiagnostic {
+                    build_id: BuildId::new("build-query").unwrap(),
+                    snapshot_id: Some(snapshot.id.clone()),
+                    severity: DiagnosticSeverity::Warning,
+                    code: DiagnosticCode::new(code).unwrap(),
+                    location: None,
+                    metrics: BTreeMap::new(),
+                })
+                .unwrap();
+        }
+        config.query_limits.max_diagnostics = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+
+        let response = query.context(&request).unwrap();
+
+        assert!(response.diagnostics.summary.warning >= 2);
+        assert_eq!(response.diagnostics.items.len(), 1);
+        assert!(response.diagnostics.truncated);
     }
 
     #[test]

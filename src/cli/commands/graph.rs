@@ -20,8 +20,9 @@ use crate::{
         index::{IndexCoordinator, IndexOutcome, IndexRequest},
         ports::GraphQuery,
         query::{
-            DiagnosticsEnvelope, EdgeDirection, FreshnessEnvelope, NeighborhoodRequest, PageInfo,
-            PageRequest, SearchRequest, ShowLookup, ShowRequest, StatusResponse,
+            ContextPolicy, ContextRequest, ContextSeed, DiagnosticsEnvelope, EdgeDirection,
+            FreshnessEnvelope, NeighborhoodRequest, PageInfo, PageRequest, SearchRequest,
+            ShowLookup, ShowRequest, StatusResponse,
         },
         query_sqlite::{SqliteGraphQuery, default_budget},
         sqlite::{
@@ -71,6 +72,8 @@ pub enum GraphCommand {
     },
     /// Inspect nodes selected by opaque id, semantic key, or evidence path.
     Show(ShowArgs),
+    /// Assemble deterministic evidence-backed context around one exact seed.
+    Context(ContextArgs),
     /// Traverse a bounded incoming/outgoing graph neighborhood.
     Neighbors {
         node_id: String,
@@ -108,6 +111,32 @@ pub struct ShowArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+#[group(skip)]
+pub struct ContextArgs {
+    /// Seed context with one opaque node id.
+    #[arg(long)]
+    node: Option<String>,
+    /// Seed context with one exact semantic key.
+    #[arg(long)]
+    symbol: Option<String>,
+    /// Seed context with one exact repository-relative evidence path.
+    #[arg(long)]
+    path: Option<String>,
+    /// Requested expansion depth; the configured service cap still applies.
+    #[arg(long)]
+    depth: Option<u32>,
+    /// Requested result count; the configured service cap still applies.
+    #[arg(long = "max-results")]
+    max_results: Option<u32>,
+    /// Requested response bytes; the configured service cap still applies.
+    #[arg(long = "max-bytes")]
+    max_bytes: Option<u64>,
+    /// Emit one machine-readable JSON document.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum Direction {
     Outgoing,
@@ -138,6 +167,7 @@ pub async fn run(command: GraphCommand) -> Result<()> {
             json,
         } => search(query, kinds, path, limit, json).await,
         GraphCommand::Show(args) => show(args).await,
+        GraphCommand::Context(args) => context(args).await,
         GraphCommand::Neighbors {
             node_id,
             direction,
@@ -266,7 +296,7 @@ async fn search(
         context.freshness_comparison()?,
     );
     let response = query.search(&SearchRequest {
-        scope: context.scope(requested_budget(&context.config, limit, None)?)?,
+        scope: context.scope(requested_budget(&context.config, limit, None, None)?)?,
         text,
         node_kinds: kinds,
         paths: path
@@ -370,6 +400,80 @@ async fn show(args: ShowArgs) -> Result<()> {
     Ok(())
 }
 
+async fn context(args: ContextArgs) -> Result<()> {
+    if usize::from(args.node.is_some())
+        + usize::from(args.symbol.is_some())
+        + usize::from(args.path.is_some())
+        != 1
+    {
+        anyhow::bail!("graph context requires exactly one of --node, --symbol, or --path");
+    }
+    let context = LocalGraphContext::load(true).await?;
+    let seed = if let Some(node) = args.node {
+        ContextSeed::Node(NodeId::new(node)?)
+    } else if let Some(symbol) = args.symbol {
+        ContextSeed::Symbol(SemanticKey::new(symbol)?)
+    } else {
+        ContextSeed::Path(
+            RepoPath::new(args.path.expect("one context seed is required"))
+                .context("--path must be repository-relative")?,
+        )
+    };
+    let response = context
+        .context(&ContextRequest {
+            scope: context.scope(requested_budget(
+                &context.config,
+                args.max_results,
+                args.max_bytes,
+                args.depth,
+            )?)?,
+            seeds: vec![seed],
+            policy: ContextPolicy {
+                direction: EdgeDirection::Both,
+                edge_kinds: vec![],
+                include_unresolved: false,
+                include_external: false,
+            },
+            page: PageRequest { cursor: None },
+        })
+        .await??;
+    if args.json {
+        print_json(&response)?;
+    } else {
+        print_query_header(
+            response.snapshot_id.as_str(),
+            &response.freshness,
+            &response.diagnostics,
+            &response.page,
+        );
+        for item in &response.data.items {
+            let reasons = item
+                .selection_reasons
+                .iter()
+                .map(|reason| format!("{:?}", reason.kind))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "{} {} {}",
+                item.kind,
+                item.semantic_key
+                    .as_ref()
+                    .map_or(item.node_id.as_str(), |key| key.as_str()),
+                evidence_location(Some(&item.path), item.span.as_ref())
+            );
+            println!(
+                "  selected={} resolution={:?} confidence={:?} extractor={}@{}",
+                reasons,
+                item.provenance.resolution,
+                item.provenance.confidence,
+                item.provenance.extractor.id,
+                item.provenance.extractor.version
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn neighbors(
     node_id: String,
     direction: Direction,
@@ -386,7 +490,7 @@ async fn neighbors(
         context.freshness_comparison()?,
     );
     let response = query.neighborhood(&NeighborhoodRequest {
-        scope: context.scope(requested_budget(&context.config, limit, depth)?)?,
+        scope: context.scope(requested_budget(&context.config, limit, None, depth)?)?,
         roots: vec![NodeId::new(node_id)?],
         direction: direction.into(),
         edge_kinds: kinds,
@@ -447,14 +551,15 @@ async fn ready_query_sidecar() -> Result<Sidecar> {
 fn requested_budget(
     config: &RepositoryGraphConfig,
     results: Option<u32>,
+    bytes: Option<u64>,
     depth: Option<u32>,
 ) -> Result<QueryBudget> {
     let defaults = &config.query_limits;
     Ok(QueryBudget::new(
         NonZeroU32::new(results.unwrap_or(defaults.max_results))
             .context("--limit must be greater than zero")?,
-        NonZeroU64::new(defaults.max_bytes)
-            .context("repository_graph.query_limits.max_bytes must be greater than zero")?,
+        NonZeroU64::new(bytes.unwrap_or(defaults.max_bytes))
+            .context("--max-bytes must be greater than zero")?,
         NonZeroU32::new(depth.unwrap_or(defaults.max_depth))
             .context("--depth must be greater than zero")?,
         NonZeroU64::new(defaults.max_duration_ms)
@@ -557,8 +662,9 @@ mod tests {
     #[test]
     fn requested_budgets_reject_zero_cli_values() {
         let config = RepositoryGraphConfig::default();
-        assert!(requested_budget(&config, Some(0), None).is_err());
-        assert!(requested_budget(&config, None, Some(0)).is_err());
+        assert!(requested_budget(&config, Some(0), None, None).is_err());
+        assert!(requested_budget(&config, None, Some(0), None).is_err());
+        assert!(requested_budget(&config, None, None, Some(0)).is_err());
     }
 
     #[test]

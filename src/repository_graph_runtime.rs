@@ -15,9 +15,9 @@ use repository_graph::{
     index::active_extractor_identities,
     ports::GraphQuery,
     query::{
-        DiagnosticSummary, DiagnosticsEnvelope, FreshnessEnvelope, PageInfo, QueryError,
-        QueryErrorCode, RetrievalAction, SearchRequest, SearchResponse, SnapshotSelector,
-        StatusData, StatusRequest, StatusResponse,
+        ContextRequest, ContextResponse, DiagnosticSummary, DiagnosticsEnvelope, FreshnessEnvelope,
+        PageInfo, QueryError, QueryErrorCode, RetrievalAction, SearchRequest, SearchResponse,
+        SnapshotSelector, StatusData, StatusRequest, StatusResponse,
     },
     query_sqlite::{FreshnessComparison, SqliteGraphQuery, default_budget},
     source::{LocalRepositorySource, SourceDiscoveryContext},
@@ -105,6 +105,23 @@ impl LocalGraphContext {
         let comparison = self.freshness_comparison().ok().flatten();
         Ok(search_response_at(self, &path, comparison, request))
     }
+
+    pub(crate) async fn context(
+        &self,
+        request: &ContextRequest,
+    ) -> Result<Result<ContextResponse, QueryError>> {
+        if !self.config.enabled {
+            return Ok(Err(query_error(
+                QueryErrorCode::InvalidRequest,
+                "repository graph is disabled; enable it before assembling context",
+                false,
+                None,
+            )));
+        }
+        let path = sidecar_path().await?;
+        let comparison = self.freshness_comparison().ok().flatten();
+        Ok(context_response_at(self, &path, comparison, request))
+    }
 }
 
 pub(crate) async fn sidecar_path() -> Result<std::path::PathBuf> {
@@ -171,6 +188,46 @@ fn search_response_at(
             freshness_comparison,
         )
         .search(request),
+        Ok(OpenQuerySidecarResult::Absent) => Err(query_error(
+            QueryErrorCode::NotBuilt,
+            "repository graph is not built; run `ferrus graph index`",
+            false,
+            Some(RetrievalAction::Index),
+        )),
+        Ok(OpenQuerySidecarResult::NeedsMigration { .. }) => Err(query_error(
+            QueryErrorCode::Incompatible,
+            "repository graph storage needs migration; run `ferrus graph index`",
+            false,
+            Some(RetrievalAction::Index),
+        )),
+        Ok(OpenQuerySidecarResult::RequiresRebuild(_)) => Err(query_error(
+            QueryErrorCode::Incompatible,
+            "repository graph storage is incompatible; rebuild the derived index",
+            false,
+            Some(RetrievalAction::Rebuild),
+        )),
+        Err(_) => Err(query_error(
+            QueryErrorCode::BackendUnavailable,
+            "repository graph storage is unavailable or inconsistent",
+            true,
+            Some(RetrievalAction::Rebuild),
+        )),
+    }
+}
+
+fn context_response_at(
+    context: &LocalGraphContext,
+    sidecar_path: &Path,
+    freshness_comparison: Option<FreshnessComparison>,
+    request: &ContextRequest,
+) -> Result<ContextResponse, QueryError> {
+    match open_for_query_at(sidecar_path) {
+        Ok(OpenQuerySidecarResult::Ready(sidecar)) => SqliteGraphQuery::new(
+            &sidecar,
+            context.config.query_limits.clone(),
+            freshness_comparison,
+        )
+        .context(request),
         Ok(OpenQuerySidecarResult::Absent) => Err(query_error(
             QueryErrorCode::NotBuilt,
             "repository graph is not built; run `ferrus graph index`",
@@ -267,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_status_and_search_are_read_only_and_actionable() {
+    fn absent_status_search_and_context_are_read_only_and_actionable() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join(SIDECAR_FILE_NAME);
         let context = context(directory.path());
@@ -288,11 +345,37 @@ mod tests {
             },
         )
         .unwrap_err();
+        let context_response = context_response_at(
+            &context,
+            &sidecar,
+            None,
+            &ContextRequest {
+                scope: context
+                    .scope(default_budget(&context.config.query_limits).unwrap())
+                    .unwrap(),
+                seeds: vec![repository_graph::query::ContextSeed::Path(
+                    repository_graph::domain::RepoPath::new("src/lib.rs").unwrap(),
+                )],
+                policy: repository_graph::query::ContextPolicy {
+                    direction: repository_graph::query::EdgeDirection::Both,
+                    edge_kinds: vec![],
+                    include_unresolved: false,
+                    include_external: false,
+                },
+                page: repository_graph::query::PageRequest { cursor: None },
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(status.data.availability, Availability::NotBuilt);
         assert_eq!(status.data.recommended_action, Some(RetrievalAction::Index));
         assert_eq!(search.code, QueryErrorCode::NotBuilt);
         assert_eq!(search.recommended_action, Some(RetrievalAction::Index));
+        assert_eq!(context_response.code, QueryErrorCode::NotBuilt);
+        assert_eq!(
+            context_response.recommended_action,
+            Some(RetrievalAction::Index)
+        );
         assert!(!sidecar.exists());
     }
 

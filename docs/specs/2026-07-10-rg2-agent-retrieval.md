@@ -139,13 +139,18 @@ Implemented by the shared local adapter in `src/repository_graph_runtime.rs` and
 Phase 1 status/search envelopes, bounded filters and cursors, uses no task context or lease helpers, and has a
 runtime-isolation test proving that reads neither open nor alter `ferrus.db`.
 
-- [ ] #2.2 Implement deterministic bounded context assembly
+- [x] #2.2 Implement deterministic bounded context assembly
 
 ID: rg2.2
 Depends on: rg2.0
 
 Build seed resolution, evidence-preserving expansion, deterministic ranking, deduplication, diagnostics,
 truncation, and continuation behavior for `repository_context`.
+
+Implemented by `SqliteGraphQuery::context`, with exact typed seed resolution, policy-aware cycle-safe expansion,
+evidence-preserving deterministic ranking, snapshot/parameter-bound cursors, diagnostics, and explicit
+result/byte/depth/duration/capability truncation. `ferrus graph context` consumes the same machine-local runtime
+adapter that the role-scoped MCP boundary will expose in RG2.4.
 
 - [ ] #2.3 Add hash-verified source snippets and repository summary
 

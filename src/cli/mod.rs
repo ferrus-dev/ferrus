@@ -227,4 +227,25 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn graph_context_surface_parses_seed_and_hard_budget_requests() {
+        assert!(
+            Cli::try_parse_from([
+                "ferrus",
+                "graph",
+                "context",
+                "--symbol",
+                "rust:struct:src/lib.rs:Thing",
+                "--depth",
+                "2",
+                "--max-results",
+                "12",
+                "--max-bytes",
+                "4096",
+                "--json",
+            ])
+            .is_ok()
+        );
+    }
 }
