@@ -18,9 +18,10 @@ mod filesystem;
 mod git;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read},
+    num::NonZeroU64,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -35,10 +36,11 @@ use super::{
         canonical_pattern_body,
     },
     domain::{
-        DiagnosticCode, Digest, ExtractorIdentity, RepoPath, RepositoryRef, SourceKind,
+        DiagnosticCode, Digest, ExtractorIdentity, RepoPath, RepositoryRef, SnapshotId, SourceKind,
         SourceRevision, SourceRevisionId,
     },
-    ports::{RepositorySource, SourceFileDescriptor, SourceFileMode},
+    ports::{RepositorySource, SnapshotContent, SourceFileDescriptor, SourceFileMode},
+    query::{ContentRequest, ContentResponse, QueryError, QueryErrorCode, RetrievalAction},
 };
 
 pub use super::ports::{SourceContent, SourceDiagnostic, SourceDiscoveryMetrics, SourceManifest};
@@ -565,6 +567,160 @@ impl RepositorySource for LocalRepositorySource {
     }
 }
 
+/// A repository-root-confined reader for file identities persisted in one
+/// immutable graph snapshot. It never discovers source identity from the
+/// process working directory and never follows symbolic links.
+pub struct LocalSnapshotContent {
+    root: SourceRoot,
+    repository: RepositoryRef,
+    snapshot_id: SnapshotId,
+    files: BTreeMap<RepoPath, SourceFileDescriptor>,
+    policy: SourcePolicy,
+    hard_max_bytes: NonZeroU64,
+}
+
+impl LocalSnapshotContent {
+    pub fn new(
+        root: impl AsRef<Path>,
+        repository: RepositoryRef,
+        snapshot_id: SnapshotId,
+        config: &SourceConfig,
+        files: Vec<SourceFileDescriptor>,
+        hard_max_bytes: NonZeroU64,
+    ) -> Result<Self, SourceError> {
+        let root = fs::canonicalize(root.as_ref()).map_err(|source| SourceError::Io {
+            operation: "canonicalize snapshot content root",
+            source,
+        })?;
+        Ok(Self {
+            root: SourceRoot::new(root)?,
+            repository,
+            snapshot_id,
+            files: files
+                .into_iter()
+                .map(|file| (file.path.clone(), file))
+                .collect(),
+            policy: SourcePolicy::new(config)?,
+            hard_max_bytes,
+        })
+    }
+}
+
+impl SnapshotContent for LocalSnapshotContent {
+    fn read_verified(&self, request: &ContentRequest) -> Result<ContentResponse, QueryError> {
+        if request.wire_version != super::QUERY_WIRE_VERSION {
+            return Err(content_error(
+                QueryErrorCode::UnsupportedWireVersion,
+                "unsupported repository content wire version",
+                false,
+                None,
+            ));
+        }
+        if request.repository != self.repository || request.snapshot_id != self.snapshot_id {
+            return Err(content_error(
+                QueryErrorCode::InvalidRequest,
+                "repository content request does not match the selected snapshot",
+                false,
+                None,
+            ));
+        }
+        if self.policy.exclusion_for_file(&request.path).is_some() {
+            return Err(content_error(
+                QueryErrorCode::ContentUnavailable,
+                "repository content is excluded by the source policy",
+                false,
+                None,
+            ));
+        }
+        let Some(file) = self.files.get(&request.path) else {
+            return Err(content_error(
+                QueryErrorCode::ContentUnavailable,
+                "repository content is unavailable for the selected snapshot",
+                false,
+                None,
+            ));
+        };
+        if file.content_identity != request.expected_content_identity {
+            return Err(content_error(
+                QueryErrorCode::ContentChanged,
+                "repository content identity does not match the selected snapshot",
+                false,
+                Some(RetrievalAction::RefreshIndex),
+            ));
+        }
+
+        let content = read_descriptor_verified(&self.root, file).map_err(|error| match error {
+            SourceError::ContentChanged => content_error(
+                QueryErrorCode::ContentChanged,
+                "repository content changed after the selected snapshot was published",
+                false,
+                Some(RetrievalAction::RefreshIndex),
+            ),
+            _ => content_error(
+                QueryErrorCode::ContentUnavailable,
+                "repository content could not be read through the confined source boundary",
+                true,
+                None,
+            ),
+        })?;
+
+        let (start, end) = request
+            .span
+            .as_ref()
+            .map_or((0_u64, content.bytes.len() as u64), |span| {
+                (span.start.byte_offset, span.end.byte_offset)
+            });
+        let Ok(start) = usize::try_from(start) else {
+            return Err(invalid_content_span());
+        };
+        let Ok(end) = usize::try_from(end) else {
+            return Err(invalid_content_span());
+        };
+        if start > end || end > content.bytes.len() {
+            return Err(invalid_content_span());
+        }
+        let limit = request.max_bytes.get().min(self.hard_max_bytes.get());
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let selected = &content.bytes[start..end];
+        let returned_len = selected.len().min(limit);
+
+        Ok(ContentResponse {
+            wire_version: super::QUERY_WIRE_VERSION,
+            repository: self.repository.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            path: request.path.clone(),
+            verified_content_identity: file.content_identity.clone(),
+            bytes: selected[..returned_len].to_vec(),
+            truncated: returned_len < selected.len(),
+        })
+    }
+}
+
+fn invalid_content_span() -> QueryError {
+    content_error(
+        QueryErrorCode::InvalidRequest,
+        "repository content span is outside the verified source bytes",
+        false,
+        None,
+    )
+}
+
+fn content_error(
+    code: QueryErrorCode,
+    message: &str,
+    retryable: bool,
+    recommended_action: Option<RetrievalAction>,
+) -> QueryError {
+    QueryError {
+        wire_version: super::QUERY_WIRE_VERSION,
+        code,
+        message: message.to_string(),
+        retryable,
+        recommended_action,
+        details: BTreeMap::new(),
+    }
+}
+
 fn same_manifest_identity(left: &SourceManifest, right: &SourceManifest) -> bool {
     left.revision == right.revision && left.extractor_set_digest == right.extractor_set_digest
 }
@@ -851,6 +1007,13 @@ pub(super) fn read_verified(
         .and_then(|index| manifest.files.get(index))
         .filter(|stored| *stored == file)
         .ok_or(SourceError::FileNotInManifest)?;
+    read_descriptor_verified(root, stored)
+}
+
+fn read_descriptor_verified(
+    root: &SourceRoot,
+    stored: &SourceFileDescriptor,
+) -> Result<SourceContent, SourceError> {
     let file = match root.open_file(&stored.path) {
         Ok(file) => file,
         Err(ConfinedOpenError::Symlink) => return Err(SourceError::ContentChanged),
@@ -1377,6 +1540,37 @@ fn component_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository_graph::domain::{
+        RepositoryId, RepositoryNamespace, SourcePosition, SourceSpan,
+    };
+
+    fn test_repository() -> RepositoryRef {
+        RepositoryRef {
+            namespace: RepositoryNamespace::new("local:test").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
+        }
+    }
+
+    fn descriptor(path: &str, bytes: &[u8]) -> SourceFileDescriptor {
+        SourceFileDescriptor {
+            path: RepoPath::new(path).unwrap(),
+            content_identity: sha256_digest(bytes),
+            byte_len: bytes.len() as u64,
+            file_mode: SourceFileMode::Regular,
+        }
+    }
+
+    fn content_request(file: &SourceFileDescriptor) -> ContentRequest {
+        ContentRequest {
+            wire_version: super::super::QUERY_WIRE_VERSION,
+            repository: test_repository(),
+            snapshot_id: SnapshotId::new("snapshot-1").unwrap(),
+            path: file.path.clone(),
+            expected_content_identity: file.content_identity.clone(),
+            span: None,
+            max_bytes: NonZeroU64::new(1024).unwrap(),
+        }
+    }
 
     #[test]
     fn globstar_matches_root_and_nested_paths() {
@@ -1491,5 +1685,99 @@ mod tests {
             account_inspected_bytes(&mut metrics, error.inspected, 6),
             Err(SourceError::TotalBytesLimitExceeded { limit: 6 })
         ));
+    }
+
+    #[test]
+    fn snapshot_content_confines_hash_verifies_and_bounds_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let bytes = b"abcdef";
+        std::fs::write(directory.path().join("src/lib.rs"), bytes).unwrap();
+        let file = descriptor("src/lib.rs", bytes);
+        let reader = LocalSnapshotContent::new(
+            directory.path(),
+            test_repository(),
+            SnapshotId::new("snapshot-1").unwrap(),
+            &SourceConfig::default(),
+            vec![file.clone()],
+            NonZeroU64::new(3).unwrap(),
+        )
+        .unwrap();
+        let mut request = content_request(&file);
+        request.span = Some(SourceSpan {
+            start: SourcePosition {
+                byte_offset: 1,
+                line: Some(1),
+                column: Some(2),
+            },
+            end: SourcePosition {
+                byte_offset: 5,
+                line: Some(1),
+                column: Some(6),
+            },
+        });
+
+        let response = reader.read_verified(&request).unwrap();
+        assert_eq!(response.bytes, b"bcd");
+        assert!(response.truncated);
+
+        std::fs::write(directory.path().join("src/lib.rs"), b"changed").unwrap();
+        assert_eq!(
+            reader.read_verified(&request).unwrap_err().code,
+            QueryErrorCode::ContentChanged
+        );
+    }
+
+    #[test]
+    fn snapshot_content_denies_sensitive_paths_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = descriptor(".env", b"SECRET=value");
+        std::fs::write(directory.path().join(".env"), b"SECRET=value").unwrap();
+        let reader = LocalSnapshotContent::new(
+            directory.path(),
+            test_repository(),
+            SnapshotId::new("snapshot-1").unwrap(),
+            &SourceConfig::default(),
+            vec![file.clone()],
+            NonZeroU64::new(1024).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader
+                .read_verified(&content_request(&file))
+                .unwrap_err()
+                .code,
+            QueryErrorCode::ContentUnavailable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_content_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let file = descriptor("link.rs", b"outside");
+        symlink(outside.path(), directory.path().join("link.rs")).unwrap();
+        let reader = LocalSnapshotContent::new(
+            directory.path(),
+            test_repository(),
+            SnapshotId::new("snapshot-1").unwrap(),
+            &SourceConfig::default(),
+            vec![file.clone()],
+            NonZeroU64::new(1024).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader
+                .read_verified(&content_request(&file))
+                .unwrap_err()
+                .code,
+            QueryErrorCode::ContentChanged
+        );
     }
 }

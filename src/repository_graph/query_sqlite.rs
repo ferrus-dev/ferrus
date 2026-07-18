@@ -20,7 +20,7 @@ use super::{
         NodeId, PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
         SourceEvidence, SourcePosition, SourceSpan,
     },
-    ports::{GraphQuery, SourceManifest},
+    ports::{GraphQuery, SourceFileDescriptor, SourceFileMode, SourceManifest},
     query::{
         ContextData, ContextItem, ContextRequest, ContextResponse, ContextSeed,
         ContextSelectionKind, ContextSelectionReason, DiagnosticSummary, DiagnosticsEnvelope,
@@ -1315,7 +1315,10 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             freshness: scope.freshness,
             diagnostics,
             page,
-            data: ContextData { items },
+            data: ContextData {
+                items,
+                snippets: vec![],
+            },
         })
     }
 }
@@ -2341,6 +2344,52 @@ fn stale_cursor_error() -> QueryError {
         recommended_action: None,
         details: BTreeMap::new(),
     }
+}
+
+/// Loads the immutable file identities needed by a `SnapshotContent`
+/// implementation without exposing the SQLite connection outside the graph
+/// library boundary.
+pub fn snapshot_file_descriptors(
+    sidecar: &Sidecar,
+    snapshot_id: &SnapshotId,
+    paths: &BTreeSet<RepoPath>,
+) -> Result<Vec<SourceFileDescriptor>, QueryError> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let stored = sidecar
+            .connection()
+            .query_row(
+                "SELECT content_algorithm, content_digest, byte_length, file_mode \
+                 FROM files WHERE snapshot_id = ?1 AND path = ?2",
+                params![snapshot_id.as_str(), path.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| backend_error())?;
+        let Some((algorithm, value, byte_len, file_mode)) = stored else {
+            continue;
+        };
+        let byte_len = u64::try_from(byte_len).map_err(|_| backend_error())?;
+        let file_mode = match file_mode {
+            0 => SourceFileMode::Regular,
+            1 => SourceFileMode::Executable,
+            _ => return Err(backend_error()),
+        };
+        files.push(SourceFileDescriptor {
+            path: path.clone(),
+            content_identity: Digest::new(algorithm, value).map_err(|_| backend_error())?,
+            byte_len,
+            file_mode,
+        });
+    }
+    Ok(files)
 }
 
 pub fn default_budget(

@@ -347,9 +347,23 @@ pub enum ContextSelectionKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextData {
     pub items: Vec<ContextItem>,
+    /// Deduplicated, hash-verified source excerpts requested by the caller.
+    /// Structural query implementations leave this empty; a trusted
+    /// `SnapshotContent` boundary may populate it without changing ranking.
+    #[serde(default)]
+    pub snippets: Vec<ContextSnippet>,
 }
 
 pub type ContextResponse = QueryResponse<ContextData>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSnippet {
+    pub path: RepoPath,
+    pub span: Option<SourceSpan>,
+    pub verified_content_identity: Digest,
+    pub text: String,
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

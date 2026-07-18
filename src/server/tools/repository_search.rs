@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ use crate::{
     repository_graph_runtime::LocalGraphContext,
 };
 
-use super::tool_err;
+use super::{repository_query_telemetry, tool_err};
 
 const MAX_QUERY_BYTES: usize = 512;
 const MAX_FILTERS: usize = 32;
@@ -115,15 +116,19 @@ pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
 }
 
 async fn run(input: RepositorySearchInput) -> Result<String> {
+    let started = Instant::now();
     let context = LocalGraphContext::load(false).await?;
     let request = match search_request(&context, input) {
         Ok(request) => request,
         Err(error) => return serialize_invalid_request(&error),
     };
-    match context.search(&request).await? {
-        Ok(response) => Ok(serde_json::to_string(&response)?),
-        Err(error) => Ok(serde_json::to_string(&error)?),
-    }
+    let response = context.search(&request).await?;
+    let serialized = match &response {
+        Ok(response) => serde_json::to_string(response)?,
+        Err(error) => serde_json::to_string(error)?,
+    };
+    repository_query_telemetry::search(&context.config, started, &response, serialized.len());
+    Ok(serialized)
 }
 
 fn serialize_invalid_request(error: &anyhow::Error) -> Result<String> {

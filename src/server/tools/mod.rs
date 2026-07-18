@@ -10,7 +10,9 @@ pub mod create_task;
 pub mod enqueue_task;
 pub mod heartbeat;
 pub mod reject;
+pub mod repository_context;
 pub mod repository_graph_status;
+mod repository_query_telemetry;
 pub mod repository_search;
 pub mod reset;
 pub mod respond_consult;
@@ -132,6 +134,7 @@ mod tests {
             ("create_task", create_task::INPUT_SCHEMA),
             ("enqueue_task", enqueue_task::INPUT_SCHEMA),
             ("reject", reject::INPUT_SCHEMA),
+            ("repository_context", repository_context::INPUT_SCHEMA),
             ("repository_search", repository_search::INPUT_SCHEMA),
             ("respond_consult", respond_consult::INPUT_SCHEMA),
             ("submit", submit::INPUT_SCHEMA),
@@ -186,6 +189,12 @@ mod tests {
         }))
         .await
         .unwrap();
+        let context = repository_context::handler(serde_json::json!({
+            "seeds": [{"type": "path", "value": "src/lib.rs"}],
+            "max_results": 5
+        }))
+        .await
+        .unwrap();
 
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&status).unwrap()["data"]["availability"],
@@ -193,6 +202,10 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&search).unwrap()["code"],
+            "not_built"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&context).unwrap()["code"],
             "not_built"
         );
         assert_eq!(tokio::fs::read(&runtime_db).await.unwrap(), sentinel);

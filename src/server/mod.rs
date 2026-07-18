@@ -175,6 +175,11 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_input_schema(|_| {
                 ToolSchema::from_json_str(tools::repository_search::INPUT_SCHEMA)
             });
+        app.map_tool("repository_context", tools::repository_context::handler)
+            .with_description(tools::repository_context::DESCRIPTION)
+            .with_input_schema(|_| {
+                ToolSchema::from_json_str(tools::repository_context::INPUT_SCHEMA)
+            });
     }
 
     // Resources
@@ -321,14 +326,14 @@ mod tests {
         assert!(!(all_roles || executor_role || task_scoped_supervisor));
         let definition_tools = 2usize;
         let review_and_consult_tools = 6usize;
-        let repository_read_tools = 2usize;
+        let repository_read_tools = 3usize;
         let shared_human_tools = 2usize;
         assert_eq!(
             definition_tools
                 + review_and_consult_tools
                 + repository_read_tools
                 + shared_human_tools,
-            12
+            13
         );
     }
 
@@ -349,9 +354,9 @@ mod tests {
         ));
         assert!(!supervisor_review_tools_visible(archive_scoped_supervisor));
         let archive_tool = 1usize;
-        let repository_read_tools = 2usize;
+        let repository_read_tools = 3usize;
         let shared_human_tools = 2usize;
-        assert_eq!(archive_tool + repository_read_tools + shared_human_tools, 5);
+        assert_eq!(archive_tool + repository_read_tools + shared_human_tools, 6);
     }
 
     #[test]

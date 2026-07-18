@@ -150,6 +150,8 @@ impl Default for IndexLimitsConfig {
 pub struct QueryLimitsConfig {
     pub max_results: u32,
     pub max_bytes: u64,
+    /// Independent aggregate cap for source snippets attached to one context response.
+    pub max_snippet_bytes: u64,
     pub max_depth: u32,
     pub max_duration_ms: u64,
     pub max_diagnostics: u32,
@@ -160,6 +162,7 @@ impl Default for QueryLimitsConfig {
         Self {
             max_results: 100,
             max_bytes: 256 * 1024,
+            max_snippet_bytes: 32 * 1024,
             max_depth: 3,
             max_duration_ms: 2_000,
             max_diagnostics: 50,
@@ -450,6 +453,7 @@ max_diagnostics = 1000
 [query_limits]
 max_results = 100
 max_bytes = 262144
+max_snippet_bytes = 32768
 max_depth = 3
 max_duration_ms = 2000
 max_diagnostics = 50

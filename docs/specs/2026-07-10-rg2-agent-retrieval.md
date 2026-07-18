@@ -152,7 +152,7 @@ evidence-preserving deterministic ranking, snapshot/parameter-bound cursors, dia
 result/byte/depth/duration/capability truncation. `ferrus graph context` consumes the same machine-local runtime
 adapter that the role-scoped MCP boundary will expose in RG2.4.
 
-- [ ] #2.3 Add hash-verified source snippets and repository summary
+- [x] #2.3 Add hash-verified source snippets and repository summary
 
 ID: rg2.3
 Depends on: rg2.1, rg2.2
@@ -160,13 +160,24 @@ Depends on: rg2.1, rg2.2
 Implement safe on-demand snippet retrieval with content-identity verification and sensitive-path checks, plus a
 strictly bounded deterministic summary resource if it remains useful after measurement.
 
-- [ ] #2.4 Integrate role-scoped MCP registration, guidance, and query telemetry
+Implemented by `LocalSnapshotContent` and the shared context runtime adapter. Opt-in snippets are root-confined,
+symlink-safe, source-policy checked, SHA-256 verified against immutable snapshot file metadata, span sliced,
+deduplicated, and independently byte bounded; changed/unavailable content produces location-bearing diagnostics.
+The conditional summary resource remains unregistered until RG2.5 demonstrates value because it currently
+duplicates status and would add unsolicited context volume.
+
+- [x] #2.4 Integrate role-scoped MCP registration, guidance, and query telemetry
 
 ID: rg2.4
 Depends on: rg2.1, rg2.2
 
 Complete server registration, tool schemas, tests, user and agent guidance, and privacy-safe query metrics without
 injecting graph output into task or review prompts.
+
+Implemented by the bounded `repository_context` schema/handler registered beside status and search for both roles,
+with status-first generated skill guidance and structured opt-in query telemetry. Metrics record only tool,
+snapshot, freshness, duration, counts, response bytes, truncation, and error category; their type cannot contain
+queries, paths, snippets, or source bodies, and repository reads remain independent from task leases/runtime state.
 
 - [ ] #2.5 Build repository navigation evaluations and establish usefulness gates
 

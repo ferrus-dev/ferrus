@@ -65,6 +65,21 @@ kind, semantic key, then opaque node ID. Selection priority is exact seed, conta
 dependency, documentation, configuration, then other relationships. Local assembly additionally has a bounded
 candidate/edge safety cap; exhausting it returns `capability` truncation rather than silently dropping facts.
 
+## Verified snippets
+
+Source text is opt-in on `repository_context`; structural results never embed file bodies by default. Requested
+snippets are deduplicated by repository path, span, and content identity, and are returned separately from ranked
+context items. The local adapter resolves every excerpt through `SnapshotContent` using the response repository,
+immutable snapshot, repository-relative path, and expected content digest. The reader holds a canonical source-root
+handle, rejects symbolic-link traversal, reapplies sensitive/source policy, verifies size, mode, and SHA-256 before
+slicing the half-open byte span, and then applies an independent aggregate snippet-byte cap.
+
+Changed, unavailable, excluded, or non-UTF-8 content is omitted and represented by bounded location-bearing
+diagnostics (`content.changed`, `content.unavailable`, or `content.non_utf8`). Snippet budget exhaustion is explicit
+and never causes unverified bytes to be returned. A compact `ferrus://repository/summary` resource is intentionally
+not registered in Phase 2 yet: before RG2.5 usefulness measurements it would duplicate status, consume prompt
+space, and weaken the status/search/context-on-demand guidance.
+
 ## Diagnostics, pagination, and budgets
 
 Diagnostics contain bounded machine codes, severity, and optional repository-relative locations, never source
@@ -80,3 +95,16 @@ cursor is issued only after at least one result was returned and only when that 
 Invalid versions, requests, selectors, or cursors remain typed errors. Storage corruption or unavailability is a
 backend error; optional absence, active indexing, a failed build, incompatibility, staleness, and budget truncation
 must not be collapsed into that category.
+
+## MCP boundary and telemetry
+
+Supervisor, Executor, and unfiltered servers expose the same read-only `repository_graph_status`,
+`repository_search`, and `repository_context` tools. None resolves, claims, renews, or mutates a task lease. Tool
+descriptions recommend status-first use, bounded requests, and the correct interpretation of missing relationships;
+task/review prompts contain no graph output.
+
+When `[repository_graph.telemetry].enabled = true`, each query emits one structured privacy-safe tracing metric with
+tool name, snapshot identity, freshness, duration, result count, serialized response bytes, truncation reason,
+diagnostic count, and error category. Its metric type cannot represent request text, filters, repository paths,
+snippets, or source bodies. Telemetry remains operational and does not mutate either `ferrus.db` or the read-only
+repository graph sidecar.
