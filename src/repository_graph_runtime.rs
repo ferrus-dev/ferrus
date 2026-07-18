@@ -297,6 +297,12 @@ fn attach_snippets_at(
             )
         })?;
     let total_limit = requested_snippet_bytes.get().min(hard_limit.get());
+    let max_diagnostics = request
+        .scope
+        .budget
+        .max_diagnostics
+        .get()
+        .min(context.config.query_limits.max_diagnostics) as usize;
     let sidecar = match open_for_query_at(sidecar_path) {
         Ok(OpenQuerySidecarResult::Ready(sidecar)) => sidecar,
         _ => {
@@ -382,13 +388,17 @@ fn attach_snippets_at(
                         omitted_for_budget = true;
                     }
                 }
-                Err(_) => {
-                    add_content_diagnostic(&mut response, request, "content.non_utf8", path, span)
-                }
+                Err(_) => add_content_diagnostic(
+                    &mut response,
+                    max_diagnostics,
+                    "content.non_utf8",
+                    path,
+                    span,
+                ),
             },
             Err(error) => add_content_diagnostic(
                 &mut response,
-                request,
+                max_diagnostics,
                 match error.code {
                     QueryErrorCode::ContentChanged => "content.changed",
                     _ => "content.unavailable",
@@ -401,7 +411,7 @@ fn attach_snippets_at(
     if omitted_for_budget {
         add_content_diagnostic_without_location(
             &mut response,
-            request,
+            max_diagnostics,
             "content.snippets_truncated",
         );
     }
@@ -410,14 +420,14 @@ fn attach_snippets_at(
 
 fn add_content_diagnostic(
     response: &mut ContextResponse,
-    request: &ContextRequest,
+    max_diagnostics: usize,
     code: &str,
     path: repository_graph::domain::RepoPath,
     span: Option<repository_graph::domain::SourceSpan>,
 ) {
     add_bounded_content_diagnostic(
         response,
-        request,
+        max_diagnostics,
         code,
         Some(DiagnosticLocation { path, span }),
     );
@@ -425,20 +435,20 @@ fn add_content_diagnostic(
 
 fn add_content_diagnostic_without_location(
     response: &mut ContextResponse,
-    request: &ContextRequest,
+    max_diagnostics: usize,
     code: &str,
 ) {
-    add_bounded_content_diagnostic(response, request, code, None);
+    add_bounded_content_diagnostic(response, max_diagnostics, code, None);
 }
 
 fn add_bounded_content_diagnostic(
     response: &mut ContextResponse,
-    request: &ContextRequest,
+    max_diagnostics: usize,
     code: &str,
     location: Option<DiagnosticLocation>,
 ) {
     response.diagnostics.summary.warning += 1;
-    if response.diagnostics.items.len() < request.scope.budget.max_diagnostics.get() as usize {
+    if response.diagnostics.items.len() < max_diagnostics {
         response.diagnostics.items.push(QueryDiagnostic {
             severity: DiagnosticSeverity::Warning,
             code: DiagnosticCode::new(code).expect("static content diagnostic code is canonical"),
@@ -636,7 +646,7 @@ mod tests {
     fn context_snippets_are_deduplicated_hash_verified_and_stale_safe() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join(SIDECAR_FILE_NAME);
-        let (context, request) = indexed_context(directory.path(), &sidecar);
+        let (mut context, request) = indexed_context(directory.path(), &sidecar);
         let response = context_response_at(&context, &sidecar, None, &request).unwrap();
 
         let enriched = attach_snippets_at(
@@ -671,6 +681,7 @@ mod tests {
             b"pub struct Changed;\n",
         )
         .unwrap();
+        context.config.query_limits.max_diagnostics = 1;
         let stale = attach_snippets_at(
             &context,
             &sidecar,
@@ -680,6 +691,9 @@ mod tests {
         )
         .unwrap();
         assert!(stale.data.snippets.is_empty());
+        assert_eq!(stale.diagnostics.items.len(), 1);
+        assert!(stale.diagnostics.summary.warning > 1);
+        assert!(stale.diagnostics.truncated);
         assert!(
             stale
                 .diagnostics
