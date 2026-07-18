@@ -126,13 +126,18 @@ Normative contract: [Repository Graph Retrieval Contract](../repository-graph-re
 source-revision envelopes, orthogonal index/build/freshness states, deterministic match classification,
 snapshot-bound pagination, bounded diagnostics, and valid truncation responses for hard budget exhaustion.
 
-- [ ] #2.1 Add graph status and bounded search MCP tools
+- [x] #2.1 Add graph status and bounded search MCP tools
 
 ID: rg2.1
 Depends on: rg2.0
 
 Register read-only status and search tools for both roles, implement missing/stale/building/failed behavior,
 filters and pagination, and verify that graph reads require no task lease and mutate no runtime state.
+
+Implemented by the shared local adapter in `src/repository_graph_runtime.rs` and the role-visible
+`repository_graph_status` and `repository_search` handlers in `src/server/tools/`. The MCP boundary preserves
+Phase 1 status/search envelopes, bounded filters and cursors, uses no task context or lease helpers, and has a
+runtime-isolation test proving that reads neither open nor alter `ferrus.db`.
 
 - [ ] #2.2 Implement deterministic bounded context assembly
 

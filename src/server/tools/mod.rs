@@ -10,6 +10,8 @@ pub mod create_task;
 pub mod enqueue_task;
 pub mod heartbeat;
 pub mod reject;
+pub mod repository_graph_status;
+pub mod repository_search;
 pub mod reset;
 pub mod respond_consult;
 pub mod review_pending;
@@ -93,6 +95,25 @@ mod tests {
         )
         .await
         .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: "test-project".to_string(),
+            name: "test".to_string(),
+            workspace_dir: dir.path().to_string_lossy().into_owned(),
+            ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+            vcs: None,
+            origin_repo: None,
+            default_branch: None,
+            current_head: None,
+            created_at: "2026-07-18T00:00:00Z".to_string(),
+            last_opened_at: "2026-07-18T00:00:00Z".to_string(),
+            version: 1,
+        };
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
         (dir, previous)
     }
 
@@ -111,6 +132,7 @@ mod tests {
             ("create_task", create_task::INPUT_SCHEMA),
             ("enqueue_task", enqueue_task::INPUT_SCHEMA),
             ("reject", reject::INPUT_SCHEMA),
+            ("repository_search", repository_search::INPUT_SCHEMA),
             ("respond_consult", respond_consult::INPUT_SCHEMA),
             ("submit", submit::INPUT_SCHEMA),
         ] {
@@ -141,6 +163,41 @@ mod tests {
         ensure_lease_owner_or_reclaim("executor:codex:2", 60)
             .await
             .unwrap();
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn repository_reads_require_no_task_lease_and_do_not_touch_runtime_state() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_runtime_project().await;
+        tokio::fs::write("ferrus.toml", "[repository_graph]\nenabled = true\n")
+            .await
+            .unwrap();
+        let data_dir = crate::project::current_project_data_dir().await.unwrap();
+        let runtime_db = data_dir.join("ferrus.db");
+        let sentinel = b"not a runtime database; repository reads must ignore it";
+        tokio::fs::write(&runtime_db, sentinel).await.unwrap();
+
+        let status = repository_graph_status::run().await.unwrap();
+        let search = repository_search::handler(serde_json::json!({
+            "query": "RuntimeTaskContext",
+            "max_results": 5
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status).unwrap()["data"]["availability"],
+            "not_built"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&search).unwrap()["code"],
+            "not_built"
+        );
+        assert_eq!(tokio::fs::read(&runtime_db).await.unwrap(), sentinel);
+        assert!(!data_dir.join("repo-graph.db").exists());
+        assert!(!std::path::Path::new(".ferrus/tasks").exists());
 
         teardown(previous);
     }

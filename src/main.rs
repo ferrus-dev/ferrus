@@ -7,6 +7,7 @@ mod hq;
 mod legacy_state;
 mod platform;
 mod project;
+mod repository_graph_runtime;
 mod runtime_status;
 mod runtime_table;
 mod server;

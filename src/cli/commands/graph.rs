@@ -1,6 +1,5 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
-    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,32 +10,30 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    project,
     repository_graph::{
-        QUERY_WIRE_VERSION,
         config::RepositoryGraphConfig,
         domain::{
             Availability, BuildId, EdgeTarget, Freshness, NodeId, PublishedViewName, QueryBudget,
-            RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SemanticKey,
+            RepoPath, SemanticKey,
         },
         health::{SidecarHealth, inspect_health_at},
-        index::{IndexCoordinator, IndexOutcome, IndexRequest, active_extractor_identities},
+        index::{IndexCoordinator, IndexOutcome, IndexRequest},
         ports::GraphQuery,
         query::{
             DiagnosticsEnvelope, EdgeDirection, FreshnessEnvelope, NeighborhoodRequest, PageInfo,
-            PageRequest, QueryScope, RetrievalAction, SearchRequest, ShowLookup, ShowRequest,
-            SnapshotSelector, StatusData, StatusRequest, StatusResponse,
+            PageRequest, SearchRequest, ShowLookup, ShowRequest, StatusResponse,
         },
-        query_sqlite::{FreshnessComparison, SqliteGraphQuery, default_budget},
-        source::{LocalRepositorySource, SourceDiscoveryContext},
+        query_sqlite::{SqliteGraphQuery, default_budget},
         sqlite::{
-            OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, Sidecar,
-            open_for_build_at, open_for_query_at,
+            OpenQuerySidecarResult, OpenSidecarResult, Sidecar, open_for_build_at,
+            open_for_query_at,
         },
+    },
+    repository_graph_runtime::{
+        CANONICAL_VIEW, LocalGraphContext, sidecar_path, status_response_at,
     },
 };
 
-const CANONICAL_VIEW: &str = "canonical";
 static BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Subcommand)]
@@ -152,64 +149,6 @@ pub async fn run(command: GraphCommand) -> Result<()> {
     }
 }
 
-struct LocalGraphContext {
-    root: std::path::PathBuf,
-    repository: RepositoryRef,
-    config: RepositoryGraphConfig,
-}
-
-impl LocalGraphContext {
-    async fn load(require_enabled: bool) -> Result<Self> {
-        let root = project::canonical_project_root().await?;
-        let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
-            .await
-            .context("ferrus.toml not found — run ferrus init first")?;
-        let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
-            .context("Invalid [repository_graph] configuration")?;
-        if require_enabled && !config.enabled {
-            anyhow::bail!(
-                "repository graph is disabled; set repository_graph.enabled = true in ferrus.toml"
-            );
-        }
-        let project_id = project::current_project_id().await?;
-        Ok(Self {
-            root,
-            repository: RepositoryRef {
-                namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
-                repository_id: RepositoryId::new("root")?,
-            },
-            config,
-        })
-    }
-
-    fn discover(&self) -> Result<LocalRepositorySource> {
-        let identities = active_extractor_identities(&self.config)?;
-        let context = SourceDiscoveryContext::from_config(
-            self.repository.clone(),
-            &self.config,
-            &identities,
-        )?;
-        LocalRepositorySource::discover(&self.root, context)
-            .context("Failed to discover the canonical repository source")
-    }
-
-    fn freshness_comparison(&self) -> Result<Option<FreshnessComparison>> {
-        if !self.config.enabled {
-            return Ok(None);
-        }
-        let source = self.discover()?;
-        Ok(Some(FreshnessComparison::from_manifest(source.manifest())))
-    }
-
-    fn scope(&self, budget: QueryBudget) -> Result<QueryScope> {
-        Ok(QueryScope::current(
-            self.repository.clone(),
-            SnapshotSelector::Published(PublishedViewName::new(CANONICAL_VIEW)?),
-            budget,
-        ))
-    }
-}
-
 #[derive(Serialize)]
 struct IndexOutput {
     status: &'static str,
@@ -310,47 +249,6 @@ async fn status(json: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn status_response_at(
-    context: &LocalGraphContext,
-    sidecar_path: &Path,
-    freshness_comparison: Option<FreshnessComparison>,
-) -> Result<StatusResponse> {
-    match open_for_query_at(sidecar_path) {
-        Ok(OpenQuerySidecarResult::Ready(sidecar)) => {
-            let query = SqliteGraphQuery::new(
-                &sidecar,
-                context.config.query_limits.clone(),
-                freshness_comparison,
-            );
-            Ok(query.status(&StatusRequest {
-                scope: context.scope(default_budget(&context.config.query_limits)?)?,
-            })?)
-        }
-        Ok(OpenQuerySidecarResult::Absent) => unavailable_status(
-            context.repository.clone(),
-            Availability::NotBuilt,
-            "not_built",
-        ),
-        Ok(OpenQuerySidecarResult::NeedsMigration {
-            found_schema_version,
-        }) => unavailable_status(
-            context.repository.clone(),
-            Availability::Incompatible,
-            &format!("schema_{found_schema_version}_needs_migration"),
-        ),
-        Ok(OpenQuerySidecarResult::RequiresRebuild(_)) => unavailable_status(
-            context.repository.clone(),
-            Availability::Incompatible,
-            "incompatible_schema",
-        ),
-        Err(_) => unavailable_status(
-            context.repository.clone(),
-            Availability::Incompatible,
-            "sidecar_unreadable",
-        ),
-    }
 }
 
 async fn search(
@@ -546,12 +444,6 @@ async fn ready_query_sidecar() -> Result<Sidecar> {
     }
 }
 
-async fn sidecar_path() -> Result<PathBuf> {
-    Ok(project::current_project_data_dir()
-        .await?
-        .join(SIDECAR_FILE_NAME))
-}
-
 fn requested_budget(
     config: &RepositoryGraphConfig,
     results: Option<u32>,
@@ -570,42 +462,6 @@ fn requested_budget(
         NonZeroU32::new(defaults.max_diagnostics)
             .context("repository_graph.query_limits.max_diagnostics must be greater than zero")?,
     ))
-}
-
-fn unavailable_status(
-    repository: RepositoryRef,
-    availability: Availability,
-    reason: &str,
-) -> Result<StatusResponse> {
-    Ok(StatusResponse {
-        wire_version: QUERY_WIRE_VERSION,
-        repository,
-        snapshot_id: None,
-        source_revision: None,
-        freshness: FreshnessEnvelope {
-            freshness: Freshness::NotApplicable,
-            compared_manifest: None,
-            reason_codes: vec![reason.to_string()],
-        },
-        diagnostics: DiagnosticsEnvelope::default(),
-        page: PageInfo {
-            next_cursor: None,
-            truncation: None,
-        },
-        data: StatusData {
-            availability,
-            build_state: None,
-            build_id: None,
-            published_view: Some(PublishedViewName::new(CANONICAL_VIEW)?),
-            graph_model_version: None,
-            statistics: None,
-            recommended_action: Some(match availability {
-                Availability::NotBuilt => RetrievalAction::Index,
-                Availability::Incompatible => RetrievalAction::Rebuild,
-                Availability::Available => RetrievalAction::RefreshIndex,
-            }),
-        },
-    })
 }
 
 fn print_query_header(
@@ -709,25 +565,5 @@ mod tests {
     fn evidence_locations_are_repository_relative() {
         let path = RepoPath::new("src/main.rs").unwrap();
         assert_eq!(evidence_location(Some(&path), None), "src/main.rs");
-    }
-
-    #[test]
-    fn unreadable_sidecar_is_reported_as_incompatible_status() {
-        let directory = tempfile::tempdir().unwrap();
-        let sidecar_path = directory.path().join(SIDECAR_FILE_NAME);
-        std::fs::write(&sidecar_path, b"not a sqlite database").unwrap();
-        let context = LocalGraphContext {
-            root: directory.path().to_path_buf(),
-            repository: RepositoryRef {
-                namespace: RepositoryNamespace::new("local:test").unwrap(),
-                repository_id: RepositoryId::new("root").unwrap(),
-            },
-            config: RepositoryGraphConfig::default(),
-        };
-
-        let response = status_response_at(&context, &sidecar_path, None).unwrap();
-
-        assert_eq!(response.data.availability, Availability::Incompatible);
-        assert_eq!(response.freshness.reason_codes, ["sidecar_unreadable"]);
     }
 }
