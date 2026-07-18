@@ -4,8 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     path::Path,
-    sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
 };
 
 use crate::{project, repository_graph};
@@ -33,72 +31,7 @@ use repository_graph::{
 };
 
 pub(crate) const CANONICAL_VIEW: &str = "canonical";
-const FRESHNESS_CACHE_TTL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FreshnessCacheKey {
-    root: std::path::PathBuf,
-    analysis_config_digest: String,
-}
-
-#[derive(Default)]
-struct FreshnessCacheEntry {
-    comparison: Option<FreshnessComparison>,
-    refreshed_at: Option<Instant>,
-    refresh_in_flight: bool,
-}
-
-#[derive(Default)]
-struct FreshnessCache {
-    entries: BTreeMap<FreshnessCacheKey, FreshnessCacheEntry>,
-}
-
-impl FreshnessCache {
-    fn cached_or_begin_refresh(
-        &mut self,
-        key: FreshnessCacheKey,
-        now: Instant,
-    ) -> (Option<FreshnessComparison>, bool) {
-        let entry = self.entries.entry(key).or_default();
-        let expired = entry.refreshed_at.is_none_or(|refreshed_at| {
-            now.saturating_duration_since(refreshed_at) >= FRESHNESS_CACHE_TTL
-        });
-        if expired {
-            if !entry.refresh_in_flight {
-                entry.refresh_in_flight = true;
-                return (None, true);
-            }
-            return (None, false);
-        }
-        (entry.comparison.clone(), false)
-    }
-
-    fn complete(
-        &mut self,
-        key: FreshnessCacheKey,
-        comparison: Option<FreshnessComparison>,
-        now: Instant,
-    ) {
-        let entry = self.entries.entry(key).or_default();
-        entry.comparison = comparison;
-        entry.refreshed_at = Some(now);
-        entry.refresh_in_flight = false;
-    }
-}
-
-fn freshness_cache() -> &'static Mutex<FreshnessCache> {
-    static CACHE: OnceLock<Mutex<FreshnessCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(FreshnessCache::default()))
-}
-
-fn with_freshness_cache<T>(operation: impl FnOnce(&mut FreshnessCache) -> T) -> T {
-    let mut cache = freshness_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    operation(&mut cache)
-}
-
-#[derive(Clone)]
 pub(crate) struct LocalGraphContext {
     pub(crate) root: std::path::PathBuf,
     pub(crate) repository: RepositoryRef,
@@ -148,36 +81,6 @@ impl LocalGraphContext {
         Ok(Some(FreshnessComparison::from_manifest(source.manifest())))
     }
 
-    fn cached_freshness_comparison(&self) -> Option<FreshnessComparison> {
-        if !self.config.enabled {
-            return None;
-        }
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let key = FreshnessCacheKey {
-            root: self.root.clone(),
-            analysis_config_digest: self
-                .config
-                .analysis_config_digest()
-                .ok()?
-                .value()
-                .to_string(),
-        };
-        let (comparison, refresh) = with_freshness_cache(|cache| {
-            cache.cached_or_begin_refresh(key.clone(), Instant::now())
-        });
-        if refresh {
-            let context = self.clone();
-            runtime.spawn_blocking(move || {
-                let comparison = context
-                    .discover()
-                    .ok()
-                    .map(|source| FreshnessComparison::from_manifest(source.manifest()));
-                with_freshness_cache(|cache| cache.complete(key, comparison, Instant::now()));
-            });
-        }
-        comparison
-    }
-
     pub(crate) fn scope(&self, budget: QueryBudget) -> Result<repository_graph::query::QueryScope> {
         Ok(repository_graph::query::QueryScope::current(
             self.repository.clone(),
@@ -188,8 +91,11 @@ impl LocalGraphContext {
 
     pub(crate) async fn status(&self) -> Result<StatusResponse> {
         let path = sidecar_path().await?;
-        let comparison = self.cached_freshness_comparison();
-        status_response_at(self, &path, comparison)
+        // Discovering the current manifest can walk and hash the repository.
+        // MCP retrieval must stay latency-bounded, so without a reliable source
+        // mutation token it reports freshness as unknown rather than stale data
+        // as fresh. The local CLI uses freshness_comparison() for exact checks.
+        status_response_at(self, &path, None)
     }
 
     pub(crate) async fn search(
@@ -205,8 +111,7 @@ impl LocalGraphContext {
             )));
         }
         let path = sidecar_path().await?;
-        let comparison = self.cached_freshness_comparison();
-        Ok(search_response_at(self, &path, comparison, request))
+        Ok(search_response_at(self, &path, None, request))
     }
 
     pub(crate) async fn context(
@@ -222,8 +127,7 @@ impl LocalGraphContext {
             )));
         }
         let path = sidecar_path().await?;
-        let comparison = self.cached_freshness_comparison();
-        Ok(context_response_at(self, &path, comparison, request))
+        Ok(context_response_at(self, &path, None, request))
     }
 
     pub(crate) async fn context_with_snippets(
@@ -667,37 +571,6 @@ mod tests {
     }
 
     #[test]
-    fn freshness_cache_never_returns_an_expired_comparison() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
-        let source = context.discover().unwrap();
-        let comparison = FreshnessComparison::from_manifest(source.manifest());
-        let key = FreshnessCacheKey {
-            root: directory.path().to_path_buf(),
-            analysis_config_digest: "test-config".to_string(),
-        };
-        let now = Instant::now();
-        let mut cache = FreshnessCache::default();
-
-        let (initial, starts_refresh) = cache.cached_or_begin_refresh(key.clone(), now);
-        assert!(initial.is_none());
-        assert!(starts_refresh);
-        let (while_refreshing, starts_refresh) = cache.cached_or_begin_refresh(key.clone(), now);
-        assert!(while_refreshing.is_none());
-        assert!(!starts_refresh);
-
-        cache.complete(key.clone(), Some(comparison.clone()), now);
-        let (cached, starts_refresh) = cache.cached_or_begin_refresh(key.clone(), now);
-        assert_eq!(cached, Some(comparison));
-        assert!(!starts_refresh);
-
-        let (expired, starts_refresh) =
-            cache.cached_or_begin_refresh(key, now + FRESHNESS_CACHE_TTL);
-        assert!(expired.is_none());
-        assert!(starts_refresh);
-    }
-
-    #[test]
     fn absent_status_search_and_context_are_read_only_and_actionable() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join(SIDECAR_FILE_NAME);
@@ -768,6 +641,23 @@ mod tests {
             status.data.recommended_action,
             Some(RetrievalAction::Rebuild)
         );
+    }
+
+    #[test]
+    fn mcp_runtime_does_not_label_changed_source_as_fresh_without_revalidation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar = directory.path().join(SIDECAR_FILE_NAME);
+        let (context, request) = indexed_context(directory.path(), &sidecar);
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            b"pub struct ChangedAfterIndex;\n",
+        )
+        .unwrap();
+
+        let response = context_response_at(&context, &sidecar, None, &request).unwrap();
+
+        assert_eq!(response.freshness.freshness, Freshness::Unknown);
+        assert_eq!(response.freshness.reason_codes, ["source_not_compared"]);
     }
 
     #[test]
