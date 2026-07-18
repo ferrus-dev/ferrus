@@ -1235,7 +1235,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             return Err(invalid_request("context requires 1..=32 seeds"));
         }
         validate_filters(&request.policy.edge_kinds, 0)?;
-        let fingerprint = context_cursor_fingerprint(request)?;
+        let fingerprint = context_cursor_fingerprint(request, scope.budget.max_depth)?;
         let offset = decode_cursor(
             request.page.cursor.as_ref(),
             "context",
@@ -1991,13 +1991,17 @@ fn show_cursor_fingerprint(request: &ShowRequest) -> Result<String, QueryError> 
 #[derive(Serialize)]
 struct ContextCursorParameters<'a> {
     seeds: Vec<String>,
+    max_depth: u32,
     direction: EdgeDirection,
     edge_kinds: Vec<&'a str>,
     include_unresolved: bool,
     include_external: bool,
 }
 
-fn context_cursor_fingerprint(request: &ContextRequest) -> Result<String, QueryError> {
+fn context_cursor_fingerprint(
+    request: &ContextRequest,
+    max_depth: u32,
+) -> Result<String, QueryError> {
     let mut seeds = request
         .seeds
         .iter()
@@ -2017,6 +2021,7 @@ fn context_cursor_fingerprint(request: &ContextRequest) -> Result<String, QueryE
         "context",
         &ContextCursorParameters {
             seeds,
+            max_depth,
             direction: request.policy.direction,
             edge_kinds,
             include_unresolved: request.policy.include_unresolved,
@@ -2620,6 +2625,15 @@ mod tests {
                 .iter()
                 .all(|right| left.node_id != right.node_id)
         }));
+
+        let mut service_capped_depth = request.clone();
+        service_capped_depth.scope.budget.max_depth = std::num::NonZeroU32::new(99).unwrap();
+        assert!(query.context(&service_capped_depth).is_ok());
+
+        let mut changed_depth = request.clone();
+        changed_depth.scope.budget.max_depth = std::num::NonZeroU32::new(1).unwrap();
+        let error = query.context(&changed_depth).unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::StaleCursor);
 
         request.policy.direction = EdgeDirection::Outgoing;
         let error = query.context(&request).unwrap_err();
