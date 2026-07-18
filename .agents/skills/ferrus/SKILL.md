@@ -148,6 +148,15 @@ Supervisor sessions use `enqueue_task` for task creation and `archive_spec` for 
 | `reset` | Failed | Mark the failed task as reset |
 | `heartbeat` | any claimed | Executor-scoped lease renewal; returns `{"status":"renewed"}` or `{"status":"error","code":"..."}` |
 
+### Repository retrieval
+
+Both roles can use the optional read-only `repository_graph_status`, `repository_search`, and
+`repository_context` tools without a task lease. Check status first when availability is unknown, use search for
+exact path/symbol discovery, then request a small bounded context packet. Ask for snippets only when source text is
+needed; snippets are hash-verified against the returned snapshot. Graph use is optional, and a missing relationship
+means only “not known by this index,” not proof that the relationship does not exist. These tools never build or
+mutate the index and graph output is not injected into task or review prompts.
+
 ## MCP resources
 
 | URI | Contents |

@@ -1,0 +1,49 @@
+{
+  "wire_version": 2,
+  "repository": {
+    "namespace": "local:test",
+    "repository_id": "root"
+  },
+  "snapshot_id": "snapshot-1",
+  "source_revision": {
+    "id": "revision-1",
+    "manifest_digest": {
+      "algorithm": "sha256",
+      "value": "00"
+    }
+  },
+  "freshness": {
+    "freshness": "fresh",
+    "compared_manifest": {
+      "algorithm": "sha256",
+      "value": "00"
+    },
+    "reason_codes": []
+  },
+  "diagnostics": {
+    "summary": {
+      "info": 0,
+      "warning": 0,
+      "error": 0
+    },
+    "items": [],
+    "truncated": false
+  },
+  "page": {
+    "next_cursor": null,
+    "truncation": null
+  },
+  "data": {
+    "availability": "available",
+    "build_state": "published",
+    "build_id": "build-1",
+    "published_view": "canonical",
+    "graph_model_version": 1,
+    "statistics": {
+      "files": 2,
+      "nodes": 8,
+      "edges": 7
+    },
+    "recommended_action": null
+  }
+}

@@ -113,7 +113,7 @@ not optional polish.
 
 ## Milestones
 
-- [ ] #2.0 Stabilize repository retrieval semantics and response envelopes
+- [x] #2.0 Stabilize repository retrieval semantics and response envelopes
 
 ID: rg2.0
 Depends on: none
@@ -121,7 +121,12 @@ Depends on: none
 Finalize MCP request/response schemas, freshness and error states, deterministic ordering, evidence rules,
 pagination, and hard budget behavior using the Phase 1 CLI queries as executable reference behavior.
 
-- [ ] #2.1 Add graph status and bounded search MCP tools
+Normative contract: [Repository Graph Retrieval Contract](../repository-graph-retrieval.md). Implemented in
+`src/repository_graph/query.rs` and `src/repository_graph/query_sqlite.rs`, including typed context seeds, explicit
+source-revision envelopes, orthogonal index/build/freshness states, deterministic match classification,
+snapshot-bound pagination, bounded diagnostics, and valid truncation responses for hard budget exhaustion.
+
+- [x] #2.1 Add graph status and bounded search MCP tools
 
 ID: rg2.1
 Depends on: rg2.0
@@ -129,7 +134,12 @@ Depends on: rg2.0
 Register read-only status and search tools for both roles, implement missing/stale/building/failed behavior,
 filters and pagination, and verify that graph reads require no task lease and mutate no runtime state.
 
-- [ ] #2.2 Implement deterministic bounded context assembly
+Implemented by the shared local adapter in `src/repository_graph_runtime.rs` and the role-visible
+`repository_graph_status` and `repository_search` handlers in `src/server/tools/`. The MCP boundary preserves
+Phase 1 status/search envelopes, bounded filters and cursors, uses no task context or lease helpers, and has a
+runtime-isolation test proving that reads neither open nor alter `ferrus.db`.
+
+- [x] #2.2 Implement deterministic bounded context assembly
 
 ID: rg2.2
 Depends on: rg2.0
@@ -137,7 +147,12 @@ Depends on: rg2.0
 Build seed resolution, evidence-preserving expansion, deterministic ranking, deduplication, diagnostics,
 truncation, and continuation behavior for `repository_context`.
 
-- [ ] #2.3 Add hash-verified source snippets and repository summary
+Implemented by `SqliteGraphQuery::context`, with exact typed seed resolution, policy-aware cycle-safe expansion,
+evidence-preserving deterministic ranking, snapshot/parameter-bound cursors, diagnostics, and explicit
+result/byte/depth/duration/capability truncation. `ferrus graph context` consumes the same machine-local runtime
+adapter that the role-scoped MCP boundary will expose in RG2.4.
+
+- [x] #2.3 Add hash-verified source snippets and repository summary
 
 ID: rg2.3
 Depends on: rg2.1, rg2.2
@@ -145,7 +160,13 @@ Depends on: rg2.1, rg2.2
 Implement safe on-demand snippet retrieval with content-identity verification and sensitive-path checks, plus a
 strictly bounded deterministic summary resource if it remains useful after measurement.
 
-- [ ] #2.4 Integrate role-scoped MCP registration, guidance, and query telemetry
+Implemented by `LocalSnapshotContent` and the shared context runtime adapter. Opt-in snippets are root-confined,
+symlink-safe, source-policy checked, SHA-256 verified against immutable snapshot file metadata, span sliced,
+deduplicated, and independently byte bounded; changed/unavailable content produces location-bearing diagnostics.
+The conditional summary resource remains unregistered until RG2.5 demonstrates value because it currently
+duplicates status and would add unsolicited context volume.
+
+- [x] #2.4 Integrate role-scoped MCP registration, guidance, and query telemetry
 
 ID: rg2.4
 Depends on: rg2.1, rg2.2
@@ -153,13 +174,25 @@ Depends on: rg2.1, rg2.2
 Complete server registration, tool schemas, tests, user and agent guidance, and privacy-safe query metrics without
 injecting graph output into task or review prompts.
 
-- [ ] #2.5 Build repository navigation evaluations and establish usefulness gates
+Implemented by the bounded `repository_context` schema/handler registered beside status and search for both roles,
+with status-first generated skill guidance and structured opt-in query telemetry. Metrics record only tool,
+snapshot, freshness, duration, counts, response bytes, truncation, and error category; their type cannot contain
+queries, paths, snippets, or source bodies, and repository reads remain independent from task leases/runtime state.
+
+- [x] #2.5 Build repository navigation evaluations and establish usefulness gates
 
 ID: rg2.5
 Depends on: rg2.3, rg2.4
 
 Create deterministic fixtures and graph-assisted versus baseline evaluation scenarios, record performance and
 context-volume results, and document thresholds for retrieval quality and later automation decisions.
+
+Implemented by the versioned 26-case corpus in `tests/fixtures/repository_graph_eval`, a shared real-index/query
+harness, `cargo test --test repository_graph_eval`, and the machine-readable
+`cargo run --example repository_graph_eval -- --output <path>` runner. Current gates achieve 100% exact-path and
+unique-symbol Recall@1, 93.75% supported-discovery Recall@10, 100% repeated-query determinism, no supported baseline
+regression, and 100% median files-read reduction. Context bytes remain substantially higher for broad traversal, so
+optional retrieval guidance is eligible while automatic injection and the summary resource remain disabled.
 
 ## Acceptance Criteria
 
@@ -203,6 +236,7 @@ context-volume results, and document thresholds for retrieval quality and later 
 - Token counting differs across agent models. Byte and character caps should remain authoritative even when an
   estimated token budget is reported.
 - Query metrics must be useful without logging sensitive user searches or source content.
-- It remains open whether `ferrus://repository/summary` adds value beyond the status and context tools.
+- RG2.5 found no evidence that `ferrus://repository/summary` adds value beyond status and on-demand tools, so it
+  remains unregistered; reevaluate only with a measured navigation benefit.
 - Cursor stability across snapshot publication must be defined; the safest default is to scope every cursor to
   one immutable snapshot.

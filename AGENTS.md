@@ -28,9 +28,11 @@ All three checks must pass before submitting: `clippy -D warnings`, `fmt --check
 ```
 src/
   main.rs                    # CLI entry, tracing init, HQ logger
-  cli/                       # clap entry and command implementations (init, serve, register)
+  cli/                       # clap entry and command implementations (init, serve, register, graph, ...)
   config/mod.rs              # Deserialize/update ferrus.toml (ChecksConfig, LimitsConfig, LeaseConfig, SpecConfig, HqConfig)
   config/claude.rs           # Claude MCP isolation config helpers
+  repository_graph/          # Backend-neutral graph contracts plus local source, index, SQLite query, diagnostics, and extractors
+  repository_graph_runtime.rs # Machine-local CLI/MCP adapter; resolves project identity, sidecar, freshness, and verified snippets
   templates.rs               # Embedded Markdown templates written by init/resource fallback
   specs.rs                   # Spec discovery, milestone parsing, selected milestone resolution
   agent_id.rs                # Stable agent IDs and MCP server names
@@ -64,6 +66,18 @@ src/
 **Tool files** expose `pub const DESCRIPTION: &str`, optionally `pub const INPUT_SCHEMA: &str`, and `pub async fn handler(...)`. Registered manually via `app.map_tool()` in `server/mod.rs` — no macros.
 
 **Runtime state**: SQLite is the runtime source of truth. MCP tools should resolve the caller’s `RuntimeTaskContext` from `ferrus.db`, update task/run rows transactionally, and write only scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`.
+
+**Repository graph boundary**: the optional repository graph is derived machine-local state in `repo-graph.db`,
+separate from the orchestration `ferrus.db`. Keep backend-neutral identities, requests, responses, and ports under
+`src/repository_graph/`; keep project-local path/config/sidecar resolution in `src/repository_graph_runtime.rs`.
+Core config loading must remain lenient toward graph settings; graph operations validate `[repository_graph]`
+strictly only when invoked.
+
+**Repository retrieval tools**: `repository_graph_status`, `repository_search`, and `repository_context` are
+read-only, role-visible tools registered in `server/mod.rs`. They require no task lease and must not mutate tasks,
+runs, events, or either database. Do not inject graph output into task/review prompts. Structural responses omit
+source bodies; requested snippets must pass the snapshot-aware, hash-verified content boundary. Treat missing
+relationships as unknown, not absent.
 
 **Per-task state machine**: The old single global `STATE.json` is gone, but each SQLite task row still follows the same Supervisor–Executor lifecycle. In `--limit 1` this is effectively the old flow, only DB-backed:
 

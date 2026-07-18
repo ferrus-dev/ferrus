@@ -15,6 +15,7 @@ Tasks are planned, implemented, checked, and reviewed in a structured, restart-s
 
 Everything is explicit:
 - Runtime state lives in SQLite; task context lives in scoped Markdown artifacts
+- Optional repository graph facts live in a separate machine-local SQLite sidecar
 - Agents are stateless between runs
 - Crashes are recoverable
 - No hidden context
@@ -156,7 +157,7 @@ pending
        ├─► reviewing ← /submit final gate pass
        │     ├─► addressing ← /reject
        │     └─► complete ← /approve
-       └─► failed ← retry or review-cycle limit
+       └─► failed ← retry, review-cycle, or executor-dispatch limit
 ```
 
 Any active Executor work state (Executing, Addressing) can pause to `Consultation` via `/consult`. HQ spawns the configured Supervisor in consultation mode, and the executor immediately calls `/wait_for_consult` to block until the Supervisor answers via `/respond_consult`.
@@ -197,6 +198,10 @@ Starts the agent coordination server on stdio. Agents load this as an MCP server
 | `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `ask_human`, `wait_for_answer`, `status`, `reset`, `heartbeat` |
 | *(omitted)* | All tools |
 
+All three server modes also expose the optional read-only repository retrieval tools
+`repository_graph_status`, `repository_search`, and `repository_context`. They do not require a task lease and never
+build an index or mutate task/run state.
+
 The unfiltered server additionally exposes compatibility tools such as `create_task` and `answer`. The `status` tool includes scoped SQLite task context when called by a running agent with a resolved runtime identity.
 
 ### `ferrus register [--supervisor <agent>] [--supervisor-model <model>] [--executor <agent>] [--executor-model <model>]`
@@ -234,6 +239,7 @@ ferrus graph search RuntimeTaskContext --kind struct --path src [--limit 20] [--
 ferrus graph show --node <node-id> [--json]
 ferrus graph show --symbol <semantic-key> [--json]
 ferrus graph show --path src/project.rs [--json]
+ferrus graph context (--node <node-id> | --symbol <semantic-key> | --path <path>) [--depth 2] [--max-results 50] [--json]
 ferrus graph neighbors <node-id> --direction both --depth 2 --limit 50 [--kind contains] [--json]
 ```
 
@@ -244,8 +250,18 @@ read-only and reports absent or incompatible storage without creating it.
 Every query reports the snapshot ID, freshness against the current source manifest, diagnostic counts,
 repository-relative evidence spans, provenance, and any truncation. CLI limits are requests: configured
 `[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
-`ferrus.db`; it stores structural facts and content identities, not source bodies. Local Criterion benchmark
-methodology and the latest dogfood results are recorded in `docs/repository-graph-benchmarks.md`.
+`ferrus.db`; it stores structural facts and content identities, not source bodies.
+
+Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
+paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
+Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically
+injected into task or review prompts, and a missing relationship means only that the current index does not know it.
+
+The normative retrieval behavior is documented in
+[`docs/repository-graph-retrieval.md`](docs/repository-graph-retrieval.md). Local Criterion methodology and dogfood
+results live in [`docs/repository-graph-benchmarks.md`](docs/repository-graph-benchmarks.md); the reproducible
+26-case navigation evaluation and current automation decision are in
+[`docs/repository-graph-evaluations.md`](docs/repository-graph-evaluations.md).
 
 ### `ferrus projects list`
 
@@ -292,6 +308,7 @@ max_review_cycles = 3    # reject→fix cycles before state → Failed
 max_feedback_lines = 30  # trailing lines per failing command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call before it returns timeout so the agent can poll again
 max_parallel_tasks = 1   # maximum number of concurrent executor sessions
+max_executor_dispatches = 6 # headless executor sessions per work phase before state → Failed; 0 disables
 
 [lease]
 ttl_secs = 90                  # how long a claimed lease is valid without renewal

@@ -152,7 +152,7 @@ fn verify_invariants() {
 
 fn search_request(fixture: &Fixture) -> SearchRequest {
     SearchRequest {
-        scope: QueryScope::v1(
+        scope: QueryScope::current(
             repository(),
             SnapshotSelector::Published(fixture.view.clone()),
             default_budget(&fixture.config.query_limits).unwrap(),

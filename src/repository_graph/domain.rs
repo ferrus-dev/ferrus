@@ -468,6 +468,7 @@ pub struct QueryBudget {
     pub max_bytes: NonZeroU64,
     pub max_depth: NonZeroU32,
     pub max_duration_ms: NonZeroU64,
+    pub max_diagnostics: NonZeroU32,
 }
 
 impl QueryBudget {
@@ -476,12 +477,14 @@ impl QueryBudget {
         max_bytes: NonZeroU64,
         max_depth: NonZeroU32,
         max_duration_ms: NonZeroU64,
+        max_diagnostics: NonZeroU32,
     ) -> Self {
         Self {
             max_results,
             max_bytes,
             max_depth,
             max_duration_ms,
+            max_diagnostics,
         }
     }
 }

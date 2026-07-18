@@ -428,6 +428,9 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "status",
             "reset",
             "heartbeat",
+            "repository_graph_status",
+            "repository_search",
+            "repository_context",
         ],
         ROLE_SUPERVISOR => &[
             "enqueue_task",
@@ -442,6 +445,9 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "ask_human",
             "wait_for_answer",
             "heartbeat",
+            "repository_graph_status",
+            "repository_search",
+            "repository_context",
         ],
         _ => &[],
     }
@@ -787,6 +793,12 @@ args = []
         let tools = entry.get("tools").and_then(toml::Value::as_table).unwrap();
         assert!(tools.contains_key("wait_for_task"));
         assert!(tools.contains_key("submit"));
+        assert!(tools.contains_key("repository_graph_status"));
+        assert!(tools.contains_key("repository_search"));
+        assert_eq!(
+            tools["repository_context"]["approval_mode"].as_str(),
+            Some("approve")
+        );
         assert!(!tools.contains_key("approve"));
     }
 
@@ -800,14 +812,20 @@ args = []
         assert!(tools.contains_key("archive_spec"));
         assert!(tools.contains_key("wait_for_consultation"));
         assert!(tools.contains_key("heartbeat"));
+        assert!(tools.contains_key("repository_graph_status"));
+        assert!(tools.contains_key("repository_search"));
+        assert_eq!(
+            tools["repository_context"]["approval_mode"].as_str(),
+            Some("approve")
+        );
         assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
     }
 
     #[test]
     fn codex_tool_approval_sets_match_role_needs() {
-        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 10);
-        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 12);
+        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 13);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 15);
     }
 
     #[test]

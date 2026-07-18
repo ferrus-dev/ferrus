@@ -1,12 +1,12 @@
 //! Bounded read-only SQLite implementation of the portable graph query contract.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::{NonZeroU32, NonZeroU64},
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, Error as SqliteError, ErrorCode, Row, params};
+use rusqlite::{Connection, Error as SqliteError, ErrorCode, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -14,19 +14,22 @@ use super::{
     QUERY_WIRE_VERSION,
     config::QueryLimitsConfig,
     domain::{
-        Availability, Confidence, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
-        FactProvenance, Freshness, GraphEdge, GraphNode, GraphSnapshot, GraphValue, NodeId,
-        PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
+        Availability, BuildId, BuildState, Confidence, DiagnosticCode, DiagnosticLocation,
+        DiagnosticSeverity, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
+        FactProvenance, Freshness, GraphBuild, GraphEdge, GraphNode, GraphSnapshot, GraphValue,
+        NodeId, PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
         SourceEvidence, SourcePosition, SourceSpan,
     },
-    ports::{GraphQuery, SourceManifest},
+    ports::{GraphQuery, SourceFileDescriptor, SourceFileMode, SourceManifest},
     query::{
-        ContextRequest, ContextResponse, DiagnosticSummary, EdgeDirection, FreshnessEnvelope,
-        NeighborhoodData, NeighborhoodEdge, NeighborhoodNode, NeighborhoodRequest,
-        NeighborhoodResponse, PageInfo, QueryError, QueryErrorCode, QueryResponse, SearchData,
-        SearchHit, SearchRequest, SearchResponse, ShowData, ShowLookup, ShowRequest, ShowResponse,
-        SnapshotSelector, SnapshotStatistics, StatusData, StatusRequest, StatusResponse,
-        Truncation, TruncationReason,
+        ContextData, ContextItem, ContextRequest, ContextResponse, ContextSeed,
+        ContextSelectionKind, ContextSelectionReason, DiagnosticSummary, DiagnosticsEnvelope,
+        EdgeDirection, FreshnessEnvelope, NeighborhoodData, NeighborhoodEdge, NeighborhoodNode,
+        NeighborhoodRequest, NeighborhoodResponse, PageInfo, QueryDiagnostic, QueryError,
+        QueryErrorCode, QueryResponse, RetrievalAction, SearchData, SearchHit, SearchMatchKind,
+        SearchRequest, SearchResponse, ShowData, ShowLookup, ShowRequest, ShowResponse,
+        SnapshotSelector, SnapshotStatistics, SourceRevisionEnvelope, StatusData, StatusRequest,
+        StatusResponse, Truncation, TruncationReason,
     },
     sqlite::Sidecar,
     store::StoreError,
@@ -43,6 +46,7 @@ const EDGE_COLUMNS: &str = "snapshot_id, id, kind, source_node_id, target_node_i
     span_end_column";
 const MAX_FILTERS: usize = 32;
 const MAX_QUERY_TEXT_BYTES: usize = 512;
+const MAX_CONTEXT_CANDIDATES: usize = 4_096;
 const SQLITE_PROGRESS_OPS: i32 = 100;
 
 struct QueryDeadline<'connection> {
@@ -72,8 +76,25 @@ impl Drop for QueryDeadline<'_> {
 }
 
 struct SearchRows {
-    rows: Vec<(GraphNode, f64)>,
+    rows: Vec<(GraphNode, SearchMatchKind)>,
     deadline_exceeded: bool,
+}
+
+struct NodeRows {
+    rows: Vec<GraphNode>,
+    deadline_exceeded: bool,
+}
+
+struct ContextCandidate {
+    node: GraphNode,
+    depth: u32,
+    selection_reasons: Vec<ContextSelectionReason>,
+}
+
+struct ContextAssembly {
+    candidates: Vec<ContextCandidate>,
+    explored_depth: u32,
+    truncation: Option<TruncationReason>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +104,15 @@ struct SearchPathFilter<'a> {
 }
 
 impl SearchRows {
+    fn deadline_exceeded() -> Self {
+        Self {
+            rows: Vec::new(),
+            deadline_exceeded: true,
+        }
+    }
+}
+
+impl NodeRows {
     fn deadline_exceeded() -> Self {
         Self {
             rows: Vec::new(),
@@ -130,19 +160,25 @@ impl<'a> SqliteGraphQuery<'a> {
     fn resolve_scope(&self, scope: &super::query::QueryScope) -> Result<ResolvedScope, QueryError> {
         validate_wire_version(scope.wire_version)?;
         let budget = EffectiveBudget::new(&scope.budget, &self.limits)?;
-        let (snapshot, published_view) = match &scope.snapshot {
+        let (snapshot, published_view, source_revision_id) = match &scope.snapshot {
             SnapshotSelector::Published(name) => {
                 let view = self
                     .sidecar
                     .published_view(&scope.repository, name)
                     .map_err(store_query_error)?
-                    .ok_or_else(not_built_error)?;
+                    .ok_or_else(|| self.unpublished_index_error(&scope.repository))?;
                 let snapshot = self
                     .sidecar
                     .snapshot(&view.snapshot_id)
                     .map_err(store_query_error)?
                     .ok_or_else(backend_error)?;
-                (snapshot, Some(name.clone()))
+                let source_revision_id = self
+                    .sidecar
+                    .build(&view.build_id)
+                    .map_err(store_query_error)?
+                    .ok_or_else(backend_error)?
+                    .source_revision_id;
+                (snapshot, Some(name.clone()), source_revision_id)
             }
             SnapshotSelector::Snapshot(id) => {
                 let snapshot = self
@@ -150,7 +186,8 @@ impl<'a> SqliteGraphQuery<'a> {
                     .snapshot(id)
                     .map_err(store_query_error)?
                     .ok_or_else(snapshot_not_found_error)?;
-                (snapshot, None)
+                let source_revision_id = snapshot.source_revision_id.clone();
+                (snapshot, None, source_revision_id)
             }
         };
         if snapshot.repository != scope.repository {
@@ -161,9 +198,43 @@ impl<'a> SqliteGraphQuery<'a> {
             repository: scope.repository.clone(),
             snapshot,
             published_view,
+            source_revision_id,
             freshness,
             budget,
         })
+    }
+
+    fn latest_build(&self, repository: &RepositoryRef) -> Result<Option<GraphBuild>, QueryError> {
+        let build_id = self
+            .sidecar
+            .connection()
+            .query_row(
+                "SELECT id FROM index_builds \
+                 WHERE repository_namespace = ?1 AND repository_id = ?2 \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_query_error)?
+            .map(BuildId::new)
+            .transpose()
+            .map_err(|_| backend_error())?;
+        build_id
+            .map(|id| self.sidecar.build(&id).map_err(store_query_error))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn unpublished_index_error(&self, repository: &RepositoryRef) -> QueryError {
+        match self.latest_build(repository) {
+            Ok(Some(build)) if build.state == BuildState::Building => index_building_error(),
+            Ok(Some(build)) if build.state == BuildState::Failed => index_failed_error(),
+            _ => not_built_error(),
+        }
     }
 
     fn status_at(
@@ -174,16 +245,17 @@ impl<'a> SqliteGraphQuery<'a> {
         validate_wire_version(request.scope.wire_version)?;
         let budget = EffectiveBudget::new(&request.scope.budget, &self.limits)?;
         let duration = Duration::from_millis(budget.max_duration_ms);
-        if started.elapsed() >= duration {
-            return Err(duration_budget_exceeded_error());
-        }
-        let _deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
         let resolved = match self.resolve_scope(&request.scope) {
             Ok(resolved) => resolved,
             Err(error)
-                if error.code == QueryErrorCode::NotBuilt
-                    && matches!(request.scope.snapshot, SnapshotSelector::Published(_)) =>
+                if matches!(
+                    error.code,
+                    QueryErrorCode::NotBuilt
+                        | QueryErrorCode::IndexBuilding
+                        | QueryErrorCode::IndexFailed
+                ) && matches!(request.scope.snapshot, SnapshotSelector::Published(_)) =>
             {
+                let latest_build = self.latest_build(&request.scope.repository)?;
                 let published_view = match &request.scope.snapshot {
                     SnapshotSelector::Published(name) => Some(name.clone()),
                     SnapshotSelector::Snapshot(_) => None,
@@ -192,6 +264,7 @@ impl<'a> SqliteGraphQuery<'a> {
                     wire_version: QUERY_WIRE_VERSION,
                     repository: request.scope.repository.clone(),
                     snapshot_id: None,
+                    source_revision: None,
                     freshness: FreshnessEnvelope {
                         freshness: Freshness::NotApplicable,
                         compared_manifest: self
@@ -200,46 +273,102 @@ impl<'a> SqliteGraphQuery<'a> {
                             .map(|comparison| comparison.source_manifest_digest.clone()),
                         reason_codes: vec!["not_built".to_string()],
                     },
-                    diagnostics: DiagnosticSummary::default(),
+                    diagnostics: if started.elapsed() >= duration {
+                        truncated_diagnostics()
+                    } else {
+                        DiagnosticsEnvelope::default()
+                    },
+                    page: page_info(
+                        (started.elapsed() >= duration).then_some(TruncationReason::Duration),
+                        0,
+                        0,
+                        0,
+                        None,
+                    )?,
                     data: StatusData {
                         availability: Availability::NotBuilt,
-                        build_state: None,
+                        build_state: latest_build.as_ref().map(|build| build.state),
+                        build_id: latest_build.as_ref().map(|build| build.id.clone()),
                         published_view,
                         graph_model_version: None,
                         statistics: None,
+                        recommended_action: Some(match error.code {
+                            QueryErrorCode::IndexBuilding => RetrievalAction::WaitForBuild,
+                            QueryErrorCode::IndexFailed => RetrievalAction::RetryIndex,
+                            _ => RetrievalAction::Index,
+                        }),
                     },
                 });
             }
             Err(error) => return Err(error),
         };
-        let build_state = self
-            .sidecar
-            .build(&resolved.snapshot.completed_by)
-            .map_err(store_query_error)?
-            .map(|build| build.state);
-        let diagnostics = self.diagnostics(&resolved.snapshot.id)?;
-        let statistics = self.statistics(&resolved.snapshot.id)?;
         if started.elapsed() >= duration {
-            return Err(duration_budget_exceeded_error());
+            return Ok(available_status_response(
+                &resolved,
+                None,
+                truncated_diagnostics(),
+                None,
+                true,
+            ));
         }
-        Ok(StatusResponse {
-            wire_version: QUERY_WIRE_VERSION,
-            repository: resolved.repository,
-            snapshot_id: Some(resolved.snapshot.id.clone()),
-            freshness: resolved.freshness,
+        let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
+        let latest_build = match self.latest_build(&resolved.repository) {
+            Ok(build) => build,
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                return Ok(available_status_response(
+                    &resolved,
+                    None,
+                    truncated_diagnostics(),
+                    None,
+                    true,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let diagnostics =
+            match self.diagnostics(&resolved.snapshot.id, resolved.budget.max_diagnostics) {
+                Ok(diagnostics) => diagnostics,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    return Ok(available_status_response(
+                        &resolved,
+                        latest_build.as_ref(),
+                        truncated_diagnostics(),
+                        None,
+                        true,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+        let statistics = match self.statistics(&resolved.snapshot.id) {
+            Ok(statistics) => statistics,
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                return Ok(available_status_response(
+                    &resolved,
+                    latest_build.as_ref(),
+                    diagnostics,
+                    None,
+                    true,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        drop(deadline);
+        Ok(available_status_response(
+            &resolved,
+            latest_build.as_ref(),
             diagnostics,
-            data: StatusData {
-                availability: Availability::Available,
-                build_state,
-                published_view: resolved.published_view,
-                graph_model_version: Some(resolved.snapshot.graph_model_version),
-                statistics: Some(statistics),
-            },
-        })
+            Some(statistics),
+            started.elapsed() >= duration,
+        ))
     }
 
-    fn diagnostics(&self, snapshot: &SnapshotId) -> Result<DiagnosticSummary, QueryError> {
-        self.sidecar
+    fn diagnostics(
+        &self,
+        snapshot: &SnapshotId,
+        max_diagnostics: u32,
+    ) -> Result<DiagnosticsEnvelope, QueryError> {
+        let summary = self
+            .sidecar
             .connection()
             .query_row(
                 "SELECT \
@@ -260,7 +389,82 @@ impl<'a> SqliteGraphQuery<'a> {
                     })
                 },
             )
-            .map_err(sqlite_query_error)
+            .map_err(sqlite_query_error)?;
+        let mut statement = self
+            .sidecar
+            .connection()
+            .prepare(
+                "SELECT diagnostic.severity, diagnostic.code, diagnostic.path, \
+                        diagnostic.span_start_byte, diagnostic.span_end_byte, \
+                        diagnostic.span_start_line, diagnostic.span_start_column, \
+                        diagnostic.span_end_line, diagnostic.span_end_column \
+                 FROM diagnostics AS diagnostic \
+                 JOIN snapshot_diagnostic_sets AS current \
+                   ON current.snapshot_id = diagnostic.snapshot_id \
+                  AND current.build_id = diagnostic.build_id \
+                 WHERE diagnostic.snapshot_id = ?1 \
+                 ORDER BY CASE diagnostic.severity \
+                              WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, \
+                          diagnostic.code, COALESCE(diagnostic.path, ''), \
+                          COALESCE(diagnostic.span_start_byte, -1), diagnostic.id \
+                 LIMIT ?2",
+            )
+            .map_err(sqlite_query_error)?;
+        let mut rows = statement
+            .query(params![
+                snapshot.as_str(),
+                i64::from(max_diagnostics.saturating_add(1)),
+            ])
+            .map_err(sqlite_query_error)?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
+            let severity = diagnostic_severity(&value::<String>(row, 0)?)?;
+            let code =
+                DiagnosticCode::new(value::<String>(row, 1)?).map_err(|_| backend_error())?;
+            let path = value::<Option<String>>(row, 2)?;
+            let span = decode_span(row, 3, 4, 5, 6, 7, 8)?;
+            let location = match (path, span) {
+                (Some(path), span) => Some(DiagnosticLocation {
+                    path: RepoPath::new(path).map_err(|_| backend_error())?,
+                    span,
+                }),
+                (None, None) => None,
+                (None, Some(_)) => return Err(backend_error()),
+            };
+            items.push(QueryDiagnostic {
+                severity,
+                code,
+                location,
+            });
+        }
+        let truncated = items.len() > max_diagnostics as usize;
+        items.truncate(max_diagnostics as usize);
+        Ok(DiagnosticsEnvelope {
+            summary,
+            items,
+            truncated,
+        })
+    }
+
+    fn diagnostics_with_deadline(
+        &self,
+        scope: &ResolvedScope,
+        started: Instant,
+    ) -> Result<(DiagnosticsEnvelope, bool), QueryError> {
+        let duration = Duration::from_millis(scope.budget.max_duration_ms);
+        if started.elapsed() >= duration {
+            return Ok((truncated_diagnostics(), true));
+        }
+        let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
+        let diagnostics = self.diagnostics(&scope.snapshot.id, scope.budget.max_diagnostics);
+        drop(deadline);
+        match diagnostics {
+            Ok(diagnostics) => Ok((diagnostics, started.elapsed() >= duration)),
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                Ok((truncated_diagnostics(), true))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn statistics(&self, snapshot: &SnapshotId) -> Result<SnapshotStatistics, QueryError> {
@@ -308,12 +512,14 @@ impl<'a> SqliteGraphQuery<'a> {
         let sql = format!(
             "SELECT {NODE_COLUMNS}, \
                 CASE \
-                    WHEN normalized_name = ?2 THEN 1.0 \
-                    WHEN normalized_name LIKE ?3 ESCAPE '\\' THEN 0.9 \
-                    WHEN normalized_name LIKE ?4 ESCAPE '\\' THEN 0.8 \
-                    WHEN lower(COALESCE(semantic_key, '')) LIKE ?4 ESCAPE '\\' THEN 0.7 \
-                    ELSE 0.6 \
-                END AS score \
+                    WHEN lower(COALESCE(semantic_key, '')) = ?2 THEN 0 \
+                    WHEN lower(COALESCE(evidence_path, '')) = ?2 THEN 1 \
+                    WHEN normalized_name = ?2 THEN 2 \
+                    WHEN normalized_name LIKE ?3 ESCAPE '\\' THEN 3 \
+                    WHEN normalized_name LIKE ?4 ESCAPE '\\' THEN 4 \
+                    WHEN lower(COALESCE(semantic_key, '')) LIKE ?4 ESCAPE '\\' THEN 5 \
+                    ELSE 6 \
+                END AS match_rank \
              FROM nodes \
              WHERE snapshot_id = ?1 \
                AND (normalized_name = ?2 \
@@ -328,7 +534,7 @@ impl<'a> SqliteGraphQuery<'a> {
                        OR evidence_path LIKE \
                           json_extract(requested_path.value, '$.descendants') ESCAPE '\\'\
                )) \
-             ORDER BY score DESC, normalized_name, id \
+             ORDER BY match_rank, normalized_name, id \
              LIMIT ?7 OFFSET ?8"
         );
         let limit = i64::from(scope.budget.max_results.saturating_add(1));
@@ -365,7 +571,10 @@ impl<'a> SqliteGraphQuery<'a> {
         let mut found = Vec::new();
         loop {
             match rows.next() {
-                Ok(Some(row)) => found.push((decode_node(row)?, value(row, 19)?)),
+                Ok(Some(row)) => found.push((
+                    decode_node(row)?,
+                    search_match_kind(value::<i64>(row, 19)?)?,
+                )),
                 Ok(None) => break,
                 Err(error) if sqlite_deadline_exceeded(&error) => {
                     return Ok(SearchRows::deadline_exceeded());
@@ -385,7 +594,7 @@ impl<'a> SqliteGraphQuery<'a> {
         request: &ShowRequest,
         offset: u64,
         started: Instant,
-    ) -> Result<Vec<GraphNode>, QueryError> {
+    ) -> Result<NodeRows, QueryError> {
         let (predicate, lookup) = match &request.lookup {
             ShowLookup::Node(id) => ("id = ?2", id.as_str()),
             ShowLookup::Symbol(key) => ("semantic_key = ?2", key.as_str()),
@@ -401,20 +610,40 @@ impl<'a> SqliteGraphQuery<'a> {
             started,
             Duration::from_millis(scope.budget.max_duration_ms),
         )?;
-        let mut statement = connection.prepare(&sql).map_err(sqlite_query_error)?;
-        let mut rows = statement
-            .query(params![
-                scope.snapshot.id.as_str(),
-                lookup,
-                i64::from(scope.budget.max_results.saturating_add(1)),
-                i64::try_from(offset).map_err(|_| stale_cursor_error())?,
-            ])
-            .map_err(sqlite_query_error)?;
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(NodeRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
+        let mut rows = match statement.query(params![
+            scope.snapshot.id.as_str(),
+            lookup,
+            i64::from(scope.budget.max_results.saturating_add(1)),
+            i64::try_from(offset).map_err(|_| stale_cursor_error())?,
+        ]) {
+            Ok(rows) => rows,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(NodeRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
-            found.push(decode_node(row)?);
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => found.push(decode_node(row)?),
+                Ok(None) => break,
+                Err(error) if sqlite_deadline_exceeded(&error) => {
+                    return Ok(NodeRows::deadline_exceeded());
+                }
+                Err(_) => return Err(backend_error()),
+            }
         }
-        Ok(found)
+        Ok(NodeRows {
+            rows: found,
+            deadline_exceeded: false,
+        })
     }
 
     fn node(&self, snapshot: &SnapshotId, id: &NodeId) -> Result<Option<GraphNode>, QueryError> {
@@ -423,12 +652,12 @@ impl<'a> SqliteGraphQuery<'a> {
             .sidecar
             .connection()
             .prepare(&sql)
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut rows = statement
             .query(params![snapshot.as_str(), id.as_str()])
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         rows.next()
-            .map_err(|_| backend_error())?
+            .map_err(sqlite_query_error)?
             .map(decode_node)
             .transpose()
     }
@@ -469,7 +698,7 @@ impl<'a> SqliteGraphQuery<'a> {
             .sidecar
             .connection()
             .prepare(&sql)
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut rows = statement
             .query(params![
                 snapshot.as_str(),
@@ -478,12 +707,204 @@ impl<'a> SqliteGraphQuery<'a> {
                 excluded,
                 i64::from(limit.saturating_add(1)),
             ])
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| backend_error())? {
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
             found.push(decode_edge(row)?);
         }
         Ok(found)
+    }
+
+    fn context_seed_nodes(
+        &self,
+        snapshot: &SnapshotId,
+        seed: &ContextSeed,
+    ) -> Result<Vec<GraphNode>, QueryError> {
+        if let ContextSeed::Node(id) = seed {
+            return Ok(self.node(snapshot, id)?.into_iter().collect());
+        }
+        let (predicate, value) = match seed {
+            ContextSeed::Symbol(key) => ("semantic_key = ?2", key.as_str()),
+            ContextSeed::Path(path) => ("evidence_path = ?2", path.as_str()),
+            ContextSeed::Node(_) => unreachable!("node seeds return above"),
+        };
+        let sql = format!(
+            "SELECT {NODE_COLUMNS} FROM nodes WHERE snapshot_id = ?1 AND {predicate} \
+             ORDER BY kind, COALESCE(semantic_key, ''), id LIMIT ?3"
+        );
+        let mut statement = self
+            .sidecar
+            .connection()
+            .prepare(&sql)
+            .map_err(sqlite_query_error)?;
+        let mut rows = statement
+            .query(params![
+                snapshot.as_str(),
+                value,
+                i64::try_from(MAX_CONTEXT_CANDIDATES + 1).expect("context cap fits in i64"),
+            ])
+            .map_err(sqlite_query_error)?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
+            found.push(decode_node(row)?);
+        }
+        Ok(found)
+    }
+
+    fn assemble_context(
+        &self,
+        scope: &ResolvedScope,
+        request: &ContextRequest,
+        started: Instant,
+    ) -> Result<ContextAssembly, QueryError> {
+        let mut candidates = BTreeMap::<NodeId, ContextCandidate>::new();
+        let mut frontier = Vec::new();
+        let mut truncation = None;
+
+        let mut seeds = request
+            .seeds
+            .iter()
+            .map(|seed| Ok((context_seed_key(seed)?, seed)))
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        seeds.sort_by(|left, right| left.0.cmp(&right.0));
+        seeds.dedup_by(|left, right| left.0 == right.0);
+        for (_, seed) in seeds {
+            let mut nodes = match self.context_seed_nodes(&scope.snapshot.id, seed) {
+                Ok(nodes) => nodes,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    set_context_truncation(&mut truncation, TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if nodes.is_empty() {
+                return Err(invalid_request("context seed matched no nodes"));
+            }
+            if nodes.len() > MAX_CONTEXT_CANDIDATES {
+                nodes.truncate(MAX_CONTEXT_CANDIDATES);
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+            }
+            for node in nodes {
+                let id = node.id.clone();
+                if !candidates.contains_key(&id) && candidates.len() >= MAX_CONTEXT_CANDIDATES {
+                    set_context_truncation(&mut truncation, TruncationReason::Capability);
+                    break;
+                }
+                let is_new = insert_context_candidate(
+                    &mut candidates,
+                    node,
+                    0,
+                    ContextSelectionReason {
+                        kind: ContextSelectionKind::ExactSeed,
+                        via_node: None,
+                        via_edge: None,
+                    },
+                );
+                if is_new {
+                    frontier.push(id);
+                }
+            }
+        }
+
+        frontier.sort();
+        let mut frontier = frontier
+            .into_iter()
+            .map(|node| (node, 0_u32))
+            .collect::<VecDeque<_>>();
+        let mut seen_edges = BTreeSet::<EdgeId>::new();
+        let mut explored_depth = 0_u32;
+
+        'walk: while let Some((current, depth)) = frontier.pop_front() {
+            explored_depth = explored_depth.max(depth);
+            if started.elapsed().as_millis() >= u128::from(scope.budget.max_duration_ms) {
+                set_context_truncation(&mut truncation, TruncationReason::Duration);
+                break;
+            }
+            let remaining_edges = MAX_CONTEXT_CANDIDATES.saturating_sub(seen_edges.len());
+            if remaining_edges == 0 {
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+                break;
+            }
+            let mut edges = match self.edges(
+                &scope.snapshot.id,
+                &current,
+                request.policy.direction,
+                &request.policy.edge_kinds,
+                seen_edges.iter(),
+                u32::try_from(remaining_edges).expect("context cap fits in u32"),
+            ) {
+                Ok(edges) => edges,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    set_context_truncation(&mut truncation, TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if edges.len() > remaining_edges {
+                edges.truncate(remaining_edges);
+                set_context_truncation(&mut truncation, TruncationReason::Capability);
+            }
+            if depth >= scope.budget.max_depth {
+                if edges
+                    .iter()
+                    .any(|edge| context_edge_allowed(edge, request) && edge_targets_node(edge))
+                {
+                    set_context_truncation(&mut truncation, TruncationReason::Depth);
+                }
+                continue;
+            }
+
+            for edge in edges {
+                seen_edges.insert(edge.id.clone());
+                if !context_edge_allowed(&edge, request) {
+                    continue;
+                }
+                let Some(next_id) = adjacent_node(&edge, &current, request.policy.direction) else {
+                    continue;
+                };
+                let next = match self.node(&scope.snapshot.id, &next_id) {
+                    Ok(Some(node)) => node,
+                    Ok(None) => return Err(backend_error()),
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        set_context_truncation(&mut truncation, TruncationReason::Duration);
+                        break 'walk;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !context_node_allowed(&next, request) {
+                    continue;
+                }
+                let next_depth = depth.saturating_add(1);
+                let reason = ContextSelectionReason {
+                    kind: context_selection_kind(&edge, &current, &next),
+                    via_node: Some(current.clone()),
+                    via_edge: Some(edge.id.clone()),
+                };
+                if !candidates.contains_key(&next_id) && candidates.len() >= MAX_CONTEXT_CANDIDATES
+                {
+                    set_context_truncation(&mut truncation, TruncationReason::Capability);
+                    break 'walk;
+                }
+                let is_new = insert_context_candidate(&mut candidates, next, next_depth, reason);
+                if is_new {
+                    frontier.push_back((next_id, next_depth));
+                }
+            }
+        }
+
+        let mut candidates = candidates
+            .into_values()
+            .filter(|candidate| candidate.node.provenance.evidence.is_some())
+            .collect::<Vec<_>>();
+        for candidate in &mut candidates {
+            sort_context_reasons(&mut candidate.selection_reasons);
+        }
+        candidates.sort_by(context_candidate_order);
+        Ok(ContextAssembly {
+            candidates,
+            explored_depth,
+            truncation,
+        })
     }
 }
 
@@ -510,7 +931,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         let mut reason = search_rows
             .deadline_exceeded
             .then_some(TruncationReason::Duration);
-        for (node, score) in rows {
+        for (node, match_kind) in rows {
             if hits.len() >= scope.budget.max_results as usize {
                 reason = Some(TruncationReason::Results);
                 break;
@@ -519,7 +940,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 reason = Some(TruncationReason::Duration);
                 break;
             }
-            let hit = search_hit(node, score, request.text.trim());
+            let hit = search_hit(node, match_kind, request.text.trim());
             let bytes = serialized_len(&hit)?;
             if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
                 reason = Some(TruncationReason::Bytes);
@@ -527,6 +948,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
             returned_bytes = returned_bytes.saturating_add(bytes);
             hits.push(hit);
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
         }
         let page = page_info(
             reason,
@@ -544,8 +970,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: SearchData { hits },
         })
@@ -561,14 +988,16 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             &scope.snapshot.id,
             &fingerprint,
         )?;
-        let rows = self.show_rows(&scope, request, offset, started)?;
-        if rows.is_empty() && offset == 0 {
+        let show_rows = self.show_rows(&scope, request, offset, started)?;
+        if show_rows.rows.is_empty() && !show_rows.deadline_exceeded && offset == 0 {
             return Err(invalid_request("graph lookup matched no nodes"));
         }
         let mut nodes = Vec::new();
         let mut returned_bytes = 0_u64;
-        let mut reason = None;
-        for node in rows {
+        let mut reason = show_rows
+            .deadline_exceeded
+            .then_some(TruncationReason::Duration);
+        for node in show_rows.rows {
             if nodes.len() >= scope.budget.max_results as usize {
                 reason = Some(TruncationReason::Results);
                 break;
@@ -584,6 +1013,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
             returned_bytes = returned_bytes.saturating_add(bytes);
             nodes.push(node);
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
         }
         let page = page_info(
             reason,
@@ -601,8 +1035,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: ShowData { nodes },
         })
@@ -623,6 +1058,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             return Err(invalid_request("neighborhood requires 1..=32 roots"));
         }
         validate_filters(&request.edge_kinds, 0)?;
+        let deadline = QueryDeadline::install(
+            self.sidecar.connection(),
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
 
         let mut nodes = BTreeMap::new();
         let mut edges = BTreeMap::new();
@@ -630,9 +1070,17 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         let mut returned_bytes = 0_u64;
         let mut reason = None;
         for root in &request.roots {
-            let node = self
-                .node(&scope.snapshot.id, root)?
-                .ok_or_else(|| invalid_request("neighborhood root was not found"))?;
+            let node = match self.node(&scope.snapshot.id, root) {
+                Ok(Some(node)) => node,
+                Ok(None) => {
+                    return Err(invalid_request("neighborhood root was not found"));
+                }
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    reason = Some(TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let item = neighborhood_node(node);
             let bytes = serialized_len(&item)?;
             if nodes.len() >= scope.budget.max_results as usize
@@ -661,18 +1109,23 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 break;
             }
             if depth >= scope.budget.max_depth {
-                if !self
-                    .edges(
-                        &scope.snapshot.id,
-                        &current,
-                        request.direction,
-                        &request.edge_kinds,
-                        std::iter::empty::<&EdgeId>(),
-                        1,
-                    )?
-                    .is_empty()
-                {
-                    reason = Some(TruncationReason::Depth);
+                match self.edges(
+                    &scope.snapshot.id,
+                    &current,
+                    request.direction,
+                    &request.edge_kinds,
+                    std::iter::empty::<&EdgeId>(),
+                    1,
+                ) {
+                    Ok(edges) if !edges.is_empty() => {
+                        reason = Some(TruncationReason::Depth);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        reason = Some(TruncationReason::Duration);
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
                 continue;
             }
@@ -684,14 +1137,22 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 reason = Some(TruncationReason::Results);
                 break;
             }
-            for edge in self.edges(
+            let next_edges = match self.edges(
                 &scope.snapshot.id,
                 &current,
                 request.direction,
                 &request.edge_kinds,
                 edges.keys(),
                 remaining,
-            )? {
+            ) {
+                Ok(edges) => edges,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    reason = Some(TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            for edge in next_edges {
                 if edges.contains_key(&edge.id) {
                     continue;
                 }
@@ -718,9 +1179,15 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                     reason = Some(TruncationReason::Results);
                     break;
                 }
-                let next = self
-                    .node(&scope.snapshot.id, &next_id)?
-                    .ok_or_else(backend_error)?;
+                let next = match self.node(&scope.snapshot.id, &next_id) {
+                    Ok(Some(node)) => node,
+                    Ok(None) => return Err(backend_error()),
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        reason = Some(TruncationReason::Duration);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let next = neighborhood_node(next);
                 let bytes = serialized_len(&next)?;
                 if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
@@ -733,6 +1200,12 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
         }
 
+        drop(deadline);
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
+        }
         let page = page_info(
             reason,
             nodes.len() + edges.len(),
@@ -744,8 +1217,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: NeighborhoodData {
                 nodes: nodes.into_values().collect(),
@@ -754,10 +1228,98 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         })
     }
 
-    fn context(&self, _request: &ContextRequest) -> Result<ContextResponse, QueryError> {
-        Err(invalid_request(
-            "ranked repository context is not available until repository graph phase 2",
-        ))
+    fn context(&self, request: &ContextRequest) -> Result<ContextResponse, QueryError> {
+        let started = Instant::now();
+        let scope = self.resolve_scope(&request.scope)?;
+        if request.seeds.is_empty() || request.seeds.len() > MAX_FILTERS {
+            return Err(invalid_request("context requires 1..=32 seeds"));
+        }
+        validate_filters(&request.policy.edge_kinds, 0)?;
+        let fingerprint = context_cursor_fingerprint(request, scope.budget.max_depth)?;
+        let offset = decode_cursor(
+            request.page.cursor.as_ref(),
+            "context",
+            &scope.snapshot.id,
+            &fingerprint,
+        )?;
+        let deadline = QueryDeadline::install(
+            self.sidecar.connection(),
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
+        let assembly = self.assemble_context(&scope, request, started)?;
+        drop(deadline);
+
+        let offset = usize::try_from(offset).map_err(|_| stale_cursor_error())?;
+        if offset > assembly.candidates.len() {
+            return Err(stale_cursor_error());
+        }
+        let mut candidates = assembly.candidates.into_iter().skip(offset).peekable();
+        let mut items = Vec::new();
+        let mut returned_bytes = 0_u64;
+        let mut reason = None;
+        for candidate in candidates.by_ref() {
+            if items.len() >= scope.budget.max_results as usize {
+                reason = Some(TruncationReason::Results);
+                break;
+            }
+            if started.elapsed().as_millis() >= u128::from(scope.budget.max_duration_ms) {
+                reason = Some(TruncationReason::Duration);
+                break;
+            }
+            let item = context_item(candidate);
+            let bytes = serialized_len(&item)?;
+            if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
+                reason = Some(TruncationReason::Bytes);
+                break;
+            }
+            returned_bytes = returned_bytes.saturating_add(bytes);
+            items.push(item);
+        }
+        let has_more_candidates = candidates.peek().is_some()
+            || matches!(
+                reason,
+                Some(TruncationReason::Results | TruncationReason::Bytes)
+            );
+        if reason.is_none() {
+            reason = assembly.truncation;
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
+        }
+        let cursor = (has_more_candidates
+            && matches!(
+                reason,
+                Some(TruncationReason::Results | TruncationReason::Bytes)
+            ))
+        .then_some((
+            "context",
+            &scope.snapshot.id,
+            fingerprint.as_str(),
+            u64::try_from(offset + items.len()).unwrap_or(u64::MAX),
+        ));
+        let page = page_info(
+            reason,
+            items.len(),
+            returned_bytes,
+            assembly.explored_depth,
+            cursor,
+        )?;
+        Ok(QueryResponse {
+            wire_version: QUERY_WIRE_VERSION,
+            repository: scope.repository,
+            snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            freshness: scope.freshness,
+            diagnostics,
+            page,
+            data: ContextData {
+                items,
+                snippets: vec![],
+            },
+        })
     }
 }
 
@@ -765,6 +1327,7 @@ struct ResolvedScope {
     repository: RepositoryRef,
     snapshot: super::domain::GraphSnapshot,
     published_view: Option<super::domain::PublishedViewName>,
+    source_revision_id: super::domain::SourceRevisionId,
     freshness: FreshnessEnvelope,
     budget: EffectiveBudget,
 }
@@ -775,6 +1338,7 @@ struct EffectiveBudget {
     max_bytes: u64,
     max_depth: u32,
     max_duration_ms: u64,
+    max_diagnostics: u32,
 }
 
 impl EffectiveBudget {
@@ -786,12 +1350,14 @@ impl EffectiveBudget {
             || service.max_bytes == 0
             || service.max_depth == 0
             || service.max_duration_ms == 0
+            || service.max_diagnostics == 0
         {
             return Err(QueryError {
                 wire_version: QUERY_WIRE_VERSION,
                 code: QueryErrorCode::BackendUnavailable,
                 message: "repository graph query limits are invalid".to_string(),
                 retryable: false,
+                recommended_action: None,
                 details: BTreeMap::new(),
             });
         }
@@ -800,6 +1366,7 @@ impl EffectiveBudget {
             max_bytes: requested.max_bytes.get().min(service.max_bytes),
             max_depth: requested.max_depth.get().min(service.max_depth),
             max_duration_ms: requested.max_duration_ms.get().min(service.max_duration_ms),
+            max_diagnostics: requested.max_diagnostics.get().min(service.max_diagnostics),
         })
     }
 }
@@ -813,6 +1380,7 @@ fn validate_wire_version(version: u32) -> Result<(), QueryError> {
             code: QueryErrorCode::UnsupportedWireVersion,
             message: "repository graph query wire version is unsupported".to_string(),
             retryable: false,
+            recommended_action: None,
             details: BTreeMap::new(),
         })
     }
@@ -872,7 +1440,71 @@ fn freshness(expected: &GraphSnapshot, actual: Option<&FreshnessComparison>) -> 
     }
 }
 
-fn search_hit(node: GraphNode, score: f64, query: &str) -> SearchHit {
+fn source_revision(
+    snapshot: &GraphSnapshot,
+    source_revision_id: &super::domain::SourceRevisionId,
+) -> SourceRevisionEnvelope {
+    SourceRevisionEnvelope {
+        id: source_revision_id.clone(),
+        manifest_digest: snapshot.source_manifest_digest.clone(),
+    }
+}
+
+fn available_status_response(
+    resolved: &ResolvedScope,
+    latest_build: Option<&GraphBuild>,
+    diagnostics: DiagnosticsEnvelope,
+    statistics: Option<SnapshotStatistics>,
+    duration_truncated: bool,
+) -> StatusResponse {
+    StatusResponse {
+        wire_version: QUERY_WIRE_VERSION,
+        repository: resolved.repository.clone(),
+        snapshot_id: Some(resolved.snapshot.id.clone()),
+        source_revision: Some(source_revision(
+            &resolved.snapshot,
+            &resolved.source_revision_id,
+        )),
+        freshness: resolved.freshness.clone(),
+        diagnostics,
+        page: PageInfo {
+            next_cursor: None,
+            truncation: duration_truncated.then_some(Truncation {
+                reason: TruncationReason::Duration,
+                returned_results: 0,
+                returned_bytes: 0,
+                explored_depth: 0,
+            }),
+        },
+        data: StatusData {
+            availability: Availability::Available,
+            build_state: latest_build.map(|build| build.state),
+            build_id: latest_build.map(|build| build.id.clone()),
+            published_view: resolved.published_view.clone(),
+            graph_model_version: Some(resolved.snapshot.graph_model_version),
+            statistics,
+            recommended_action: status_action(latest_build, resolved.freshness.freshness),
+        },
+    }
+}
+
+fn truncated_diagnostics() -> DiagnosticsEnvelope {
+    DiagnosticsEnvelope {
+        truncated: true,
+        ..DiagnosticsEnvelope::default()
+    }
+}
+
+fn status_action(build: Option<&GraphBuild>, freshness: Freshness) -> Option<RetrievalAction> {
+    match build.map(|build| build.state) {
+        Some(BuildState::Building) => Some(RetrievalAction::WaitForBuild),
+        Some(BuildState::Failed) => Some(RetrievalAction::RetryIndex),
+        _ if freshness == Freshness::Stale => Some(RetrievalAction::RefreshIndex),
+        _ => None,
+    }
+}
+
+fn search_hit(node: GraphNode, match_kind: SearchMatchKind, query: &str) -> SearchHit {
     let normalized = query.to_lowercase();
     let mut matched_fields = Vec::new();
     if node
@@ -915,8 +1547,253 @@ fn search_hit(node: GraphNode, score: f64, query: &str) -> SearchHit {
         path,
         span,
         provenance: node.provenance,
-        score,
+        match_kind,
+        score: match_kind.score(),
         matched_fields,
+    }
+}
+
+impl SearchMatchKind {
+    fn score(self) -> f64 {
+        match self {
+            Self::ExactSemanticKey => 1.0,
+            Self::ExactPath => 0.99,
+            Self::ExactNormalizedName => 0.98,
+            Self::NormalizedNamePrefix => 0.9,
+            Self::NormalizedNameContains => 0.8,
+            Self::SemanticKeyContains => 0.7,
+            Self::PathContains => 0.6,
+        }
+    }
+}
+
+fn search_match_kind(rank: i64) -> Result<SearchMatchKind, QueryError> {
+    match rank {
+        0 => Ok(SearchMatchKind::ExactSemanticKey),
+        1 => Ok(SearchMatchKind::ExactPath),
+        2 => Ok(SearchMatchKind::ExactNormalizedName),
+        3 => Ok(SearchMatchKind::NormalizedNamePrefix),
+        4 => Ok(SearchMatchKind::NormalizedNameContains),
+        5 => Ok(SearchMatchKind::SemanticKeyContains),
+        6 => Ok(SearchMatchKind::PathContains),
+        _ => Err(backend_error()),
+    }
+}
+
+fn insert_context_candidate(
+    candidates: &mut BTreeMap<NodeId, ContextCandidate>,
+    node: GraphNode,
+    depth: u32,
+    reason: ContextSelectionReason,
+) -> bool {
+    match candidates.entry(node.id.clone()) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let candidate = entry.get_mut();
+            candidate.depth = candidate.depth.min(depth);
+            if !candidate.selection_reasons.contains(&reason) {
+                candidate.selection_reasons.push(reason);
+            }
+            false
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(ContextCandidate {
+                node,
+                depth,
+                selection_reasons: vec![reason],
+            });
+            true
+        }
+    }
+}
+
+fn context_edge_allowed(edge: &GraphEdge, request: &ContextRequest) -> bool {
+    match edge.provenance.resolution {
+        ResolutionState::Resolved => true,
+        ResolutionState::Unresolved => request.policy.include_unresolved,
+        ResolutionState::External => request.policy.include_external,
+    }
+}
+
+fn context_node_allowed(node: &GraphNode, request: &ContextRequest) -> bool {
+    match node.provenance.resolution {
+        ResolutionState::Resolved => true,
+        ResolutionState::Unresolved => request.policy.include_unresolved,
+        ResolutionState::External => request.policy.include_external,
+    }
+}
+
+fn edge_targets_node(edge: &GraphEdge) -> bool {
+    matches!(edge.target, EdgeTarget::Node(_))
+}
+
+fn context_selection_kind(
+    edge: &GraphEdge,
+    current: &NodeId,
+    next: &GraphNode,
+) -> ContextSelectionKind {
+    if edge.provenance.resolution == ResolutionState::Resolved
+        && matches!(edge.kind.as_str(), "imports" | "re_exports" | "depends_on")
+    {
+        return ContextSelectionKind::ResolvedDependency;
+    }
+    if next.kind == "document" {
+        return ContextSelectionKind::Documentation;
+    }
+    if matches!(
+        next.kind.as_str(),
+        "manifest"
+            | "configuration"
+            | "entry_point"
+            | "cargo_workspace"
+            | "cargo_package"
+            | "cargo_target"
+            | "dependency"
+    ) {
+        return ContextSelectionKind::Configuration;
+    }
+    if edge.kind == "declares_module"
+        || edge.kind == "contains" && edge.source == *current && is_declaration_node(next)
+    {
+        return ContextSelectionKind::Declaration;
+    }
+    if edge.kind == "contains" {
+        return ContextSelectionKind::Containment;
+    }
+    ContextSelectionKind::Relationship
+}
+
+fn is_declaration_node(node: &GraphNode) -> bool {
+    matches!(
+        node.kind.as_str(),
+        "module"
+            | "mod_declaration"
+            | "struct"
+            | "enum"
+            | "union"
+            | "trait"
+            | "impl"
+            | "function"
+            | "type_alias"
+            | "const"
+            | "static"
+            | "macro"
+    )
+}
+
+fn context_selection_rank(kind: ContextSelectionKind) -> u8 {
+    match kind {
+        ContextSelectionKind::ExactSeed => 0,
+        ContextSelectionKind::Containment => 1,
+        ContextSelectionKind::Declaration => 2,
+        ContextSelectionKind::ResolvedDependency => 3,
+        ContextSelectionKind::Documentation => 4,
+        ContextSelectionKind::Configuration => 5,
+        ContextSelectionKind::Relationship => 6,
+    }
+}
+
+fn sort_context_reasons(reasons: &mut Vec<ContextSelectionReason>) {
+    reasons.sort_by(|left, right| {
+        context_selection_rank(left.kind)
+            .cmp(&context_selection_rank(right.kind))
+            .then_with(|| {
+                left.via_node
+                    .as_ref()
+                    .map(NodeId::as_str)
+                    .cmp(&right.via_node.as_ref().map(NodeId::as_str))
+            })
+            .then_with(|| {
+                left.via_edge
+                    .as_ref()
+                    .map(EdgeId::as_str)
+                    .cmp(&right.via_edge.as_ref().map(EdgeId::as_str))
+            })
+    });
+    reasons.dedup();
+}
+
+fn context_candidate_order(
+    left: &ContextCandidate,
+    right: &ContextCandidate,
+) -> std::cmp::Ordering {
+    let left_evidence = left
+        .node
+        .provenance
+        .evidence
+        .as_ref()
+        .expect("context candidates without evidence are filtered before sorting");
+    let right_evidence = right
+        .node
+        .provenance
+        .evidence
+        .as_ref()
+        .expect("context candidates without evidence are filtered before sorting");
+    let left_rank = left
+        .selection_reasons
+        .iter()
+        .map(|reason| context_selection_rank(reason.kind))
+        .min()
+        .unwrap_or(u8::MAX);
+    let right_rank = right
+        .selection_reasons
+        .iter()
+        .map(|reason| context_selection_rank(reason.kind))
+        .min()
+        .unwrap_or(u8::MAX);
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| left.depth.cmp(&right.depth))
+        .then_with(|| left_evidence.path.cmp(&right_evidence.path))
+        .then_with(|| {
+            left_evidence
+                .span
+                .as_ref()
+                .map(|span| span.start.byte_offset)
+                .unwrap_or(u64::MAX)
+                .cmp(
+                    &right_evidence
+                        .span
+                        .as_ref()
+                        .map(|span| span.start.byte_offset)
+                        .unwrap_or(u64::MAX),
+                )
+        })
+        .then_with(|| left.node.kind.cmp(&right.node.kind))
+        .then_with(|| left.node.semantic_key.cmp(&right.node.semantic_key))
+        .then_with(|| left.node.id.cmp(&right.node.id))
+}
+
+fn context_item(candidate: ContextCandidate) -> ContextItem {
+    let evidence = candidate
+        .node
+        .provenance
+        .evidence
+        .clone()
+        .expect("context candidates without evidence are filtered before materialization");
+    ContextItem {
+        node_id: candidate.node.id,
+        kind: candidate.node.kind,
+        semantic_key: candidate.node.semantic_key,
+        path: evidence.path,
+        span: evidence.span,
+        content_identity: evidence.content_identity,
+        provenance: candidate.node.provenance,
+        selection_reasons: candidate.selection_reasons,
+    }
+}
+
+fn set_context_truncation(current: &mut Option<TruncationReason>, next: TruncationReason) {
+    fn priority(reason: TruncationReason) -> u8 {
+        match reason {
+            TruncationReason::Duration => 0,
+            TruncationReason::Capability => 1,
+            TruncationReason::Depth => 2,
+            TruncationReason::Bytes => 3,
+            TruncationReason::Results => 4,
+        }
+    }
+    if current.is_none_or(|reason| priority(next) < priority(reason)) {
+        *current = Some(next);
     }
 }
 
@@ -1111,6 +1988,52 @@ fn show_cursor_fingerprint(request: &ShowRequest) -> Result<String, QueryError> 
     cursor_fingerprint("show", &request.lookup)
 }
 
+#[derive(Serialize)]
+struct ContextCursorParameters<'a> {
+    seeds: Vec<String>,
+    max_depth: u32,
+    direction: EdgeDirection,
+    edge_kinds: Vec<&'a str>,
+    include_unresolved: bool,
+    include_external: bool,
+}
+
+fn context_cursor_fingerprint(
+    request: &ContextRequest,
+    max_depth: u32,
+) -> Result<String, QueryError> {
+    let mut seeds = request
+        .seeds
+        .iter()
+        .map(context_seed_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    seeds.sort_unstable();
+    seeds.dedup();
+    let mut edge_kinds = request
+        .policy
+        .edge_kinds
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    edge_kinds.sort_unstable();
+    edge_kinds.dedup();
+    cursor_fingerprint(
+        "context",
+        &ContextCursorParameters {
+            seeds,
+            max_depth,
+            direction: request.policy.direction,
+            edge_kinds,
+            include_unresolved: request.policy.include_unresolved,
+            include_external: request.policy.include_external,
+        },
+    )
+}
+
+fn context_seed_key(seed: &ContextSeed) -> Result<String, QueryError> {
+    serde_json::to_string(seed).map_err(|_| backend_error())
+}
+
 fn cursor_fingerprint<T: Serialize>(operation: &str, parameters: &T) -> Result<String, QueryError> {
     let bytes = serde_json::to_vec(parameters).map_err(|_| backend_error())?;
     let mut hasher = Sha256::new();
@@ -1275,6 +2198,15 @@ fn confidence(value: &str) -> Result<Confidence, QueryError> {
     }
 }
 
+fn diagnostic_severity(value: &str) -> Result<DiagnosticSeverity, QueryError> {
+    match value {
+        "info" => Ok(DiagnosticSeverity::Info),
+        "warning" => Ok(DiagnosticSeverity::Warning),
+        "error" => Ok(DiagnosticSeverity::Error),
+        _ => Err(backend_error()),
+    }
+}
+
 fn optional_u32(value: Option<i64>) -> Result<Option<u32>, QueryError> {
     value
         .map(u32::try_from)
@@ -1335,6 +2267,7 @@ fn invalid_request(message: &'static str) -> QueryError {
         code: QueryErrorCode::InvalidRequest,
         message: message.to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1345,6 +2278,7 @@ fn backend_error() -> QueryError {
         code: QueryErrorCode::BackendUnavailable,
         message: "repository graph storage is unavailable or inconsistent".to_string(),
         retryable: true,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1355,6 +2289,7 @@ fn duration_budget_exceeded_error() -> QueryError {
         code: QueryErrorCode::BudgetExceeded,
         message: "repository graph query exceeded the duration budget".to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1365,6 +2300,30 @@ fn not_built_error() -> QueryError {
         code: QueryErrorCode::NotBuilt,
         message: "repository graph is not built; run `ferrus graph index`".to_string(),
         retryable: false,
+        recommended_action: Some(RetrievalAction::Index),
+        details: BTreeMap::new(),
+    }
+}
+
+fn index_building_error() -> QueryError {
+    QueryError {
+        wire_version: QUERY_WIRE_VERSION,
+        code: QueryErrorCode::IndexBuilding,
+        message: "repository graph is currently building; retry after indexing completes"
+            .to_string(),
+        retryable: true,
+        recommended_action: Some(RetrievalAction::WaitForBuild),
+        details: BTreeMap::new(),
+    }
+}
+
+fn index_failed_error() -> QueryError {
+    QueryError {
+        wire_version: QUERY_WIRE_VERSION,
+        code: QueryErrorCode::IndexFailed,
+        message: "repository graph build failed; run `ferrus graph index` to retry".to_string(),
+        retryable: false,
+        recommended_action: Some(RetrievalAction::RetryIndex),
         details: BTreeMap::new(),
     }
 }
@@ -1375,6 +2334,7 @@ fn snapshot_not_found_error() -> QueryError {
         code: QueryErrorCode::SnapshotNotFound,
         message: "repository graph snapshot was not found".to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1386,8 +2346,55 @@ fn stale_cursor_error() -> QueryError {
         message: "repository graph cursor does not match this query snapshot or parameters"
             .to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
+}
+
+/// Loads the immutable file identities needed by a `SnapshotContent`
+/// implementation without exposing the SQLite connection outside the graph
+/// library boundary.
+pub fn snapshot_file_descriptors(
+    sidecar: &Sidecar,
+    snapshot_id: &SnapshotId,
+    paths: &BTreeSet<RepoPath>,
+) -> Result<Vec<SourceFileDescriptor>, QueryError> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let stored = sidecar
+            .connection()
+            .query_row(
+                "SELECT content_algorithm, content_digest, byte_length, file_mode \
+                 FROM files WHERE snapshot_id = ?1 AND path = ?2",
+                params![snapshot_id.as_str(), path.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| backend_error())?;
+        let Some((algorithm, value, byte_len, file_mode)) = stored else {
+            continue;
+        };
+        let byte_len = u64::try_from(byte_len).map_err(|_| backend_error())?;
+        let file_mode = match file_mode {
+            0 => SourceFileMode::Regular,
+            1 => SourceFileMode::Executable,
+            _ => return Err(backend_error()),
+        };
+        files.push(SourceFileDescriptor {
+            path: path.clone(),
+            content_identity: Digest::new(algorithm, value).map_err(|_| backend_error())?,
+            byte_len,
+            file_mode,
+        });
+    }
+    Ok(files)
 }
 
 pub fn default_budget(
@@ -1402,6 +2409,8 @@ pub fn default_budget(
             .ok_or_else(|| invalid_request("query max_depth must be greater than zero"))?,
         NonZeroU64::new(limits.max_duration_ms)
             .ok_or_else(|| invalid_request("query max_duration_ms must be greater than zero"))?,
+        NonZeroU32::new(limits.max_diagnostics)
+            .ok_or_else(|| invalid_request("query max_diagnostics must be greater than zero"))?,
     ))
 }
 
@@ -1410,10 +2419,15 @@ mod tests {
     use super::*;
     use crate::repository_graph::{
         config::RepositoryGraphConfig,
-        domain::{BuildId, PublishedViewName, RepositoryId, RepositoryNamespace},
+        domain::{
+            Availability, BuildId, BuildState, DiagnosticCode, DiagnosticSeverity, GraphBuild,
+            GraphDiagnostic, PublishedViewName, RepositoryId, RepositoryNamespace, SnapshotId,
+            SourceRevisionId,
+        },
         index::{IndexCoordinator, IndexRequest, active_extractor_identities},
         source::{FilesystemRepositorySource, SourceDiscoveryContext},
         sqlite::{OpenSidecarResult, open_for_build_at},
+        store::BuildFailure,
     };
 
     fn repository() -> RepositoryRef {
@@ -1492,11 +2506,397 @@ mod tests {
     }
 
     fn scope(config: &RepositoryGraphConfig) -> super::super::query::QueryScope {
-        super::super::query::QueryScope::v1(
+        super::super::query::QueryScope::current(
             repository(),
             SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
             default_budget(&config.query_limits).unwrap(),
         )
+    }
+
+    fn context_request(config: &RepositoryGraphConfig, seed: ContextSeed) -> ContextRequest {
+        ContextRequest {
+            scope: scope(config),
+            seeds: vec![seed],
+            policy: super::super::query::ContextPolicy {
+                direction: EdgeDirection::Both,
+                edge_kinds: vec![],
+                include_unresolved: false,
+                include_external: false,
+            },
+            page: super::super::query::PageRequest { cursor: None },
+        }
+    }
+
+    fn fixture_symbol(query: &SqliteGraphQuery<'_>, config: &RepositoryGraphConfig) -> SemanticKey {
+        query
+            .search(&SearchRequest {
+                scope: scope(config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec!["struct".to_string()],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap()
+            .data
+            .hits
+            .into_iter()
+            .find_map(|hit| hit.semantic_key)
+            .unwrap()
+    }
+
+    #[test]
+    fn context_resolves_seeds_ranks_deduplicates_and_preserves_evidence() {
+        let (_source, _sidecar_dir, sidecar, config, comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), Some(comparison));
+        let symbol = ContextSeed::Symbol(fixture_symbol(&query, &config));
+        let request = context_request(&config, symbol.clone());
+
+        let first = query.context(&request).unwrap();
+        let second = query.context(&request).unwrap();
+
+        assert!(!first.data.items.is_empty());
+        assert_eq!(
+            first.data.items[0].selection_reasons[0].kind,
+            ContextSelectionKind::ExactSeed
+        );
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        let mut node_ids = BTreeSet::new();
+        let mut selection_kinds = BTreeSet::new();
+        for item in &first.data.items {
+            assert!(node_ids.insert(item.node_id.clone()));
+            let evidence = item.provenance.evidence.as_ref().unwrap();
+            assert_eq!(item.path, evidence.path);
+            assert_eq!(item.span, evidence.span);
+            assert_eq!(item.content_identity, evidence.content_identity);
+            let mut reasons = item.selection_reasons.clone();
+            sort_context_reasons(&mut reasons);
+            reasons.dedup();
+            assert_eq!(item.selection_reasons, reasons);
+            selection_kinds.extend(
+                item.selection_reasons
+                    .iter()
+                    .map(|reason| context_selection_rank(reason.kind)),
+            );
+        }
+        assert!(
+            selection_kinds.contains(&context_selection_rank(ContextSelectionKind::Containment))
+        );
+        assert!(
+            selection_kinds.contains(&context_selection_rank(ContextSelectionKind::Declaration))
+        );
+
+        let mut ordered = context_request(&config, symbol.clone());
+        ordered
+            .seeds
+            .push(ContextSeed::Path(RepoPath::new("src/lib.rs").unwrap()));
+        let mut reversed = ordered.clone();
+        reversed.seeds.reverse();
+        assert_eq!(
+            serde_json::to_value(query.context(&ordered).unwrap()).unwrap(),
+            serde_json::to_value(query.context(&reversed).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn context_pagination_is_snapshot_and_parameter_bound() {
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
+        config.query_limits.max_results = 2;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+
+        let first = query.context(&request).unwrap();
+        assert_eq!(first.data.items.len(), 2);
+        assert_eq!(
+            first.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Results
+        );
+        request.page.cursor = first.page.next_cursor.clone();
+        let second = query.context(&request).unwrap();
+        assert!(first.data.items.iter().all(|left| {
+            second
+                .data
+                .items
+                .iter()
+                .all(|right| left.node_id != right.node_id)
+        }));
+
+        let mut service_capped_depth = request.clone();
+        service_capped_depth.scope.budget.max_depth = std::num::NonZeroU32::new(99).unwrap();
+        assert!(query.context(&service_capped_depth).is_ok());
+
+        let mut changed_depth = request.clone();
+        changed_depth.scope.budget.max_depth = std::num::NonZeroU32::new(1).unwrap();
+        let error = query.context(&changed_depth).unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::StaleCursor);
+
+        request.policy.direction = EdgeDirection::Outgoing;
+        let error = query.context(&request).unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::StaleCursor);
+    }
+
+    #[test]
+    fn context_depth_and_byte_budgets_return_terminal_truncation() {
+        let (_source, _sidecar_dir, sidecar, mut config, _comparison) = indexed_fixture();
+        config.query_limits.max_depth = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let seed = ContextSeed::Symbol(fixture_symbol(&query, &config));
+
+        let depth = query
+            .context(&context_request(&config, seed.clone()))
+            .unwrap();
+        assert_eq!(
+            depth.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Depth
+        );
+        assert!(depth.page.next_cursor.is_none());
+
+        config.query_limits.max_bytes = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let bytes = query.context(&context_request(&config, seed)).unwrap();
+        assert!(bytes.data.items.is_empty());
+        assert_eq!(
+            bytes.page.truncation.as_ref().unwrap().reason,
+            TruncationReason::Bytes
+        );
+        assert!(bytes.page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn context_rejects_empty_and_missing_seeds() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(
+            &config,
+            ContextSeed::Node(NodeId::new("node:missing").unwrap()),
+        );
+        assert_eq!(
+            query.context(&request).unwrap_err().code,
+            QueryErrorCode::InvalidRequest
+        );
+        request.seeds.clear();
+        assert_eq!(
+            query.context(&request).unwrap_err().code,
+            QueryErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn context_policy_controls_unresolved_and_external_candidates() {
+        for (resolution, include_unresolved, include_external) in
+            [("unresolved", true, false), ("external", false, true)]
+        {
+            let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+            let (file, classified, edge): (String, String, String) = sidecar
+                .connection()
+                .query_row(
+                    "SELECT edge.source_node_id, edge.target_node_id, edge.id \
+                     FROM edges AS edge \
+                     JOIN nodes AS source ON source.snapshot_id = edge.snapshot_id \
+                                         AND source.id = edge.source_node_id \
+                     JOIN nodes AS target ON target.snapshot_id = edge.snapshot_id \
+                                         AND target.id = edge.target_node_id \
+                     WHERE edge.kind = 'classified_as' \
+                       AND source.kind = 'file' \
+                       AND source.evidence_path = 'Cargo.toml' \
+                       AND target.kind = 'configuration' \
+                     LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            sidecar
+                .connection()
+                .execute(
+                    "UPDATE nodes SET resolution_state = ?1 WHERE id = ?2",
+                    params![resolution, classified],
+                )
+                .unwrap();
+            sidecar
+                .connection()
+                .execute(
+                    "UPDATE edges SET resolution_state = ?1 WHERE id = ?2",
+                    params![resolution, edge],
+                )
+                .unwrap();
+            let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+            let mut request =
+                context_request(&config, ContextSeed::Node(NodeId::new(file).unwrap()));
+            request.policy.direction = EdgeDirection::Outgoing;
+            request.policy.edge_kinds = vec!["classified_as".to_string()];
+
+            let excluded = query.context(&request).unwrap();
+            assert!(
+                excluded
+                    .data
+                    .items
+                    .iter()
+                    .all(|item| item.node_id.as_str() != classified)
+            );
+
+            request.policy.include_unresolved = include_unresolved;
+            request.policy.include_external = include_external;
+            let included = query.context(&request).unwrap();
+            let classified_item = included
+                .data
+                .items
+                .iter()
+                .find(|item| item.node_id.as_str() == classified)
+                .unwrap();
+            assert!(
+                classified_item
+                    .selection_reasons
+                    .iter()
+                    .any(|reason| reason.kind == ContextSelectionKind::Configuration)
+            );
+        }
+    }
+
+    #[test]
+    fn context_classifies_documentation_facts_ahead_of_generic_relationships() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) =
+            indexed_fixture_with_extra_files(&[("README.md", "# Fixture\n")]);
+        let (file, document): (String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT edge.source_node_id, edge.target_node_id \
+                 FROM edges AS edge \
+                 JOIN nodes AS source ON source.snapshot_id = edge.snapshot_id \
+                                     AND source.id = edge.source_node_id \
+                 JOIN nodes AS target ON target.snapshot_id = edge.snapshot_id \
+                                     AND target.id = edge.target_node_id \
+                 WHERE edge.kind = 'classified_as' \
+                   AND source.evidence_path = 'README.md' \
+                   AND target.kind = 'document' \
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(&config, ContextSeed::Node(NodeId::new(file).unwrap()));
+        request.policy.direction = EdgeDirection::Outgoing;
+        request.policy.edge_kinds = vec!["classified_as".to_string()];
+
+        let response = query.context(&request).unwrap();
+        let item = response
+            .data
+            .items
+            .iter()
+            .find(|item| item.node_id.as_str() == document)
+            .unwrap();
+
+        assert!(
+            item.selection_reasons
+                .iter()
+                .any(|reason| reason.kind == ContextSelectionKind::Documentation)
+        );
+    }
+
+    #[test]
+    fn context_labels_resolved_import_targets_as_dependencies() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) =
+            indexed_fixture_with_extra_files(&[
+                (
+                    "src/lib.rs",
+                    "pub mod api;\nuse crate::api::Api;\npub fn make() -> Api { Api }\n",
+                ),
+                ("src/api.rs", "pub struct Api;\n"),
+            ]);
+        let (source, target): (String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT source_node_id, target_node_id FROM edges \
+                 WHERE kind = 'imports' AND target_node_id IS NOT NULL \
+                 ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(&config, ContextSeed::Node(NodeId::new(source).unwrap()));
+        request.policy.direction = EdgeDirection::Outgoing;
+        request.policy.edge_kinds = vec!["imports".to_string()];
+
+        let response = query.context(&request).unwrap();
+        let target = response
+            .data
+            .items
+            .iter()
+            .find(|item| item.node_id.as_str() == target)
+            .unwrap();
+
+        assert!(
+            target
+                .selection_reasons
+                .iter()
+                .any(|reason| reason.kind == ContextSelectionKind::ResolvedDependency)
+        );
+        assert_eq!(target.provenance.resolution, ResolutionState::Resolved);
+    }
+
+    #[test]
+    fn context_assembly_observes_an_expired_deadline() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+        let resolved = query.resolve_scope(&request.scope).unwrap();
+        let started = Instant::now()
+            - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
+        let deadline = QueryDeadline::install(
+            sidecar.connection(),
+            started,
+            Duration::from_millis(config.query_limits.max_duration_ms),
+        )
+        .unwrap();
+
+        let assembly = query
+            .assemble_context(&resolved, &request, started)
+            .unwrap();
+        drop(deadline);
+
+        assert_eq!(assembly.truncation, Some(TruncationReason::Duration));
+    }
+
+    #[test]
+    fn context_returns_bounded_snapshot_diagnostics() {
+        let (_source, _sidecar_dir, mut sidecar, mut config, _comparison) = indexed_fixture();
+        let snapshot = sidecar
+            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap();
+        for code in ["context.a", "context.b"] {
+            sidecar
+                .record_diagnostic(&GraphDiagnostic {
+                    build_id: BuildId::new("build-query").unwrap(),
+                    snapshot_id: Some(snapshot.id.clone()),
+                    severity: DiagnosticSeverity::Warning,
+                    code: DiagnosticCode::new(code).unwrap(),
+                    location: None,
+                    metrics: BTreeMap::new(),
+                })
+                .unwrap();
+        }
+        config.query_limits.max_diagnostics = 1;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let request = context_request(
+            &config,
+            ContextSeed::Symbol(fixture_symbol(&query, &config)),
+        );
+
+        let response = query.context(&request).unwrap();
+
+        assert!(response.diagnostics.summary.warning >= 2);
+        assert_eq!(response.diagnostics.items.len(), 1);
+        assert!(response.diagnostics.truncated);
     }
 
     #[test]
@@ -1505,7 +2905,7 @@ mod tests {
         let query = SqliteGraphQuery::new(
             &sidecar,
             config.query_limits.clone(),
-            Some(freshness_comparison),
+            Some(freshness_comparison.clone()),
         );
         let search = query
             .search(&SearchRequest {
@@ -1517,6 +2917,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(search.freshness.freshness, Freshness::Fresh);
+        assert_eq!(
+            search.source_revision.manifest_digest,
+            freshness_comparison.source_manifest_digest
+        );
         assert!(!search.data.hits.is_empty());
         let hit = &search.data.hits[0];
         assert_eq!(hit.path.as_ref().unwrap().as_str(), "src/lib.rs");
@@ -1547,6 +2951,192 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| node.id == hit.node_id)
+        );
+    }
+
+    #[test]
+    fn search_classifies_exact_matches_and_is_snapshot_deterministic() {
+        let (_source, _sidecar_dir, sidecar, config, comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), Some(comparison));
+
+        for (text, expected) in [
+            ("RuntimeTaskContext", SearchMatchKind::ExactNormalizedName),
+            ("src/lib.rs", SearchMatchKind::ExactPath),
+        ] {
+            let request = SearchRequest {
+                scope: scope(&config),
+                text: text.to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            };
+            let first = query.search(&request).unwrap();
+            let second = query.search(&request).unwrap();
+
+            assert_eq!(first.data.hits.first().unwrap().match_kind, expected);
+            assert_eq!(
+                serde_json::to_value(first).unwrap(),
+                serde_json::to_value(second).unwrap()
+            );
+        }
+
+        let symbol = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec!["struct".to_string()],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap()
+            .data
+            .hits
+            .into_iter()
+            .find_map(|hit| hit.semantic_key)
+            .unwrap();
+        let exact_symbol = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: symbol.as_str().to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+        assert_eq!(
+            exact_symbol.data.hits.first().unwrap().match_kind,
+            SearchMatchKind::ExactSemanticKey
+        );
+    }
+
+    #[test]
+    fn previous_wire_versions_are_rejected_explicitly() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request_scope = scope(&config);
+        request_scope.wire_version = QUERY_WIRE_VERSION - 1;
+
+        let error = query
+            .status(&StatusRequest {
+                scope: request_scope,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, QueryErrorCode::UnsupportedWireVersion);
+        assert_eq!(error.wire_version, QUERY_WIRE_VERSION);
+    }
+
+    #[test]
+    fn unbuilt_status_and_queries_distinguish_building_and_failed_attempts() {
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let OpenSidecarResult::Ready(mut sidecar) =
+            open_for_build_at(&sidecar_dir.path().join("repo-graph.db")).unwrap()
+        else {
+            panic!("new sidecar unexpectedly requires rebuild");
+        };
+        let config = RepositoryGraphConfig::default();
+        let build = GraphBuild {
+            id: BuildId::new("build-in-progress").unwrap(),
+            repository: repository(),
+            source_revision_id: SourceRevisionId::new("revision-next").unwrap(),
+            prospective_snapshot_id: SnapshotId::new("snapshot-next").unwrap(),
+            state: BuildState::Building,
+        };
+        sidecar.start_build(&build).unwrap();
+
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let status = query
+            .status(&StatusRequest {
+                scope: scope(&config),
+            })
+            .unwrap();
+        assert_eq!(status.data.availability, Availability::NotBuilt);
+        assert_eq!(status.data.build_state, Some(BuildState::Building));
+        assert_eq!(
+            status.data.recommended_action,
+            Some(RetrievalAction::WaitForBuild)
+        );
+        let error = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "anything".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::IndexBuilding);
+
+        drop(query);
+        sidecar
+            .fail_build(&BuildFailure {
+                build_id: build.id,
+                code: DiagnosticCode::new("index.failed").unwrap(),
+            })
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let status = query
+            .status(&StatusRequest {
+                scope: scope(&config),
+            })
+            .unwrap();
+        assert_eq!(status.data.build_state, Some(BuildState::Failed));
+        assert_eq!(
+            status.data.recommended_action,
+            Some(RetrievalAction::RetryIndex)
+        );
+        let error = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "anything".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::IndexFailed);
+    }
+
+    #[test]
+    fn diagnostics_are_deterministic_and_capped_independently() {
+        let (_source, _sidecar_dir, mut sidecar, mut config, _comparison) = indexed_fixture();
+        let snapshot = sidecar
+            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap();
+        for code in ["query.z", "query.a", "query.m"] {
+            sidecar
+                .record_diagnostic(&GraphDiagnostic {
+                    build_id: BuildId::new("build-query").unwrap(),
+                    snapshot_id: Some(snapshot.id.clone()),
+                    severity: DiagnosticSeverity::Warning,
+                    code: DiagnosticCode::new(code).unwrap(),
+                    location: None,
+                    metrics: BTreeMap::new(),
+                })
+                .unwrap();
+        }
+        config.query_limits.max_diagnostics = 2;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let response = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+
+        assert!(response.diagnostics.truncated);
+        assert_eq!(response.diagnostics.items.len(), 2);
+        assert!(response.diagnostics.summary.warning >= 3);
+        assert!(
+            response
+                .diagnostics
+                .items
+                .windows(2)
+                .all(|items| { items[0].code.as_str() <= items[1].code.as_str() })
         );
     }
 
@@ -1776,11 +3366,12 @@ mod tests {
         let started = Instant::now()
             - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
 
-        let error = query
+        let rows = query
             .show_rows(&resolved_scope, &request, 0, started)
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.code, QueryErrorCode::BudgetExceeded);
+        assert!(rows.deadline_exceeded);
+        assert!(rows.rows.is_empty());
     }
 
     #[test]
@@ -1790,16 +3381,20 @@ mod tests {
         let started = Instant::now()
             - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
 
-        let error = query
+        let response = query
             .status_at(
                 &StatusRequest {
                     scope: scope(&config),
                 },
                 started,
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.code, QueryErrorCode::BudgetExceeded);
+        assert_eq!(
+            response.page.truncation.unwrap().reason,
+            TruncationReason::Duration
+        );
+        assert!(response.data.statistics.is_none());
     }
 
     #[test]

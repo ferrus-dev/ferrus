@@ -164,6 +164,24 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_description(tools::wait_for_consult::DESCRIPTION);
     }
 
+    if repository_retrieval_tools_visible(all_roles, supervisor_role, executor_role) {
+        app.map_tool(
+            "repository_graph_status",
+            tools::repository_graph_status::handler,
+        )
+        .with_description(tools::repository_graph_status::DESCRIPTION);
+        app.map_tool("repository_search", tools::repository_search::handler)
+            .with_description(tools::repository_search::DESCRIPTION)
+            .with_input_schema(|_| {
+                ToolSchema::from_json_str(tools::repository_search::INPUT_SCHEMA)
+            });
+        app.map_tool("repository_context", tools::repository_context::handler)
+            .with_description(tools::repository_context::DESCRIPTION)
+            .with_input_schema(|_| {
+                ToolSchema::from_json_str(tools::repository_context::INPUT_SCHEMA)
+            });
+    }
+
     // Resources
     app.add_resource("ferrus://task", "Task");
     app.add_resource("ferrus://task_template", "Task Template");
@@ -248,6 +266,14 @@ fn supervisor_review_tools_visible(archive_scoped_supervisor: bool) -> bool {
     !archive_scoped_supervisor
 }
 
+fn repository_retrieval_tools_visible(
+    all_roles: bool,
+    supervisor_role: bool,
+    executor_role: bool,
+) -> bool {
+    all_roles || supervisor_role || executor_role
+}
+
 fn supervisor_task_scope_from_agent_id(agent_id: &str) -> Option<&str> {
     let mut parts = agent_id.split(':');
     let role = parts.next()?;
@@ -280,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_supervisor_mapping_fits_one_tool_page_without_heartbeat() {
+    fn interactive_supervisor_mapping_includes_repository_reads_without_heartbeat() {
         let all_roles = false;
         let executor_role = false;
         let archive_scoped_supervisor = false;
@@ -300,10 +326,14 @@ mod tests {
         assert!(!(all_roles || executor_role || task_scoped_supervisor));
         let definition_tools = 2usize;
         let review_and_consult_tools = 6usize;
+        let repository_read_tools = 3usize;
         let shared_human_tools = 2usize;
         assert_eq!(
-            definition_tools + review_and_consult_tools + shared_human_tools,
-            10
+            definition_tools
+                + review_and_consult_tools
+                + repository_read_tools
+                + shared_human_tools,
+            13
         );
     }
 
@@ -324,8 +354,9 @@ mod tests {
         ));
         assert!(!supervisor_review_tools_visible(archive_scoped_supervisor));
         let archive_tool = 1usize;
+        let repository_read_tools = 3usize;
         let shared_human_tools = 2usize;
-        assert_eq!(archive_tool + shared_human_tools, 3);
+        assert_eq!(archive_tool + repository_read_tools + shared_human_tools, 6);
     }
 
     #[test]
@@ -359,5 +390,13 @@ mod tests {
         let all_roles = true;
         let executor_role = false;
         assert!(all_roles || executor_role || task_scoped_supervisor);
+    }
+
+    #[test]
+    fn repository_reads_are_visible_to_every_server_role() {
+        assert!(repository_retrieval_tools_visible(true, false, false));
+        assert!(repository_retrieval_tools_visible(false, true, false));
+        assert!(repository_retrieval_tools_visible(false, false, true));
+        assert!(!repository_retrieval_tools_visible(false, false, false));
     }
 }
