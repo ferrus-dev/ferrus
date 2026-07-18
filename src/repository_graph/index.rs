@@ -839,7 +839,7 @@ mod tests {
         let query = SqliteGraphQuery::new(sidecar, config.query_limits.clone(), None);
         query
             .status(&StatusRequest {
-                scope: QueryScope::v1(
+                scope: QueryScope::current(
                     repository(),
                     SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
                     default_budget(&config.query_limits).unwrap(),
@@ -1041,7 +1041,7 @@ mod tests {
 
         let first_source = discover(repository_dir.path(), &config);
         let first = run(&mut sidecar, &first_source, &config, "build-1", false).unwrap();
-        let first_warning_count = status(&sidecar, &config).diagnostics.warning;
+        let first_warning_count = status(&sidecar, &config).diagnostics.summary.warning;
 
         write(
             &repository_dir.path().join(".ferrus/project.toml"),
@@ -1052,7 +1052,7 @@ mod tests {
         assert_eq!(second.snapshot.id, first.snapshot.id);
         assert!(second.reused_existing_snapshot);
         assert_eq!(
-            status(&sidecar, &config).diagnostics.warning,
+            status(&sidecar, &config).diagnostics.summary.warning,
             first_warning_count + 1
         );
         assert!(
@@ -1068,7 +1068,7 @@ mod tests {
         let third = run(&mut sidecar, &third_source, &config, "build-3", false).unwrap();
         assert_eq!(third.snapshot.id, first.snapshot.id);
         assert_eq!(
-            status(&sidecar, &config).diagnostics.warning,
+            status(&sidecar, &config).diagnostics.summary.warning,
             first_warning_count
         );
         assert!(

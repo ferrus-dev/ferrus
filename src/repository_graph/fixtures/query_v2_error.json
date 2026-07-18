@@ -1,5 +1,5 @@
 {
-  "wire_version": 1,
+  "wire_version": 2,
   "code": "stale_cursor",
   "message": "cursor no longer matches snapshot",
   "retryable": false,

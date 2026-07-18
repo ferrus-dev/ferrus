@@ -152,6 +152,7 @@ pub struct QueryLimitsConfig {
     pub max_bytes: u64,
     pub max_depth: u32,
     pub max_duration_ms: u64,
+    pub max_diagnostics: u32,
 }
 
 impl Default for QueryLimitsConfig {
@@ -161,6 +162,7 @@ impl Default for QueryLimitsConfig {
             max_bytes: 256 * 1024,
             max_depth: 3,
             max_duration_ms: 2_000,
+            max_diagnostics: 50,
         }
     }
 }
@@ -450,6 +452,7 @@ max_results = 100
 max_bytes = 262144
 max_depth = 3
 max_duration_ms = 2000
+max_diagnostics = 50
 
 [retention]
 max_snapshots = 5

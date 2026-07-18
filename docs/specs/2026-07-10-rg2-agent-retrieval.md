@@ -113,13 +113,18 @@ not optional polish.
 
 ## Milestones
 
-- [ ] #2.0 Stabilize repository retrieval semantics and response envelopes
+- [x] #2.0 Stabilize repository retrieval semantics and response envelopes
 
 ID: rg2.0
 Depends on: none
 
 Finalize MCP request/response schemas, freshness and error states, deterministic ordering, evidence rules,
 pagination, and hard budget behavior using the Phase 1 CLI queries as executable reference behavior.
+
+Normative contract: [Repository Graph Retrieval Contract](../repository-graph-retrieval.md). Implemented in
+`src/repository_graph/query.rs` and `src/repository_graph/query_sqlite.rs`, including typed context seeds, explicit
+source-revision envelopes, orthogonal index/build/freshness states, deterministic match classification,
+snapshot-bound pagination, bounded diagnostics, and valid truncation responses for hard budget exhaustion.
 
 - [ ] #2.1 Add graph status and bounded search MCP tools
 

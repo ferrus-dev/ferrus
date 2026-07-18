@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, Error as SqliteError, ErrorCode, Row, params};
+use rusqlite::{Connection, Error as SqliteError, ErrorCode, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -14,19 +14,21 @@ use super::{
     QUERY_WIRE_VERSION,
     config::QueryLimitsConfig,
     domain::{
-        Availability, Confidence, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
-        FactProvenance, Freshness, GraphEdge, GraphNode, GraphSnapshot, GraphValue, NodeId,
-        PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
+        Availability, BuildId, BuildState, Confidence, DiagnosticCode, DiagnosticLocation,
+        DiagnosticSeverity, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
+        FactProvenance, Freshness, GraphBuild, GraphEdge, GraphNode, GraphSnapshot, GraphValue,
+        NodeId, PageCursor, RepoPath, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
         SourceEvidence, SourcePosition, SourceSpan,
     },
     ports::{GraphQuery, SourceManifest},
     query::{
-        ContextRequest, ContextResponse, DiagnosticSummary, EdgeDirection, FreshnessEnvelope,
-        NeighborhoodData, NeighborhoodEdge, NeighborhoodNode, NeighborhoodRequest,
-        NeighborhoodResponse, PageInfo, QueryError, QueryErrorCode, QueryResponse, SearchData,
-        SearchHit, SearchRequest, SearchResponse, ShowData, ShowLookup, ShowRequest, ShowResponse,
-        SnapshotSelector, SnapshotStatistics, StatusData, StatusRequest, StatusResponse,
-        Truncation, TruncationReason,
+        ContextRequest, ContextResponse, DiagnosticSummary, DiagnosticsEnvelope, EdgeDirection,
+        FreshnessEnvelope, NeighborhoodData, NeighborhoodEdge, NeighborhoodNode,
+        NeighborhoodRequest, NeighborhoodResponse, PageInfo, QueryDiagnostic, QueryError,
+        QueryErrorCode, QueryResponse, RetrievalAction, SearchData, SearchHit, SearchMatchKind,
+        SearchRequest, SearchResponse, ShowData, ShowLookup, ShowRequest, ShowResponse,
+        SnapshotSelector, SnapshotStatistics, SourceRevisionEnvelope, StatusData, StatusRequest,
+        StatusResponse, Truncation, TruncationReason,
     },
     sqlite::Sidecar,
     store::StoreError,
@@ -72,7 +74,12 @@ impl Drop for QueryDeadline<'_> {
 }
 
 struct SearchRows {
-    rows: Vec<(GraphNode, f64)>,
+    rows: Vec<(GraphNode, SearchMatchKind)>,
+    deadline_exceeded: bool,
+}
+
+struct NodeRows {
+    rows: Vec<GraphNode>,
     deadline_exceeded: bool,
 }
 
@@ -83,6 +90,15 @@ struct SearchPathFilter<'a> {
 }
 
 impl SearchRows {
+    fn deadline_exceeded() -> Self {
+        Self {
+            rows: Vec::new(),
+            deadline_exceeded: true,
+        }
+    }
+}
+
+impl NodeRows {
     fn deadline_exceeded() -> Self {
         Self {
             rows: Vec::new(),
@@ -130,19 +146,25 @@ impl<'a> SqliteGraphQuery<'a> {
     fn resolve_scope(&self, scope: &super::query::QueryScope) -> Result<ResolvedScope, QueryError> {
         validate_wire_version(scope.wire_version)?;
         let budget = EffectiveBudget::new(&scope.budget, &self.limits)?;
-        let (snapshot, published_view) = match &scope.snapshot {
+        let (snapshot, published_view, source_revision_id) = match &scope.snapshot {
             SnapshotSelector::Published(name) => {
                 let view = self
                     .sidecar
                     .published_view(&scope.repository, name)
                     .map_err(store_query_error)?
-                    .ok_or_else(not_built_error)?;
+                    .ok_or_else(|| self.unpublished_index_error(&scope.repository))?;
                 let snapshot = self
                     .sidecar
                     .snapshot(&view.snapshot_id)
                     .map_err(store_query_error)?
                     .ok_or_else(backend_error)?;
-                (snapshot, Some(name.clone()))
+                let source_revision_id = self
+                    .sidecar
+                    .build(&view.build_id)
+                    .map_err(store_query_error)?
+                    .ok_or_else(backend_error)?
+                    .source_revision_id;
+                (snapshot, Some(name.clone()), source_revision_id)
             }
             SnapshotSelector::Snapshot(id) => {
                 let snapshot = self
@@ -150,7 +172,8 @@ impl<'a> SqliteGraphQuery<'a> {
                     .snapshot(id)
                     .map_err(store_query_error)?
                     .ok_or_else(snapshot_not_found_error)?;
-                (snapshot, None)
+                let source_revision_id = snapshot.source_revision_id.clone();
+                (snapshot, None, source_revision_id)
             }
         };
         if snapshot.repository != scope.repository {
@@ -161,9 +184,43 @@ impl<'a> SqliteGraphQuery<'a> {
             repository: scope.repository.clone(),
             snapshot,
             published_view,
+            source_revision_id,
             freshness,
             budget,
         })
+    }
+
+    fn latest_build(&self, repository: &RepositoryRef) -> Result<Option<GraphBuild>, QueryError> {
+        let build_id = self
+            .sidecar
+            .connection()
+            .query_row(
+                "SELECT id FROM index_builds \
+                 WHERE repository_namespace = ?1 AND repository_id = ?2 \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_query_error)?
+            .map(BuildId::new)
+            .transpose()
+            .map_err(|_| backend_error())?;
+        build_id
+            .map(|id| self.sidecar.build(&id).map_err(store_query_error))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn unpublished_index_error(&self, repository: &RepositoryRef) -> QueryError {
+        match self.latest_build(repository) {
+            Ok(Some(build)) if build.state == BuildState::Building => index_building_error(),
+            Ok(Some(build)) if build.state == BuildState::Failed => index_failed_error(),
+            _ => not_built_error(),
+        }
     }
 
     fn status_at(
@@ -174,16 +231,17 @@ impl<'a> SqliteGraphQuery<'a> {
         validate_wire_version(request.scope.wire_version)?;
         let budget = EffectiveBudget::new(&request.scope.budget, &self.limits)?;
         let duration = Duration::from_millis(budget.max_duration_ms);
-        if started.elapsed() >= duration {
-            return Err(duration_budget_exceeded_error());
-        }
-        let _deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
         let resolved = match self.resolve_scope(&request.scope) {
             Ok(resolved) => resolved,
             Err(error)
-                if error.code == QueryErrorCode::NotBuilt
-                    && matches!(request.scope.snapshot, SnapshotSelector::Published(_)) =>
+                if matches!(
+                    error.code,
+                    QueryErrorCode::NotBuilt
+                        | QueryErrorCode::IndexBuilding
+                        | QueryErrorCode::IndexFailed
+                ) && matches!(request.scope.snapshot, SnapshotSelector::Published(_)) =>
             {
+                let latest_build = self.latest_build(&request.scope.repository)?;
                 let published_view = match &request.scope.snapshot {
                     SnapshotSelector::Published(name) => Some(name.clone()),
                     SnapshotSelector::Snapshot(_) => None,
@@ -192,6 +250,7 @@ impl<'a> SqliteGraphQuery<'a> {
                     wire_version: QUERY_WIRE_VERSION,
                     repository: request.scope.repository.clone(),
                     snapshot_id: None,
+                    source_revision: None,
                     freshness: FreshnessEnvelope {
                         freshness: Freshness::NotApplicable,
                         compared_manifest: self
@@ -200,46 +259,102 @@ impl<'a> SqliteGraphQuery<'a> {
                             .map(|comparison| comparison.source_manifest_digest.clone()),
                         reason_codes: vec!["not_built".to_string()],
                     },
-                    diagnostics: DiagnosticSummary::default(),
+                    diagnostics: if started.elapsed() >= duration {
+                        truncated_diagnostics()
+                    } else {
+                        DiagnosticsEnvelope::default()
+                    },
+                    page: page_info(
+                        (started.elapsed() >= duration).then_some(TruncationReason::Duration),
+                        0,
+                        0,
+                        0,
+                        None,
+                    )?,
                     data: StatusData {
                         availability: Availability::NotBuilt,
-                        build_state: None,
+                        build_state: latest_build.as_ref().map(|build| build.state),
+                        build_id: latest_build.as_ref().map(|build| build.id.clone()),
                         published_view,
                         graph_model_version: None,
                         statistics: None,
+                        recommended_action: Some(match error.code {
+                            QueryErrorCode::IndexBuilding => RetrievalAction::WaitForBuild,
+                            QueryErrorCode::IndexFailed => RetrievalAction::RetryIndex,
+                            _ => RetrievalAction::Index,
+                        }),
                     },
                 });
             }
             Err(error) => return Err(error),
         };
-        let build_state = self
-            .sidecar
-            .build(&resolved.snapshot.completed_by)
-            .map_err(store_query_error)?
-            .map(|build| build.state);
-        let diagnostics = self.diagnostics(&resolved.snapshot.id)?;
-        let statistics = self.statistics(&resolved.snapshot.id)?;
         if started.elapsed() >= duration {
-            return Err(duration_budget_exceeded_error());
+            return Ok(available_status_response(
+                &resolved,
+                None,
+                truncated_diagnostics(),
+                None,
+                true,
+            ));
         }
-        Ok(StatusResponse {
-            wire_version: QUERY_WIRE_VERSION,
-            repository: resolved.repository,
-            snapshot_id: Some(resolved.snapshot.id.clone()),
-            freshness: resolved.freshness,
+        let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
+        let latest_build = match self.latest_build(&resolved.repository) {
+            Ok(build) => build,
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                return Ok(available_status_response(
+                    &resolved,
+                    None,
+                    truncated_diagnostics(),
+                    None,
+                    true,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let diagnostics =
+            match self.diagnostics(&resolved.snapshot.id, resolved.budget.max_diagnostics) {
+                Ok(diagnostics) => diagnostics,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    return Ok(available_status_response(
+                        &resolved,
+                        latest_build.as_ref(),
+                        truncated_diagnostics(),
+                        None,
+                        true,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+        let statistics = match self.statistics(&resolved.snapshot.id) {
+            Ok(statistics) => statistics,
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                return Ok(available_status_response(
+                    &resolved,
+                    latest_build.as_ref(),
+                    diagnostics,
+                    None,
+                    true,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        drop(deadline);
+        Ok(available_status_response(
+            &resolved,
+            latest_build.as_ref(),
             diagnostics,
-            data: StatusData {
-                availability: Availability::Available,
-                build_state,
-                published_view: resolved.published_view,
-                graph_model_version: Some(resolved.snapshot.graph_model_version),
-                statistics: Some(statistics),
-            },
-        })
+            Some(statistics),
+            started.elapsed() >= duration,
+        ))
     }
 
-    fn diagnostics(&self, snapshot: &SnapshotId) -> Result<DiagnosticSummary, QueryError> {
-        self.sidecar
+    fn diagnostics(
+        &self,
+        snapshot: &SnapshotId,
+        max_diagnostics: u32,
+    ) -> Result<DiagnosticsEnvelope, QueryError> {
+        let summary = self
+            .sidecar
             .connection()
             .query_row(
                 "SELECT \
@@ -260,7 +375,82 @@ impl<'a> SqliteGraphQuery<'a> {
                     })
                 },
             )
-            .map_err(sqlite_query_error)
+            .map_err(sqlite_query_error)?;
+        let mut statement = self
+            .sidecar
+            .connection()
+            .prepare(
+                "SELECT diagnostic.severity, diagnostic.code, diagnostic.path, \
+                        diagnostic.span_start_byte, diagnostic.span_end_byte, \
+                        diagnostic.span_start_line, diagnostic.span_start_column, \
+                        diagnostic.span_end_line, diagnostic.span_end_column \
+                 FROM diagnostics AS diagnostic \
+                 JOIN snapshot_diagnostic_sets AS current \
+                   ON current.snapshot_id = diagnostic.snapshot_id \
+                  AND current.build_id = diagnostic.build_id \
+                 WHERE diagnostic.snapshot_id = ?1 \
+                 ORDER BY CASE diagnostic.severity \
+                              WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, \
+                          diagnostic.code, COALESCE(diagnostic.path, ''), \
+                          COALESCE(diagnostic.span_start_byte, -1), diagnostic.id \
+                 LIMIT ?2",
+            )
+            .map_err(sqlite_query_error)?;
+        let mut rows = statement
+            .query(params![
+                snapshot.as_str(),
+                i64::from(max_diagnostics.saturating_add(1)),
+            ])
+            .map_err(sqlite_query_error)?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
+            let severity = diagnostic_severity(&value::<String>(row, 0)?)?;
+            let code =
+                DiagnosticCode::new(value::<String>(row, 1)?).map_err(|_| backend_error())?;
+            let path = value::<Option<String>>(row, 2)?;
+            let span = decode_span(row, 3, 4, 5, 6, 7, 8)?;
+            let location = match (path, span) {
+                (Some(path), span) => Some(DiagnosticLocation {
+                    path: RepoPath::new(path).map_err(|_| backend_error())?,
+                    span,
+                }),
+                (None, None) => None,
+                (None, Some(_)) => return Err(backend_error()),
+            };
+            items.push(QueryDiagnostic {
+                severity,
+                code,
+                location,
+            });
+        }
+        let truncated = items.len() > max_diagnostics as usize;
+        items.truncate(max_diagnostics as usize);
+        Ok(DiagnosticsEnvelope {
+            summary,
+            items,
+            truncated,
+        })
+    }
+
+    fn diagnostics_with_deadline(
+        &self,
+        scope: &ResolvedScope,
+        started: Instant,
+    ) -> Result<(DiagnosticsEnvelope, bool), QueryError> {
+        let duration = Duration::from_millis(scope.budget.max_duration_ms);
+        if started.elapsed() >= duration {
+            return Ok((truncated_diagnostics(), true));
+        }
+        let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
+        let diagnostics = self.diagnostics(&scope.snapshot.id, scope.budget.max_diagnostics);
+        drop(deadline);
+        match diagnostics {
+            Ok(diagnostics) => Ok((diagnostics, started.elapsed() >= duration)),
+            Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                Ok((truncated_diagnostics(), true))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn statistics(&self, snapshot: &SnapshotId) -> Result<SnapshotStatistics, QueryError> {
@@ -308,12 +498,14 @@ impl<'a> SqliteGraphQuery<'a> {
         let sql = format!(
             "SELECT {NODE_COLUMNS}, \
                 CASE \
-                    WHEN normalized_name = ?2 THEN 1.0 \
-                    WHEN normalized_name LIKE ?3 ESCAPE '\\' THEN 0.9 \
-                    WHEN normalized_name LIKE ?4 ESCAPE '\\' THEN 0.8 \
-                    WHEN lower(COALESCE(semantic_key, '')) LIKE ?4 ESCAPE '\\' THEN 0.7 \
-                    ELSE 0.6 \
-                END AS score \
+                    WHEN lower(COALESCE(semantic_key, '')) = ?2 THEN 0 \
+                    WHEN lower(COALESCE(evidence_path, '')) = ?2 THEN 1 \
+                    WHEN normalized_name = ?2 THEN 2 \
+                    WHEN normalized_name LIKE ?3 ESCAPE '\\' THEN 3 \
+                    WHEN normalized_name LIKE ?4 ESCAPE '\\' THEN 4 \
+                    WHEN lower(COALESCE(semantic_key, '')) LIKE ?4 ESCAPE '\\' THEN 5 \
+                    ELSE 6 \
+                END AS match_rank \
              FROM nodes \
              WHERE snapshot_id = ?1 \
                AND (normalized_name = ?2 \
@@ -328,7 +520,7 @@ impl<'a> SqliteGraphQuery<'a> {
                        OR evidence_path LIKE \
                           json_extract(requested_path.value, '$.descendants') ESCAPE '\\'\
                )) \
-             ORDER BY score DESC, normalized_name, id \
+             ORDER BY match_rank, normalized_name, id \
              LIMIT ?7 OFFSET ?8"
         );
         let limit = i64::from(scope.budget.max_results.saturating_add(1));
@@ -365,7 +557,10 @@ impl<'a> SqliteGraphQuery<'a> {
         let mut found = Vec::new();
         loop {
             match rows.next() {
-                Ok(Some(row)) => found.push((decode_node(row)?, value(row, 19)?)),
+                Ok(Some(row)) => found.push((
+                    decode_node(row)?,
+                    search_match_kind(value::<i64>(row, 19)?)?,
+                )),
                 Ok(None) => break,
                 Err(error) if sqlite_deadline_exceeded(&error) => {
                     return Ok(SearchRows::deadline_exceeded());
@@ -385,7 +580,7 @@ impl<'a> SqliteGraphQuery<'a> {
         request: &ShowRequest,
         offset: u64,
         started: Instant,
-    ) -> Result<Vec<GraphNode>, QueryError> {
+    ) -> Result<NodeRows, QueryError> {
         let (predicate, lookup) = match &request.lookup {
             ShowLookup::Node(id) => ("id = ?2", id.as_str()),
             ShowLookup::Symbol(key) => ("semantic_key = ?2", key.as_str()),
@@ -401,20 +596,40 @@ impl<'a> SqliteGraphQuery<'a> {
             started,
             Duration::from_millis(scope.budget.max_duration_ms),
         )?;
-        let mut statement = connection.prepare(&sql).map_err(sqlite_query_error)?;
-        let mut rows = statement
-            .query(params![
-                scope.snapshot.id.as_str(),
-                lookup,
-                i64::from(scope.budget.max_results.saturating_add(1)),
-                i64::try_from(offset).map_err(|_| stale_cursor_error())?,
-            ])
-            .map_err(sqlite_query_error)?;
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(NodeRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
+        let mut rows = match statement.query(params![
+            scope.snapshot.id.as_str(),
+            lookup,
+            i64::from(scope.budget.max_results.saturating_add(1)),
+            i64::try_from(offset).map_err(|_| stale_cursor_error())?,
+        ]) {
+            Ok(rows) => rows,
+            Err(error) if sqlite_deadline_exceeded(&error) => {
+                return Ok(NodeRows::deadline_exceeded());
+            }
+            Err(_) => return Err(backend_error()),
+        };
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
-            found.push(decode_node(row)?);
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => found.push(decode_node(row)?),
+                Ok(None) => break,
+                Err(error) if sqlite_deadline_exceeded(&error) => {
+                    return Ok(NodeRows::deadline_exceeded());
+                }
+                Err(_) => return Err(backend_error()),
+            }
         }
-        Ok(found)
+        Ok(NodeRows {
+            rows: found,
+            deadline_exceeded: false,
+        })
     }
 
     fn node(&self, snapshot: &SnapshotId, id: &NodeId) -> Result<Option<GraphNode>, QueryError> {
@@ -423,12 +638,12 @@ impl<'a> SqliteGraphQuery<'a> {
             .sidecar
             .connection()
             .prepare(&sql)
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut rows = statement
             .query(params![snapshot.as_str(), id.as_str()])
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         rows.next()
-            .map_err(|_| backend_error())?
+            .map_err(sqlite_query_error)?
             .map(decode_node)
             .transpose()
     }
@@ -469,7 +684,7 @@ impl<'a> SqliteGraphQuery<'a> {
             .sidecar
             .connection()
             .prepare(&sql)
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut rows = statement
             .query(params![
                 snapshot.as_str(),
@@ -478,9 +693,9 @@ impl<'a> SqliteGraphQuery<'a> {
                 excluded,
                 i64::from(limit.saturating_add(1)),
             ])
-            .map_err(|_| backend_error())?;
+            .map_err(sqlite_query_error)?;
         let mut found = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| backend_error())? {
+        while let Some(row) = rows.next().map_err(sqlite_query_error)? {
             found.push(decode_edge(row)?);
         }
         Ok(found)
@@ -510,7 +725,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         let mut reason = search_rows
             .deadline_exceeded
             .then_some(TruncationReason::Duration);
-        for (node, score) in rows {
+        for (node, match_kind) in rows {
             if hits.len() >= scope.budget.max_results as usize {
                 reason = Some(TruncationReason::Results);
                 break;
@@ -519,7 +734,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 reason = Some(TruncationReason::Duration);
                 break;
             }
-            let hit = search_hit(node, score, request.text.trim());
+            let hit = search_hit(node, match_kind, request.text.trim());
             let bytes = serialized_len(&hit)?;
             if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
                 reason = Some(TruncationReason::Bytes);
@@ -527,6 +742,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
             returned_bytes = returned_bytes.saturating_add(bytes);
             hits.push(hit);
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
         }
         let page = page_info(
             reason,
@@ -544,8 +764,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: SearchData { hits },
         })
@@ -561,14 +782,16 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             &scope.snapshot.id,
             &fingerprint,
         )?;
-        let rows = self.show_rows(&scope, request, offset, started)?;
-        if rows.is_empty() && offset == 0 {
+        let show_rows = self.show_rows(&scope, request, offset, started)?;
+        if show_rows.rows.is_empty() && !show_rows.deadline_exceeded && offset == 0 {
             return Err(invalid_request("graph lookup matched no nodes"));
         }
         let mut nodes = Vec::new();
         let mut returned_bytes = 0_u64;
-        let mut reason = None;
-        for node in rows {
+        let mut reason = show_rows
+            .deadline_exceeded
+            .then_some(TruncationReason::Duration);
+        for node in show_rows.rows {
             if nodes.len() >= scope.budget.max_results as usize {
                 reason = Some(TruncationReason::Results);
                 break;
@@ -584,6 +807,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
             returned_bytes = returned_bytes.saturating_add(bytes);
             nodes.push(node);
+        }
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
         }
         let page = page_info(
             reason,
@@ -601,8 +829,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: ShowData { nodes },
         })
@@ -623,6 +852,11 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             return Err(invalid_request("neighborhood requires 1..=32 roots"));
         }
         validate_filters(&request.edge_kinds, 0)?;
+        let deadline = QueryDeadline::install(
+            self.sidecar.connection(),
+            started,
+            Duration::from_millis(scope.budget.max_duration_ms),
+        )?;
 
         let mut nodes = BTreeMap::new();
         let mut edges = BTreeMap::new();
@@ -630,9 +864,17 @@ impl GraphQuery for SqliteGraphQuery<'_> {
         let mut returned_bytes = 0_u64;
         let mut reason = None;
         for root in &request.roots {
-            let node = self
-                .node(&scope.snapshot.id, root)?
-                .ok_or_else(|| invalid_request("neighborhood root was not found"))?;
+            let node = match self.node(&scope.snapshot.id, root) {
+                Ok(Some(node)) => node,
+                Ok(None) => {
+                    return Err(invalid_request("neighborhood root was not found"));
+                }
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    reason = Some(TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let item = neighborhood_node(node);
             let bytes = serialized_len(&item)?;
             if nodes.len() >= scope.budget.max_results as usize
@@ -661,18 +903,23 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 break;
             }
             if depth >= scope.budget.max_depth {
-                if !self
-                    .edges(
-                        &scope.snapshot.id,
-                        &current,
-                        request.direction,
-                        &request.edge_kinds,
-                        std::iter::empty::<&EdgeId>(),
-                        1,
-                    )?
-                    .is_empty()
-                {
-                    reason = Some(TruncationReason::Depth);
+                match self.edges(
+                    &scope.snapshot.id,
+                    &current,
+                    request.direction,
+                    &request.edge_kinds,
+                    std::iter::empty::<&EdgeId>(),
+                    1,
+                ) {
+                    Ok(edges) if !edges.is_empty() => {
+                        reason = Some(TruncationReason::Depth);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        reason = Some(TruncationReason::Duration);
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
                 continue;
             }
@@ -684,14 +931,22 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                 reason = Some(TruncationReason::Results);
                 break;
             }
-            for edge in self.edges(
+            let next_edges = match self.edges(
                 &scope.snapshot.id,
                 &current,
                 request.direction,
                 &request.edge_kinds,
                 edges.keys(),
                 remaining,
-            )? {
+            ) {
+                Ok(edges) => edges,
+                Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                    reason = Some(TruncationReason::Duration);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            for edge in next_edges {
                 if edges.contains_key(&edge.id) {
                     continue;
                 }
@@ -718,9 +973,15 @@ impl GraphQuery for SqliteGraphQuery<'_> {
                     reason = Some(TruncationReason::Results);
                     break;
                 }
-                let next = self
-                    .node(&scope.snapshot.id, &next_id)?
-                    .ok_or_else(backend_error)?;
+                let next = match self.node(&scope.snapshot.id, &next_id) {
+                    Ok(Some(node)) => node,
+                    Ok(None) => return Err(backend_error()),
+                    Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
+                        reason = Some(TruncationReason::Duration);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let next = neighborhood_node(next);
                 let bytes = serialized_len(&next)?;
                 if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
@@ -733,6 +994,12 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             }
         }
 
+        drop(deadline);
+        let (diagnostics, diagnostics_timed_out) =
+            self.diagnostics_with_deadline(&scope, started)?;
+        if diagnostics_timed_out {
+            reason = Some(TruncationReason::Duration);
+        }
         let page = page_info(
             reason,
             nodes.len() + edges.len(),
@@ -744,8 +1011,9 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             wire_version: QUERY_WIRE_VERSION,
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
+            source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
             freshness: scope.freshness,
-            diagnostics: self.diagnostics(&scope.snapshot.id)?,
+            diagnostics,
             page,
             data: NeighborhoodData {
                 nodes: nodes.into_values().collect(),
@@ -765,6 +1033,7 @@ struct ResolvedScope {
     repository: RepositoryRef,
     snapshot: super::domain::GraphSnapshot,
     published_view: Option<super::domain::PublishedViewName>,
+    source_revision_id: super::domain::SourceRevisionId,
     freshness: FreshnessEnvelope,
     budget: EffectiveBudget,
 }
@@ -775,6 +1044,7 @@ struct EffectiveBudget {
     max_bytes: u64,
     max_depth: u32,
     max_duration_ms: u64,
+    max_diagnostics: u32,
 }
 
 impl EffectiveBudget {
@@ -786,12 +1056,14 @@ impl EffectiveBudget {
             || service.max_bytes == 0
             || service.max_depth == 0
             || service.max_duration_ms == 0
+            || service.max_diagnostics == 0
         {
             return Err(QueryError {
                 wire_version: QUERY_WIRE_VERSION,
                 code: QueryErrorCode::BackendUnavailable,
                 message: "repository graph query limits are invalid".to_string(),
                 retryable: false,
+                recommended_action: None,
                 details: BTreeMap::new(),
             });
         }
@@ -800,6 +1072,7 @@ impl EffectiveBudget {
             max_bytes: requested.max_bytes.get().min(service.max_bytes),
             max_depth: requested.max_depth.get().min(service.max_depth),
             max_duration_ms: requested.max_duration_ms.get().min(service.max_duration_ms),
+            max_diagnostics: requested.max_diagnostics.get().min(service.max_diagnostics),
         })
     }
 }
@@ -813,6 +1086,7 @@ fn validate_wire_version(version: u32) -> Result<(), QueryError> {
             code: QueryErrorCode::UnsupportedWireVersion,
             message: "repository graph query wire version is unsupported".to_string(),
             retryable: false,
+            recommended_action: None,
             details: BTreeMap::new(),
         })
     }
@@ -872,7 +1146,71 @@ fn freshness(expected: &GraphSnapshot, actual: Option<&FreshnessComparison>) -> 
     }
 }
 
-fn search_hit(node: GraphNode, score: f64, query: &str) -> SearchHit {
+fn source_revision(
+    snapshot: &GraphSnapshot,
+    source_revision_id: &super::domain::SourceRevisionId,
+) -> SourceRevisionEnvelope {
+    SourceRevisionEnvelope {
+        id: source_revision_id.clone(),
+        manifest_digest: snapshot.source_manifest_digest.clone(),
+    }
+}
+
+fn available_status_response(
+    resolved: &ResolvedScope,
+    latest_build: Option<&GraphBuild>,
+    diagnostics: DiagnosticsEnvelope,
+    statistics: Option<SnapshotStatistics>,
+    duration_truncated: bool,
+) -> StatusResponse {
+    StatusResponse {
+        wire_version: QUERY_WIRE_VERSION,
+        repository: resolved.repository.clone(),
+        snapshot_id: Some(resolved.snapshot.id.clone()),
+        source_revision: Some(source_revision(
+            &resolved.snapshot,
+            &resolved.source_revision_id,
+        )),
+        freshness: resolved.freshness.clone(),
+        diagnostics,
+        page: PageInfo {
+            next_cursor: None,
+            truncation: duration_truncated.then_some(Truncation {
+                reason: TruncationReason::Duration,
+                returned_results: 0,
+                returned_bytes: 0,
+                explored_depth: 0,
+            }),
+        },
+        data: StatusData {
+            availability: Availability::Available,
+            build_state: latest_build.map(|build| build.state),
+            build_id: latest_build.map(|build| build.id.clone()),
+            published_view: resolved.published_view.clone(),
+            graph_model_version: Some(resolved.snapshot.graph_model_version),
+            statistics,
+            recommended_action: status_action(latest_build, resolved.freshness.freshness),
+        },
+    }
+}
+
+fn truncated_diagnostics() -> DiagnosticsEnvelope {
+    DiagnosticsEnvelope {
+        truncated: true,
+        ..DiagnosticsEnvelope::default()
+    }
+}
+
+fn status_action(build: Option<&GraphBuild>, freshness: Freshness) -> Option<RetrievalAction> {
+    match build.map(|build| build.state) {
+        Some(BuildState::Building) => Some(RetrievalAction::WaitForBuild),
+        Some(BuildState::Failed) => Some(RetrievalAction::RetryIndex),
+        _ if freshness == Freshness::Stale => Some(RetrievalAction::RefreshIndex),
+        _ => None,
+    }
+}
+
+fn search_hit(node: GraphNode, match_kind: SearchMatchKind, query: &str) -> SearchHit {
     let normalized = query.to_lowercase();
     let mut matched_fields = Vec::new();
     if node
@@ -915,8 +1253,36 @@ fn search_hit(node: GraphNode, score: f64, query: &str) -> SearchHit {
         path,
         span,
         provenance: node.provenance,
-        score,
+        match_kind,
+        score: match_kind.score(),
         matched_fields,
+    }
+}
+
+impl SearchMatchKind {
+    fn score(self) -> f64 {
+        match self {
+            Self::ExactSemanticKey => 1.0,
+            Self::ExactPath => 0.99,
+            Self::ExactNormalizedName => 0.98,
+            Self::NormalizedNamePrefix => 0.9,
+            Self::NormalizedNameContains => 0.8,
+            Self::SemanticKeyContains => 0.7,
+            Self::PathContains => 0.6,
+        }
+    }
+}
+
+fn search_match_kind(rank: i64) -> Result<SearchMatchKind, QueryError> {
+    match rank {
+        0 => Ok(SearchMatchKind::ExactSemanticKey),
+        1 => Ok(SearchMatchKind::ExactPath),
+        2 => Ok(SearchMatchKind::ExactNormalizedName),
+        3 => Ok(SearchMatchKind::NormalizedNamePrefix),
+        4 => Ok(SearchMatchKind::NormalizedNameContains),
+        5 => Ok(SearchMatchKind::SemanticKeyContains),
+        6 => Ok(SearchMatchKind::PathContains),
+        _ => Err(backend_error()),
     }
 }
 
@@ -1275,6 +1641,15 @@ fn confidence(value: &str) -> Result<Confidence, QueryError> {
     }
 }
 
+fn diagnostic_severity(value: &str) -> Result<DiagnosticSeverity, QueryError> {
+    match value {
+        "info" => Ok(DiagnosticSeverity::Info),
+        "warning" => Ok(DiagnosticSeverity::Warning),
+        "error" => Ok(DiagnosticSeverity::Error),
+        _ => Err(backend_error()),
+    }
+}
+
 fn optional_u32(value: Option<i64>) -> Result<Option<u32>, QueryError> {
     value
         .map(u32::try_from)
@@ -1335,6 +1710,7 @@ fn invalid_request(message: &'static str) -> QueryError {
         code: QueryErrorCode::InvalidRequest,
         message: message.to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1345,6 +1721,7 @@ fn backend_error() -> QueryError {
         code: QueryErrorCode::BackendUnavailable,
         message: "repository graph storage is unavailable or inconsistent".to_string(),
         retryable: true,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1355,6 +1732,7 @@ fn duration_budget_exceeded_error() -> QueryError {
         code: QueryErrorCode::BudgetExceeded,
         message: "repository graph query exceeded the duration budget".to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1365,6 +1743,30 @@ fn not_built_error() -> QueryError {
         code: QueryErrorCode::NotBuilt,
         message: "repository graph is not built; run `ferrus graph index`".to_string(),
         retryable: false,
+        recommended_action: Some(RetrievalAction::Index),
+        details: BTreeMap::new(),
+    }
+}
+
+fn index_building_error() -> QueryError {
+    QueryError {
+        wire_version: QUERY_WIRE_VERSION,
+        code: QueryErrorCode::IndexBuilding,
+        message: "repository graph is currently building; retry after indexing completes"
+            .to_string(),
+        retryable: true,
+        recommended_action: Some(RetrievalAction::WaitForBuild),
+        details: BTreeMap::new(),
+    }
+}
+
+fn index_failed_error() -> QueryError {
+    QueryError {
+        wire_version: QUERY_WIRE_VERSION,
+        code: QueryErrorCode::IndexFailed,
+        message: "repository graph build failed; run `ferrus graph index` to retry".to_string(),
+        retryable: false,
+        recommended_action: Some(RetrievalAction::RetryIndex),
         details: BTreeMap::new(),
     }
 }
@@ -1375,6 +1777,7 @@ fn snapshot_not_found_error() -> QueryError {
         code: QueryErrorCode::SnapshotNotFound,
         message: "repository graph snapshot was not found".to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1386,6 +1789,7 @@ fn stale_cursor_error() -> QueryError {
         message: "repository graph cursor does not match this query snapshot or parameters"
             .to_string(),
         retryable: false,
+        recommended_action: None,
         details: BTreeMap::new(),
     }
 }
@@ -1402,6 +1806,8 @@ pub fn default_budget(
             .ok_or_else(|| invalid_request("query max_depth must be greater than zero"))?,
         NonZeroU64::new(limits.max_duration_ms)
             .ok_or_else(|| invalid_request("query max_duration_ms must be greater than zero"))?,
+        NonZeroU32::new(limits.max_diagnostics)
+            .ok_or_else(|| invalid_request("query max_diagnostics must be greater than zero"))?,
     ))
 }
 
@@ -1410,10 +1816,15 @@ mod tests {
     use super::*;
     use crate::repository_graph::{
         config::RepositoryGraphConfig,
-        domain::{BuildId, PublishedViewName, RepositoryId, RepositoryNamespace},
+        domain::{
+            Availability, BuildId, BuildState, DiagnosticCode, DiagnosticSeverity, GraphBuild,
+            GraphDiagnostic, PublishedViewName, RepositoryId, RepositoryNamespace, SnapshotId,
+            SourceRevisionId,
+        },
         index::{IndexCoordinator, IndexRequest, active_extractor_identities},
         source::{FilesystemRepositorySource, SourceDiscoveryContext},
         sqlite::{OpenSidecarResult, open_for_build_at},
+        store::BuildFailure,
     };
 
     fn repository() -> RepositoryRef {
@@ -1492,7 +1903,7 @@ mod tests {
     }
 
     fn scope(config: &RepositoryGraphConfig) -> super::super::query::QueryScope {
-        super::super::query::QueryScope::v1(
+        super::super::query::QueryScope::current(
             repository(),
             SnapshotSelector::Published(PublishedViewName::new("canonical").unwrap()),
             default_budget(&config.query_limits).unwrap(),
@@ -1505,7 +1916,7 @@ mod tests {
         let query = SqliteGraphQuery::new(
             &sidecar,
             config.query_limits.clone(),
-            Some(freshness_comparison),
+            Some(freshness_comparison.clone()),
         );
         let search = query
             .search(&SearchRequest {
@@ -1517,6 +1928,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(search.freshness.freshness, Freshness::Fresh);
+        assert_eq!(
+            search.source_revision.manifest_digest,
+            freshness_comparison.source_manifest_digest
+        );
         assert!(!search.data.hits.is_empty());
         let hit = &search.data.hits[0];
         assert_eq!(hit.path.as_ref().unwrap().as_str(), "src/lib.rs");
@@ -1547,6 +1962,192 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| node.id == hit.node_id)
+        );
+    }
+
+    #[test]
+    fn search_classifies_exact_matches_and_is_snapshot_deterministic() {
+        let (_source, _sidecar_dir, sidecar, config, comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), Some(comparison));
+
+        for (text, expected) in [
+            ("RuntimeTaskContext", SearchMatchKind::ExactNormalizedName),
+            ("src/lib.rs", SearchMatchKind::ExactPath),
+        ] {
+            let request = SearchRequest {
+                scope: scope(&config),
+                text: text.to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            };
+            let first = query.search(&request).unwrap();
+            let second = query.search(&request).unwrap();
+
+            assert_eq!(first.data.hits.first().unwrap().match_kind, expected);
+            assert_eq!(
+                serde_json::to_value(first).unwrap(),
+                serde_json::to_value(second).unwrap()
+            );
+        }
+
+        let symbol = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec!["struct".to_string()],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap()
+            .data
+            .hits
+            .into_iter()
+            .find_map(|hit| hit.semantic_key)
+            .unwrap();
+        let exact_symbol = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: symbol.as_str().to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+        assert_eq!(
+            exact_symbol.data.hits.first().unwrap().match_kind,
+            SearchMatchKind::ExactSemanticKey
+        );
+    }
+
+    #[test]
+    fn previous_wire_versions_are_rejected_explicitly() {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request_scope = scope(&config);
+        request_scope.wire_version = QUERY_WIRE_VERSION - 1;
+
+        let error = query
+            .status(&StatusRequest {
+                scope: request_scope,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, QueryErrorCode::UnsupportedWireVersion);
+        assert_eq!(error.wire_version, QUERY_WIRE_VERSION);
+    }
+
+    #[test]
+    fn unbuilt_status_and_queries_distinguish_building_and_failed_attempts() {
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let OpenSidecarResult::Ready(mut sidecar) =
+            open_for_build_at(&sidecar_dir.path().join("repo-graph.db")).unwrap()
+        else {
+            panic!("new sidecar unexpectedly requires rebuild");
+        };
+        let config = RepositoryGraphConfig::default();
+        let build = GraphBuild {
+            id: BuildId::new("build-in-progress").unwrap(),
+            repository: repository(),
+            source_revision_id: SourceRevisionId::new("revision-next").unwrap(),
+            prospective_snapshot_id: SnapshotId::new("snapshot-next").unwrap(),
+            state: BuildState::Building,
+        };
+        sidecar.start_build(&build).unwrap();
+
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let status = query
+            .status(&StatusRequest {
+                scope: scope(&config),
+            })
+            .unwrap();
+        assert_eq!(status.data.availability, Availability::NotBuilt);
+        assert_eq!(status.data.build_state, Some(BuildState::Building));
+        assert_eq!(
+            status.data.recommended_action,
+            Some(RetrievalAction::WaitForBuild)
+        );
+        let error = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "anything".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::IndexBuilding);
+
+        drop(query);
+        sidecar
+            .fail_build(&BuildFailure {
+                build_id: build.id,
+                code: DiagnosticCode::new("index.failed").unwrap(),
+            })
+            .unwrap();
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let status = query
+            .status(&StatusRequest {
+                scope: scope(&config),
+            })
+            .unwrap();
+        assert_eq!(status.data.build_state, Some(BuildState::Failed));
+        assert_eq!(
+            status.data.recommended_action,
+            Some(RetrievalAction::RetryIndex)
+        );
+        let error = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "anything".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap_err();
+        assert_eq!(error.code, QueryErrorCode::IndexFailed);
+    }
+
+    #[test]
+    fn diagnostics_are_deterministic_and_capped_independently() {
+        let (_source, _sidecar_dir, mut sidecar, mut config, _comparison) = indexed_fixture();
+        let snapshot = sidecar
+            .published_snapshot(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap();
+        for code in ["query.z", "query.a", "query.m"] {
+            sidecar
+                .record_diagnostic(&GraphDiagnostic {
+                    build_id: BuildId::new("build-query").unwrap(),
+                    snapshot_id: Some(snapshot.id.clone()),
+                    severity: DiagnosticSeverity::Warning,
+                    code: DiagnosticCode::new(code).unwrap(),
+                    location: None,
+                    metrics: BTreeMap::new(),
+                })
+                .unwrap();
+        }
+        config.query_limits.max_diagnostics = 2;
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let response = query
+            .search(&SearchRequest {
+                scope: scope(&config),
+                text: "RuntimeTaskContext".to_string(),
+                node_kinds: vec![],
+                paths: vec![],
+                page: super::super::query::PageRequest { cursor: None },
+            })
+            .unwrap();
+
+        assert!(response.diagnostics.truncated);
+        assert_eq!(response.diagnostics.items.len(), 2);
+        assert!(response.diagnostics.summary.warning >= 3);
+        assert!(
+            response
+                .diagnostics
+                .items
+                .windows(2)
+                .all(|items| { items[0].code.as_str() <= items[1].code.as_str() })
         );
     }
 
@@ -1776,11 +2377,12 @@ mod tests {
         let started = Instant::now()
             - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
 
-        let error = query
+        let rows = query
             .show_rows(&resolved_scope, &request, 0, started)
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.code, QueryErrorCode::BudgetExceeded);
+        assert!(rows.deadline_exceeded);
+        assert!(rows.rows.is_empty());
     }
 
     #[test]
@@ -1790,16 +2392,20 @@ mod tests {
         let started = Instant::now()
             - Duration::from_millis(config.query_limits.max_duration_ms.saturating_add(1));
 
-        let error = query
+        let response = query
             .status_at(
                 &StatusRequest {
                     scope: scope(&config),
                 },
                 started,
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.code, QueryErrorCode::BudgetExceeded);
+        assert_eq!(
+            response.page.truncation.unwrap().reason,
+            TruncationReason::Duration
+        );
+        assert!(response.data.statistics.is_none());
     }
 
     #[test]

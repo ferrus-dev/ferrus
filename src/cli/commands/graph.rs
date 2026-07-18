@@ -23,9 +23,9 @@ use crate::{
         index::{IndexCoordinator, IndexOutcome, IndexRequest, active_extractor_identities},
         ports::GraphQuery,
         query::{
-            DiagnosticSummary, EdgeDirection, FreshnessEnvelope, NeighborhoodRequest, PageInfo,
-            PageRequest, QueryScope, SearchRequest, ShowLookup, ShowRequest, SnapshotSelector,
-            StatusData, StatusRequest, StatusResponse,
+            DiagnosticsEnvelope, EdgeDirection, FreshnessEnvelope, NeighborhoodRequest, PageInfo,
+            PageRequest, QueryScope, RetrievalAction, SearchRequest, ShowLookup, ShowRequest,
+            SnapshotSelector, StatusData, StatusRequest, StatusResponse,
         },
         query_sqlite::{FreshnessComparison, SqliteGraphQuery, default_budget},
         source::{LocalRepositorySource, SourceDiscoveryContext},
@@ -202,7 +202,7 @@ impl LocalGraphContext {
     }
 
     fn scope(&self, budget: QueryBudget) -> Result<QueryScope> {
-        Ok(QueryScope::v1(
+        Ok(QueryScope::current(
             self.repository.clone(),
             SnapshotSelector::Published(PublishedViewName::new(CANONICAL_VIEW)?),
             budget,
@@ -567,6 +567,8 @@ fn requested_budget(
             .context("--depth must be greater than zero")?,
         NonZeroU64::new(defaults.max_duration_ms)
             .context("repository_graph.query_limits.max_duration_ms must be greater than zero")?,
+        NonZeroU32::new(defaults.max_diagnostics)
+            .context("repository_graph.query_limits.max_diagnostics must be greater than zero")?,
     ))
 }
 
@@ -579,18 +581,29 @@ fn unavailable_status(
         wire_version: QUERY_WIRE_VERSION,
         repository,
         snapshot_id: None,
+        source_revision: None,
         freshness: FreshnessEnvelope {
             freshness: Freshness::NotApplicable,
             compared_manifest: None,
             reason_codes: vec![reason.to_string()],
         },
-        diagnostics: DiagnosticSummary::default(),
+        diagnostics: DiagnosticsEnvelope::default(),
+        page: PageInfo {
+            next_cursor: None,
+            truncation: None,
+        },
         data: StatusData {
             availability,
             build_state: None,
+            build_id: None,
             published_view: Some(PublishedViewName::new(CANONICAL_VIEW)?),
             graph_model_version: None,
             statistics: None,
+            recommended_action: Some(match availability {
+                Availability::NotBuilt => RetrievalAction::Index,
+                Availability::Incompatible => RetrievalAction::Rebuild,
+                Availability::Available => RetrievalAction::RefreshIndex,
+            }),
         },
     })
 }
@@ -598,7 +611,7 @@ fn unavailable_status(
 fn print_query_header(
     snapshot: &str,
     freshness: &FreshnessEnvelope,
-    diagnostics: &DiagnosticSummary,
+    diagnostics: &DiagnosticsEnvelope,
     page: &PageInfo,
 ) {
     println!("Snapshot: {snapshot}");
@@ -617,10 +630,11 @@ fn print_query_header(
     }
 }
 
-fn print_diagnostics(diagnostics: &DiagnosticSummary) {
+fn print_diagnostics(diagnostics: &DiagnosticsEnvelope) {
+    let summary = &diagnostics.summary;
     println!(
         "Diagnostics: {} info, {} warnings, {} errors",
-        diagnostics.info, diagnostics.warning, diagnostics.error
+        summary.info, summary.warning, summary.error
     );
 }
 
