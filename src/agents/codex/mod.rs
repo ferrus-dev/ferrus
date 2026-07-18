@@ -430,6 +430,7 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "heartbeat",
             "repository_graph_status",
             "repository_search",
+            "repository_context",
         ],
         ROLE_SUPERVISOR => &[
             "enqueue_task",
@@ -446,6 +447,7 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "heartbeat",
             "repository_graph_status",
             "repository_search",
+            "repository_context",
         ],
         _ => &[],
     }
@@ -793,6 +795,10 @@ args = []
         assert!(tools.contains_key("submit"));
         assert!(tools.contains_key("repository_graph_status"));
         assert!(tools.contains_key("repository_search"));
+        assert_eq!(
+            tools["repository_context"]["approval_mode"].as_str(),
+            Some("approve")
+        );
         assert!(!tools.contains_key("approve"));
     }
 
@@ -808,14 +814,18 @@ args = []
         assert!(tools.contains_key("heartbeat"));
         assert!(tools.contains_key("repository_graph_status"));
         assert!(tools.contains_key("repository_search"));
+        assert_eq!(
+            tools["repository_context"]["approval_mode"].as_str(),
+            Some("approve")
+        );
         assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
     }
 
     #[test]
     fn codex_tool_approval_sets_match_role_needs() {
-        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 12);
-        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 14);
+        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 13);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 15);
     }
 
     #[test]
