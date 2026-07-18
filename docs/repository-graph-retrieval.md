@@ -108,3 +108,10 @@ tool name, snapshot identity, freshness, duration, result count, serialized resp
 diagnostic count, and error category. Its metric type cannot represent request text, filters, repository paths,
 snippets, or source bodies. Telemetry remains operational and does not mutate either `ferrus.db` or the read-only
 repository graph sidecar.
+
+## Evaluation gate
+
+The deterministic navigation corpus, baseline definition, reproducible JSON runner, current quality results, and
+automation decision are documented in [Repository Graph Navigation Evaluations](repository-graph-evaluations.md).
+Retrieval or ranking changes must preserve its correctness and recall gates; latency remains recorded rather than
+hard-gated across machines.

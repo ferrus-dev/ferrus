@@ -179,13 +179,20 @@ with status-first generated skill guidance and structured opt-in query telemetry
 snapshot, freshness, duration, counts, response bytes, truncation, and error category; their type cannot contain
 queries, paths, snippets, or source bodies, and repository reads remain independent from task leases/runtime state.
 
-- [ ] #2.5 Build repository navigation evaluations and establish usefulness gates
+- [x] #2.5 Build repository navigation evaluations and establish usefulness gates
 
 ID: rg2.5
 Depends on: rg2.3, rg2.4
 
 Create deterministic fixtures and graph-assisted versus baseline evaluation scenarios, record performance and
 context-volume results, and document thresholds for retrieval quality and later automation decisions.
+
+Implemented by the versioned 26-case corpus in `tests/fixtures/repository_graph_eval`, a shared real-index/query
+harness, `cargo test --test repository_graph_eval`, and the machine-readable
+`cargo run --example repository_graph_eval -- --output <path>` runner. Current gates achieve 100% exact-path and
+unique-symbol Recall@1, 93.75% supported-discovery Recall@10, 100% repeated-query determinism, no supported baseline
+regression, and 100% median files-read reduction. Context bytes remain substantially higher for broad traversal, so
+optional retrieval guidance is eligible while automatic injection and the summary resource remain disabled.
 
 ## Acceptance Criteria
 
@@ -229,6 +236,7 @@ context-volume results, and document thresholds for retrieval quality and later 
 - Token counting differs across agent models. Byte and character caps should remain authoritative even when an
   estimated token budget is reported.
 - Query metrics must be useful without logging sensitive user searches or source content.
-- It remains open whether `ferrus://repository/summary` adds value beyond the status and context tools.
+- RG2.5 found no evidence that `ferrus://repository/summary` adds value beyond status and on-demand tools, so it
+  remains unregistered; reevaluate only with a measured navigation benefit.
 - Cursor stability across snapshot publication must be defined; the safest default is to scope every cursor to
   one immutable snapshot.

@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "corpus_version": "rg2.5-v1",
+  "cases": [
+    {
+      "id": "exact-path-api",
+      "labels": ["exact_path", "navigation"],
+      "operation": "search",
+      "query": "src/api.rs",
+      "baseline_hint": "src/api.rs",
+      "expected_paths": ["src/api.rs"],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "exact-path-readme",
+      "labels": ["exact_path", "documentation"],
+      "operation": "search",
+      "query": "README.md",
+      "baseline_hint": "README.md",
+      "expected_paths": ["README.md"],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "exact-path-config",
+      "labels": ["exact_path", "configuration"],
+      "operation": "search",
+      "query": "config/app.toml",
+      "baseline_hint": "config/app.toml",
+      "expected_paths": ["config/app.toml"],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "exact-path-malformed",
+      "labels": ["exact_path", "malformed_source"],
+      "operation": "search",
+      "query": "src/malformed.rs",
+      "baseline_hint": "src/malformed.rs",
+      "expected_paths": ["src/malformed.rs"],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "unique-runtime-context",
+      "labels": ["exact_unique_symbol", "supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "RuntimeTaskContext",
+      "baseline_hint": "RuntimeTaskContext",
+      "expected_paths": ["src/service.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "unique-api-client",
+      "labels": ["exact_unique_symbol", "supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "ApiClient",
+      "baseline_hint": "ApiClient",
+      "expected_paths": ["src/api.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "unique-background-worker",
+      "labels": ["exact_unique_symbol", "supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "BackgroundWorker",
+      "baseline_hint": "BackgroundWorker",
+      "expected_paths": ["src/worker.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "unique-navigation-target",
+      "labels": ["exact_unique_symbol", "supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "navigation_target",
+      "baseline_hint": "navigation_target",
+      "expected_paths": ["src/zeta_navigation.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "ambiguous-shared-symbol",
+      "labels": ["ambiguous_symbol", "supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "Shared",
+      "baseline_hint": "pub struct Shared",
+      "expected_paths": ["src/duplicate_a.rs", "src/duplicate_b.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "discover-build-context",
+      "labels": ["supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "build_context",
+      "baseline_hint": "build_context",
+      "expected_paths": ["src/service.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "discover-worker-run",
+      "labels": ["supported_discovery", "navigation"],
+      "operation": "search",
+      "query": "run_worker",
+      "baseline_hint": "run_worker",
+      "expected_paths": ["src/worker.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "discover-guide",
+      "labels": ["supported_discovery", "documentation"],
+      "operation": "search",
+      "query": "guide.md",
+      "baseline_hint": "guide.md",
+      "expected_paths": ["docs/guide.md"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "discover-app-config",
+      "labels": ["supported_discovery", "configuration"],
+      "operation": "search",
+      "query": "app.toml",
+      "baseline_hint": "app.toml",
+      "expected_paths": ["config/app.toml"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "discover-entrypoint",
+      "labels": ["supported_discovery", "configuration"],
+      "operation": "search",
+      "query": "entrypoint.sh",
+      "baseline_hint": "entrypoint.sh",
+      "expected_paths": ["scripts/entrypoint.sh"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "dependency-service-api",
+      "labels": ["supported_discovery", "dependency", "navigation"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "src/service.rs"},
+      "baseline_hint": "pub struct ApiClient",
+      "expected_paths": ["src/api.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "dependency-worker-service",
+      "labels": ["supported_discovery", "dependency", "navigation"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "src/worker.rs"},
+      "baseline_hint": "pub fn build_context",
+      "expected_paths": ["src/service.rs"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "documentation-architecture",
+      "labels": ["supported_discovery", "documentation"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "docs/architecture.md"},
+      "baseline_hint": "Architecture Overview",
+      "expected_paths": ["docs/architecture.md"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "configuration-context",
+      "labels": ["supported_discovery", "configuration"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "config/app.toml"},
+      "baseline_hint": "timeout_ms",
+      "expected_paths": ["config/app.toml"],
+      "supported": true,
+      "designated_navigation": true
+    },
+    {
+      "id": "malformed-rust-visible",
+      "labels": ["supported_discovery", "malformed_source"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "src/malformed.rs"},
+      "baseline_hint": "deliberately malformed",
+      "expected_paths": ["src/malformed.rs"],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "unsupported-macro-expansion",
+      "labels": ["unsupported_capability"],
+      "operation": "search",
+      "query": "derive_generated_route",
+      "baseline_hint": "derive_generated_route",
+      "expected_paths": ["src/macro_only.rs"],
+      "supported": false,
+      "designated_navigation": false
+    },
+    {
+      "id": "missing-index-actionable",
+      "labels": ["missing_index"],
+      "operation": "missing_index",
+      "baseline_hint": "RuntimeTaskContext",
+      "expected_paths": [],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "stale-index-visible",
+      "labels": ["stale_index"],
+      "operation": "stale_status",
+      "baseline_hint": "RuntimeTaskContext",
+      "expected_paths": [],
+      "supported": true,
+      "designated_navigation": false
+    },
+    {
+      "id": "search-result-truncation",
+      "labels": ["truncation", "ambiguous_symbol"],
+      "operation": "search_truncation",
+      "query": "Shared",
+      "baseline_hint": "pub struct Shared",
+      "expected_paths": ["src/duplicate_a.rs", "src/duplicate_b.rs"],
+      "supported": true,
+      "designated_navigation": false,
+      "expected_truncation": "results"
+    },
+    {
+      "id": "context-result-truncation",
+      "labels": ["truncation", "dependency"],
+      "operation": "context_truncation",
+      "seed": {"type": "path", "value": "src/service.rs"},
+      "baseline_hint": "pub struct ApiClient",
+      "expected_paths": ["src/api.rs"],
+      "supported": true,
+      "designated_navigation": false,
+      "expected_truncation": "results"
+    },
+    {
+      "id": "repeat-search-determinism",
+      "labels": ["determinism", "supported_discovery"],
+      "operation": "search",
+      "query": "RuntimeTaskContext",
+      "baseline_hint": "RuntimeTaskContext",
+      "expected_paths": ["src/service.rs"],
+      "supported": true,
+      "designated_navigation": false,
+      "require_repeat_determinism": true
+    },
+    {
+      "id": "repeat-context-determinism",
+      "labels": ["determinism", "dependency"],
+      "operation": "context",
+      "seed": {"type": "path", "value": "src/worker.rs"},
+      "baseline_hint": "pub fn build_context",
+      "expected_paths": ["src/service.rs"],
+      "supported": true,
+      "designated_navigation": false,
+      "require_repeat_determinism": true
+    }
+  ]
+}
