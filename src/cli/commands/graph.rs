@@ -419,24 +419,28 @@ async fn context(args: ContextArgs) -> Result<()> {
                 .context("--path must be repository-relative")?,
         )
     };
-    let response = context
-        .context(&ContextRequest {
-            scope: context.scope(requested_budget(
-                &context.config,
-                args.max_results,
-                args.max_bytes,
-                args.depth,
-            )?)?,
-            seeds: vec![seed],
-            policy: ContextPolicy {
-                direction: EdgeDirection::Both,
-                edge_kinds: vec![],
-                include_unresolved: false,
-                include_external: false,
-            },
-            page: PageRequest { cursor: None },
-        })
-        .await??;
+    let sidecar = ready_query_sidecar().await?;
+    let query = SqliteGraphQuery::new(
+        &sidecar,
+        context.config.query_limits.clone(),
+        context.freshness_comparison()?,
+    );
+    let response = query.context(&ContextRequest {
+        scope: context.scope(requested_budget(
+            &context.config,
+            args.max_results,
+            args.max_bytes,
+            args.depth,
+        )?)?,
+        seeds: vec![seed],
+        policy: ContextPolicy {
+            direction: EdgeDirection::Both,
+            edge_kinds: vec![],
+            include_unresolved: false,
+            include_external: false,
+        },
+        page: PageRequest { cursor: None },
+    })?;
     if args.json {
         print_json(&response)?;
     } else {
