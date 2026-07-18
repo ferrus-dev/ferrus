@@ -682,7 +682,7 @@ impl SnapshotContent for LocalSnapshotContent {
         let limit = request.max_bytes.get().min(self.hard_max_bytes.get());
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let selected = &content.bytes[start..end];
-        let returned_len = selected.len().min(limit);
+        let returned_len = clamp_utf8_truncation(selected, selected.len().min(limit));
 
         Ok(ContentResponse {
             wire_version: super::QUERY_WIRE_VERSION,
@@ -694,6 +694,20 @@ impl SnapshotContent for LocalSnapshotContent {
             truncated: returned_len < selected.len(),
         })
     }
+}
+
+fn clamp_utf8_truncation(bytes: &[u8], requested_len: usize) -> usize {
+    let requested_len = requested_len.min(bytes.len());
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        // Preserve invalid source bytes so the snippet adapter can report the
+        // existing content.non_utf8 diagnostic instead of hiding corruption.
+        return requested_len;
+    };
+    let mut returned_len = requested_len;
+    while !text.is_char_boundary(returned_len) {
+        returned_len -= 1;
+    }
+    returned_len
 }
 
 fn invalid_content_span() -> QueryError {
@@ -1726,6 +1740,33 @@ mod tests {
             reader.read_verified(&request).unwrap_err().code,
             QueryErrorCode::ContentChanged
         );
+    }
+
+    #[test]
+    fn snapshot_content_clamps_byte_limits_to_utf8_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = "aéz".as_bytes();
+        std::fs::write(directory.path().join("unicode.rs"), bytes).unwrap();
+        let file = descriptor("unicode.rs", bytes);
+
+        for (hard_limit, request_limit) in [(2, 1024), (1024, 2)] {
+            let reader = LocalSnapshotContent::new(
+                directory.path(),
+                test_repository(),
+                SnapshotId::new("snapshot-1").unwrap(),
+                &SourceConfig::default(),
+                vec![file.clone()],
+                NonZeroU64::new(hard_limit).unwrap(),
+            )
+            .unwrap();
+            let mut request = content_request(&file);
+            request.max_bytes = NonZeroU64::new(request_limit).unwrap();
+
+            let response = reader.read_verified(&request).unwrap();
+
+            assert_eq!(std::str::from_utf8(&response.bytes).unwrap(), "a");
+            assert!(response.truncated);
+        }
     }
 
     #[test]
