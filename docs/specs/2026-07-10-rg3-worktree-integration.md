@@ -119,7 +119,7 @@ cross-process contract.
 
 ## Milestones
 
-- [ ] #3.0 Add explicit runtime schema migrations for repository view references
+- [x] #3.0 Add explicit runtime schema migrations for repository view references
 
 ID: rg3.0
 Depends on: none
@@ -127,6 +127,10 @@ Depends on: none
 Introduce versioned `ferrus.db` migrations, adopt existing databases safely, and persist optional baseline
 snapshot, overlay revision, and repository-view status for tasks or runs without changing existing lifecycle
 semantics.
+
+Implemented in `src/project.rs` with ordered transactional runtime migrations, durable migration history and
+schema version validation, plus typed task/run repository-view persistence. Existing rows are adopted as
+`not_built` without changing task or run lifecycle fields.
 
 - [ ] #3.1 Pin task and run context to baseline repository snapshots
 

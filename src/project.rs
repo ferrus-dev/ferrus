@@ -21,15 +21,77 @@ use crate::{
     agent_id::ENV_PROJECT_ROOT,
     legacy_state::{self, LegacyTaskState},
     platform,
+    repository_graph::domain::{OverlayRevisionId, SnapshotId},
 };
 
 const PROJECT_VERSION: u32 = 1;
+const RUNTIME_SCHEMA_VERSION: u32 = 2;
 const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 const CURRENT_TASK_ID: &str = "current";
 const CURRENT_TASK_PATH: &str = ".ferrus/TASK.md";
 const BASELINE_WORKTREE_METADATA_DIR: &str = ".baseline-trees";
 const BASELINE_REF_PREFIX: &str = "refs/ferrus/baselines";
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RepositoryViewStatus {
+    #[default]
+    NotBuilt,
+    Available,
+    Stale,
+    Unavailable,
+    Failed,
+}
+
+impl RepositoryViewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBuilt => "not_built",
+            Self::Available => "available",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "not_built" => Ok(Self::NotBuilt),
+            "available" => Ok(Self::Available),
+            "stale" => Ok(Self::Stale),
+            "unavailable" => Ok(Self::Unavailable),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("Unknown repository view status in ferrus.db: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryViewReference {
+    pub baseline_snapshot_id: Option<SnapshotId>,
+    pub overlay_revision_id: Option<OverlayRevisionId>,
+    pub status: RepositoryViewStatus,
+}
+
+impl RepositoryViewReference {
+    pub fn new(
+        baseline_snapshot_id: Option<SnapshotId>,
+        overlay_revision_id: Option<OverlayRevisionId>,
+        status: RepositoryViewStatus,
+    ) -> Result<Self> {
+        if overlay_revision_id.is_some() && baseline_snapshot_id.is_none() {
+            anyhow::bail!("A repository overlay revision requires a baseline snapshot");
+        }
+        if status == RepositoryViewStatus::Available && baseline_snapshot_id.is_none() {
+            anyhow::bail!("An available repository view requires a baseline snapshot");
+        }
+        Ok(Self {
+            baseline_snapshot_id,
+            overlay_revision_id,
+            status,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalProjectRef {
@@ -1349,6 +1411,120 @@ pub async fn list_runs(limit: usize) -> Result<Vec<RunRecord>> {
         Ok(runs)
     })
     .await?
+}
+
+#[allow(dead_code)]
+pub async fn task_repository_view(task_id: &str) -> Result<Option<RepositoryViewReference>> {
+    read_repository_view("tasks", task_id).await
+}
+
+#[allow(dead_code)]
+pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewReference>> {
+    read_repository_view("runs", run_id).await
+}
+
+async fn read_repository_view(
+    owner_table: &'static str,
+    owner_id: &str,
+) -> Result<Option<RepositoryViewReference>> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    let database_path = current_database_path().await?;
+    let owner_id = owner_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Option<RepositoryViewReference>> {
+        let connection = open_runtime_database(&database_path)?;
+        let sql = format!(
+            "SELECT baseline_snapshot_id, overlay_revision_id, repository_view_status \
+             FROM {owner_table} WHERE id = ?1"
+        );
+        let values = connection
+            .query_row(&sql, [&owner_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        values
+            .map(repository_view_reference_from_database)
+            .transpose()
+    })
+    .await?
+}
+
+#[allow(dead_code)]
+pub async fn record_task_repository_view(
+    task_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    record_repository_view("tasks", task_id, repository_view).await
+}
+
+#[allow(dead_code)]
+pub async fn record_run_repository_view(
+    run_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    record_repository_view("runs", run_id, repository_view).await
+}
+
+async fn record_repository_view(
+    owner_table: &'static str,
+    owner_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    RepositoryViewReference::new(
+        repository_view.baseline_snapshot_id.clone(),
+        repository_view.overlay_revision_id.clone(),
+        repository_view.status,
+    )?;
+    let database_path = current_database_path().await?;
+    let owner_id = owner_id.to_string();
+    let baseline_snapshot_id = repository_view
+        .baseline_snapshot_id
+        .as_ref()
+        .map(|identity| identity.as_str().to_string());
+    let overlay_revision_id = repository_view
+        .overlay_revision_id
+        .as_ref()
+        .map(|identity| identity.as_str().to_string());
+    let status = repository_view.status.as_str();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = open_runtime_database(&database_path)?;
+        let sql = format!(
+            "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
+             repository_view_status = ?3 WHERE id = ?4"
+        );
+        let updated = connection.execute(
+            &sql,
+            params![baseline_snapshot_id, overlay_revision_id, status, owner_id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
+        }
+        Ok(())
+    })
+    .await?
+}
+
+fn repository_view_reference_from_database(
+    values: (Option<String>, Option<String>, String),
+) -> Result<RepositoryViewReference> {
+    let (baseline_snapshot_id, overlay_revision_id, status) = values;
+    let baseline_snapshot_id = baseline_snapshot_id
+        .map(SnapshotId::new)
+        .transpose()
+        .context("Invalid baseline snapshot identity in ferrus.db")?;
+    let overlay_revision_id = overlay_revision_id
+        .map(OverlayRevisionId::new)
+        .transpose()
+        .context("Invalid overlay revision identity in ferrus.db")?;
+    RepositoryViewReference::new(
+        baseline_snapshot_id,
+        overlay_revision_id,
+        RepositoryViewStatus::from_database(&status)?,
+    )
 }
 
 pub async fn list_events(limit: usize, run_id: Option<String>) -> Result<Vec<EventRecord>> {
@@ -3597,9 +3773,9 @@ async fn preview_expired_task_leases(database_path: &Path) -> Result<usize> {
 async fn initialize_database(path: &Path) -> Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        initialize_schema(&connection)?;
+        initialize_schema(&mut connection)?;
         Ok(())
     })
     .await?
@@ -3610,7 +3786,12 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
     tokio::task::spawn_blocking(move || -> Result<bool> {
         let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        for table in ["tasks", "runs", "events"] {
+        if runtime_schema_version(&connection)? != RUNTIME_SCHEMA_VERSION
+            || validate_runtime_migration_history(&connection).is_err()
+        {
+            return Ok(false);
+        }
+        for table in ["tasks", "runs", "events", "runtime_schema_migrations"] {
             let exists: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 [table],
@@ -3630,8 +3811,20 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
             "failure_reason",
             "awaiting_human_by",
             "awaiting_human_status",
+            "baseline_snapshot_id",
+            "overlay_revision_id",
+            "repository_view_status",
         ] {
             if !column_exists(&connection, "tasks", column)? {
+                return Ok(false);
+            }
+        }
+        for column in [
+            "baseline_snapshot_id",
+            "overlay_revision_id",
+            "repository_view_status",
+        ] {
+            if !column_exists(&connection, "runs", column)? {
                 return Ok(false);
             }
         }
@@ -3716,17 +3909,126 @@ async fn current_task_identity() -> (String, String) {
 }
 
 fn open_runtime_database(path: &Path) -> Result<Connection> {
-    let connection =
+    let mut connection =
         Connection::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
-    initialize_schema(&connection)?;
+    initialize_schema(&mut connection)?;
     Ok(connection)
 }
 
-fn initialize_schema(connection: &Connection) -> Result<()> {
+fn initialize_schema(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    migrate_runtime_schema(connection)?;
+    // Some pre-migration installations wrote this compatibility table lazily.
+    // Keep importing it idempotently even after the schema baseline is adopted.
+    migrate_legacy_runtime_metadata(connection)
+}
+
+struct RuntimeMigration {
+    version: u32,
+    name: &'static str,
+    apply: fn(&Transaction<'_>) -> Result<()>,
+}
+
+const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
+    RuntimeMigration {
+        version: 1,
+        name: "adopt_legacy_runtime_schema",
+        apply: adopt_legacy_runtime_schema,
+    },
+    RuntimeMigration {
+        version: 2,
+        name: "repository_view_references",
+        apply: add_repository_view_references,
+    },
+];
+
+fn migrate_runtime_schema(connection: &mut Connection) -> Result<()> {
+    validate_runtime_migration_history(connection)?;
+
+    for migration in RUNTIME_MIGRATIONS {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_version = runtime_schema_version(&transaction)?;
+        if current_version >= migration.version {
+            transaction.commit()?;
+            continue;
+        }
+        if current_version + 1 != migration.version {
+            anyhow::bail!(
+                "Cannot apply ferrus.db migration {} after schema version {}",
+                migration.version,
+                current_version
+            );
+        }
+
+        (migration.apply)(&transaction).with_context(|| {
+            format!(
+                "Failed to apply ferrus.db migration {} ({})",
+                migration.version, migration.name
+            )
+        })?;
+        transaction.execute(
+            r#"
+            INSERT INTO runtime_schema_migrations (version, name, applied_at)
+            VALUES (?1, ?2, ?3)
+            "#,
+            params![migration.version, migration.name, timestamp()],
+        )?;
+        transaction.pragma_update(None, "user_version", migration.version)?;
+        transaction.commit()?;
+    }
+
+    validate_runtime_migration_history(connection)
+}
+
+fn validate_runtime_migration_history(connection: &Connection) -> Result<()> {
+    let version = runtime_schema_version(connection)?;
+    if version > RUNTIME_SCHEMA_VERSION {
+        anyhow::bail!(
+            "ferrus.db schema version {version} is newer than supported version {RUNTIME_SCHEMA_VERSION}"
+        );
+    }
+
+    if !table_exists(connection, "runtime_schema_migrations")? {
+        if version == 0 {
+            return Ok(());
+        }
+        anyhow::bail!("ferrus.db migration history is missing for schema version {version}");
+    }
+
+    let mut statement = connection
+        .prepare("SELECT version, name FROM runtime_schema_migrations ORDER BY version")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let history = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if history.len() != version as usize {
+        anyhow::bail!("ferrus.db migration history is incomplete for schema version {version}");
+    }
+    for (index, (applied_version, applied_name)) in history.iter().enumerate() {
+        let expected = &RUNTIME_MIGRATIONS[index];
+        if *applied_version != expected.version || applied_name != expected.name {
+            anyhow::bail!(
+                "ferrus.db migration history diverges at version {}",
+                expected.version
+            );
+        }
+    }
+    Ok(())
+}
+
+fn runtime_schema_version(connection: &Connection) -> Result<u32> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn adopt_legacy_runtime_schema(connection: &Transaction<'_>) -> Result<()> {
     connection.execute_batch(
         r#"
-        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            applied_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
@@ -3838,6 +4140,26 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "TEXT",
     )?;
     migrate_legacy_runtime_metadata(connection)?;
+    Ok(())
+}
+
+fn add_repository_view_references(connection: &Transaction<'_>) -> Result<()> {
+    const STATUS_COLUMN: &str = "TEXT NOT NULL DEFAULT 'not_built' CHECK \
+        (repository_view_status IN ('not_built', 'available', 'stale', 'unavailable', 'failed'))";
+
+    for table in ["tasks", "runs"] {
+        ensure_column(connection, table, "baseline_snapshot_id", "TEXT")?;
+        ensure_column(connection, table, "overlay_revision_id", "TEXT")?;
+        ensure_column(connection, table, "repository_view_status", STATUS_COLUMN)?;
+    }
+    connection.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tasks_repository_view_baseline
+            ON tasks(baseline_snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_repository_view_baseline
+            ON runs(baseline_snapshot_id);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -4936,6 +5258,245 @@ mod tests {
 
     fn teardown(previous: PathBuf) {
         std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn runtime_schema_migrations_adopt_legacy_database_without_data_loss() {
+        let dir = TempDir::new().unwrap();
+        let database_path = dir.path().join("ferrus.db");
+        let mut connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pid INTEGER,
+                    workspace_path TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id)
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+                CREATE TABLE runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                INSERT INTO tasks (id, path, status)
+                VALUES ('t-007', '.ferrus/tasks/t-007.md', 'reviewing');
+                INSERT INTO runs (
+                    id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path
+                ) VALUES (
+                    'r-007', 't-007', 'executor', 'codex', 'reviewing',
+                    '2026-07-19T00:00:00Z', '2026-07-19T00:01:00Z', 42, '/tmp/worktree'
+                );
+                INSERT INTO events (run_id, type, payload_json, created_at)
+                VALUES ('r-007', 'submission_recorded', '{}', '2026-07-19T00:01:00Z');
+                INSERT INTO runtime_metadata (key, value)
+                VALUES ('selected_spec', 'docs/specs/legacy.md');
+                "#,
+            )
+            .unwrap();
+
+        initialize_schema(&mut connection).unwrap();
+
+        assert_eq!(
+            runtime_schema_version(&connection).unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
+        let migrations: Vec<(u32, String)> = connection
+            .prepare("SELECT version, name FROM runtime_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            migrations,
+            vec![
+                (1, "adopt_legacy_runtime_schema".to_string()),
+                (2, "repository_view_references".to_string()),
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT status FROM tasks WHERE id = 't-007'", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "reviewing"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT workspace_path FROM runs WHERE id = 'r-007'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "/tmp/worktree"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_project_selection_from_database(&connection)
+                .unwrap()
+                .selected_spec
+                .as_deref(),
+            Some("docs/specs/legacy.md")
+        );
+        for table in ["tasks", "runs"] {
+            let status = connection
+                .query_row(
+                    &format!("SELECT repository_view_status FROM {table} WHERE id = ?1"),
+                    [if table == "tasks" { "t-007" } else { "r-007" }],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(status, "not_built");
+        }
+
+        initialize_schema(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_schema_migrations",
+                    [],
+                    |row| { row.get::<_, u32>(0) }
+                )
+                .unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_schema_migration_rolls_back_a_failed_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, path TEXT NOT NULL, status TEXT NOT NULL);
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pid INTEGER,
+                    workspace_path TEXT NOT NULL
+                );
+                CREATE TABLE idx_tasks_repository_view_baseline (value TEXT);
+                "#,
+            )
+            .unwrap();
+        let mut connection = connection;
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+
+        assert!(error.to_string().contains("migration 2"));
+        assert_eq!(runtime_schema_version(&connection).unwrap(), 1);
+        assert!(!column_exists(&connection, "tasks", "baseline_snapshot_id").unwrap());
+        assert!(!column_exists(&connection, "runs", "baseline_snapshot_id").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_schema_migrations WHERE version = 2",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_schema_rejects_newer_versions_without_mutation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+
+        assert!(error.to_string().contains("newer than supported"));
+        assert_eq!(runtime_schema_version(&connection).unwrap(), 99);
+        assert!(!table_exists(&connection, "runtime_schema_migrations").unwrap());
+    }
+
+    #[tokio::test]
+    async fn repository_view_references_round_trip_for_tasks_and_runs() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_run_started_for_task_with_workspace(
+            "r-view",
+            "executor",
+            "codex",
+            42,
+            Some("t-001"),
+            "/tmp/worktree".to_string(),
+        )
+        .await
+        .unwrap();
+        let repository_view = RepositoryViewReference::new(
+            Some(SnapshotId::new("snapshot-baseline").unwrap()),
+            Some(OverlayRevisionId::new("overlay-1").unwrap()),
+            RepositoryViewStatus::Stale,
+        )
+        .unwrap();
+
+        record_task_repository_view("t-001", &repository_view)
+            .await
+            .unwrap();
+        record_run_repository_view("r-view", &repository_view)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            task_repository_view("t-001").await.unwrap(),
+            Some(repository_view.clone())
+        );
+        assert_eq!(
+            run_repository_view("r-view").await.unwrap(),
+            Some(repository_view)
+        );
+        teardown(previous);
+    }
+
+    #[test]
+    fn repository_view_reference_rejects_overlay_without_baseline() {
+        let result = RepositoryViewReference::new(
+            None,
+            Some(OverlayRevisionId::new("overlay-1").unwrap()),
+            RepositoryViewStatus::Available,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
