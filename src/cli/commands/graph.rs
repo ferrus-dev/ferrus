@@ -189,7 +189,10 @@ struct IndexOutput {
 
 async fn index(full: bool, json: bool) -> Result<()> {
     let context = LocalGraphContext::load(true).await?;
-    let source = context.discover()?;
+    // Indexing always publishes the canonical view. A managed Executor may invoke
+    // the CLI from its task worktree, but unapproved task contents must remain in
+    // that task's overlay publication until approval.
+    let source = context.discover_canonical()?;
     let mut sidecar = match open_for_build_at(&sidecar_path().await?)? {
         OpenSidecarResult::Ready(sidecar) => sidecar,
         OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(

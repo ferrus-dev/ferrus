@@ -1098,6 +1098,10 @@ mod tests {
             teardown(previous);
             return;
         }
+        // Keep the rollback byte-exact on Windows too. Otherwise Git's global
+        // autocrlf setting can turn the restored LF source into CRLF, correctly
+        // making the canonical source manifest stale after the rollback.
+        assert!(git(dir.path(), ["config", "core.autocrlf", "false"]).success());
         tokio::fs::write("file.txt", "base\n").await.unwrap();
         assert!(git(dir.path(), ["add", "file.txt"]).success());
         assert!(

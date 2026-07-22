@@ -142,14 +142,23 @@ impl LocalGraphContext {
     }
 
     pub(crate) fn discover(&self) -> Result<LocalRepositorySource> {
+        self.discover_at(&self.root)
+            .context("Failed to discover the repository source")
+    }
+
+    pub(crate) fn discover_canonical(&self) -> Result<LocalRepositorySource> {
+        self.discover_at(&self.project_root)
+            .context("Failed to discover the canonical repository source")
+    }
+
+    fn discover_at(&self, root: &Path) -> Result<LocalRepositorySource> {
         let identities = active_extractor_identities(&self.config)?;
         let context = SourceDiscoveryContext::from_config(
             self.repository.clone(),
             &self.config,
             &identities,
         )?;
-        LocalRepositorySource::discover(&self.root, context)
-            .context("Failed to discover the canonical repository source")
+        LocalRepositorySource::discover(root, context).map_err(Into::into)
     }
 
     pub(crate) fn freshness_comparison(&self) -> Result<Option<FreshnessComparison>> {
@@ -1614,6 +1623,43 @@ mod tests {
             task_view_id: None,
             run_id: None,
         }
+    }
+
+    #[test]
+    fn canonical_discovery_ignores_a_task_worktree_root() {
+        let canonical = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(canonical.path().join("src")).unwrap();
+        std::fs::create_dir_all(worktree.path().join("src")).unwrap();
+        std::fs::write(
+            canonical.path().join("src/lib.rs"),
+            b"pub struct CanonicalSymbol;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            worktree.path().join("src/lib.rs"),
+            b"pub struct UnapprovedTaskSymbol;\n",
+        )
+        .unwrap();
+        let mut graph_context = context(canonical.path());
+        graph_context.root = worktree.path().to_path_buf();
+
+        let task_source = graph_context.discover().unwrap();
+        let canonical_source = graph_context.discover_canonical().unwrap();
+
+        assert_ne!(
+            task_source.manifest().revision.manifest_digest,
+            canonical_source.manifest().revision.manifest_digest
+        );
+        assert_eq!(
+            canonical_source.manifest().revision.manifest_digest,
+            context(canonical.path())
+                .discover()
+                .unwrap()
+                .manifest()
+                .revision
+                .manifest_digest
+        );
     }
 
     #[test]

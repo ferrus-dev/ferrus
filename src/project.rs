@@ -1548,8 +1548,8 @@ pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewRe
 }
 
 /// Returns the graph identities that ordinary sidecar garbage collection must
-/// preserve. Only non-terminal tasks retain task publications indefinitely;
-/// completed task snapshots age out through the configured sidecar retention.
+/// preserve. Non-terminal tasks and runs retain their publications indefinitely;
+/// completed task and run snapshots age out through configured sidecar retention.
 pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRetentionReferences> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || -> Result<RepositoryGraphRetentionReferences> {
@@ -1563,6 +1563,7 @@ pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRe
             FROM tasks
             LEFT JOIN runs ON runs.task_id = tasks.id
             WHERE tasks.status NOT IN ('complete', 'failed', 'reset')
+               OR runs.status NOT IN ('completed', 'failed', 'interrupted')
             ORDER BY tasks.id, runs.id
             "#,
         )?;
@@ -6693,7 +6694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_references_include_active_views_and_exclude_completed_tasks() {
+    async fn retention_references_include_active_tasks_and_runs() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let (_dir, previous) = setup_project().await;
         record_task_status(
@@ -6706,6 +6707,13 @@ mod tests {
         record_task_status(
             "t-complete",
             ".ferrus/tasks/t-complete.md",
+            TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        record_task_status(
+            "t-live-run",
+            ".ferrus/tasks/t-live-run.md",
             TaskStatus::Complete,
         )
         .await
@@ -6724,12 +6732,32 @@ mod tests {
             RepositoryViewStatus::Available,
         )
         .unwrap();
+        let live_run = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-live-run").unwrap(),
+            Some(OverlayRevisionId::new("overlay-live-run").unwrap()),
+            SnapshotId::new("view-live-run").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
         record_task_repository_view("t-active", &active)
             .await
             .unwrap();
         record_task_repository_view("t-complete", &completed)
             .await
             .unwrap();
+        record_task_repository_view("t-live-run", &live_run)
+            .await
+            .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-live",
+            "supervisor",
+            "supervisor:codex:t-live-run",
+            std::process::id(),
+            Some("t-live-run"),
+            "/tmp/canonical".to_string(),
+        )
+        .await
+        .unwrap();
 
         let references = repository_graph_retention_references().await.unwrap();
 
@@ -6757,6 +6785,21 @@ mod tests {
             !references
                 .view_names
                 .contains(&PublishedViewName::new("task-overlay:t-complete").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("baseline-live-run").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-live-run").unwrap())
+        );
+        assert!(
+            references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-live-run").unwrap())
         );
 
         std::env::set_current_dir(previous).unwrap();
