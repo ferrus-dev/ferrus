@@ -68,6 +68,17 @@ pub(crate) struct LocalGraphContext {
 
 impl LocalGraphContext {
     pub(crate) async fn load(require_enabled: bool) -> Result<Self> {
+        let agent_id = std::env::var(ENV_AGENT_ID)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Self::load_with_agent(require_enabled, agent_id.as_deref()).await
+    }
+
+    pub(crate) async fn load_for_agent(require_enabled: bool, agent_id: &str) -> Result<Self> {
+        Self::load_with_agent(require_enabled, Some(agent_id)).await
+    }
+
+    async fn load_with_agent(require_enabled: bool, agent_id: Option<&str>) -> Result<Self> {
         let root = project::canonical_project_root().await?;
         let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
             .await
@@ -83,11 +94,9 @@ impl LocalGraphContext {
         let requested_task_id = std::env::var(ENV_TASK_ID)
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let runtime_context = match std::env::var(ENV_AGENT_ID) {
-            Ok(agent_id) if !agent_id.trim().is_empty() => {
-                project::runtime_task_context_for_agent(agent_id.trim()).await?
-            }
-            _ => None,
+        let runtime_context = match agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(agent_id) => project::runtime_task_context_for_agent(agent_id).await?,
+            None => None,
         };
         if let Some(requested_task_id) = requested_task_id.as_deref() {
             let Some(runtime) = runtime_context.as_ref() else {

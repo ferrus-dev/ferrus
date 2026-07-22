@@ -107,17 +107,33 @@ struct RepositorySearchInput {
     cursor: Option<String>,
 }
 
-pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
+pub async fn handler(
+    ctx: neva::di::Dc<crate::server::ServerContext>,
+    input: serde_json::Value,
+) -> Result<String, Error> {
+    handler_for_agent(ctx.agent_id(), input).await
+}
+
+pub async fn handler_for_agent(agent_id: &str, input: serde_json::Value) -> Result<String, Error> {
     let input = match parse_input(input) {
         Ok(input) => input,
         Err(error) => return serialize_invalid_request(&error).map_err(tool_err),
     };
-    run(input).await.map_err(tool_err)
+    run(Some(agent_id), input).await.map_err(tool_err)
 }
 
-async fn run(input: RepositorySearchInput) -> Result<String> {
+#[cfg(test)]
+pub(super) async fn run_without_agent(input: serde_json::Value) -> Result<String> {
+    let input = parse_input(input)?;
+    run(None, input).await
+}
+
+async fn run(agent_id: Option<&str>, input: RepositorySearchInput) -> Result<String> {
     let started = Instant::now();
-    let context = LocalGraphContext::load(false).await?;
+    let context = match agent_id {
+        Some(agent_id) => LocalGraphContext::load_for_agent(false, agent_id).await?,
+        None => LocalGraphContext::load(false).await?,
+    };
     let request = match search_request(&context, input) {
         Ok(request) => request,
         Err(error) => return serialize_invalid_request(&error),
@@ -242,7 +258,9 @@ mod tests {
 
     #[tokio::test]
     async fn boundary_validation_returns_a_versioned_query_error() {
-        let response = handler(serde_json::json!({"query": "   "})).await.unwrap();
+        let response = handler_for_agent("executor:codex:1", serde_json::json!({"query": "   "}))
+            .await
+            .unwrap();
         let response: QueryError = serde_json::from_str(&response).unwrap();
 
         assert_eq!(response.wire_version, QUERY_WIRE_VERSION);
