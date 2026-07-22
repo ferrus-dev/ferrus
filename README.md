@@ -266,6 +266,13 @@ task overlay, Consultants use the attached task view and Executor workspace, and
 their review run. An invalid task binding or unavailable submitted freeze is reported instead of silently falling
 back to canonical context.
 
+Approval compares the actual canonical source manifest before and after patch application, integration checks,
+spec updates, and any rollback. A changed post-operation manifest is durably marked stale with its source revision
+and manifest identity. A clean rollback records no proposed integration; partial mutations remain stale and are
+refreshed from the files actually left in canonical. Best-effort incremental indexing starts only after the
+canonical approval lock is released, and its success or failure never changes the task approval outcome. A manual
+`ferrus graph index` clears the same durable invalidation after publishing its verified snapshot.
+
 Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
 Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically

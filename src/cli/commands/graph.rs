@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
+    project,
     repository_graph::{
         config::RepositoryGraphConfig,
         domain::{
@@ -207,6 +208,24 @@ async fn index(full: bool, json: bool) -> Result<()> {
             force_full: full,
         },
     )?;
+    let source_identity = project::CanonicalSourceIdentity {
+        source_revision_id: source.manifest().revision.id.clone(),
+        manifest_digest: source.manifest().revision.manifest_digest.clone(),
+    };
+    if let Err(error) = project::record_canonical_graph_refresh(
+        None,
+        None,
+        &source_identity,
+        &outcome.snapshot.id,
+        &outcome.build_id,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = ?error,
+            "canonical graph indexed but durable freshness state was not updated"
+        );
+    }
     if json {
         print_json(&IndexOutput {
             status: "indexed",

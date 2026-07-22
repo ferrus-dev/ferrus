@@ -84,6 +84,9 @@ The successful submitted view is frozen with its immutable Git tree during the R
 sessions use canonical, Executors use mutable task views, Consultants use the attached task view, and Reviewers
 use the frozen run view so recovery does not depend on the Executor worktree. Invalid task bindings never fall
 back to canonical; rejection preserves the frozen review run and resumes a mutable task successor.
+Approval compares canonical manifests before and after integration or rollback, records the actual resulting
+source as stale only when it changed, and starts incremental refresh after releasing the approval lock. A clean
+rollback does not record the proposed patch, and graph refresh outcomes never change the task approval lifecycle.
 
 <!-- ferrus-supervisor-instructions -->
 ## Ferrus Supervisor

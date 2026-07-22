@@ -191,7 +191,7 @@ mutable worktree view, Consultants to the attached task view and Executor worksp
 frozen run view. Frozen snippets read hash-verified Git blobs after worktree changes/removal, while rejection
 clears only the task's frozen source identity and preserves reviewer history as it resumes a mutable successor.
 
-- [ ] #3.5 Integrate manifest-driven canonical invalidation with approval
+- [x] #3.5 Integrate manifest-driven canonical invalidation with approval
 
 ID: rg3.5
 Depends on: rg3.1
@@ -199,6 +199,14 @@ Depends on: rg3.1
 Compare actual canonical manifests around integration, record successful integrated revisions, handle partial or
 rollback-failed mutations honestly, schedule refresh outside the approval critical section, and keep graph refresh
 outcomes separate from task approval outcomes.
+
+Implemented with before/after canonical source observations around the existing approval lock and a versioned
+`ferrus.db` canonical-graph state containing only source revision, manifest, snapshot, and freshness identities.
+A clean rollback that restores the original manifest records no proposed integration; successful or partial
+canonical mutations record the actual post-operation identity as stale. Incremental canonical indexing is spawned
+only after releasing the approval lock, preserves the last published graph on failure, and records its outcome
+without changing Complete/Reviewing, leases, retries, or review cycles. Explicit `ferrus graph index` also clears
+the durable invalidation, while ordinary exact manifest comparisons continue detecting external edits.
 
 - [ ] #3.6 Add concurrent-view isolation, retention, recovery, and observability
 

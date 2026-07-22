@@ -21,11 +21,13 @@ use crate::{
     agent_id::ENV_PROJECT_ROOT,
     legacy_state::{self, LegacyTaskState},
     platform,
-    repository_graph::domain::{Digest, OverlayRevisionId, SnapshotId, TaskViewLifecycle},
+    repository_graph::domain::{
+        BuildId, Digest, OverlayRevisionId, SnapshotId, SourceRevisionId, TaskViewLifecycle,
+    },
 };
 
 const PROJECT_VERSION: u32 = 1;
-const RUNTIME_SCHEMA_VERSION: u32 = 3;
+const RUNTIME_SCHEMA_VERSION: u32 = 4;
 const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 const CURRENT_TASK_ID: &str = "current";
 const CURRENT_TASK_PATH: &str = ".ferrus/TASK.md";
@@ -62,6 +64,55 @@ impl RepositoryViewStatus {
             "unavailable" => Ok(Self::Unavailable),
             "failed" => Ok(Self::Failed),
             _ => anyhow::bail!("Unknown repository view status in ferrus.db: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CanonicalGraphStatus {
+    #[default]
+    Unknown,
+    Stale,
+    Fresh,
+}
+
+impl CanonicalGraphStatus {
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "unknown" => Ok(Self::Unknown),
+            "stale" => Ok(Self::Stale),
+            "fresh" => Ok(Self::Fresh),
+            _ => anyhow::bail!("Unknown canonical graph status in ferrus.db: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSourceIdentity {
+    pub source_revision_id: SourceRevisionId,
+    pub manifest_digest: Digest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanonicalGraphReference {
+    pub source: Option<CanonicalSourceIdentity>,
+    pub snapshot_id: Option<SnapshotId>,
+    pub status: CanonicalGraphStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalInvalidationReason {
+    ApprovedIntegration,
+    PartialMutation,
+    SourceComparisonUnavailable,
+}
+
+impl CanonicalInvalidationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ApprovedIntegration => "approved_integration",
+            Self::PartialMutation => "partial_mutation",
+            Self::SourceComparisonUnavailable => "source_comparison_unavailable",
         }
     }
 }
@@ -1487,6 +1538,243 @@ pub async fn task_repository_view(task_id: &str) -> Result<Option<RepositoryView
 #[allow(dead_code)]
 pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewReference>> {
     read_repository_view("runs", run_id).await
+}
+
+pub async fn canonical_graph_reference() -> Result<CanonicalGraphReference> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphReference> {
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("Failed to open {} read-only", database_path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let values = connection.query_row(
+            r#"
+            SELECT canonical_source_revision_id,
+                   canonical_manifest_algorithm, canonical_manifest_digest,
+                   canonical_graph_snapshot_id, canonical_graph_status
+            FROM project_runtime_state
+            WHERE row_id = 1
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        canonical_graph_reference_from_database(values)
+    })
+    .await?
+}
+
+pub async fn record_canonical_graph_invalidation(
+    task_id: &str,
+    run_id: Option<&str>,
+    source: Option<&CanonicalSourceIdentity>,
+    reason: CanonicalInvalidationReason,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    let run_id = run_id.map(str::to_string);
+    let source = source.cloned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_source_revision_id = ?1,
+                canonical_manifest_algorithm = ?2,
+                canonical_manifest_digest = ?3,
+                canonical_graph_status = 'stale',
+                canonical_graph_updated_at = ?4,
+                updated_at = ?4
+            WHERE row_id = 1
+            "#,
+            params![
+                source
+                    .as_ref()
+                    .map(|identity| identity.source_revision_id.as_str()),
+                source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.algorithm()),
+                source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.value()),
+                timestamp(),
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_invalidated",
+            &serde_json::json!({
+                "task_id": task_id,
+                "reason": reason.as_str(),
+                "source_revision_id": source
+                    .as_ref()
+                    .map(|identity| identity.source_revision_id.as_str()),
+                "manifest_digest": source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.value()),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn record_canonical_graph_invalidation_best_effort(
+    task_id: &str,
+    run_id: Option<&str>,
+    source: Option<&CanonicalSourceIdentity>,
+    reason: CanonicalInvalidationReason,
+) {
+    if let Err(error) = record_canonical_graph_invalidation(task_id, run_id, source, reason).await {
+        warn!(
+            task_id,
+            error = ?error,
+            "failed to record canonical repository graph invalidation"
+        );
+    }
+}
+
+pub async fn record_canonical_graph_refresh(
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    source: &CanonicalSourceIdentity,
+    snapshot_id: &SnapshotId,
+    build_id: &BuildId,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.map(str::to_string);
+    let run_id = run_id.map(str::to_string);
+    let source = source.clone();
+    let snapshot_id = snapshot_id.clone();
+    let build_id = build_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_source_revision_id = ?1,
+                canonical_manifest_algorithm = ?2,
+                canonical_manifest_digest = ?3,
+                canonical_graph_snapshot_id = ?4,
+                canonical_graph_status = 'fresh',
+                canonical_graph_updated_at = ?5,
+                updated_at = ?5
+            WHERE row_id = 1
+            "#,
+            params![
+                source.source_revision_id.as_str(),
+                source.manifest_digest.algorithm(),
+                source.manifest_digest.value(),
+                snapshot_id.as_str(),
+                timestamp(),
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_refreshed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "source_revision_id": source.source_revision_id.as_str(),
+                "snapshot_id": snapshot_id.as_str(),
+                "build_id": build_id.as_str(),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn record_canonical_graph_refresh_failed_best_effort(
+    task_id: &str,
+    run_id: Option<&str>,
+) {
+    let database_path = match current_database_path().await {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(task_id, error = ?error, "failed to resolve canonical graph state database");
+            return;
+        }
+    };
+    let task_id = task_id.to_string();
+    let task_id_for_log = task_id.clone();
+    let run_id = run_id.map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_graph_status = 'stale',
+                canonical_graph_updated_at = ?1,
+                updated_at = ?1
+            WHERE row_id = 1
+            "#,
+            [timestamp()],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_refresh_failed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "failure_code": "canonical_refresh_failed",
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await;
+    if let Err(error) = result.unwrap_or_else(|error| Err(error.into())) {
+        warn!(task_id = task_id_for_log, error = ?error, "failed to record canonical graph refresh failure");
+    }
+}
+
+type CanonicalGraphDatabaseValues = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn canonical_graph_reference_from_database(
+    values: CanonicalGraphDatabaseValues,
+) -> Result<CanonicalGraphReference> {
+    let (source_revision_id, algorithm, digest, snapshot_id, status) = values;
+    let source = match (source_revision_id, algorithm, digest) {
+        (Some(revision), Some(algorithm), Some(value)) => Some(CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new(revision)
+                .context("Invalid canonical source revision in ferrus.db")?,
+            manifest_digest: Digest::new(algorithm, value)
+                .context("Invalid canonical manifest digest in ferrus.db")?,
+        }),
+        (None, None, None) => None,
+        _ => anyhow::bail!("Incomplete canonical source identity in ferrus.db"),
+    };
+    Ok(CanonicalGraphReference {
+        source,
+        snapshot_id: snapshot_id
+            .map(SnapshotId::new)
+            .transpose()
+            .context("Invalid canonical graph snapshot in ferrus.db")?,
+        status: CanonicalGraphStatus::from_database(&status)?,
+    })
 }
 
 async fn read_repository_view(
@@ -4310,6 +4598,18 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
                 return Ok(false);
             }
         }
+        for column in [
+            "canonical_source_revision_id",
+            "canonical_manifest_algorithm",
+            "canonical_manifest_digest",
+            "canonical_graph_snapshot_id",
+            "canonical_graph_status",
+            "canonical_graph_updated_at",
+        ] {
+            if !column_exists(&connection, "project_runtime_state", column)? {
+                return Ok(false);
+            }
+        }
         Ok(true)
     })
     .await?
@@ -4427,6 +4727,11 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
         version: 3,
         name: "frozen_repository_views",
         apply: add_frozen_repository_views,
+    },
+    RuntimeMigration {
+        version: 4,
+        name: "canonical_graph_state",
+        apply: add_canonical_graph_state,
     },
 ];
 
@@ -4673,6 +4978,47 @@ fn add_frozen_repository_views(connection: &Transaction<'_>) -> Result<()> {
             ON runs(repository_view_snapshot_id);
         "#,
     )?;
+    Ok(())
+}
+
+fn add_canonical_graph_state(connection: &Transaction<'_>) -> Result<()> {
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_source_revision_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_manifest_algorithm",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_manifest_digest",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_snapshot_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_status",
+        "TEXT NOT NULL DEFAULT 'unknown' CHECK (canonical_graph_status IN ('unknown', 'stale', 'fresh'))",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_updated_at",
+        "TEXT",
+    )?;
+    ensure_project_runtime_state_row(connection)?;
     Ok(())
 }
 
@@ -5846,6 +6192,7 @@ mod tests {
                 (1, "adopt_legacy_runtime_schema".to_string()),
                 (2, "repository_view_references".to_string()),
                 (3, "frozen_repository_views".to_string()),
+                (4, "canonical_graph_state".to_string()),
             ]
         );
         assert_eq!(
@@ -5897,6 +6244,16 @@ mod tests {
                 .unwrap();
             assert_eq!(lifecycle, "mutable");
         }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT canonical_graph_status FROM project_runtime_state WHERE row_id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "unknown"
+        );
 
         initialize_schema(&mut connection).unwrap();
         assert_eq!(
@@ -6136,6 +6493,75 @@ mod tests {
                 .lifecycle,
             TaskViewLifecycle::FrozenSubmitted
         );
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn canonical_graph_invalidation_and_refresh_round_trip_without_task_mutation() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference::default()
+        );
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source.clone()),
+                snapshot_id: None,
+                status: CanonicalGraphStatus::Stale,
+            }
+        );
+
+        let snapshot = SnapshotId::new("canonical-snapshot-1").unwrap();
+        record_canonical_graph_refresh(
+            Some("t-001"),
+            None,
+            &source,
+            &snapshot,
+            &BuildId::new("canonical-build-1").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source),
+                snapshot_id: Some(snapshot.clone()),
+                status: CanonicalGraphStatus::Fresh,
+            }
+        );
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            None,
+            CanonicalInvalidationReason::SourceComparisonUnavailable,
+        )
+        .await
+        .unwrap();
+        let stale = canonical_graph_reference().await.unwrap();
+        assert_eq!(stale.status, CanonicalGraphStatus::Stale);
+        assert_eq!(stale.source, None);
+        assert_eq!(stale.snapshot_id, Some(snapshot));
+        assert_eq!(
+            list_tasks().await.unwrap()[0].status,
+            TaskStatus::Executing.as_str()
+        );
+
         teardown(previous);
     }
 

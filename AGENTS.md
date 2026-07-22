@@ -87,6 +87,10 @@ Submit atomically stores a best-effort frozen graph snapshot plus immutable Git 
 Route taskless sessions to canonical, Executors to mutable task views, Consultants to the attached task view and
 Executor workspace, and Reviewers to the frozen run view. Never fall back to canonical for an invalid task binding
 or a missing reviewer freeze; rejection resumes a mutable task successor without rewriting the frozen review run.
+Approval must compare actual canonical manifests around integration and rollback. Record only the post-operation
+source identity when canonical content changed; a clean rollback must not record the proposed patch as integrated.
+Schedule any incremental canonical refresh after releasing the approval lock, preserve the last publication on
+failure, and never couple graph outcomes to task status, leases, retries, or review cycles.
 
 **Per-task state machine**: The old single global `STATE.json` is gone, but each SQLite task row still follows the same Supervisor–Executor lifecycle. In `--limit 1` this is effectively the old flow, only DB-backed:
 

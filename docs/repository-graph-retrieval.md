@@ -29,6 +29,11 @@ recommended actions are `index`, `wait_for_build`, `retry_index`, `refresh_index
 snapshot, ordinary queries distinguish `not_built`, `index_building`, and `index_failed`; status returns those
 conditions as data so an agent can inspect them without treating optional graph absence as an internal failure.
 
+Canonical approval persists a conservative stale marker when the actual post-operation source manifest differs
+from the pre-integration manifest. Latency-bounded MCP reads may use that marker to report `stale` without walking
+the repository; they never use a stored `fresh` marker as proof of current freshness. Exact local CLI freshness
+still discovers the current manifest, so external edits are detected independently of Ferrus approval events.
+
 ## Search
 
 Search considers normalized names, semantic keys, and repository-relative evidence paths. Node-kind filters are

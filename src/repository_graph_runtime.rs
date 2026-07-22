@@ -47,6 +47,7 @@ use repository_graph::{
 pub(crate) const CANONICAL_VIEW: &str = "canonical";
 static TASK_BASELINE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TASK_OVERLAY_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CANONICAL_REFRESH_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct LocalGraphContext {
     pub(crate) project_root: std::path::PathBuf,
@@ -189,6 +190,10 @@ impl LocalGraphContext {
         // mutation token it reports freshness as unknown rather than stale data
         // as fresh. The local CLI uses freshness_comparison() for exact checks.
         let mut response = status_response_at(self, &path, None)?;
+        if let Some(reference) = self.canonical_invalidation().await {
+            response.freshness = canonical_stale_freshness(reference);
+            response.data.recommended_action = Some(RetrievalAction::RefreshIndex);
+        }
         self.attach_task_view_to_status(&mut response);
         Ok(response)
     }
@@ -209,12 +214,14 @@ impl LocalGraphContext {
             return Ok(Err(unavailable_task_view_error(status)));
         }
         let path = sidecar_path().await?;
-        Ok(
-            search_response_at(self, &path, None, request).map(|mut response| {
-                self.attach_task_view(&mut response);
-                response
-            }),
-        )
+        let mut response = search_response_at(self, &path, None, request);
+        if let Ok(response) = response.as_mut() {
+            // The durable stale marker is conservative and avoids a full
+            // source scan on latency-bounded MCP reads.
+            self.apply_canonical_invalidation(response).await;
+            self.attach_task_view(response);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn context(
@@ -233,12 +240,12 @@ impl LocalGraphContext {
             return Ok(Err(unavailable_task_view_error(status)));
         }
         let path = sidecar_path().await?;
-        Ok(
-            context_response_at(self, &path, None, request).map(|mut response| {
-                self.attach_task_view(&mut response);
-                response
-            }),
-        )
+        let mut response = context_response_at(self, &path, None, request);
+        if let Ok(response) = response.as_mut() {
+            self.apply_canonical_invalidation(response).await;
+            self.attach_task_view(response);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn context_with_snippets(
@@ -283,6 +290,38 @@ impl LocalGraphContext {
     fn attach_task_view_to_status(&self, response: &mut StatusResponse) {
         response.task_view = self.task_view_envelope();
     }
+
+    async fn apply_canonical_invalidation<T>(&self, response: &mut QueryResponse<T>) {
+        let Some(reference) = self.canonical_invalidation().await else {
+            return;
+        };
+        response.freshness = canonical_stale_freshness(reference);
+    }
+
+    async fn canonical_invalidation(&self) -> Option<project::CanonicalGraphReference> {
+        if self.repository_view.is_some() {
+            return None;
+        }
+        let reference = match project::canonical_graph_reference().await {
+            Ok(reference) => reference,
+            Err(error) => {
+                tracing::warn!(error = ?error, "failed to read canonical graph invalidation state");
+                return None;
+            }
+        };
+        if reference.status != project::CanonicalGraphStatus::Stale {
+            return None;
+        }
+        Some(reference)
+    }
+}
+
+fn canonical_stale_freshness(reference: project::CanonicalGraphReference) -> FreshnessEnvelope {
+    FreshnessEnvelope {
+        freshness: Freshness::Stale,
+        compared_manifest: reference.source.map(|source| source.manifest_digest),
+        reason_codes: vec!["canonical_invalidation".to_string()],
+    }
 }
 
 fn task_overlay_view_name(task_view_id: &TaskViewId) -> Result<PublishedViewName> {
@@ -296,6 +335,146 @@ pub(crate) async fn sidecar_path() -> Result<std::path::PathBuf> {
     Ok(project::current_project_data_dir()
         .await?
         .join(SIDECAR_FILE_NAME))
+}
+
+async fn canonical_source_at(
+    root: &Path,
+) -> Result<Option<(RepositoryGraphConfig, RepositoryRef, LocalRepositorySource)>> {
+    let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while observing canonical source")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
+    };
+    let root = root.to_path_buf();
+    let discovery_config = config.clone();
+    let discovery_repository = repository.clone();
+    let source = tokio::task::spawn_blocking(move || -> Result<LocalRepositorySource> {
+        let identities = active_extractor_identities(&discovery_config)?;
+        let context = SourceDiscoveryContext::from_config(
+            discovery_repository,
+            &discovery_config,
+            &identities,
+        )?;
+        Ok(LocalRepositorySource::discover(root, context)?)
+    })
+    .await??;
+    Ok(Some((config, repository, source)))
+}
+
+pub(crate) async fn canonical_source_identity_at(
+    root: &Path,
+) -> Result<Option<project::CanonicalSourceIdentity>> {
+    Ok(canonical_source_at(root)
+        .await?
+        .map(|(_, _, source)| project::CanonicalSourceIdentity {
+            source_revision_id: source.manifest().revision.id.clone(),
+            manifest_digest: source.manifest().revision.manifest_digest.clone(),
+        }))
+}
+
+pub(crate) fn schedule_canonical_refresh_after_approval(
+    project_root: std::path::PathBuf,
+    task_id: String,
+    run_id: Option<String>,
+) {
+    tokio::spawn(async move {
+        match refresh_canonical_graph_at(&project_root).await {
+            Ok(None) => {}
+            Ok(Some((source, snapshot_id, build_id))) => {
+                if let Err(error) = project::record_canonical_graph_refresh(
+                    Some(&task_id),
+                    run_id.as_deref(),
+                    &source,
+                    &snapshot_id,
+                    &build_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        error = ?error,
+                        "canonical graph refreshed but durable freshness state was not updated"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    error = ?error,
+                    "best-effort canonical graph refresh failed after approval"
+                );
+                project::record_canonical_graph_refresh_failed_best_effort(
+                    &task_id,
+                    run_id.as_deref(),
+                )
+                .await;
+            }
+        }
+    });
+}
+
+async fn refresh_canonical_graph_at(
+    project_root: &Path,
+) -> Result<
+    Option<(
+        project::CanonicalSourceIdentity,
+        repository_graph::domain::SnapshotId,
+        BuildId,
+    )>,
+> {
+    let Some((config, repository, source)) = canonical_source_at(project_root).await? else {
+        return Ok(None);
+    };
+    let source_identity = project::CanonicalSourceIdentity {
+        source_revision_id: source.manifest().revision.id.clone(),
+        manifest_digest: source.manifest().revision.manifest_digest.clone(),
+    };
+    let sidecar_path = sidecar_path().await?;
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut sidecar = match open_for_build_at(&sidecar_path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        Ok(IndexCoordinator::new(&mut sidecar).index(
+            &source,
+            &config,
+            IndexRequest {
+                build_id: next_canonical_refresh_build_id()?,
+                view_name: PublishedViewName::new(CANONICAL_VIEW)?,
+                force_full: false,
+            },
+        )?)
+    })
+    .await??;
+    debug_assert_eq!(outcome.snapshot.repository, repository);
+    Ok(Some((
+        source_identity,
+        outcome.snapshot.id,
+        outcome.build_id,
+    )))
+}
+
+fn next_canonical_refresh_build_id() -> Result<BuildId> {
+    let sequence = CANONICAL_REFRESH_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(BuildId::new(format!(
+        "canonical-approval:{nanos:x}:{sequence:x}"
+    ))?)
 }
 
 pub(crate) async fn schedule_task_baseline_pin(
