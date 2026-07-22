@@ -16,6 +16,7 @@
 
 mod filesystem;
 mod git;
+mod worktree;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,6 +47,10 @@ use super::{
 pub use super::ports::{SourceContent, SourceDiagnostic, SourceDiscoveryMetrics, SourceManifest};
 pub use filesystem::FilesystemRepositorySource;
 pub use git::GitRepositorySource;
+pub use worktree::{
+    GitWorktreeChange, GitWorktreeInventory, TaskWorktreeOverlay, capture_worktree_tree,
+    parse_git_tree_digest,
+};
 
 const SOURCE_MANIFEST_VERSION: u32 = 1;
 const SOURCE_POLICY_VERSION: u32 = 1;
@@ -66,6 +71,10 @@ pub enum SourceError {
     GitCommand { operation: &'static str },
     #[error("repository source root is not the Git worktree root")]
     NotGitRoot,
+    #[error("repository source does not match the requested repository identity")]
+    RepositoryMismatch,
+    #[error("pinned Git tree identity is invalid or unsupported")]
+    InvalidGitTree,
     #[error("repository source contains colliding portable paths")]
     PathCollision,
     #[error("repository source file count exceeds configured limit {limit}")]

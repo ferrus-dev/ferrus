@@ -187,7 +187,7 @@ relationship does not exist.
 
 ### Task repository view
 
-`TaskRepositoryView` is not a mutable alias to canonical `latest`. It contains:
+`TaskRepositoryView` is not a mutable alias to canonical `latest`. An available view contains:
 
 - task/run authorization scope;
 - immutable baseline snapshot ID;
@@ -195,6 +195,16 @@ relationship does not exist.
 - overlay source-manifest digest;
 - view lifecycle: mutable task view or frozen submitted view;
 - freshness for baseline and overlay separately.
+
+Its explicit state distinguishes baseline-only, baseline-plus-overlay, stale, unavailable, and failed views, so a
+caller never falls back to canonical context merely because a task view could not be built.
+
+`WorkspaceRef` carries only repository identity, task-view namespace, and pinned Git tree identity. The local
+worktree path belongs to the machine-local source adapter and is never part of a portable view identity.
+
+`WorkspaceOverlayManifest` is the deterministic, policy-aware changed-file input for overlay construction. It
+records additions, modifications, deletions, and rename evidence (as delete plus add), while source descriptors and
+content identities are present only for paths that remain indexable under the effective source policy.
 
 The overlay revision is derived from the pinned baseline plus the task's included changed, added, and deleted
 content under the same source policy. Two tasks never share an overlay namespace merely because their content

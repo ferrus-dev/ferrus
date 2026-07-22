@@ -2855,73 +2855,12 @@ async fn persist_executor_workspace_baseline(
 }
 
 async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
-    let add = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .args(["add", "-A", "."])
-        .output()
-        .await
-        .context("Failed to stage executor workspace baseline")?;
-    if !add.status.success() {
-        let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to stage executor workspace baseline at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                add.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    let tree = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .arg("write-tree")
-        .output()
-        .await
-        .context("Failed to capture executor workspace baseline tree")?;
-    if !tree.status.success() {
-        let stderr = String::from_utf8_lossy(&tree.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace baseline tree at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                tree.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    let mut reset_index = Command::new("git");
-    reset_index.arg("-C").arg(workspace_dir).arg("read-tree");
-    if git_has_head(workspace_dir).await {
-        reset_index.arg("HEAD");
-    } else {
-        reset_index.arg("--empty");
-    }
-    let reset_index = reset_index
-        .output()
-        .await
-        .context("Failed to restore executor workspace index")?;
-    if !reset_index.status.success() {
-        let stderr = String::from_utf8_lossy(&reset_index.stderr)
-            .trim()
-            .to_string();
-        anyhow::bail!(
-            "Failed to restore executor workspace index at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                reset_index.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&tree.stdout).trim().to_string())
+    let workspace_dir = workspace_dir.to_path_buf();
+    let tree = tokio::task::spawn_blocking(move || {
+        crate::repository_graph::source::capture_worktree_tree(workspace_dir)
+    })
+    .await??;
+    Ok(tree.value().to_string())
 }
 
 async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path) -> Result<()> {

@@ -146,13 +146,19 @@ against the pinned Git tree; task and run records retain the resulting snapshot 
 selects that immutable snapshot directly even after canonical publication advances. Missing, changed, or failed
 baseline sources remain explicit graph-view states and do not alter task lifecycle state.
 
-- [ ] #3.2 Implement task worktree overlay manifests and invalidation
+- [x] #3.2 Implement task worktree overlay manifests and invalidation
 
 ID: rg3.2
 Depends on: rg3.1
 
 Create shared Git/source primitives that compute changed, added, deleted, renamed, policy, and content-identity
 information relative to the pinned baseline without duplicating task patch logic.
+
+Implemented in `src/repository_graph/source/worktree.rs` with portable `WorkspaceRef` and validated
+`TaskRepositoryView` contracts, a read-only baseline-relative Git inventory, deterministic task-scoped overlay
+revisions, effective-policy source descriptors, hash-verified changed-file reads, and revalidation. HQ baseline
+capture, graph baseline validation, and submission patch inventory now share these primitives without mutating the
+Executor's real Git index. Overlay graph composition and query routing remain scoped to rg3.3.
 
 - [ ] #3.3 Compose baseline and overlay graph views
 

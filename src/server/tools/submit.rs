@@ -12,6 +12,7 @@ use crate::{
     agent_id::{ENV_BASELINE_TREE, ENV_PROJECT_ROOT},
     config::Config,
     project::{self, RuntimeTaskContext, TaskCheckFailure},
+    repository_graph::source::{GitWorktreeInventory, parse_git_tree_digest},
     state::store,
 };
 
@@ -276,9 +277,22 @@ fn baseline_tree_from_project_data(task_id: &str) -> Option<String> {
 }
 
 async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
-    let tracked = tracked_files().await?;
+    let root = std::env::current_dir()?;
+    let baseline_digest = parse_git_tree_digest(baseline)?;
+    let inventory =
+        tokio::task::spawn_blocking(move || GitWorktreeInventory::discover(root, baseline_digest))
+            .await??;
+    let tracked = inventory
+        .tracked_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
     let tracked_set = tracked.iter().cloned().collect::<HashSet<_>>();
-    let baseline_files = baseline_files(baseline).await?;
+    let baseline_files = inventory
+        .baseline_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
     let baseline_set = baseline_files.iter().cloned().collect::<HashSet<_>>();
     let mut patch = tracked_workspace_patch(baseline, &tracked).await?;
 
@@ -289,7 +303,11 @@ async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
         patch.push_str(&baseline_untracked_path_patch(baseline, &path).await?);
     }
 
-    for path in untracked_files().await? {
+    for path in inventory
+        .untracked_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+    {
         if baseline_set.contains(&path) {
             continue;
         }
@@ -352,72 +370,6 @@ fn tracked_pathspec_batches(tracked: &[String]) -> Vec<&[String]> {
     }
     batches.push(&tracked[start..]);
     batches
-}
-
-async fn tracked_files() -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "-z"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-async fn baseline_files(baseline: &str) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-tree", "-r", "-z", "--name-only"])
-        .arg(baseline)
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-async fn untracked_files() -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-fn split_nul_paths(output: &[u8]) -> Vec<String> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| String::from_utf8_lossy(path).into_owned())
-        .collect()
 }
 
 async fn baseline_untracked_path_patch(baseline: &str, path: &str) -> Result<String> {

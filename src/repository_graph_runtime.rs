@@ -3,8 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,9 +14,8 @@ use repository_graph::{
     QUERY_WIRE_VERSION,
     config::RepositoryGraphConfig,
     domain::{
-        Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Digest,
-        Freshness, PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace,
-        RepositoryRef,
+        Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Freshness,
+        PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace, RepositoryRef,
     },
     index::{IndexCoordinator, IndexRequest, active_extractor_identities},
     ports::{GraphQuery, SnapshotContent},
@@ -31,7 +29,8 @@ use repository_graph::{
         FreshnessComparison, SqliteGraphQuery, default_budget, snapshot_file_descriptors,
     },
     source::{
-        LocalRepositorySource, LocalSnapshotContent, SourceDiscoveryContext, TaskBaselineSource,
+        GitWorktreeInventory, LocalRepositorySource, LocalSnapshotContent, SourceDiscoveryContext,
+        TaskBaselineSource, parse_git_tree_digest,
     },
     sqlite::{
         OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, open_for_build_at,
@@ -336,7 +335,7 @@ async fn resolve_task_baseline(
         );
     }
 
-    let baseline_tree = git_tree_digest(baseline_tree.expect("checked above"))?;
+    let baseline_tree = parse_git_tree_digest(baseline_tree.expect("checked above"))?;
     let workspace_root = workspace_root.to_path_buf();
     let config = context.config.clone();
     let repository = context.repository.clone();
@@ -344,18 +343,11 @@ async fn resolve_task_baseline(
     let snapshot = tokio::task::spawn_blocking(move || -> Result<_> {
         let identities = active_extractor_identities(&config)?;
         let discovery = SourceDiscoveryContext::from_config(repository, &config, &identities)?;
-        let source =
-            TaskBaselineSource::discover(&workspace_root, discovery, baseline_tree.clone())?;
-        if workspace_tree_identity(
-            &workspace_root,
-            baseline_tree.value(),
-            sidecar_path
-                .parent()
-                .context("Repository graph sidecar has no parent directory")?,
-        )? != baseline_tree.value()
-        {
+        let inventory = GitWorktreeInventory::discover(&workspace_root, baseline_tree.clone())?;
+        if !inventory.changes().is_empty() {
             anyhow::bail!("managed worktree no longer matches its pinned baseline tree");
         }
+        let source = TaskBaselineSource::discover(&workspace_root, discovery, baseline_tree)?;
         let mut sidecar = match open_for_build_at(&sidecar_path)? {
             OpenSidecarResult::Ready(sidecar) => sidecar,
             OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
@@ -382,74 +374,6 @@ async fn resolve_task_baseline(
         None,
         project::RepositoryViewStatus::Available,
     )
-}
-
-struct TemporaryGitIndex {
-    path: PathBuf,
-}
-
-impl Drop for TemporaryGitIndex {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn workspace_tree_identity(root: &Path, baseline_tree: &str, data_dir: &Path) -> Result<String> {
-    let sequence = TASK_BASELINE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let index_dir = data_dir.join("baseline-indexes");
-    std::fs::create_dir_all(&index_dir).context("Failed to create baseline index workspace")?;
-    let index = TemporaryGitIndex {
-        path: index_dir.join(format!("{nanos:x}-{sequence:x}.index")),
-    };
-    run_git_with_index(root, &index.path, &["read-tree", baseline_tree])?;
-    run_git_with_index(
-        root,
-        &index.path,
-        &[
-            "add",
-            "-A",
-            "--",
-            ".",
-            ":(exclude).ferrus",
-            ":(exclude).ferrus/**",
-        ],
-    )?;
-    let output = run_git_with_index(root, &index.path, &["write-tree"])?;
-    let identity = std::str::from_utf8(&output)
-        .context("Git returned a non-UTF-8 tree identity")?
-        .trim();
-    git_tree_digest(identity)?;
-    Ok(identity.to_string())
-}
-
-fn run_git_with_index(root: &Path, index: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .env("GIT_INDEX_FILE", index)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .context("Failed to inspect the managed worktree baseline")?;
-    if !output.status.success() {
-        anyhow::bail!("Git could not verify the managed worktree baseline");
-    }
-    Ok(output.stdout)
-}
-
-fn git_tree_digest(value: &str) -> Result<Digest> {
-    let value = value.trim();
-    let algorithm = match value.len() {
-        40 => "git-tree-sha1",
-        64 => "git-tree-sha256",
-        _ => anyhow::bail!("Pinned baseline tree has an unsupported identity"),
-    };
-    Digest::new(algorithm, value).context("Pinned baseline tree is not canonical hexadecimal")
 }
 
 fn next_task_baseline_build_id(task_id: &str) -> Result<BuildId> {

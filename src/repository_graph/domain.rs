@@ -71,6 +71,16 @@ pub struct RepositoryRef {
     pub repository_id: RepositoryId,
 }
 
+/// Portable authority for one task-owned Git worktree view.
+///
+/// The machine-local checkout path deliberately stays outside this contract.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkspaceRef {
+    pub repository: RepositoryRef,
+    pub task_view_id: TaskViewId,
+    pub baseline_revision: Digest,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RepoPathError {
     #[error("repository path must not be empty")]
@@ -448,17 +458,121 @@ pub enum TaskViewLifecycle {
     FrozenSubmitted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskViewState {
+    BaselineOnly,
+    BaselineWithOverlay,
+    Unavailable,
+    Stale,
+    Failed,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TaskRepositoryViewError {
+    #[error("task repository view state and identities are inconsistent")]
+    InconsistentState,
+    #[error("task repository view task id must not be empty")]
+    EmptyTaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskRepositoryView {
     pub id: TaskViewId,
     pub task_id: String,
     pub run_id: Option<String>,
-    pub baseline_snapshot_id: SnapshotId,
+    pub state: TaskViewState,
+    pub baseline_snapshot_id: Option<SnapshotId>,
     pub overlay_revision_id: Option<OverlayRevisionId>,
     pub overlay_manifest_digest: Option<Digest>,
     pub lifecycle: TaskViewLifecycle,
     pub baseline_freshness: Freshness,
     pub overlay_freshness: Freshness,
+}
+
+impl<'de> Deserialize<'de> for TaskRepositoryView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireTaskRepositoryView {
+            id: TaskViewId,
+            task_id: String,
+            run_id: Option<String>,
+            state: TaskViewState,
+            baseline_snapshot_id: Option<SnapshotId>,
+            overlay_revision_id: Option<OverlayRevisionId>,
+            overlay_manifest_digest: Option<Digest>,
+            lifecycle: TaskViewLifecycle,
+            baseline_freshness: Freshness,
+            overlay_freshness: Freshness,
+        }
+
+        let wire = WireTaskRepositoryView::deserialize(deserializer)?;
+        Self::new(
+            wire.id,
+            wire.task_id,
+            wire.run_id,
+            wire.state,
+            wire.baseline_snapshot_id,
+            wire.overlay_revision_id,
+            wire.overlay_manifest_digest,
+            wire.lifecycle,
+            wire.baseline_freshness,
+            wire.overlay_freshness,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl TaskRepositoryView {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: TaskViewId,
+        task_id: String,
+        run_id: Option<String>,
+        state: TaskViewState,
+        baseline_snapshot_id: Option<SnapshotId>,
+        overlay_revision_id: Option<OverlayRevisionId>,
+        overlay_manifest_digest: Option<Digest>,
+        lifecycle: TaskViewLifecycle,
+        baseline_freshness: Freshness,
+        overlay_freshness: Freshness,
+    ) -> Result<Self, TaskRepositoryViewError> {
+        if task_id.trim().is_empty() {
+            return Err(TaskRepositoryViewError::EmptyTaskId);
+        }
+        let overlay_identity_is_complete =
+            overlay_revision_id.is_some() == overlay_manifest_digest.is_some();
+        let state_is_consistent = match state {
+            TaskViewState::BaselineOnly => {
+                baseline_snapshot_id.is_some() && overlay_revision_id.is_none()
+            }
+            TaskViewState::BaselineWithOverlay => {
+                baseline_snapshot_id.is_some() && overlay_revision_id.is_some()
+            }
+            TaskViewState::Stale => baseline_snapshot_id.is_some(),
+            TaskViewState::Unavailable | TaskViewState::Failed => {
+                baseline_snapshot_id.is_none() && overlay_revision_id.is_none()
+            }
+        };
+        if !overlay_identity_is_complete || !state_is_consistent {
+            return Err(TaskRepositoryViewError::InconsistentState);
+        }
+        Ok(Self {
+            id,
+            task_id,
+            run_id,
+            state,
+            baseline_snapshot_id,
+            overlay_revision_id,
+            overlay_manifest_digest,
+            lifecycle,
+            baseline_freshness,
+            overlay_freshness,
+        })
+    }
 }
 
 /// Mandatory budgets shared by every graph query request.
@@ -578,5 +692,78 @@ mod tests {
             "message": "arbitrary source body"
         });
         assert!(serde_json::from_value::<GraphDiagnostic>(json).is_err());
+    }
+
+    #[test]
+    fn task_repository_view_states_require_matching_identities() {
+        let baseline = SnapshotId::new("snapshot-1").unwrap();
+        let overlay = OverlayRevisionId::new("overlay-1").unwrap();
+        let overlay_digest = Digest::new("sha256", "00").unwrap();
+        let build = |state, baseline_snapshot_id, overlay_revision_id, overlay_manifest_digest| {
+            TaskRepositoryView::new(
+                TaskViewId::new("task-view-1").unwrap(),
+                "t-001".to_string(),
+                None,
+                state,
+                baseline_snapshot_id,
+                overlay_revision_id,
+                overlay_manifest_digest,
+                TaskViewLifecycle::Mutable,
+                Freshness::Fresh,
+                Freshness::Fresh,
+            )
+        };
+
+        assert!(
+            build(
+                TaskViewState::BaselineOnly,
+                Some(baseline.clone()),
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            build(
+                TaskViewState::BaselineWithOverlay,
+                Some(baseline.clone()),
+                Some(overlay.clone()),
+                Some(overlay_digest.clone())
+            )
+            .is_ok()
+        );
+        assert!(build(TaskViewState::Unavailable, None, None, None).is_ok());
+        assert!(
+            build(
+                TaskViewState::BaselineWithOverlay,
+                Some(baseline),
+                Some(overlay),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            build(
+                TaskViewState::Failed,
+                Some(SnapshotId::new("snapshot-2").unwrap()),
+                None,
+                None
+            )
+            .is_err()
+        );
+
+        let invalid_wire = serde_json::json!({
+            "id": "task-view-1",
+            "task_id": "t-001",
+            "run_id": null,
+            "state": "baseline_with_overlay",
+            "baseline_snapshot_id": "snapshot-1",
+            "overlay_revision_id": "overlay-1",
+            "overlay_manifest_digest": null,
+            "lifecycle": "mutable",
+            "baseline_freshness": "fresh",
+            "overlay_freshness": "fresh"
+        });
+        assert!(serde_json::from_value::<TaskRepositoryView>(invalid_wire).is_err());
     }
 }
