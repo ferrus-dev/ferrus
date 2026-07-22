@@ -15,7 +15,7 @@ use super::{
         Availability, BuildId, BuildState, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity,
         Digest, EdgeId, EdgeTarget, FactProvenance, Freshness, GraphNode, NodeId,
         OverlayRevisionId, PageCursor, PublishedViewName, QueryBudget, RepoPath, RepositoryRef,
-        SemanticKey, SnapshotId, SourceRevisionId, SourceSpan, TaskViewId,
+        SemanticKey, SnapshotId, SourceRevisionId, SourceSpan, TaskViewId, TaskViewLifecycle,
     },
 };
 
@@ -179,6 +179,7 @@ pub struct TaskViewEnvelope {
     pub task_view_id: TaskViewId,
     pub baseline_snapshot_id: SnapshotId,
     pub overlay_revision_id: Option<OverlayRevisionId>,
+    pub lifecycle: TaskViewLifecycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn search_request_serialization_matches_v3_fixture() {
+    fn search_request_serialization_matches_v4_fixture() {
         let request = SearchRequest {
             scope: QueryScope::current(
                 repository(),
@@ -575,7 +576,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&request).unwrap(),
-            include_str!("fixtures/query_v3_search.json")
+            include_str!("fixtures/query_v4_search.json")
                 .trim()
                 .replace("\r\n", "\n")
         );
@@ -596,14 +597,14 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&error).unwrap(),
-            include_str!("fixtures/query_v3_error.json")
+            include_str!("fixtures/query_v4_error.json")
                 .trim()
                 .replace("\r\n", "\n")
         );
     }
 
     #[test]
-    fn status_response_serialization_matches_v3_envelope_fixture() {
+    fn status_response_serialization_matches_v4_envelope_fixture() {
         let response = StatusResponse {
             wire_version: QUERY_WIRE_VERSION,
             repository: repository(),
@@ -640,7 +641,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string_pretty(&response).unwrap(),
-            include_str!("fixtures/query_v3_status.json")
+            include_str!("fixtures/query_v4_status.json")
                 .trim()
                 .replace("\r\n", "\n")
         );

@@ -522,6 +522,35 @@ fn verify_tree(root: &Path, baseline: &Digest) -> Result<(), SourceError> {
     run_git(root, &["cat-file", "-e", &tree], "verify baseline tree").map(|_| ())
 }
 
+pub(super) fn read_tree_descriptor_verified(
+    root: &Path,
+    tree: &Digest,
+    file: &SourceFileDescriptor,
+) -> Result<SourceContent, SourceError> {
+    validate_git_tree_digest(tree)?;
+    let root = canonical_root(root)?;
+    ensure_worktree_root(&root)?;
+    verify_tree(&root, tree)?;
+    let entries = baseline_entries(&root, tree)?;
+    let object_id = entries
+        .get(&file.path)
+        .map(|entry| entry.object_id.as_str())
+        .ok_or(SourceError::FileNotInManifest)?;
+    let output = run_git(
+        &root,
+        &["cat-file", "blob", object_id],
+        "read frozen submitted blob",
+    )?;
+    if output.stdout.len() as u64 != file.byte_len
+        || sha256_digest(&output.stdout) != file.content_identity
+    {
+        return Err(SourceError::ContentChanged);
+    }
+    Ok(SourceContent {
+        bytes: output.stdout,
+    })
+}
+
 fn baseline_entries(
     root: &Path,
     baseline: &Digest,

@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    agent_id::{ENV_AGENT_ID, ENV_BASELINE_TREE},
+    agent_id::{ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID},
     project, repository_graph,
 };
 use anyhow::{Context, Result};
@@ -19,7 +19,7 @@ use repository_graph::{
     domain::{
         Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Freshness,
         PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace, RepositoryRef,
-        TaskViewId, WorkspaceRef,
+        TaskViewId, TaskViewLifecycle, WorkspaceRef,
     },
     index::{IndexCoordinator, IndexRequest, active_extractor_identities},
     ports::{GraphQuery, SnapshotContent},
@@ -34,8 +34,9 @@ use repository_graph::{
         snapshot_file_descriptors,
     },
     source::{
-        GitWorktreeInventory, LocalRepositorySource, LocalSnapshotContent, SourceDiscoveryContext,
-        TaskBaselineSource, TaskOverlaySource, parse_git_tree_digest,
+        GitTreeSnapshotContent, GitWorktreeInventory, LocalRepositorySource, LocalSnapshotContent,
+        SourceDiscoveryContext, TaskBaselineSource, TaskOverlaySource, capture_worktree_tree,
+        parse_git_tree_digest,
     },
     sqlite::{
         OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, open_for_build_at,
@@ -48,6 +49,7 @@ static TASK_BASELINE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TASK_OVERLAY_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct LocalGraphContext {
+    pub(crate) project_root: std::path::PathBuf,
     pub(crate) root: std::path::PathBuf,
     pub(crate) repository: RepositoryRef,
     pub(crate) config: RepositoryGraphConfig,
@@ -69,12 +71,38 @@ impl LocalGraphContext {
             );
         }
         let project_id = project::current_project_id().await?;
+        let requested_task_id = std::env::var(ENV_TASK_ID)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let runtime_context = match std::env::var(ENV_AGENT_ID) {
             Ok(agent_id) if !agent_id.trim().is_empty() => {
                 project::runtime_task_context_for_agent(agent_id.trim()).await?
             }
             _ => None,
         };
+        if let Some(requested_task_id) = requested_task_id.as_deref() {
+            let Some(runtime) = runtime_context.as_ref() else {
+                anyhow::bail!(
+                    "repository graph task binding {requested_task_id:?} is not attached to the current runtime"
+                );
+            };
+            if runtime.task_id != requested_task_id {
+                anyhow::bail!(
+                    "repository graph task binding does not match the current runtime task"
+                );
+            }
+        }
+        if config.enabled
+            && runtime_context.as_ref().is_some_and(|runtime| {
+                runtime.run_role.as_deref() == Some("supervisor")
+                    && runtime.status == project::TaskStatus::Reviewing.as_str()
+                    && runtime.repository_view.lifecycle != TaskViewLifecycle::FrozenSubmitted
+            })
+        {
+            anyhow::bail!(
+                "the submitted repository view is unavailable for this reviewer; inspect the task source directly"
+            );
+        }
         let repository_view = runtime_context
             .as_ref()
             .map(|context| context.repository_view.clone());
@@ -84,10 +112,11 @@ impl LocalGraphContext {
             .transpose()?;
         let source_root = runtime_context
             .as_ref()
-            .and_then(|context| context.workspace_path.as_ref())
+            .and_then(|context| context.repository_workspace_path.as_ref())
             .map(std::path::PathBuf::from)
-            .unwrap_or(root);
+            .unwrap_or_else(|| root.clone());
         Ok(Self {
+            project_root: root,
             root: source_root,
             repository: RepositoryRef {
                 namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
@@ -120,6 +149,11 @@ impl LocalGraphContext {
 
     pub(crate) fn scope(&self, budget: QueryBudget) -> Result<repository_graph::query::QueryScope> {
         let snapshot = match (&self.repository_view, &self.task_view_id) {
+            (Some(view), _) if view.view_snapshot_id.is_some() => SnapshotSelector::Snapshot(
+                view.view_snapshot_id
+                    .clone()
+                    .expect("checked materialized snapshot identity"),
+            ),
             (Some(view), Some(task_view_id)) if view.overlay_revision_id.is_some() => {
                 SnapshotSelector::Published(task_overlay_view_name(task_view_id)?)
             }
@@ -238,6 +272,7 @@ impl LocalGraphContext {
             task_view_id: self.task_view_id.clone()?,
             baseline_snapshot_id: view.baseline_snapshot_id.clone()?,
             overlay_revision_id: view.overlay_revision_id.clone(),
+            lifecycle: view.lifecycle,
         })
     }
 
@@ -352,6 +387,93 @@ pub(crate) async fn refresh_task_overlay_best_effort_for_context(
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum RepositoryViewFreeze {
+    NotAttempted,
+    Frozen(project::RepositoryViewReference),
+    Failed,
+}
+
+/// Prepares the immutable graph/source identity persisted by the submit
+/// transaction. Git writes only content-addressed objects through an isolated
+/// temporary index; it never changes the task's real index or lifecycle row.
+pub(crate) async fn prepare_submitted_repository_view(
+    runtime: &project::RuntimeTaskContext,
+) -> RepositoryViewFreeze {
+    let Some(workspace_root) = runtime.workspace_path.as_deref() else {
+        return RepositoryViewFreeze::NotAttempted;
+    };
+    let Some(baseline_tree) = std::env::var(ENV_BASELINE_TREE)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return RepositoryViewFreeze::NotAttempted;
+    };
+    let graph_context = match LocalGraphContext::load(false).await {
+        Ok(context) if context.config.enabled => context,
+        Ok(_) => return RepositoryViewFreeze::NotAttempted,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to prepare submitted repository view; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+    drop(graph_context);
+
+    let mutable_view = match refresh_task_overlay(
+        &runtime.task_id,
+        Path::new(workspace_root),
+        baseline_tree.trim(),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to refresh submitted repository view; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+    let workspace_root = std::path::PathBuf::from(workspace_root);
+    let source_tree =
+        match tokio::task::spawn_blocking(move || capture_worktree_tree(&workspace_root)).await {
+            Ok(Ok(tree)) => tree,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    task_id = runtime.task_id,
+                    error = ?error,
+                    "failed to capture submitted source tree; submit will continue"
+                );
+                return RepositoryViewFreeze::Failed;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = runtime.task_id,
+                    error = ?error,
+                    "submitted source capture task failed; submit will continue"
+                );
+                return RepositoryViewFreeze::Failed;
+            }
+        };
+    match mutable_view.frozen(source_tree) {
+        Ok(view) => RepositoryViewFreeze::Frozen(view),
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "submitted repository view was not materialized; submit will continue"
+            );
+            RepositoryViewFreeze::Failed
+        }
+    }
+}
+
 pub(crate) async fn refresh_task_overlay(
     task_id: &str,
     workspace_root: &Path,
@@ -409,7 +531,7 @@ pub(crate) async fn refresh_task_overlay(
             return Ok(None);
         }
         let overlay_revision_id = source.overlay_manifest().revision_id.clone();
-        IndexCoordinator::new(&mut sidecar).index(
+        let outcome = IndexCoordinator::new(&mut sidecar).index(
             &source,
             &config,
             IndexRequest {
@@ -418,31 +540,34 @@ pub(crate) async fn refresh_task_overlay(
                 force_full: false,
             },
         )?;
-        Ok(Some(overlay_revision_id))
+        Ok(Some((overlay_revision_id, outcome.snapshot.id)))
     })
     .await;
 
     let repository_view = match refreshed {
-        Ok(Ok(overlay_revision_id)) => project::RepositoryViewReference::new(
-            Some(baseline_snapshot_id),
-            overlay_revision_id,
+        Ok(Ok(Some((overlay_revision_id, view_snapshot_id)))) => {
+            project::RepositoryViewReference::materialized(
+                baseline_snapshot_id,
+                Some(overlay_revision_id),
+                view_snapshot_id,
+                project::RepositoryViewStatus::Available,
+            )?
+        }
+        Ok(Ok(None)) => project::RepositoryViewReference::materialized(
+            baseline_snapshot_id.clone(),
+            None,
+            baseline_snapshot_id,
             project::RepositoryViewStatus::Available,
         )?,
         Ok(Err(error)) => {
-            let stale = project::RepositoryViewReference::new(
-                Some(baseline_snapshot_id),
-                existing.overlay_revision_id.clone(),
-                project::RepositoryViewStatus::Stale,
-            )?;
+            let mut stale = existing.clone().mutable_successor();
+            stale.status = project::RepositoryViewStatus::Stale;
             project::record_task_repository_view_at(&database_path, &task_id, &stale).await?;
             return Err(error);
         }
         Err(error) => {
-            let stale = project::RepositoryViewReference::new(
-                Some(baseline_snapshot_id),
-                existing.overlay_revision_id.clone(),
-                project::RepositoryViewStatus::Stale,
-            )?;
+            let mut stale = existing.mutable_successor();
+            stale.status = project::RepositoryViewStatus::Stale;
             project::record_task_repository_view_at(&database_path, &task_id, &stale).await?;
             return Err(error.into());
         }
@@ -464,14 +589,19 @@ fn resolved_repository_view(
                 error = ?error,
                 "failed to pin task repository graph baseline; dispatch will continue"
             );
-            match existing.and_then(|view| view.baseline_snapshot_id) {
-                Some(snapshot_id) => project::RepositoryViewReference::new(
-                    Some(snapshot_id),
-                    None,
-                    project::RepositoryViewStatus::Stale,
-                )
-                .expect("a retained baseline snapshot is a valid stale view"),
+            match existing {
+                Some(view) if view.baseline_snapshot_id.is_some() => {
+                    let mut view = view.mutable_successor();
+                    view.status = project::RepositoryViewStatus::Stale;
+                    view
+                }
                 None => project::RepositoryViewReference::new(
+                    None,
+                    None,
+                    project::RepositoryViewStatus::Failed,
+                )
+                .expect("a failed unavailable view has no overlay"),
+                Some(_) => project::RepositoryViewReference::new(
                     None,
                     None,
                     project::RepositoryViewStatus::Failed,
@@ -499,15 +629,13 @@ async fn resolve_task_baseline(
                     .is_some(),
                 _ => false,
             };
-            return project::RepositoryViewReference::new(
-                Some(snapshot_id.clone()),
-                existing.overlay_revision_id.clone(),
-                if retained {
-                    existing.status
-                } else {
-                    project::RepositoryViewStatus::Stale
-                },
-            );
+            let mut retained_view = existing.clone().mutable_successor();
+            retained_view.status = if retained {
+                existing.status
+            } else {
+                project::RepositoryViewStatus::Stale
+            };
+            return Ok(retained_view);
         }
         if existing.status != project::RepositoryViewStatus::NotBuilt {
             return Ok(existing.clone());
@@ -555,9 +683,10 @@ async fn resolve_task_baseline(
     })
     .await??;
 
-    project::RepositoryViewReference::new(
-        Some(snapshot),
+    project::RepositoryViewReference::materialized(
+        snapshot.clone(),
         None,
+        snapshot,
         project::RepositoryViewStatus::Available,
     )
 }
@@ -753,22 +882,55 @@ fn attach_snippets_at(
         .collect::<BTreeSet<_>>();
     let files = snapshot_file_descriptors(&sidecar, &response.snapshot_id, &paths)?;
 
-    let content = LocalSnapshotContent::new(
-        &context.root,
-        context.repository.clone(),
-        response.snapshot_id.clone(),
-        &context.config.source,
-        files,
-        hard_limit,
-    )
-    .map_err(|_| {
-        query_error(
-            QueryErrorCode::ContentUnavailable,
-            "repository content boundary could not be initialized",
-            true,
-            None,
-        )
-    })?;
+    let content: Box<dyn SnapshotContent> = match context.repository_view.as_ref() {
+        Some(view) if view.lifecycle == TaskViewLifecycle::FrozenSubmitted => {
+            let tree = view.frozen_source_tree.clone().ok_or_else(|| {
+                query_error(
+                    QueryErrorCode::ContentUnavailable,
+                    "frozen repository view is missing its source tree identity",
+                    false,
+                    None,
+                )
+            })?;
+            Box::new(
+                GitTreeSnapshotContent::new(
+                    &context.project_root,
+                    context.repository.clone(),
+                    response.snapshot_id.clone(),
+                    tree,
+                    &context.config.source,
+                    files,
+                    hard_limit,
+                )
+                .map_err(|_| {
+                    query_error(
+                        QueryErrorCode::ContentUnavailable,
+                        "frozen repository content boundary could not be initialized",
+                        true,
+                        None,
+                    )
+                })?,
+            )
+        }
+        _ => Box::new(
+            LocalSnapshotContent::new(
+                &context.root,
+                context.repository.clone(),
+                response.snapshot_id.clone(),
+                &context.config.source,
+                files,
+                hard_limit,
+            )
+            .map_err(|_| {
+                query_error(
+                    QueryErrorCode::ContentUnavailable,
+                    "repository content boundary could not be initialized",
+                    true,
+                    None,
+                )
+            })?,
+        ),
+    };
 
     let evidence = response
         .data
@@ -1000,6 +1162,7 @@ mod tests {
 
     fn context(root: &Path) -> LocalGraphContext {
         LocalGraphContext {
+            project_root: root.to_path_buf(),
             root: root.to_path_buf(),
             repository: RepositoryRef {
                 namespace: RepositoryNamespace::new("local:test").unwrap(),
@@ -1329,6 +1492,7 @@ mod tests {
                 task_view_id: TaskViewId::new("t-001").unwrap(),
                 baseline_snapshot_id: repository_view.baseline_snapshot_id.clone().unwrap(),
                 overlay_revision_id: repository_view.overlay_revision_id.clone(),
+                lifecycle: TaskViewLifecycle::Mutable,
             })
         );
         assert!(
@@ -1396,6 +1560,33 @@ mod tests {
                 .any(|item| item.path.as_str() == "src/added.rs")
         );
         assert_eq!(context_response.task_view, overlay_response.task_view);
+
+        let frozen_view = repository_view
+            .clone()
+            .frozen(capture_worktree_tree(root).unwrap())
+            .unwrap();
+        task_context.repository_view = Some(frozen_view);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub struct ChangedAfterSubmission;\n",
+        )
+        .unwrap();
+        let frozen_response = task_context
+            .context_with_snippets(&context_request, NonZeroU64::new(1024).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            frozen_response
+                .data
+                .snippets
+                .iter()
+                .any(|snippet| snippet.text.contains("OverlaySymbol"))
+        );
+        assert_eq!(
+            frozen_response.task_view.unwrap().lifecycle,
+            TaskViewLifecycle::FrozenSubmitted
+        );
 
         project::record_task_status(
             "t-002",
@@ -1472,6 +1663,29 @@ mod tests {
                 .status,
             project::TaskStatus::Executing.as_str()
         );
+        let previous_agent = std::env::var_os(ENV_AGENT_ID);
+        let previous_task = std::env::var_os(ENV_TASK_ID);
+        // SAFETY: cwd_lock serializes Ferrus tests that mutate process-global runtime context.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "executor:codex:missing");
+            std::env::set_var(ENV_TASK_ID, "t-missing");
+        }
+        let invalid_binding = match LocalGraphContext::load(false).await {
+            Ok(_) => panic!("invalid task binding unexpectedly selected canonical context"),
+            Err(error) => error,
+        };
+        assert!(invalid_binding.to_string().contains("not attached"));
+        // SAFETY: the same lock remains held while the prior environment is restored.
+        unsafe {
+            match previous_agent {
+                Some(value) => std::env::set_var(ENV_AGENT_ID, value),
+                None => std::env::remove_var(ENV_AGENT_ID),
+            }
+            match previous_task {
+                Some(value) => std::env::set_var(ENV_TASK_ID, value),
+                None => std::env::remove_var(ENV_TASK_ID),
+            }
+        }
         std::env::set_current_dir(previous).unwrap();
     }
 

@@ -80,6 +80,10 @@ and do not require a claimed task.
 For a managed Executor worktree, `/check` and the final submit gate refresh a task-owned overlay best-effort.
 Repository retrieval stays read-only and returns the pinned baseline snapshot together with the overlay revision;
 graph refresh failures never change task lifecycle state.
+The successful submitted view is frozen with its immutable Git tree during the Reviewing handoff. Taskless
+sessions use canonical, Executors use mutable task views, Consultants use the attached task view, and Reviewers
+use the frozen run view so recovery does not depend on the Executor worktree. Invalid task bindings never fall
+back to canonical; rejection preserves the frozen review run and resumes a mutable task successor.
 
 <!-- ferrus-supervisor-instructions -->
 ## Ferrus Supervisor

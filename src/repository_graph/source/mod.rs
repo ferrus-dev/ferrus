@@ -639,6 +639,116 @@ pub struct LocalSnapshotContent {
     hard_max_bytes: NonZeroU64,
 }
 
+/// Snapshot reader backed by an immutable Git tree captured at submission.
+/// Git objects remain available after the managed worktree is removed, while
+/// every returned blob is still checked against the graph file descriptor.
+pub struct GitTreeSnapshotContent {
+    root: PathBuf,
+    repository: RepositoryRef,
+    snapshot_id: SnapshotId,
+    tree: Digest,
+    files: BTreeMap<RepoPath, SourceFileDescriptor>,
+    policy: SourcePolicy,
+    hard_max_bytes: NonZeroU64,
+}
+
+impl GitTreeSnapshotContent {
+    pub fn new(
+        root: impl AsRef<Path>,
+        repository: RepositoryRef,
+        snapshot_id: SnapshotId,
+        tree: Digest,
+        config: &SourceConfig,
+        files: Vec<SourceFileDescriptor>,
+        hard_max_bytes: NonZeroU64,
+    ) -> Result<Self, SourceError> {
+        let root = fs::canonicalize(root.as_ref()).map_err(|source| SourceError::Io {
+            operation: "canonicalize frozen content repository root",
+            source,
+        })?;
+        Ok(Self {
+            root,
+            repository,
+            snapshot_id,
+            tree,
+            files: files
+                .into_iter()
+                .map(|file| (file.path.clone(), file))
+                .collect(),
+            policy: SourcePolicy::new(config)?,
+            hard_max_bytes,
+        })
+    }
+}
+
+impl SnapshotContent for GitTreeSnapshotContent {
+    fn read_verified(&self, request: &ContentRequest) -> Result<ContentResponse, QueryError> {
+        if request.wire_version != super::QUERY_WIRE_VERSION {
+            return Err(content_error(
+                QueryErrorCode::UnsupportedWireVersion,
+                "unsupported repository content wire version",
+                false,
+                None,
+            ));
+        }
+        if request.repository != self.repository || request.snapshot_id != self.snapshot_id {
+            return Err(content_error(
+                QueryErrorCode::InvalidRequest,
+                "repository content request does not match the selected snapshot",
+                false,
+                None,
+            ));
+        }
+        if self.policy.exclusion_for_file(&request.path).is_some() {
+            return Err(content_error(
+                QueryErrorCode::ContentUnavailable,
+                "repository content is excluded by the source policy",
+                false,
+                None,
+            ));
+        }
+        let Some(file) = self.files.get(&request.path) else {
+            return Err(content_error(
+                QueryErrorCode::ContentUnavailable,
+                "repository content is unavailable for the selected snapshot",
+                false,
+                None,
+            ));
+        };
+        if file.content_identity != request.expected_content_identity {
+            return Err(content_error(
+                QueryErrorCode::ContentChanged,
+                "repository content identity does not match the selected snapshot",
+                false,
+                Some(RetrievalAction::RefreshIndex),
+            ));
+        }
+        let content = worktree::read_tree_descriptor_verified(&self.root, &self.tree, file)
+            .map_err(|error| match error {
+                SourceError::ContentChanged => content_error(
+                    QueryErrorCode::ContentChanged,
+                    "frozen repository content does not match the selected snapshot",
+                    false,
+                    None,
+                ),
+                _ => content_error(
+                    QueryErrorCode::ContentUnavailable,
+                    "frozen repository content could not be read",
+                    true,
+                    None,
+                ),
+            })?;
+        content_response_for_bytes(
+            request,
+            &self.repository,
+            &self.snapshot_id,
+            file,
+            &content.bytes,
+            self.hard_max_bytes,
+        )
+    }
+}
+
 impl LocalSnapshotContent {
     pub fn new(
         root: impl AsRef<Path>,
@@ -724,36 +834,54 @@ impl SnapshotContent for LocalSnapshotContent {
             ),
         })?;
 
-        let (start, end) = request
-            .span
-            .as_ref()
-            .map_or((0_u64, content.bytes.len() as u64), |span| {
-                (span.start.byte_offset, span.end.byte_offset)
-            });
-        let Ok(start) = usize::try_from(start) else {
-            return Err(invalid_content_span());
-        };
-        let Ok(end) = usize::try_from(end) else {
-            return Err(invalid_content_span());
-        };
-        if start > end || end > content.bytes.len() {
-            return Err(invalid_content_span());
-        }
-        let limit = request.max_bytes.get().min(self.hard_max_bytes.get());
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        let selected = &content.bytes[start..end];
-        let returned_len = clamp_utf8_truncation(selected, selected.len().min(limit));
-
-        Ok(ContentResponse {
-            wire_version: super::QUERY_WIRE_VERSION,
-            repository: self.repository.clone(),
-            snapshot_id: self.snapshot_id.clone(),
-            path: request.path.clone(),
-            verified_content_identity: file.content_identity.clone(),
-            bytes: selected[..returned_len].to_vec(),
-            truncated: returned_len < selected.len(),
-        })
+        content_response_for_bytes(
+            request,
+            &self.repository,
+            &self.snapshot_id,
+            file,
+            &content.bytes,
+            self.hard_max_bytes,
+        )
     }
+}
+
+fn content_response_for_bytes(
+    request: &ContentRequest,
+    repository: &RepositoryRef,
+    snapshot_id: &SnapshotId,
+    file: &SourceFileDescriptor,
+    bytes: &[u8],
+    hard_max_bytes: NonZeroU64,
+) -> Result<ContentResponse, QueryError> {
+    let (start, end) = request
+        .span
+        .as_ref()
+        .map_or((0_u64, bytes.len() as u64), |span| {
+            (span.start.byte_offset, span.end.byte_offset)
+        });
+    let Ok(start) = usize::try_from(start) else {
+        return Err(invalid_content_span());
+    };
+    let Ok(end) = usize::try_from(end) else {
+        return Err(invalid_content_span());
+    };
+    if start > end || end > bytes.len() {
+        return Err(invalid_content_span());
+    }
+    let limit = request.max_bytes.get().min(hard_max_bytes.get());
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let selected = &bytes[start..end];
+    let returned_len = clamp_utf8_truncation(selected, selected.len().min(limit));
+
+    Ok(ContentResponse {
+        wire_version: super::QUERY_WIRE_VERSION,
+        repository: repository.clone(),
+        snapshot_id: snapshot_id.clone(),
+        path: request.path.clone(),
+        verified_content_identity: file.content_identity.clone(),
+        bytes: selected[..returned_len].to_vec(),
+        truncated: returned_len < selected.len(),
+    })
 }
 
 fn clamp_utf8_truncation(bytes: &[u8], requested_len: usize) -> usize {
@@ -1854,6 +1982,42 @@ mod tests {
                 .code,
             QueryErrorCode::ContentUnavailable
         );
+    }
+
+    #[test]
+    fn frozen_git_tree_content_survives_worktree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let original = b"pub struct Submitted;\n";
+        std::fs::write(directory.path().join("src/lib.rs"), original).unwrap();
+        let tree = capture_worktree_tree(directory.path()).unwrap();
+        let file = descriptor("src/lib.rs", original);
+        let reader = GitTreeSnapshotContent::new(
+            directory.path(),
+            test_repository(),
+            SnapshotId::new("snapshot-1").unwrap(),
+            tree,
+            &SourceConfig::default(),
+            vec![file.clone()],
+            NonZeroU64::new(1024).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            b"pub struct Addressing;\n",
+        )
+        .unwrap();
+
+        let response = reader.read_verified(&content_request(&file)).unwrap();
+        assert_eq!(response.bytes, original);
     }
 
     #[cfg(unix)]

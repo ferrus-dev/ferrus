@@ -255,7 +255,16 @@ repository-relative evidence spans, provenance, and any truncation. CLI limits a
 Managed Executor worktrees use a task-owned graph view pinned to the dispatch baseline. `/check` and the final
 submit gate refresh its changed-file overlay best-effort: unchanged fragments are reused, changed and added files
 replace or extend the view, and deleted paths hide baseline facts. Task-view responses include both the baseline
-snapshot and overlay revision; a graph refresh failure never changes task lifecycle state.
+snapshot, overlay revision, and mutable/frozen lifecycle; a graph refresh failure never changes task lifecycle
+state. Submit freezes the successfully materialized view with an immutable Git tree in the same runtime
+transaction as the Reviewing handoff. Reviewers and recovery sessions therefore reopen the exact submitted graph
+and hash-verified snippets after the Executor worktree disappears; rejection preserves that run history while the
+task resumes a mutable successor view.
+
+Runtime identity selects the view explicitly: taskless/manual sessions use canonical, Executors use their mutable
+task overlay, Consultants use the attached task view and Executor workspace, and Reviewers use the frozen view on
+their review run. An invalid task binding or unavailable submitted freeze is reported instead of silently falling
+back to canonical context.
 
 Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.

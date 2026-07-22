@@ -277,6 +277,7 @@ mod tests {
     fn request_preserves_filters_cursor_and_client_budgets() {
         let directory = tempfile::tempdir().unwrap();
         let context = LocalGraphContext {
+            project_root: directory.path().to_path_buf(),
             root: directory.path().to_path_buf(),
             repository: crate::repository_graph::domain::RepositoryRef {
                 namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")
@@ -315,6 +316,7 @@ mod tests {
     fn invalid_paths_and_zero_budgets_are_rejected_before_querying() {
         let directory = tempfile::tempdir().unwrap();
         let context = LocalGraphContext {
+            project_root: directory.path().to_path_buf(),
             root: directory.path().to_path_buf(),
             repository: crate::repository_graph::domain::RepositoryRef {
                 namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")

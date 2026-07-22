@@ -84,12 +84,12 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
 
     if config.checks.commands.is_empty() {
         info!("No check commands configured; treating final check gate as pass");
-        crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context)
-            .await;
+        let frozen_view =
+            crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
         project::record_task_check_passed(&context.task_id).await?;
         write_submission(&context, &content).await?;
         write_submission_patch(&context).await?;
-        record_task_status(&context, project::TaskStatus::Reviewing).await?;
+        record_submission(&context, frozen_view).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
             "submitted",
@@ -110,13 +110,14 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         .as_deref()
         .unwrap_or(context.task_id.as_str());
     let gate = check_gate::run(&config, attempt, log_scope).await?;
-    crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context).await;
     match gate {
         CheckGateResult::Passed => {
+            let frozen_view =
+                crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
             project::record_task_check_passed(&context.task_id).await?;
             write_submission(&context, &content).await?;
             write_submission_patch(&context).await?;
-            record_task_status(&context, project::TaskStatus::Reviewing).await?;
+            record_submission(&context, frozen_view).await?;
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
                 "submitted",
@@ -478,11 +479,23 @@ fn temporary_file_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{counter}", std::process::id()))
 }
 
-async fn record_task_status(
+async fn record_submission(
     context: &RuntimeTaskContext,
-    status: project::TaskStatus,
+    freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
 ) -> Result<()> {
-    project::record_task_status(&context.task_id, &context.task_path, status).await
+    let (frozen_view, failed) = match &freeze {
+        crate::repository_graph_runtime::RepositoryViewFreeze::NotAttempted => (None, false),
+        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => (Some(view), false),
+        crate::repository_graph_runtime::RepositoryViewFreeze::Failed => (None, true),
+    };
+    project::record_task_submitted(
+        &context.task_id,
+        &context.task_path,
+        context.run_id.as_deref(),
+        frozen_view,
+        failed,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1100,7 +1113,9 @@ mod tests {
             review_cycles: 0,
             failure_reason: None,
             run_id: None,
+            run_role: Some("executor".to_string()),
             workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            repository_workspace_path: Some(workspace.to_string_lossy().into_owned()),
             repository_view: project::RepositoryViewReference::default(),
         }
     }

@@ -83,6 +83,10 @@ relationships as unknown, not absent.
 baseline and the last successful changed-file overlay refresh. `/check` and the final submit gate refresh that
 overlay best-effort; graph failures must not change task/run lifecycle. Keep retrieval tools read-only. Reuse
 baseline fragments for unchanged files, remove deleted-path facts, and return explicit baseline/overlay identities.
+Submit atomically stores a best-effort frozen graph snapshot plus immutable Git tree with the Reviewing handoff.
+Route taskless sessions to canonical, Executors to mutable task views, Consultants to the attached task view and
+Executor workspace, and Reviewers to the frozen run view. Never fall back to canonical for an invalid task binding
+or a missing reviewer freeze; rejection resumes a mutable task successor without rewriting the frozen review run.
 
 **Per-task state machine**: The old single global `STATE.json` is gone, but each SQLite task row still follows the same Supervisor–Executor lifecycle. In `--limit 1` this is effectively the old flow, only DB-backed:
 

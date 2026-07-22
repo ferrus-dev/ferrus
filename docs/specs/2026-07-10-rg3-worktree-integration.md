@@ -175,13 +175,21 @@ publications are isolated by `TaskViewId`; `/check` and the final submit gate re
 coupling failures to task lifecycle, while retrieval remains read-only. Search, context, status, and verified
 snippets route through the composed snapshot and return the explicit baseline snapshot plus overlay revision.
 
-- [ ] #3.4 Freeze submitted views and route role-specific retrieval
+- [x] #3.4 Freeze submitted views and route role-specific retrieval
 
 ID: rg3.4
 Depends on: rg3.3
 
 Resolve taskless, Executor, Consultant, and Reviewer views from runtime identity; best-effort freeze submitted
 views; reopen them for review/recovery; and resume a mutable successor after rejection without weakening submit.
+
+Implemented with a versioned `ferrus.db` migration that persists the materialized graph snapshot, submitted Git
+tree, and mutable/frozen lifecycle on task and run records. Submit refreshes and prepares the view best-effort,
+then freezes it atomically with the normal Reviewing transition; bounded freeze failures are recorded without
+changing submit eligibility. Runtime retrieval now routes taskless sessions to canonical, Executors to their
+mutable worktree view, Consultants to the attached task view and Executor workspace, and Reviewers to their exact
+frozen run view. Frozen snippets read hash-verified Git blobs after worktree changes/removal, while rejection
+clears only the task's frozen source identity and preserves reviewer history as it resumes a mutable successor.
 
 - [ ] #3.5 Integrate manifest-driven canonical invalidation with approval
 
