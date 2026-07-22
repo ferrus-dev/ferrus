@@ -231,6 +231,28 @@ pub struct StatusData {
     pub graph_model_version: Option<u32>,
     pub statistics: Option<SnapshotStatistics>,
     pub recommended_action: Option<RetrievalAction>,
+    /// Present for an authoritative task binding, including unavailable views
+    /// that do not yet have a baseline snapshot envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_view_status: Option<TaskViewStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<RetrievalFallback>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskViewStatus {
+    NotBuilt,
+    Available,
+    Stale,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalFallback {
+    DirectSourceInspection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,6 +658,8 @@ mod tests {
                     edges: 7,
                 }),
                 recommended_action: None,
+                task_view_status: None,
+                fallback: None,
             },
         };
 

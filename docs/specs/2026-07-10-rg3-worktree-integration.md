@@ -208,7 +208,7 @@ only after releasing the approval lock, preserves the last published graph on fa
 without changing Complete/Reviewing, leases, retries, or review cycles. Explicit `ferrus graph index` also clears
 the durable invalidation, while ordinary exact manifest comparisons continue detecting external edits.
 
-- [ ] #3.6 Add concurrent-view isolation, retention, recovery, and observability
+- [x] #3.6 Add concurrent-view isolation, retention, recovery, and observability
 
 ID: rg3.6
 Depends on: rg3.4, rg3.5
@@ -216,6 +216,17 @@ Depends on: rg3.4, rg3.5
 Protect task namespaces, deduplicate refreshes, retain referenced and frozen snapshots, garbage-collect safe
 candidates, recover interrupted overlay builds, expose canonical/task-view status and privacy-safe metrics, and add
 multi-worktree fixtures, restart/failure tests, lifecycle documentation, and pinned-versus-canonical evaluations.
+
+Implemented with sidecar schema v6 refresh leases keyed by repository and published-view identity, so concurrent
+canonical or task refreshes are deduplicated without sharing task namespaces. `ferrus.db` supplies a read-only
+protection set for all non-terminal task/run baseline and materialized snapshots; maintenance retains those plus
+published canonical views, removes expired completed-task publications and unreferenced snapshots within the
+configured limits, prunes orphan fragments/builds, and never derives ownership from paths or PIDs. `ferrus
+recover` marks only genuinely unfinished graph builds failed and reclaims expired refresh leases, while completed
+snapshot transactions remain reusable. Task status exposes unavailable/stale fallback explicitly, doctor reports
+durable canonical staleness and pending graph recovery, and telemetry contains only bounded identity/counter
+fields. Existing multi-worktree overlay, freeze/restart, deletion/rename, cross-task isolation, and
+pinned-versus-canonical fixtures are complemented by lease, recovery, retention, and runtime-reference tests.
 
 ## Acceptance Criteria
 

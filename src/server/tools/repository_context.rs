@@ -170,7 +170,7 @@ async fn run(input: RepositoryContextInput) -> Result<String> {
         Ok(response) => serde_json::to_string(response)?,
         Err(error) => serde_json::to_string(error)?,
     };
-    repository_query_telemetry::context(&context.config, started, &response, serialized.len());
+    repository_query_telemetry::context(&context, started, &response, serialized.len());
     Ok(serialized)
 }
 
@@ -318,6 +318,7 @@ mod tests {
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
             task_view_id: None,
+            run_id: None,
         }
     }
 

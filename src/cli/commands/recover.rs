@@ -18,6 +18,31 @@ pub async fn run(dry_run: bool, worktrees: bool) -> Result<()> {
     );
     println!("Interrupted runs: {}", recovery.interrupted_runs);
     println!("Expired task leases: {}", recovery.expired_task_leases);
+    let graph = if dry_run {
+        crate::repository_graph_runtime::preview_graph_recovery().await
+    } else {
+        crate::repository_graph_runtime::recover_graph_state().await
+    };
+    match graph {
+        Ok(graph) => {
+            println!("Interrupted graph builds: {}", graph.interrupted_builds);
+            println!(
+                "Expired graph refresh leases: {}",
+                graph.expired_refresh_leases
+            );
+            if !dry_run {
+                println!("Graph views removed: {}", graph.removed_views);
+                println!("Graph snapshots removed: {}", graph.removed_snapshots);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = ?error,
+                "repository graph recovery was unavailable; runtime recovery completed"
+            );
+            println!("Repository graph recovery: unavailable (runtime recovery completed)");
+        }
+    }
     if worktrees {
         if dry_run {
             let orphaned = project::preview_orphaned_worktrees().await?;

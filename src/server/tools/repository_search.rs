@@ -127,7 +127,7 @@ async fn run(input: RepositorySearchInput) -> Result<String> {
         Ok(response) => serde_json::to_string(response)?,
         Err(error) => serde_json::to_string(error)?,
     };
-    repository_query_telemetry::search(&context.config, started, &response, serialized.len());
+    repository_query_telemetry::search(&context, started, &response, serialized.len());
     Ok(serialized)
 }
 
@@ -287,6 +287,7 @@ mod tests {
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
             task_view_id: None,
+            run_id: None,
         };
         let input = parse_input(serde_json::json!({
             "query": "  crate::api  ",
@@ -326,6 +327,7 @@ mod tests {
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
             task_view_id: None,
+            run_id: None,
         };
 
         let invalid_path = parse_input(serde_json::json!({

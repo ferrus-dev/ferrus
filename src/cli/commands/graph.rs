@@ -226,6 +226,7 @@ async fn index(full: bool, json: bool) -> Result<()> {
             "canonical graph indexed but durable freshness state was not updated"
         );
     }
+    crate::repository_graph_runtime::maintain_graph_best_effort().await;
     if json {
         print_json(&IndexOutput {
             status: "indexed",

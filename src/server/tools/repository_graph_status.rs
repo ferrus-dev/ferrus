@@ -20,6 +20,6 @@ pub(super) async fn run() -> Result<String> {
     let context = LocalGraphContext::load(false).await?;
     let response = context.status().await?;
     let serialized = serde_json::to_string(&response)?;
-    repository_query_telemetry::status(&context.config, started, &response, serialized.len());
+    repository_query_telemetry::status(&context, started, &response, serialized.len());
     Ok(serialized)
 }

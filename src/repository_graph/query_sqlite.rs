@@ -298,6 +298,8 @@ impl<'a> SqliteGraphQuery<'a> {
                             QueryErrorCode::IndexFailed => RetrievalAction::RetryIndex,
                             _ => RetrievalAction::Index,
                         }),
+                        task_view_status: None,
+                        fallback: None,
                     },
                 });
             }
@@ -1490,6 +1492,8 @@ fn available_status_response(
             graph_model_version: Some(resolved.snapshot.graph_model_version),
             statistics,
             recommended_action: status_action(latest_build, resolved.freshness.freshness),
+            task_view_status: None,
+            fallback: None,
         },
     }
 }

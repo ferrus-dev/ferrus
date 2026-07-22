@@ -109,10 +109,16 @@ descriptions recommend status-first use, bounded requests, and the correct inter
 task/review prompts contain no graph output.
 
 When `[repository_graph.telemetry].enabled = true`, each query emits one structured privacy-safe tracing metric with
-tool name, snapshot identity, freshness, duration, result count, serialized response bytes, truncation reason,
-diagnostic count, and error category. Its metric type cannot represent request text, filters, repository paths,
-snippets, or source bodies. Telemetry remains operational and does not mutate either `ferrus.db` or the read-only
-repository graph sidecar.
+tool name, repository/task/run/baseline/overlay/build/snapshot identities, freshness, duration, result count,
+serialized response bytes, truncation reason, diagnostic count, and error category. Maintenance emits the same
+bounded identity plus recovery/retention counters. These metric types cannot represent request text, filters,
+repository paths, snippets, or source bodies. Query telemetry remains read-only; maintenance runs only from
+explicit graph write/recovery paths and never mutates task lifecycle state.
+
+Task status distinguishes an authoritative task binding from canonical context even when no baseline snapshot is
+available: `task_view_status` reports `not_built`, `stale`, `unavailable`, or `failed`, and `fallback` directs the
+agent to inspect source rather than silently querying canonical. Materialized responses continue returning the
+baseline snapshot, optional overlay revision, mutable/frozen lifecycle, evidence, freshness, and truncation.
 
 ## Evaluation gate
 

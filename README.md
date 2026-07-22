@@ -273,6 +273,14 @@ refreshed from the files actually left in canonical. Best-effort incremental ind
 canonical approval lock is released, and its success or failure never changes the task approval outcome. A manual
 `ferrus graph index` clears the same durable invalidation after publishing its verified snapshot.
 
+Canonical and task refreshes are coordinated by expiring SQLite leases scoped to the exact published view, so
+concurrent tasks cannot publish into one another's namespace and duplicate refreshes are suppressed across Ferrus
+processes. Ordinary maintenance keeps every snapshot referenced by a non-terminal task/run (including frozen
+review views) plus all published canonical snapshots. Completed-task publications and unreferenced snapshots age
+out under `[repository_graph.retention]`; deleting a managed worktree never deletes a retained immutable baseline.
+Interrupted builds never expose partial facts: `ferrus recover` marks only unfinished attempts failed, reclaims
+expired graph refresh leases, and garbage-collects safe candidates without changing task lifecycle state.
+
 Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
 Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically
@@ -290,7 +298,7 @@ Lists projects registered under `~/.ferrus/projects`, including project id, name
 
 ### `ferrus recover`
 
-Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled.
+Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled. It also recovers unfinished repository-graph builds, expired view-refresh leases, and safe retention candidates when the optional sidecar is available; graph recovery failure is reported but does not undo runtime recovery.
 
 Use `ferrus recover --dry-run` to print the pending recovery counters without changing runtime state.
 Use `ferrus recover --worktrees` to also remove orphaned managed task worktrees that no active task or active run still owns. Combine it with `--dry-run` to preview the orphan count without removing anything.

@@ -22,7 +22,8 @@ use crate::{
     legacy_state::{self, LegacyTaskState},
     platform,
     repository_graph::domain::{
-        BuildId, Digest, OverlayRevisionId, SnapshotId, SourceRevisionId, TaskViewLifecycle,
+        BuildId, Digest, OverlayRevisionId, PublishedViewName, SnapshotId, SourceRevisionId,
+        TaskViewLifecycle,
     },
 };
 
@@ -98,6 +99,12 @@ pub struct CanonicalGraphReference {
     pub source: Option<CanonicalSourceIdentity>,
     pub snapshot_id: Option<SnapshotId>,
     pub status: CanonicalGraphStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryGraphRetentionReferences {
+    pub snapshot_ids: std::collections::BTreeSet<SnapshotId>,
+    pub view_names: std::collections::BTreeSet<PublishedViewName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1538,6 +1545,65 @@ pub async fn task_repository_view(task_id: &str) -> Result<Option<RepositoryView
 #[allow(dead_code)]
 pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewReference>> {
     read_repository_view("runs", run_id).await
+}
+
+/// Returns the graph identities that ordinary sidecar garbage collection must
+/// preserve. Only non-terminal tasks retain task publications indefinitely;
+/// completed task snapshots age out through the configured sidecar retention.
+pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRetentionReferences> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<RepositoryGraphRetentionReferences> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut references = RepositoryGraphRetentionReferences::default();
+        let mut statement = connection.prepare(
+            r#"
+            SELECT tasks.id,
+                   tasks.baseline_snapshot_id, tasks.repository_view_snapshot_id,
+                   runs.baseline_snapshot_id, runs.repository_view_snapshot_id
+            FROM tasks
+            LEFT JOIN runs ON runs.task_id = tasks.id
+            WHERE tasks.status NOT IN ('complete', 'failed', 'reset')
+            ORDER BY tasks.id, runs.id
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (task_id, task_baseline, task_view, run_baseline, run_view) = row?;
+            for snapshot in [task_baseline, task_view, run_baseline, run_view]
+                .into_iter()
+                .flatten()
+            {
+                references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
+            }
+            references
+                .view_names
+                .insert(PublishedViewName::new(format!("task-baseline:{task_id}"))?);
+            references
+                .view_names
+                .insert(PublishedViewName::new(format!("task-overlay:{task_id}"))?);
+        }
+        let canonical_snapshot = connection
+            .query_row(
+                "SELECT canonical_graph_snapshot_id FROM project_runtime_state WHERE row_id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(snapshot) = canonical_snapshot {
+            references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
+        }
+        Ok(references)
+    })
+    .await?
 }
 
 pub async fn canonical_graph_reference() -> Result<CanonicalGraphReference> {
@@ -6623,6 +6689,76 @@ mod tests {
 
         assert!(!std::path::Path::new(".ferrus/tasks/t-007.md").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-007").exists());
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_references_include_active_views_and_exclude_completed_tasks() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_status(
+            "t-active",
+            ".ferrus/tasks/t-active.md",
+            TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        record_task_status(
+            "t-complete",
+            ".ferrus/tasks/t-complete.md",
+            TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        let active = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-active").unwrap(),
+            Some(OverlayRevisionId::new("overlay-active").unwrap()),
+            SnapshotId::new("view-active").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        let completed = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-complete").unwrap(),
+            Some(OverlayRevisionId::new("overlay-complete").unwrap()),
+            SnapshotId::new("view-complete").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        record_task_repository_view("t-active", &active)
+            .await
+            .unwrap();
+        record_task_repository_view("t-complete", &completed)
+            .await
+            .unwrap();
+
+        let references = repository_graph_retention_references().await.unwrap();
+
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("baseline-active").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-active").unwrap())
+        );
+        assert!(
+            references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-active").unwrap())
+        );
+        assert!(
+            !references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-complete").unwrap())
+        );
+        assert!(
+            !references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-complete").unwrap())
+        );
+
         std::env::set_current_dir(previous).unwrap();
     }
 

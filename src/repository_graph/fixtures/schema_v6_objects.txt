@@ -4,6 +4,7 @@ index:edges_evidence_path_idx
 index:edges_source_idx
 index:edges_target_idx
 index:fragment_cache_last_used_idx
+index:graph_refresh_leases_expiry_idx
 index:index_builds_repository_state_idx
 index:index_builds_snapshot_idx
 index:nodes_evidence_path_idx
@@ -18,6 +19,7 @@ table:diagnostics
 table:edges
 table:files
 table:fragment_cache
+table:graph_refresh_leases
 table:index_builds
 table:nodes
 table:published_views

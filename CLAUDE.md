@@ -87,6 +87,9 @@ back to canonical; rejection preserves the frozen review run and resumes a mutab
 Approval compares canonical manifests before and after integration or rollback, records the actual resulting
 source as stale only when it changed, and starts incremental refresh after releasing the approval lock. A clean
 rollback does not record the proposed patch, and graph refresh outcomes never change the task approval lifecycle.
+Repository/view-scoped SQLite leases deduplicate refreshes across processes. Sidecar maintenance protects all
+non-terminal task/run and canonical snapshot references, collects only unreferenced completed overlays and old
+failures, and lets `ferrus recover` resolve interrupted graph builds without changing task state.
 
 <!-- ferrus-supervisor-instructions -->
 ## Ferrus Supervisor

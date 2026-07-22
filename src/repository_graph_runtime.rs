@@ -5,7 +5,7 @@ use std::{
     num::NonZeroU64,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -22,12 +22,14 @@ use repository_graph::{
         TaskViewId, TaskViewLifecycle, WorkspaceRef,
     },
     index::{IndexCoordinator, IndexRequest, active_extractor_identities},
+    maintenance::{GraphMaintenanceReport, RefreshLeaseOutcome, RetentionProtection},
     ports::{GraphQuery, SnapshotContent},
     query::{
         ContentRequest, ContextRequest, ContextResponse, ContextSnippet, DiagnosticSummary,
         DiagnosticsEnvelope, FreshnessEnvelope, PageInfo, QueryDiagnostic, QueryError,
-        QueryErrorCode, QueryResponse, RetrievalAction, SearchRequest, SearchResponse,
-        SnapshotSelector, StatusData, StatusRequest, StatusResponse, TaskViewEnvelope,
+        QueryErrorCode, QueryResponse, RetrievalAction, RetrievalFallback, SearchRequest,
+        SearchResponse, SnapshotSelector, StatusData, StatusRequest, StatusResponse,
+        TaskViewEnvelope, TaskViewStatus,
     },
     query_sqlite::{
         FreshnessComparison, SqliteGraphQuery, all_snapshot_file_descriptors, default_budget,
@@ -48,6 +50,11 @@ pub(crate) const CANONICAL_VIEW: &str = "canonical";
 static TASK_BASELINE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TASK_OVERLAY_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_REFRESH_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+const REFRESH_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, thiserror::Error)]
+#[error("repository graph refresh is already in progress for this view")]
+struct RefreshAlreadyInProgress;
 
 pub(crate) struct LocalGraphContext {
     pub(crate) project_root: std::path::PathBuf,
@@ -56,6 +63,7 @@ pub(crate) struct LocalGraphContext {
     pub(crate) config: RepositoryGraphConfig,
     pub(crate) repository_view: Option<project::RepositoryViewReference>,
     pub(crate) task_view_id: Option<TaskViewId>,
+    pub(crate) run_id: Option<String>,
 }
 
 impl LocalGraphContext {
@@ -111,6 +119,9 @@ impl LocalGraphContext {
             .as_ref()
             .map(|context| TaskViewId::new(&context.task_id))
             .transpose()?;
+        let run_id = runtime_context
+            .as_ref()
+            .and_then(|context| context.run_id.clone());
         let source_root = runtime_context
             .as_ref()
             .and_then(|context| context.repository_workspace_path.as_ref())
@@ -126,6 +137,7 @@ impl LocalGraphContext {
             config,
             repository_view,
             task_view_id,
+            run_id,
         })
     }
 
@@ -177,12 +189,14 @@ impl LocalGraphContext {
 
     pub(crate) async fn status(&self) -> Result<StatusResponse> {
         if let Some(status) = self.unavailable_task_view_status() {
-            return unavailable_status(
+            let mut response = unavailable_status(
                 self.repository.clone(),
                 Availability::NotBuilt,
                 status.as_str(),
                 RetrievalAction::Index,
-            );
+            )?;
+            self.attach_task_view_to_status(&mut response);
+            return Ok(response);
         }
         let path = sidecar_path().await?;
         // Discovering the current manifest can walk and hash the repository.
@@ -273,7 +287,7 @@ impl LocalGraphContext {
             .and_then(|view| view.baseline_snapshot_id.is_none().then_some(view.status))
     }
 
-    fn task_view_envelope(&self) -> Option<TaskViewEnvelope> {
+    pub(crate) fn task_view_envelope(&self) -> Option<TaskViewEnvelope> {
         let view = self.repository_view.as_ref()?;
         Some(TaskViewEnvelope {
             task_view_id: self.task_view_id.clone()?,
@@ -289,6 +303,11 @@ impl LocalGraphContext {
 
     fn attach_task_view_to_status(&self, response: &mut StatusResponse) {
         response.task_view = self.task_view_envelope();
+        if let Some(view) = self.repository_view.as_ref() {
+            response.data.task_view_status = Some(task_view_status(view.status));
+            response.data.fallback = (view.status != project::RepositoryViewStatus::Available)
+                .then_some(RetrievalFallback::DirectSourceInspection);
+        }
     }
 
     async fn apply_canonical_invalidation<T>(&self, response: &mut QueryResponse<T>) {
@@ -316,6 +335,16 @@ impl LocalGraphContext {
     }
 }
 
+fn task_view_status(status: project::RepositoryViewStatus) -> TaskViewStatus {
+    match status {
+        project::RepositoryViewStatus::NotBuilt => TaskViewStatus::NotBuilt,
+        project::RepositoryViewStatus::Available => TaskViewStatus::Available,
+        project::RepositoryViewStatus::Stale => TaskViewStatus::Stale,
+        project::RepositoryViewStatus::Unavailable => TaskViewStatus::Unavailable,
+        project::RepositoryViewStatus::Failed => TaskViewStatus::Failed,
+    }
+}
+
 fn canonical_stale_freshness(reference: project::CanonicalGraphReference) -> FreshnessEnvelope {
     FreshnessEnvelope {
         freshness: Freshness::Stale,
@@ -335,6 +364,158 @@ pub(crate) async fn sidecar_path() -> Result<std::path::PathBuf> {
     Ok(project::current_project_data_dir()
         .await?
         .join(SIDECAR_FILE_NAME))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphDoctorObservation {
+    pub(crate) healthy: bool,
+    pub(crate) message: String,
+}
+
+pub(crate) async fn maintain_graph_best_effort() {
+    if let Err(error) = maintain_graph().await {
+        tracing::warn!(
+            error = ?error,
+            "repository graph maintenance failed; orchestration lifecycle is unchanged"
+        );
+    }
+}
+
+pub(crate) async fn maintain_graph() -> Result<GraphMaintenanceReport> {
+    let (config, repository, path) = graph_maintenance_context().await?;
+    if !path.exists() {
+        return Ok(GraphMaintenanceReport::default());
+    }
+    let references = project::repository_graph_retention_references().await?;
+    let protection = RetentionProtection {
+        snapshot_ids: references.snapshot_ids,
+        published_views: references.view_names,
+    };
+    let telemetry_enabled = config.telemetry.enabled;
+    let retention = config.retention.clone();
+    let metric_repository = repository.clone();
+    let report = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut sidecar = match open_for_build_at(&path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        let recovery = sidecar.recover_interrupted_builds()?;
+        let retention = sidecar.collect_garbage(&repository, &retention, &protection)?;
+        Ok(GraphMaintenanceReport {
+            interrupted_builds: recovery.interrupted_builds,
+            expired_refresh_leases: recovery.expired_refresh_leases,
+            ..retention
+        })
+    })
+    .await??;
+    if telemetry_enabled {
+        let encoded = serde_json::to_string(&report)
+            .expect("privacy-safe graph maintenance metrics are always serializable");
+        tracing::info!(
+            target: "ferrus::repository_graph::maintenance",
+            repository_namespace = metric_repository.namespace.as_str(),
+            repository_id = metric_repository.repository_id.as_str(),
+            metric = %encoded,
+            "repository graph maintenance"
+        );
+    }
+    Ok(report)
+}
+
+pub(crate) async fn preview_graph_recovery() -> Result<GraphMaintenanceReport> {
+    let (_, _, path) = graph_maintenance_context().await?;
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        match open_for_query_at(&path)? {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar.preview_recovery(),
+            OpenQuerySidecarResult::Absent
+            | OpenQuerySidecarResult::NeedsMigration { .. }
+            | OpenQuerySidecarResult::RequiresRebuild(_) => Ok(GraphMaintenanceReport::default()),
+        }
+    })
+    .await?
+}
+
+pub(crate) async fn recover_graph_state() -> Result<GraphMaintenanceReport> {
+    maintain_graph().await
+}
+
+pub(crate) async fn graph_doctor_observations() -> Vec<GraphDoctorObservation> {
+    match graph_maintenance_context().await {
+        Ok((config, _, _)) if !config.enabled => {
+            return vec![GraphDoctorObservation {
+                healthy: true,
+                message: "optional repository graph is disabled".to_string(),
+            }];
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return vec![GraphDoctorObservation {
+                healthy: false,
+                message: format!("repository graph configuration is unavailable ({error})"),
+            }];
+        }
+    }
+    let mut observations = Vec::new();
+    match project::canonical_graph_reference().await {
+        Ok(reference) => observations.push(GraphDoctorObservation {
+            healthy: reference.status != project::CanonicalGraphStatus::Stale,
+            message: match reference.status {
+                project::CanonicalGraphStatus::Unknown => {
+                    "canonical repository graph freshness has not been recorded".to_string()
+                }
+                project::CanonicalGraphStatus::Stale => {
+                    "canonical repository graph is stale; run `ferrus graph index`".to_string()
+                }
+                project::CanonicalGraphStatus::Fresh => {
+                    "canonical repository graph has a recorded fresh snapshot".to_string()
+                }
+            },
+        }),
+        Err(error) => observations.push(GraphDoctorObservation {
+            healthy: false,
+            message: format!("canonical repository graph state is unreadable ({error})"),
+        }),
+    }
+    match preview_graph_recovery().await {
+        Ok(report) => observations.push(GraphDoctorObservation {
+            healthy: report.pending_recovery() == 0,
+            message: format!(
+                "repository graph recovery pending: {} interrupted builds, {} expired refresh leases{}",
+                report.interrupted_builds,
+                report.expired_refresh_leases,
+                if report.pending_recovery() == 0 {
+                    ""
+                } else {
+                    "; run `ferrus recover`"
+                }
+            ),
+        }),
+        Err(error) => observations.push(GraphDoctorObservation {
+            healthy: false,
+            message: format!("repository graph recovery state is unreadable ({error})"),
+        }),
+    }
+    observations
+}
+
+async fn graph_maintenance_context()
+-> Result<(RepositoryGraphConfig, RepositoryRef, std::path::PathBuf)> {
+    let root = project::canonical_project_root().await?;
+    let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while maintaining repository graph")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
+    };
+    Ok((config, repository, sidecar_path().await?))
 }
 
 async fn canonical_source_at(
@@ -404,6 +585,13 @@ pub(crate) fn schedule_canonical_refresh_after_approval(
                         "canonical graph refreshed but durable freshness state was not updated"
                     );
                 }
+                maintain_graph_best_effort().await;
+            }
+            Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+                tracing::debug!(
+                    task_id,
+                    "canonical repository graph refresh was deduplicated"
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -438,6 +626,7 @@ async fn refresh_canonical_graph_at(
         manifest_digest: source.manifest().revision.manifest_digest.clone(),
     };
     let sidecar_path = sidecar_path().await?;
+    let indexed_repository = repository.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut sidecar = match open_for_build_at(&sidecar_path)? {
             OpenSidecarResult::Ready(sidecar) => sidecar,
@@ -447,15 +636,33 @@ async fn refresh_canonical_graph_at(
                 reason.supported_schema_version
             ),
         };
-        Ok(IndexCoordinator::new(&mut sidecar).index(
+        let build_id = next_canonical_refresh_build_id()?;
+        let view_name = PublishedViewName::new(CANONICAL_VIEW)?;
+        if sidecar.acquire_refresh_lease(
+            &indexed_repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
+        }
+        let indexed = IndexCoordinator::new(&mut sidecar).index(
             &source,
             &config,
             IndexRequest {
-                build_id: next_canonical_refresh_build_id()?,
-                view_name: PublishedViewName::new(CANONICAL_VIEW)?,
+                build_id: build_id.clone(),
+                view_name: view_name.clone(),
                 force_full: false,
             },
-        )?)
+        );
+        let released =
+            sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
+        let outcome = indexed?;
+        if !released? {
+            anyhow::bail!("canonical repository graph refresh lease was lost");
+        }
+        Ok(outcome)
     })
     .await??;
     debug_assert_eq!(outcome.snapshot.repository, repository);
@@ -532,6 +739,8 @@ pub(crate) async fn schedule_task_baseline_pin(
                 error = ?error,
                 "failed to persist task repository graph baseline; dispatch already continued"
             );
+        } else {
+            maintain_graph_best_effort().await;
         }
     });
 }
@@ -696,30 +905,49 @@ pub(crate) async fn refresh_task_overlay(
         }
         let baseline_files =
             all_snapshot_file_descriptors(&sidecar, &indexed_baseline_snapshot_id)?;
-        let source = TaskOverlaySource::discover(
-            &workspace_root,
-            WorkspaceRef {
-                repository,
-                task_view_id: task_view_id.clone(),
-                baseline_revision,
-            },
-            discovery,
-            baseline_files,
-        )?;
-        if source.overlay_manifest().changes.is_empty() {
-            return Ok(None);
+        let view_name = task_overlay_view_name(&task_view_id)?;
+        let build_id = next_task_overlay_build_id(&task_view_id)?;
+        if sidecar.acquire_refresh_lease(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
         }
-        let overlay_revision_id = source.overlay_manifest().revision_id.clone();
-        let outcome = IndexCoordinator::new(&mut sidecar).index(
-            &source,
-            &config,
-            IndexRequest {
-                build_id: next_task_overlay_build_id(&task_view_id)?,
-                view_name: task_overlay_view_name(&task_view_id)?,
-                force_full: false,
-            },
-        )?;
-        Ok(Some((overlay_revision_id, outcome.snapshot.id)))
+        let refreshed = (|| -> Result<_> {
+            let source = TaskOverlaySource::discover(
+                &workspace_root,
+                WorkspaceRef {
+                    repository: repository.clone(),
+                    task_view_id: task_view_id.clone(),
+                    baseline_revision,
+                },
+                discovery,
+                baseline_files,
+            )?;
+            if source.overlay_manifest().changes.is_empty() {
+                return Ok(None);
+            }
+            let overlay_revision_id = source.overlay_manifest().revision_id.clone();
+            let outcome = IndexCoordinator::new(&mut sidecar).index(
+                &source,
+                &config,
+                IndexRequest {
+                    build_id: build_id.clone(),
+                    view_name: view_name.clone(),
+                    force_full: false,
+                },
+            )?;
+            Ok(Some((overlay_revision_id, outcome.snapshot.id)))
+        })();
+        let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
+        let refreshed = refreshed?;
+        if !released? {
+            anyhow::bail!("task repository graph refresh lease was lost");
+        }
+        Ok(refreshed)
     })
     .await;
 
@@ -738,6 +966,9 @@ pub(crate) async fn refresh_task_overlay(
             baseline_snapshot_id,
             project::RepositoryViewStatus::Available,
         )?,
+        Ok(Err(error)) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+            return Err(error);
+        }
         Ok(Err(error)) => {
             let mut stale = existing.clone().mutable_successor();
             stale.status = project::RepositoryViewStatus::Stale;
@@ -752,6 +983,7 @@ pub(crate) async fn refresh_task_overlay(
         }
     };
     project::record_task_repository_view_at(&database_path, &task_id, &repository_view).await?;
+    maintain_graph_best_effort().await;
     Ok(repository_view)
 }
 
@@ -763,6 +995,9 @@ fn resolved_repository_view(
     match resolved {
         Ok(repository_view) => repository_view,
         Err(error) => {
+            if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() {
+                return existing.unwrap_or_default();
+            }
             tracing::warn!(
                 task_id,
                 error = ?error,
@@ -835,7 +1070,8 @@ async fn resolve_task_baseline(
     let task_id = task_id.to_string();
     let snapshot = tokio::task::spawn_blocking(move || -> Result<_> {
         let identities = active_extractor_identities(&config)?;
-        let discovery = SourceDiscoveryContext::from_config(repository, &config, &identities)?;
+        let discovery =
+            SourceDiscoveryContext::from_config(repository.clone(), &config, &identities)?;
         let inventory = GitWorktreeInventory::discover(&workspace_root, baseline_tree.clone())?;
         if !inventory.changes().is_empty() {
             anyhow::bail!("managed worktree no longer matches its pinned baseline tree");
@@ -849,15 +1085,31 @@ async fn resolve_task_baseline(
                 reason.supported_schema_version
             ),
         };
-        let outcome = IndexCoordinator::new(&mut sidecar).index(
+        let build_id = next_task_baseline_build_id(&task_id)?;
+        let view_name = PublishedViewName::new(format!("task-baseline:{task_id}"))?;
+        if sidecar.acquire_refresh_lease(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
+        }
+        let indexed = IndexCoordinator::new(&mut sidecar).index(
             &source,
             &config,
             IndexRequest {
-                build_id: next_task_baseline_build_id(&task_id)?,
-                view_name: PublishedViewName::new(format!("task-baseline:{task_id}"))?,
+                build_id: build_id.clone(),
+                view_name: view_name.clone(),
                 force_full: false,
             },
-        )?;
+        );
+        let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
+        let outcome = indexed?;
+        if !released? {
+            anyhow::bail!("task baseline repository graph refresh lease was lost");
+        }
         Ok(outcome.snapshot.id)
     })
     .await??;
@@ -1264,6 +1516,8 @@ fn unavailable_status(
             graph_model_version: None,
             statistics: None,
             recommended_action: Some(action),
+            task_view_status: None,
+            fallback: None,
         },
     })
 }
@@ -1285,12 +1539,20 @@ fn query_error(
 }
 
 fn unavailable_task_view_error(status: project::RepositoryViewStatus) -> QueryError {
-    query_error(
+    let mut error = query_error(
         QueryErrorCode::NotBuilt,
         "repository graph is unavailable for the current task baseline; inspect source directly",
         matches!(status, project::RepositoryViewStatus::Stale),
         Some(RetrievalAction::Index),
-    )
+    );
+    error
+        .details
+        .insert("task_view_status".to_string(), status.as_str().to_string());
+    error.details.insert(
+        "fallback".to_string(),
+        "direct_source_inspection".to_string(),
+    );
+    error
 }
 
 #[cfg(test)]
@@ -1350,6 +1612,7 @@ mod tests {
             config: RepositoryGraphConfig::default(),
             repository_view: None,
             task_view_id: None,
+            run_id: None,
         }
     }
 
@@ -1407,6 +1670,40 @@ mod tests {
             Some(RetrievalAction::Index)
         );
         assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn unavailable_task_status_exposes_binding_and_direct_source_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = context(directory.path());
+        context.repository_view = Some(
+            project::RepositoryViewReference::new(
+                None,
+                None,
+                project::RepositoryViewStatus::Unavailable,
+            )
+            .unwrap(),
+        );
+        context.task_view_id = Some(TaskViewId::new("t-001").unwrap());
+        let mut response = unavailable_status(
+            context.repository.clone(),
+            Availability::NotBuilt,
+            "unavailable",
+            RetrievalAction::Index,
+        )
+        .unwrap();
+
+        context.attach_task_view_to_status(&mut response);
+
+        assert_eq!(response.task_view, None);
+        assert_eq!(
+            response.data.task_view_status,
+            Some(TaskViewStatus::Unavailable)
+        );
+        assert_eq!(
+            response.data.fallback,
+            Some(RetrievalFallback::DirectSourceInspection)
+        );
     }
 
     #[test]

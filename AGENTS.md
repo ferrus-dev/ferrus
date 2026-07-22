@@ -91,6 +91,10 @@ Approval must compare actual canonical manifests around integration and rollback
 source identity when canonical content changed; a clean rollback must not record the proposed patch as integrated.
 Schedule any incremental canonical refresh after releasing the approval lock, preserve the last publication on
 failure, and never couple graph outcomes to task status, leases, retries, or review cycles.
+Coordinate graph refreshes with repository/view-scoped sidecar leases, never path/PID ownership. Retention must
+protect baseline/materialized snapshots referenced by non-terminal tasks or runs and every published canonical
+view before collecting completed-task publications, unreferenced snapshots, orphan fragments, or old failed
+builds. Recovery may mark only unfinished graph builds failed and must not mutate orchestration lifecycle state.
 
 **Per-task state machine**: The old single global `STATE.json` is gone, but each SQLite task row still follows the same Supervisor–Executor lifecycle. In `--limit 1` this is effectively the old flow, only DB-backed:
 

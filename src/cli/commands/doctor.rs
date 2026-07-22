@@ -14,6 +14,10 @@ pub async fn run() -> Result<()> {
         let status = if check.ok { "ok" } else { "error" };
         println!("{status}: {}", check.message);
     }
+    for observation in crate::repository_graph_runtime::graph_doctor_observations().await {
+        let status = if observation.healthy { "ok" } else { "warning" };
+        println!("{status}: {}", observation.message);
+    }
 
     for warning in register::legacy_mcp_config_warnings().await? {
         println!("warning: {warning}");
