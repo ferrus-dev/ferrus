@@ -1145,6 +1145,7 @@ mod tests {
             failure_reason: None,
             run_id: None,
             workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            repository_view: project::RepositoryViewReference::default(),
         }
     }
 

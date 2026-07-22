@@ -567,6 +567,57 @@ impl RepositorySource for LocalRepositorySource {
     }
 }
 
+/// A task's immutable baseline identity backed by a still-unmodified managed
+/// worktree during initial dispatch. Reads remain confined to the worktree and
+/// revalidation delegates to the discovered source, while the manifest records
+/// the pinned Git tree instead of the mutable checkout's HEAD tree.
+#[derive(Debug, Clone)]
+pub struct TaskBaselineSource {
+    source: LocalRepositorySource,
+    manifest: SourceManifest,
+}
+
+impl TaskBaselineSource {
+    pub fn discover(
+        root: impl AsRef<Path>,
+        context: SourceDiscoveryContext,
+        baseline_tree: Digest,
+    ) -> Result<Self, SourceError> {
+        let source = LocalRepositorySource::discover(root, context)?;
+        if !matches!(source, LocalRepositorySource::Git(_)) {
+            return Err(SourceError::NotGitRoot);
+        }
+        let mut manifest = source.manifest().clone();
+        set_manifest_source_state(
+            &mut manifest,
+            SourceKind::TaskBaseline,
+            Some(baseline_tree),
+            false,
+        );
+        Ok(Self { source, manifest })
+    }
+}
+
+impl RepositorySource for TaskBaselineSource {
+    type Error = SourceError;
+
+    fn repository(&self) -> &RepositoryRef {
+        &self.manifest.revision.repository
+    }
+
+    fn manifest(&self) -> &SourceManifest {
+        &self.manifest
+    }
+
+    fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error> {
+        self.source.read_verified(file)
+    }
+
+    fn revalidate(&self) -> Result<bool, Self::Error> {
+        self.source.revalidate()
+    }
+}
+
 /// A repository-root-confined reader for file identities persisted in one
 /// immutable graph snapshot. It never discovers source identity from the
 /// process working directory and never follows symbolic links.

@@ -315,6 +315,7 @@ mod tests {
                 repository_id: crate::repository_graph::domain::RepositoryId::new("root").unwrap(),
             },
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
+            repository_view: None,
         }
     }
 

@@ -132,13 +132,19 @@ Implemented in `src/project.rs` with ordered transactional runtime migrations, d
 schema version validation, plus typed task/run repository-view persistence. Existing rows are adopted as
 `not_built` without changing task or run lifecycle fields.
 
-- [ ] #3.1 Pin task and run context to baseline repository snapshots
+- [x] #3.1 Pin task and run context to baseline repository snapshots
 
 ID: rg3.1
 Depends on: rg3.0
 
 Resolve Ferrus baseline Git trees during dispatch, find or build matching graph snapshots best-effort, persist the
 association, pass it through runtime context, and keep task queries pinned when canonical `latest` advances.
+
+Implemented across `src/hq/mod.rs`, `src/project.rs`, `src/repository_graph/source/mod.rs`, and
+`src/repository_graph_runtime.rs`: managed-worktree dispatch schedules a non-blocking, best-effort baseline build
+against the pinned Git tree; task and run records retain the resulting snapshot association; runtime retrieval
+selects that immutable snapshot directly even after canonical publication advances. Missing, changed, or failed
+baseline sources remain explicit graph-view states and do not alter task lifecycle state.
 
 - [ ] #3.2 Implement task worktree overlay manifests and invalidation
 

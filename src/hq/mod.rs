@@ -938,6 +938,12 @@ impl HqContext {
         }
 
         let workspace = prepare_executor_workspace(task_id).await?;
+        crate::repository_graph_runtime::schedule_task_baseline_pin(
+            task_id,
+            &workspace.workspace_dir,
+            workspace.baseline_tree.as_deref(),
+        )
+        .await;
         let mut env = vec![
             (ENV_AGENT_ID, name.to_string()),
             (ENV_TASK_ID, task_id.to_string()),

@@ -238,6 +238,7 @@ pub struct RuntimeTaskContext {
     pub failure_reason: Option<String>,
     pub run_id: Option<String>,
     pub workspace_path: Option<String>,
+    pub repository_view: RepositoryViewReference,
 }
 
 #[derive(Debug, Clone)]
@@ -1457,7 +1458,16 @@ pub async fn record_task_repository_view(
     task_id: &str,
     repository_view: &RepositoryViewReference,
 ) -> Result<()> {
-    record_repository_view("tasks", task_id, repository_view).await
+    let database_path = current_database_path().await?;
+    record_task_repository_view_at(&database_path, task_id, repository_view).await
+}
+
+pub(crate) async fn record_task_repository_view_at(
+    database_path: &Path,
+    task_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    record_repository_view_at(database_path, "tasks", task_id, repository_view).await
 }
 
 #[allow(dead_code)]
@@ -1465,10 +1475,12 @@ pub async fn record_run_repository_view(
     run_id: &str,
     repository_view: &RepositoryViewReference,
 ) -> Result<()> {
-    record_repository_view("runs", run_id, repository_view).await
+    let database_path = current_database_path().await?;
+    record_repository_view_at(&database_path, "runs", run_id, repository_view).await
 }
 
-async fn record_repository_view(
+async fn record_repository_view_at(
+    database_path: &Path,
     owner_table: &'static str,
     owner_id: &str,
     repository_view: &RepositoryViewReference,
@@ -1479,7 +1491,7 @@ async fn record_repository_view(
         repository_view.overlay_revision_id.clone(),
         repository_view.status,
     )?;
-    let database_path = current_database_path().await?;
+    let database_path = database_path.to_path_buf();
     let owner_id = owner_id.to_string();
     let baseline_snapshot_id = repository_view
         .baseline_snapshot_id
@@ -1491,18 +1503,39 @@ async fn record_repository_view(
         .map(|identity| identity.as_str().to_string());
     let status = repository_view.status.as_str();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = open_runtime_database(&database_path)?;
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sql = format!(
             "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
              repository_view_status = ?3 WHERE id = ?4"
         );
-        let updated = connection.execute(
+        let updated = transaction.execute(
             &sql,
-            params![baseline_snapshot_id, overlay_revision_id, status, owner_id],
+            params![
+                baseline_snapshot_id.as_deref(),
+                overlay_revision_id.as_deref(),
+                status,
+                owner_id
+            ],
         )?;
         if updated == 0 {
             anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
         }
+        if owner_table == "tasks" {
+            transaction.execute(
+                r#"
+                UPDATE runs
+                SET baseline_snapshot_id = ?1,
+                    overlay_revision_id = ?2,
+                    repository_view_status = ?3
+                WHERE task_id = ?4
+                  AND baseline_snapshot_id IS NULL
+                  AND repository_view_status IN ('not_built', 'unavailable', 'failed')
+                "#,
+                params![baseline_snapshot_id, overlay_revision_id, status, owner_id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     })
     .await?
@@ -1525,6 +1558,20 @@ fn repository_view_reference_from_database(
         overlay_revision_id,
         RepositoryViewStatus::from_database(&status)?,
     )
+}
+
+fn repository_view_reference_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RepositoryViewReference> {
+    repository_view_reference_from_database((
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+    ))
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(offset, rusqlite::types::Type::Text, error.into())
+    })
 }
 
 pub async fn list_events(limit: usize, run_id: Option<String>) -> Result<Vec<EventRecord>> {
@@ -2722,11 +2769,13 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
             check_retries,
             review_cycles,
             failure_reason,
+            repository_view,
         )) = connection
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_status
                 FROM tasks
                 WHERE claimed_by = ?1
                 ORDER BY
@@ -2747,6 +2796,7 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                         row.get::<_, i64>(6)? as u32,
                         row.get::<_, i64>(7)? as u32,
                         row.get::<_, Option<String>>(8)?,
+                        repository_view_reference_from_row(row, 9)?,
                     ))
                 },
             )
@@ -2766,6 +2816,7 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                 failure_reason,
                 run_id: run.as_ref().map(|run| run.id.clone()),
                 workspace_path: run.map(|run| run.workspace_path),
+                repository_view,
             }));
         }
 
@@ -2775,7 +2826,9 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                 SELECT runs.id, runs.workspace_path,
                        tasks.id, tasks.path, tasks.spec_path, tasks.milestone_id,
                        tasks.status, tasks.paused_status,
-                       tasks.check_retries, tasks.review_cycles, tasks.failure_reason
+                       tasks.check_retries, tasks.review_cycles, tasks.failure_reason,
+                       tasks.baseline_snapshot_id, tasks.overlay_revision_id,
+                       tasks.repository_view_status
                 FROM runs
                 JOIN tasks ON tasks.id = runs.task_id
                 WHERE runs.agent = ?1 AND runs.status IN ('running', 'checking', 'reviewing')
@@ -2800,6 +2853,7 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                         failure_reason: row.get(10)?,
                         run_id: Some(run_id),
                         workspace_path: Some(workspace_path),
+                        repository_view: repository_view_reference_from_row(row, 11)?,
                     })
                 },
             )
@@ -2901,7 +2955,9 @@ fn consultation_context_for_run(
             r#"
             SELECT tasks.id, tasks.path, tasks.spec_path, tasks.milestone_id,
                    tasks.status, tasks.paused_status,
-                   tasks.check_retries, tasks.review_cycles, tasks.failure_reason
+                   tasks.check_retries, tasks.review_cycles, tasks.failure_reason,
+                   tasks.baseline_snapshot_id, tasks.overlay_revision_id,
+                   tasks.repository_view_status
             FROM runs
             JOIN tasks ON tasks.id = runs.task_id
             WHERE runs.id = ?1 AND tasks.status = ?2
@@ -2923,6 +2979,7 @@ fn consultation_context_for_run(
                     failure_reason: row.get(8)?,
                     run_id: Some(run_id.to_string()),
                     workspace_path: None,
+                    repository_view: repository_view_reference_from_row(row, 9)?,
                 })
             },
         )
@@ -3038,14 +3095,21 @@ pub async fn record_run_started_for_task_with_workspace(
         connection.execute(
             r#"
             INSERT INTO runs (
-                id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path
+                id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path,
+                baseline_snapshot_id, overlay_revision_id, repository_view_status
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                   baseline_snapshot_id, overlay_revision_id, repository_view_status
+            FROM tasks
+            WHERE id = ?2
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 updated_at = excluded.updated_at,
                 pid = excluded.pid,
-                workspace_path = excluded.workspace_path
+                workspace_path = excluded.workspace_path,
+                baseline_snapshot_id = excluded.baseline_snapshot_id,
+                overlay_revision_id = excluded.overlay_revision_id,
+                repository_view_status = excluded.repository_view_status
             "#,
             params![
                 record_for_insert.id,
@@ -3131,7 +3195,17 @@ pub async fn attach_running_run_to_task(
         };
 
         connection.execute(
-            "UPDATE runs SET task_id = ?1, updated_at = ?2 WHERE id = ?3",
+            r#"
+            UPDATE runs
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
+            WHERE id = ?3
+            "#,
             params![task_id, timestamp(), run_id],
         )?;
         insert_event(
@@ -3185,7 +3259,8 @@ pub async fn attach_running_run_to_next_consultation(
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_status
                 FROM tasks
                 WHERE status = ?1
                   AND NOT EXISTS (
@@ -3213,6 +3288,7 @@ pub async fn attach_running_run_to_next_consultation(
                         failure_reason: row.get(8)?,
                         run_id: Some(run_id.clone()),
                         workspace_path: None,
+                        repository_view: repository_view_reference_from_row(row, 9)?,
                     })
                 },
             )
@@ -3226,7 +3302,13 @@ pub async fn attach_running_run_to_next_consultation(
         let attached = transaction.execute(
             r#"
             UPDATE runs
-            SET task_id = ?1, updated_at = ?2
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
             WHERE id = ?3
               AND NOT EXISTS (
                   SELECT 1
@@ -3282,7 +3364,8 @@ pub async fn attach_running_run_to_consultation(
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_status
                 FROM tasks
                 WHERE id = ?1
                   AND status = ?2
@@ -3310,6 +3393,7 @@ pub async fn attach_running_run_to_consultation(
                         failure_reason: row.get(8)?,
                         run_id: Some(run_id.clone()),
                         workspace_path: None,
+                        repository_view: repository_view_reference_from_row(row, 9)?,
                     })
                 },
             )
@@ -3323,7 +3407,13 @@ pub async fn attach_running_run_to_consultation(
         let attached = transaction.execute(
             r#"
             UPDATE runs
-            SET task_id = ?1, updated_at = ?2
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
             WHERE id = ?3
               AND NOT EXISTS (
                   SELECT 1
@@ -5453,29 +5543,33 @@ mod tests {
     async fn repository_view_references_round_trip_for_tasks_and_runs() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let (_dir, previous) = setup_project().await;
-        record_run_started_for_task_with_workspace(
-            "r-view",
-            "executor",
-            "codex",
-            42,
-            Some("t-001"),
-            "/tmp/worktree".to_string(),
-        )
-        .await
-        .unwrap();
         let repository_view = RepositoryViewReference::new(
             Some(SnapshotId::new("snapshot-baseline").unwrap()),
             Some(OverlayRevisionId::new("overlay-1").unwrap()),
             RepositoryViewStatus::Stale,
         )
         .unwrap();
-
         record_task_repository_view("t-001", &repository_view)
             .await
             .unwrap();
-        record_run_repository_view("r-view", &repository_view)
-            .await
-            .unwrap();
+        claim_task(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            "executor:codex:t-001",
+            60,
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-view",
+            "executor",
+            "executor:codex:t-001",
+            42,
+            Some("t-001"),
+            "/tmp/worktree".to_string(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             task_repository_view("t-001").await.unwrap(),
@@ -5483,6 +5577,47 @@ mod tests {
         );
         assert_eq!(
             run_repository_view("r-view").await.unwrap(),
+            Some(repository_view.clone())
+        );
+        assert_eq!(
+            runtime_task_context_for_agent("executor:codex:t-001")
+                .await
+                .unwrap()
+                .unwrap()
+                .repository_view,
+            repository_view
+        );
+
+        record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-late-pin",
+            "executor",
+            "executor:codex:t-002",
+            43,
+            Some("t-002"),
+            "/tmp/worktree-2".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_repository_view("r-late-pin")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RepositoryViewStatus::NotBuilt
+        );
+        record_task_repository_view("t-002", &repository_view)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_repository_view("r-late-pin").await.unwrap(),
             Some(repository_view)
         );
         teardown(previous);
