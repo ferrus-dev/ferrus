@@ -316,6 +316,7 @@ mod tests {
             },
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
+            task_view_id: None,
         }
     }
 

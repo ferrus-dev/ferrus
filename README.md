@@ -252,6 +252,11 @@ repository-relative evidence spans, provenance, and any truncation. CLI limits a
 `[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
 `ferrus.db`; it stores structural facts and content identities, not source bodies.
 
+Managed Executor worktrees use a task-owned graph view pinned to the dispatch baseline. `/check` and the final
+submit gate refresh its changed-file overlay best-effort: unchanged fragments are reused, changed and added files
+replace or extend the view, and deleted paths hide baseline facts. Task-view responses include both the baseline
+snapshot and overlay revision; a graph refresh failure never changes task lifecycle state.
+
 Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
 Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically

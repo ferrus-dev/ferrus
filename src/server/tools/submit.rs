@@ -84,6 +84,8 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
 
     if config.checks.commands.is_empty() {
         info!("No check commands configured; treating final check gate as pass");
+        crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context)
+            .await;
         project::record_task_check_passed(&context.task_id).await?;
         write_submission(&context, &content).await?;
         write_submission_patch(&context).await?;
@@ -107,7 +109,9 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         .run_id
         .as_deref()
         .unwrap_or(context.task_id.as_str());
-    match check_gate::run(&config, attempt, log_scope).await? {
+    let gate = check_gate::run(&config, attempt, log_scope).await?;
+    crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context).await;
+    match gate {
         CheckGateResult::Passed => {
             project::record_task_check_passed(&context.task_id).await?;
             write_submission(&context, &content).await?;

@@ -160,13 +160,20 @@ revisions, effective-policy source descriptors, hash-verified changed-file reads
 capture, graph baseline validation, and submission patch inventory now share these primitives without mutating the
 Executor's real Git index. Overlay graph composition and query routing remain scoped to rg3.3.
 
-- [ ] #3.3 Compose baseline and overlay graph views
+- [x] #3.3 Compose baseline and overlay graph views
 
 ID: rg3.3
 Depends on: rg3.2
 
 Analyze changed fragments, hide deleted baseline facts, re-resolve affected edges, provide task-scoped search,
 context, and verified snippets, and return explicit baseline and overlay identities.
+
+Implemented with an effective `TaskOverlaySource` that combines pinned baseline descriptors with the
+policy-filtered worktree delta, reads unchanged bytes from immutable Git objects, and lets the content-addressed
+fragment cache avoid reparsing unchanged files before complete-view relationship resolution. Task-owned
+publications are isolated by `TaskViewId`; `/check` and the final submit gate refresh them best-effort without
+coupling failures to task lifecycle, while retrieval remains read-only. Search, context, status, and verified
+snippets route through the composed snapshot and return the explicit baseline snapshot plus overlay revision.
 
 - [ ] #3.4 Freeze submitted views and route role-specific retrieval
 

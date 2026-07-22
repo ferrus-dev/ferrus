@@ -26,6 +26,6 @@ mod contracts;
 /// Schema-independent graph model version.
 pub const GRAPH_MODEL_VERSION: u32 = 1;
 /// Version of the repository retrieval request/response JSON contract.
-pub const QUERY_WIRE_VERSION: u32 = 2;
+pub const QUERY_WIRE_VERSION: u32 = 3;
 /// Version of the extractor input/output contract.
 pub const EXTRACTOR_CONTRACT_VERSION: u32 = 2;

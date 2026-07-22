@@ -1,5 +1,5 @@
 {
-  "wire_version": 2,
+  "wire_version": 3,
   "repository": {
     "namespace": "local:test",
     "repository_id": "root"

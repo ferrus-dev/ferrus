@@ -12,11 +12,14 @@ use serde::Serialize;
 use super::{
     LocalRepositorySource, SourceContent, SourceDiscoveryContext, SourceError,
     git::{canonical_root, ensure_worktree_root, git_command, trim_ascii},
-    sha256_digest,
+    manifest_digest, revision_id, sha256_digest,
 };
 use crate::repository_graph::{
-    domain::{Digest, OverlayRevisionId, RepoPath, WorkspaceRef},
-    ports::{OverlayChangeKind, OverlayFileChange, SourceFileDescriptor, WorkspaceOverlayManifest},
+    domain::{Digest, OverlayRevisionId, RepoPath, SourceKind, SourceRevision, WorkspaceRef},
+    ports::{
+        OverlayChangeKind, OverlayFileChange, RepositorySource, SourceDiscoveryMetrics,
+        SourceFileDescriptor, SourceManifest, WorkspaceOverlayManifest,
+    },
 };
 
 static TEMPORARY_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +46,7 @@ pub struct GitWorktreeInventory {
     root: PathBuf,
     baseline_revision: Digest,
     baseline_paths: Vec<RepoPath>,
+    baseline_objects: BTreeMap<RepoPath, String>,
     tracked_paths: Vec<RepoPath>,
     untracked_paths: Vec<RepoPath>,
     changes: Vec<GitWorktreeChange>,
@@ -77,6 +81,10 @@ impl GitWorktreeInventory {
             root,
             baseline_revision,
             baseline_paths: baseline_entries.keys().cloned().collect(),
+            baseline_objects: baseline_entries
+                .iter()
+                .map(|(path, entry)| (path.clone(), entry.object_id.clone()))
+                .collect(),
             tracked_paths,
             untracked_paths,
             changes,
@@ -95,6 +103,10 @@ impl GitWorktreeInventory {
         &self.baseline_paths
     }
 
+    fn baseline_object(&self, path: &RepoPath) -> Option<&str> {
+        self.baseline_objects.get(path).map(String::as_str)
+    }
+
     pub fn tracked_paths(&self) -> &[RepoPath] {
         &self.tracked_paths
     }
@@ -105,6 +117,190 @@ impl GitWorktreeInventory {
 
     pub fn changes(&self) -> &[GitWorktreeChange] {
         &self.changes
+    }
+}
+
+/// Effective task source composed from immutable baseline descriptors and the
+/// policy-filtered worktree delta. Unchanged bytes are read from the pinned Git
+/// tree, while changed bytes cross the worktree's hash-verifying boundary.
+/// This lets the indexer reuse cached baseline fragments and parse only changed
+/// paths while still running cross-file resolution over the complete view.
+#[derive(Debug, Clone)]
+pub struct TaskOverlaySource {
+    inventory: GitWorktreeInventory,
+    overlay: TaskWorktreeOverlay,
+    manifest: SourceManifest,
+    baseline_files: BTreeMap<RepoPath, SourceFileDescriptor>,
+}
+
+impl TaskOverlaySource {
+    pub fn discover(
+        root: impl AsRef<Path>,
+        workspace: WorkspaceRef,
+        context: SourceDiscoveryContext,
+        baseline_files: Vec<SourceFileDescriptor>,
+    ) -> Result<Self, SourceError> {
+        let inventory =
+            GitWorktreeInventory::discover(root.as_ref(), workspace.baseline_revision.clone())?;
+        let overlay = TaskWorktreeOverlay::discover(root, workspace.clone(), context.clone())?;
+        let baseline_files = baseline_files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<BTreeMap<_, _>>();
+        if baseline_files
+            .keys()
+            .any(|path| inventory.baseline_object(path).is_none())
+        {
+            return Err(SourceError::FileNotInManifest);
+        }
+
+        let mut effective_files = baseline_files.clone();
+        for change in &overlay.manifest().changes {
+            match &change.current_file {
+                Some(file) => {
+                    effective_files.insert(change.path.clone(), file.clone());
+                }
+                None => {
+                    effective_files.remove(&change.path);
+                }
+            }
+        }
+        let files = effective_files.into_values().collect::<Vec<_>>();
+        let included = files.len() as u64;
+        let effective_manifest_digest = manifest_digest(&files, &context.source_policy_digest);
+        let source_manifest_digest = composed_manifest_digest(
+            &effective_manifest_digest,
+            &overlay.manifest().manifest_digest,
+        );
+        let dirty = !overlay.manifest().changes.is_empty();
+        let includes_untracked = overlay
+            .manifest()
+            .changes
+            .iter()
+            .any(|change| change.kind == OverlayChangeKind::Added);
+        let source_kind = SourceKind::WorkspaceOverlay;
+        let base_revision = Some(workspace.baseline_revision.clone());
+        let source_revision = SourceRevision {
+            id: revision_id(
+                &workspace.repository,
+                source_kind,
+                base_revision.as_ref(),
+                &source_manifest_digest,
+                &context.analysis_config_digest,
+                dirty,
+                includes_untracked,
+            ),
+            repository: workspace.repository,
+            source_kind,
+            base_revision,
+            manifest_digest: source_manifest_digest,
+            analysis_config_digest: context.analysis_config_digest.clone(),
+            dirty,
+            includes_untracked,
+        };
+        let total_bytes = files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.byte_len));
+        let manifest = SourceManifest {
+            revision: source_revision,
+            extractor_set_digest: context.extractor_set_digest.clone(),
+            files,
+            diagnostics: overlay.manifest().diagnostics.clone(),
+            metrics: SourceDiscoveryMetrics {
+                included,
+                total_bytes,
+                ..overlay.manifest().metrics.clone()
+            },
+        };
+
+        Ok(Self {
+            inventory,
+            overlay,
+            manifest,
+            baseline_files,
+        })
+    }
+
+    pub fn overlay_manifest(&self) -> &WorkspaceOverlayManifest {
+        self.overlay.manifest()
+    }
+
+    fn read_baseline_verified(
+        &self,
+        file: &SourceFileDescriptor,
+    ) -> Result<SourceContent, SourceError> {
+        if self.baseline_files.get(&file.path) != Some(file) {
+            return Err(SourceError::FileNotInManifest);
+        }
+        let object_id = self
+            .inventory
+            .baseline_object(&file.path)
+            .ok_or(SourceError::FileNotInManifest)?;
+        let output = run_git(
+            &self.inventory.root,
+            &["cat-file", "blob", object_id],
+            "read pinned baseline blob",
+        )?;
+        if output.stdout.len() as u64 != file.byte_len
+            || sha256_digest(&output.stdout) != file.content_identity
+        {
+            return Err(SourceError::ContentChanged);
+        }
+        Ok(SourceContent {
+            bytes: output.stdout,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ComposedManifestIdentity<'a> {
+    version: u32,
+    effective_manifest_digest: &'a Digest,
+    overlay_manifest_digest: &'a Digest,
+}
+
+fn composed_manifest_digest(
+    effective_manifest_digest: &Digest,
+    overlay_manifest_digest: &Digest,
+) -> Digest {
+    sha256_digest(
+        &serde_json::to_vec(&ComposedManifestIdentity {
+            version: 1,
+            effective_manifest_digest,
+            overlay_manifest_digest,
+        })
+        .expect("canonical composed manifest serialization cannot fail"),
+    )
+}
+
+impl RepositorySource for TaskOverlaySource {
+    type Error = SourceError;
+
+    fn repository(&self) -> &crate::repository_graph::domain::RepositoryRef {
+        &self.manifest.revision.repository
+    }
+
+    fn manifest(&self) -> &SourceManifest {
+        &self.manifest
+    }
+
+    fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error> {
+        if self
+            .overlay
+            .manifest()
+            .changes
+            .iter()
+            .filter_map(|change| change.current_file.as_ref())
+            .any(|changed| changed == file)
+        {
+            self.overlay.read_verified(file)
+        } else {
+            self.read_baseline_verified(file)
+        }
+    }
+
+    fn revalidate(&self) -> Result<bool, Self::Error> {
+        self.overlay.revalidate()
     }
 }
 
@@ -828,5 +1024,82 @@ mod tests {
             Err(SourceError::ContentChanged)
         ));
         assert!(!overlay.revalidate().unwrap());
+    }
+
+    #[test]
+    fn composed_overlay_replaces_changed_paths_hides_deletions_and_reads_baseline_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        initialize(root);
+        fs::write(root.join("changed.rs"), "pub struct Before;\n").unwrap();
+        fs::write(root.join("deleted.rs"), "pub struct Deleted;\n").unwrap();
+        fs::write(root.join("unchanged.rs"), "pub struct Unchanged;\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "baseline"]);
+        let baseline = parse_git_tree_digest(&git(root, &["rev-parse", "HEAD^{tree}"])).unwrap();
+        let config = RepositoryGraphConfig::default();
+        let context = SourceDiscoveryContext::from_config(repository(), &config, &[]).unwrap();
+        let baseline_source = LocalRepositorySource::discover(root, context.clone()).unwrap();
+        let baseline_manifest_digest = baseline_source.manifest().revision.manifest_digest.clone();
+        let baseline_files = baseline_source.manifest().files.clone();
+
+        fs::write(root.join("changed.rs"), "pub struct After;\n").unwrap();
+        fs::remove_file(root.join("deleted.rs")).unwrap();
+        fs::write(root.join("added.rs"), "pub struct Added;\n").unwrap();
+        let composed = TaskOverlaySource::discover(
+            root,
+            workspace("task-composed", baseline.clone()),
+            context,
+            baseline_files,
+        )
+        .unwrap();
+
+        let files = composed
+            .manifest()
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(files.contains(&"added.rs"));
+        assert!(files.contains(&"changed.rs"));
+        assert!(files.contains(&"unchanged.rs"));
+        assert!(!files.contains(&"deleted.rs"));
+        assert_eq!(
+            composed.manifest().revision.source_kind,
+            SourceKind::WorkspaceOverlay
+        );
+        assert_eq!(
+            composed.manifest().revision.base_revision.as_ref(),
+            Some(&baseline)
+        );
+        assert_ne!(
+            composed.manifest().revision.manifest_digest,
+            baseline_manifest_digest
+        );
+
+        let changed = composed
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == "changed.rs")
+            .unwrap();
+        let unchanged = composed
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == "unchanged.rs")
+            .unwrap();
+        assert_eq!(
+            composed.read_verified(changed).unwrap().bytes,
+            b"pub struct After;\n"
+        );
+        assert_eq!(
+            composed.read_verified(unchanged).unwrap().bytes,
+            b"pub struct Unchanged;\n"
+        );
+        assert!(composed.revalidate().unwrap());
+
+        fs::write(root.join("unchanged.rs"), "pub struct NowChanged;\n").unwrap();
+        assert!(!composed.revalidate().unwrap());
     }
 }

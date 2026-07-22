@@ -77,6 +77,10 @@ an exact path or symbol, and request a small bounded context packet only when it
 and hash-verified; graph output is not automatically added to prompts. These tools never build or publish an index
 and do not require a claimed task.
 
+For a managed Executor worktree, `/check` and the final submit gate refresh a task-owned overlay best-effort.
+Repository retrieval stays read-only and returns the pinned baseline snapshot together with the overlay revision;
+graph refresh failures never change task lifecycle state.
+
 <!-- ferrus-supervisor-instructions -->
 ## Ferrus Supervisor
 

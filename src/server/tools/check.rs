@@ -47,6 +47,8 @@ async fn run(agent_id: Option<&str>) -> Result<String> {
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     if config.checks.commands.is_empty() {
+        crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context)
+            .await;
         project::record_task_check_passed(&context.task_id).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
@@ -67,7 +69,9 @@ async fn run(agent_id: Option<&str>) -> Result<String> {
         .run_id
         .as_deref()
         .unwrap_or(context.task_id.as_str());
-    match check_gate::run(&config, attempt, log_scope).await? {
+    let gate = check_gate::run(&config, attempt, log_scope).await?;
+    crate::repository_graph_runtime::refresh_task_overlay_best_effort_for_context(&context).await;
+    match gate {
         CheckGateResult::Passed => {
             project::record_task_check_passed(&context.task_id).await?;
             project::record_runtime_event_best_effort(

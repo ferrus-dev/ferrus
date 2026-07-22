@@ -48,8 +48,8 @@ pub use super::ports::{SourceContent, SourceDiagnostic, SourceDiscoveryMetrics, 
 pub use filesystem::FilesystemRepositorySource;
 pub use git::GitRepositorySource;
 pub use worktree::{
-    GitWorktreeChange, GitWorktreeInventory, TaskWorktreeOverlay, capture_worktree_tree,
-    parse_git_tree_digest,
+    GitWorktreeChange, GitWorktreeInventory, TaskOverlaySource, TaskWorktreeOverlay,
+    capture_worktree_tree, parse_git_tree_digest,
 };
 
 const SOURCE_MANIFEST_VERSION: u32 = 1;
@@ -1293,7 +1293,10 @@ struct CanonicalManifest<'a> {
     files: &'a [SourceFileDescriptor],
 }
 
-fn manifest_digest(files: &[SourceFileDescriptor], source_policy_digest: &Digest) -> Digest {
+pub(super) fn manifest_digest(
+    files: &[SourceFileDescriptor],
+    source_policy_digest: &Digest,
+) -> Digest {
     let canonical = CanonicalManifest {
         version: SOURCE_MANIFEST_VERSION,
         source_policy_version: SOURCE_POLICY_VERSION,
@@ -1318,7 +1321,7 @@ struct CanonicalRevision<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn revision_id(
+pub(super) fn revision_id(
     repository: &RepositoryRef,
     source_kind: SourceKind,
     base_revision: Option<&Digest>,

@@ -13,9 +13,9 @@ use super::{
     QUERY_WIRE_VERSION,
     domain::{
         Availability, BuildId, BuildState, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity,
-        Digest, EdgeId, EdgeTarget, FactProvenance, Freshness, GraphNode, NodeId, PageCursor,
-        PublishedViewName, QueryBudget, RepoPath, RepositoryRef, SemanticKey, SnapshotId,
-        SourceRevisionId, SourceSpan,
+        Digest, EdgeId, EdgeTarget, FactProvenance, Freshness, GraphNode, NodeId,
+        OverlayRevisionId, PageCursor, PublishedViewName, QueryBudget, RepoPath, RepositoryRef,
+        SemanticKey, SnapshotId, SourceRevisionId, SourceSpan, TaskViewId,
     },
 };
 
@@ -171,6 +171,16 @@ pub struct SourceRevisionEnvelope {
     pub manifest_digest: Digest,
 }
 
+/// Explicit task-view identity returned alongside the materialized query
+/// snapshot. The snapshot may be shared by equivalent overlays, while this
+/// pair preserves the task-owned baseline and overlay authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskViewEnvelope {
+    pub task_view_id: TaskViewId,
+    pub baseline_snapshot_id: SnapshotId,
+    pub overlay_revision_id: Option<OverlayRevisionId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalAction {
@@ -202,6 +212,8 @@ pub struct QueryResponse<T> {
     pub repository: RepositoryRef,
     pub snapshot_id: SnapshotId,
     pub source_revision: SourceRevisionEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_view: Option<TaskViewEnvelope>,
     pub freshness: FreshnessEnvelope,
     pub diagnostics: DiagnosticsEnvelope,
     pub page: PageInfo,
@@ -226,6 +238,8 @@ pub struct StatusResponse {
     pub repository: RepositoryRef,
     pub snapshot_id: Option<SnapshotId>,
     pub source_revision: Option<SourceRevisionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_view: Option<TaskViewEnvelope>,
     pub freshness: FreshnessEnvelope,
     pub diagnostics: DiagnosticsEnvelope,
     pub page: PageInfo,
@@ -547,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn search_request_serialization_matches_v2_fixture() {
+    fn search_request_serialization_matches_v3_fixture() {
         let request = SearchRequest {
             scope: QueryScope::current(
                 repository(),
@@ -561,7 +575,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&request).unwrap(),
-            include_str!("fixtures/query_v2_search.json")
+            include_str!("fixtures/query_v3_search.json")
                 .trim()
                 .replace("\r\n", "\n")
         );
@@ -582,14 +596,14 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&error).unwrap(),
-            include_str!("fixtures/query_v2_error.json")
+            include_str!("fixtures/query_v3_error.json")
                 .trim()
                 .replace("\r\n", "\n")
         );
     }
 
     #[test]
-    fn status_response_serialization_matches_v2_envelope_fixture() {
+    fn status_response_serialization_matches_v3_envelope_fixture() {
         let response = StatusResponse {
             wire_version: QUERY_WIRE_VERSION,
             repository: repository(),
@@ -598,6 +612,7 @@ mod tests {
                 id: SourceRevisionId::new("revision-1").unwrap(),
                 manifest_digest: Digest::new("sha256", "00").unwrap(),
             }),
+            task_view: None,
             freshness: FreshnessEnvelope {
                 freshness: Freshness::Fresh,
                 compared_manifest: Some(Digest::new("sha256", "00").unwrap()),
@@ -625,7 +640,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string_pretty(&response).unwrap(),
-            include_str!("fixtures/query_v2_status.json")
+            include_str!("fixtures/query_v3_status.json")
                 .trim()
                 .replace("\r\n", "\n")
         );

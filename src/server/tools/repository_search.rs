@@ -285,6 +285,7 @@ mod tests {
             },
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
+            task_view_id: None,
         };
         let input = parse_input(serde_json::json!({
             "query": "  crate::api  ",
@@ -322,6 +323,7 @@ mod tests {
             },
             config: crate::repository_graph::config::RepositoryGraphConfig::default(),
             repository_view: None,
+            task_view_id: None,
         };
 
         let invalid_path = parse_input(serde_json::json!({

@@ -79,6 +79,11 @@ runs, events, or either database. Do not inject graph output into task/review pr
 source bodies; requested snippets must pass the snapshot-aware, hash-verified content boundary. Treat missing
 relationships as unknown, not absent.
 
+**Task graph overlays**: managed Executor worktrees query a task-owned publication composed from the pinned
+baseline and the last successful changed-file overlay refresh. `/check` and the final submit gate refresh that
+overlay best-effort; graph failures must not change task/run lifecycle. Keep retrieval tools read-only. Reuse
+baseline fragments for unchanged files, remove deleted-path facts, and return explicit baseline/overlay identities.
+
 **Per-task state machine**: The old single global `STATE.json` is gone, but each SQLite task row still follows the same Supervisor–Executor lifecycle. In `--limit 1` this is effectively the old flow, only DB-backed:
 
 ```
