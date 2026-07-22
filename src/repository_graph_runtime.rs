@@ -1052,26 +1052,23 @@ async fn resolve_task_baseline(
     baseline_tree: Option<&str>,
     existing: Option<&project::RepositoryViewReference>,
 ) -> Result<project::RepositoryViewReference> {
-    if let Some(existing) = existing {
-        if let Some(snapshot_id) = existing.baseline_snapshot_id.as_ref() {
-            let retained = match open_for_query_at(&sidecar_path) {
-                Ok(OpenQuerySidecarResult::Ready(sidecar)) => sidecar
-                    .snapshot(snapshot_id)
-                    .context("Failed to inspect the pinned baseline snapshot")?
-                    .is_some(),
-                _ => false,
-            };
-            let mut retained_view = existing.clone().mutable_successor();
-            retained_view.status = if retained {
-                existing.status
-            } else {
-                project::RepositoryViewStatus::Stale
-            };
-            return Ok(retained_view);
-        }
-        if existing.status != project::RepositoryViewStatus::NotBuilt {
-            return Ok(existing.clone());
-        }
+    if let Some(existing) = existing
+        && let Some(snapshot_id) = existing.baseline_snapshot_id.as_ref()
+    {
+        let retained = match open_for_query_at(&sidecar_path) {
+            Ok(OpenQuerySidecarResult::Ready(sidecar)) => sidecar
+                .snapshot(snapshot_id)
+                .context("Failed to inspect the pinned baseline snapshot")?
+                .is_some(),
+            _ => false,
+        };
+        let mut retained_view = existing.clone().mutable_successor();
+        retained_view.status = if retained {
+            existing.status
+        } else {
+            project::RepositoryViewStatus::Stale
+        };
+        return Ok(retained_view);
     }
     if !context.config.enabled || baseline_tree.is_none() {
         return project::RepositoryViewReference::new(
@@ -2155,6 +2152,30 @@ mod tests {
                 .status,
             project::TaskStatus::Executing.as_str()
         );
+
+        std::fs::write(root.join("src/lib.rs"), "pub struct BaselineSymbol;\n").unwrap();
+        std::fs::write(root.join("src/deleted.rs"), "pub struct DeletedSymbol;\n").unwrap();
+        std::fs::remove_file(root.join("src/added.rs")).unwrap();
+        schedule_task_baseline_pin("t-002", root, Some(&baseline_tree)).await;
+        for _ in 0..100 {
+            if project::task_repository_view("t-002")
+                .await
+                .unwrap()
+                .is_some_and(|view| view.status == project::RepositoryViewStatus::Available)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let retried_view = project::task_repository_view("t-002")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retried_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        assert!(retried_view.baseline_snapshot_id.is_some());
 
         std::fs::write(root.join("src/lib.rs"), "pub struct AgentEdit;\n").unwrap();
         project::record_task_status(

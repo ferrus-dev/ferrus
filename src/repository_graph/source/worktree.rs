@@ -752,9 +752,10 @@ fn untracked_matches_baseline(
     path: &RepoPath,
     baseline: &BaselineEntry,
 ) -> Result<bool, SourceError> {
+    let filter_path = format!("--path={}", path.as_str());
     let output = run_git(
         root,
-        &["hash-object", "--no-filters", "--", path.as_str()],
+        &["hash-object", &filter_path, "--", path.as_str()],
         "hash baseline-seeded worktree path",
     )?;
     let object_id =
@@ -991,6 +992,24 @@ mod tests {
 
         assert!(inventory.changes().is_empty());
         assert_eq!(git(root, &["ls-files", "--stage"]), index_before);
+    }
+
+    #[test]
+    fn captured_untracked_files_are_compared_with_git_path_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        initialize(root);
+        fs::write(root.join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+        fs::write(root.join("seeded.txt"), b"seeded\r\n").unwrap();
+
+        let captured = capture_worktree_tree(root).unwrap();
+        let inventory = GitWorktreeInventory::discover(root, captured.clone()).unwrap();
+
+        assert_eq!(
+            git(root, &["show", &format!("{}:seeded.txt", captured.value())]),
+            "seeded"
+        );
+        assert!(inventory.changes().is_empty());
     }
 
     #[test]
