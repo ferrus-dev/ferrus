@@ -576,13 +576,14 @@ impl RepositorySource for LocalRepositorySource {
     }
 }
 
-/// A task's immutable baseline identity backed by a still-unmodified managed
-/// worktree during initial dispatch. Reads remain confined to the worktree and
-/// revalidation delegates to the discovered source, while the manifest records
-/// the pinned Git tree instead of the mutable checkout's HEAD tree.
+/// A task's immutable baseline read directly from its pinned Git tree.
+///
+/// The managed worktree is used only to locate the repository object database;
+/// discovery, extractor reads, and revalidation never observe checkout bytes.
 #[derive(Debug, Clone)]
 pub struct TaskBaselineSource {
-    source: LocalRepositorySource,
+    root: PathBuf,
+    baseline_tree: Digest,
     manifest: SourceManifest,
 }
 
@@ -592,18 +593,14 @@ impl TaskBaselineSource {
         context: SourceDiscoveryContext,
         baseline_tree: Digest,
     ) -> Result<Self, SourceError> {
-        let source = LocalRepositorySource::discover(root, context)?;
-        if !matches!(source, LocalRepositorySource::Git(_)) {
-            return Err(SourceError::NotGitRoot);
-        }
-        let mut manifest = source.manifest().clone();
-        set_manifest_source_state(
-            &mut manifest,
-            SourceKind::TaskBaseline,
-            Some(baseline_tree),
-            false,
-        );
-        Ok(Self { source, manifest })
+        let root = git::canonical_root(root.as_ref())?;
+        git::ensure_worktree_root(&root)?;
+        let manifest = worktree::discover_tree_manifest(&root, &context, baseline_tree.clone())?;
+        Ok(Self {
+            root,
+            baseline_tree,
+            manifest,
+        })
     }
 }
 
@@ -619,11 +616,14 @@ impl RepositorySource for TaskBaselineSource {
     }
 
     fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error> {
-        self.source.read_verified(file)
+        if !self.manifest.files.iter().any(|stored| stored == file) {
+            return Err(SourceError::FileNotInManifest);
+        }
+        worktree::read_tree_descriptor_verified(&self.root, &self.baseline_tree, file)
     }
 
     fn revalidate(&self) -> Result<bool, Self::Error> {
-        self.source.revalidate()
+        worktree::verify_tree_available(&self.root, &self.baseline_tree).map(|()| true)
     }
 }
 
@@ -2018,6 +2018,48 @@ mod tests {
 
         let response = reader.read_verified(&content_request(&file)).unwrap();
         assert_eq!(response.bytes, original);
+    }
+
+    #[test]
+    fn task_baseline_discovery_and_reads_ignore_worktree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let original = b"pub struct Baseline;\n";
+        std::fs::write(directory.path().join("src/lib.rs"), original).unwrap();
+        let tree = capture_worktree_tree(directory.path()).unwrap();
+        let context = SourceDiscoveryContext::from_config(
+            test_repository(),
+            &RepositoryGraphConfig::default(),
+            &[],
+        )
+        .unwrap();
+
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            b"pub struct ExecutorEdit;\n",
+        )
+        .unwrap();
+        let source = TaskBaselineSource::discover(directory.path(), context, tree).unwrap();
+        let file = source
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == "src/lib.rs")
+            .unwrap();
+
+        assert_eq!(source.read_verified(file).unwrap().bytes, original);
+        assert!(source.revalidate().unwrap());
+        assert_eq!(
+            source.manifest().revision.source_kind,
+            SourceKind::TaskBaseline
+        );
     }
 
     #[cfg(unix)]

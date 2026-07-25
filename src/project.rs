@@ -101,6 +101,17 @@ pub struct CanonicalGraphReference {
     pub status: CanonicalGraphStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalGraphRefreshGuard {
+    invalidation_event_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalGraphRefreshOutcome {
+    Recorded,
+    Superseded,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepositoryGraphRetentionReferences {
     pub snapshot_ids: std::collections::BTreeSet<SnapshotId>,
@@ -1638,6 +1649,20 @@ pub async fn canonical_graph_reference() -> Result<CanonicalGraphReference> {
     .await?
 }
 
+pub async fn canonical_graph_refresh_guard() -> Result<CanonicalGraphRefreshGuard> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphRefreshGuard> {
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("Failed to open {} read-only", database_path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(CanonicalGraphRefreshGuard {
+            invalidation_event_id: latest_canonical_graph_invalidation_event_id(&connection)?,
+        })
+    })
+    .await?
+}
+
 pub async fn record_canonical_graph_invalidation(
     task_id: &str,
     run_id: Option<&str>,
@@ -1715,21 +1740,22 @@ pub async fn record_canonical_graph_invalidation_best_effort(
 pub async fn record_canonical_graph_refresh(
     task_id: Option<&str>,
     run_id: Option<&str>,
+    guard: CanonicalGraphRefreshGuard,
     source: &CanonicalSourceIdentity,
     snapshot_id: &SnapshotId,
     build_id: &BuildId,
-) -> Result<()> {
+) -> Result<CanonicalGraphRefreshOutcome> {
     let database_path = current_database_path().await?;
     let task_id = task_id.map(str::to_string);
     let run_id = run_id.map(str::to_string);
     let source = source.clone();
     let snapshot_id = snapshot_id.clone();
     let build_id = build_id.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphRefreshOutcome> {
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_project_runtime_state_row(&transaction)?;
-        transaction.execute(
+        let updated = transaction.execute(
             r#"
             UPDATE project_runtime_state
             SET canonical_source_revision_id = ?1,
@@ -1740,6 +1766,11 @@ pub async fn record_canonical_graph_refresh(
                 canonical_graph_updated_at = ?5,
                 updated_at = ?5
             WHERE row_id = 1
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_invalidated'
+                  ) = ?6
             "#,
             params![
                 source.source_revision_id.as_str(),
@@ -1747,8 +1778,13 @@ pub async fn record_canonical_graph_refresh(
                 source.manifest_digest.value(),
                 snapshot_id.as_str(),
                 timestamp(),
+                guard.invalidation_event_id,
             ],
         )?;
+        if updated == 0 {
+            transaction.commit()?;
+            return Ok(CanonicalGraphRefreshOutcome::Superseded);
+        }
         insert_event_in_transaction(
             &transaction,
             run_id.as_deref(),
@@ -1761,9 +1797,21 @@ pub async fn record_canonical_graph_refresh(
             }),
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(CanonicalGraphRefreshOutcome::Recorded)
     })
     .await?
+}
+
+fn latest_canonical_graph_invalidation_event_id(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        r#"
+        SELECT COALESCE(MAX(id), 0)
+        FROM events
+        WHERE type = 'canonical_graph_invalidated'
+        "#,
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 pub async fn record_canonical_graph_refresh_failed_best_effort(
@@ -6692,15 +6740,20 @@ mod tests {
         );
 
         let snapshot = SnapshotId::new("canonical-snapshot-1").unwrap();
-        record_canonical_graph_refresh(
-            Some("t-001"),
-            None,
-            &source,
-            &snapshot,
-            &BuildId::new("canonical-build-1").unwrap(),
-        )
-        .await
-        .unwrap();
+        let guard = canonical_graph_refresh_guard().await.unwrap();
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                guard,
+                &source,
+                &snapshot,
+                &BuildId::new("canonical-build-1").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Recorded
+        );
         assert_eq!(
             canonical_graph_reference().await.unwrap(),
             CanonicalGraphReference {
@@ -6725,6 +6778,62 @@ mod tests {
         assert_eq!(
             list_tasks().await.unwrap()[0].status,
             TaskStatus::Executing.as_str()
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn canonical_graph_refresh_does_not_overwrite_a_newer_invalidation() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let first_source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+        let newer_source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-2").unwrap(),
+            manifest_digest: Digest::new("sha256", "bb").unwrap(),
+        };
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&first_source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        let refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&newer_source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                refresh_guard,
+                &first_source,
+                &SnapshotId::new("older-snapshot").unwrap(),
+                &BuildId::new("older-build").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Superseded
+        );
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(newer_source),
+                snapshot_id: None,
+                status: CanonicalGraphStatus::Stale,
+            }
         );
 
         teardown(previous);

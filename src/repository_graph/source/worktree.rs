@@ -10,15 +10,15 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    LocalRepositorySource, SourceContent, SourceDiscoveryContext, SourceError,
+    DiagnosticCollector, LocalRepositorySource, SourceContent, SourceDiscoveryContext, SourceError,
     git::{canonical_root, ensure_worktree_root, git_command, trim_ascii},
-    manifest_digest, revision_id, sha256_digest,
+    is_binary, manifest_digest, revision_id, sha256_digest,
 };
 use crate::repository_graph::{
     domain::{Digest, OverlayRevisionId, RepoPath, SourceKind, SourceRevision, WorkspaceRef},
     ports::{
         OverlayChangeKind, OverlayFileChange, RepositorySource, SourceDiscoveryMetrics,
-        SourceFileDescriptor, SourceManifest, WorkspaceOverlayManifest,
+        SourceFileDescriptor, SourceFileMode, SourceManifest, WorkspaceOverlayManifest,
     },
 };
 
@@ -520,6 +520,162 @@ pub fn capture_worktree_tree(root: impl AsRef<Path>) -> Result<Digest, SourceErr
 fn verify_tree(root: &Path, baseline: &Digest) -> Result<(), SourceError> {
     let tree = format!("{}^{{tree}}", baseline.value());
     run_git(root, &["cat-file", "-e", &tree], "verify baseline tree").map(|_| ())
+}
+
+pub(super) fn verify_tree_available(root: &Path, tree: &Digest) -> Result<(), SourceError> {
+    validate_git_tree_digest(tree)?;
+    verify_tree(root, tree)
+}
+
+pub(super) fn discover_tree_manifest(
+    root: &Path,
+    context: &SourceDiscoveryContext,
+    tree: Digest,
+) -> Result<SourceManifest, SourceError> {
+    validate_git_tree_digest(&tree)?;
+    verify_tree(root, &tree)?;
+    let entries = baseline_entries(root, &tree)?;
+    if entries.len() as u64 > context.limits.max_files {
+        return Err(SourceError::FileLimitExceeded {
+            limit: context.limits.max_files,
+        });
+    }
+
+    let mut diagnostics = DiagnosticCollector::new(context.limits.max_diagnostics);
+    let mut metrics = SourceDiscoveryMetrics {
+        candidates: entries.len() as u64,
+        ..SourceDiscoveryMetrics::default()
+    };
+    let mut directories = BTreeSet::new();
+    let mut files = Vec::new();
+
+    for (path, entry) in entries {
+        record_tree_parent_directories(&path, &mut directories, context.limits.max_directories)?;
+        if let Some(code) = context.policy.exclusion_for_file(&path) {
+            diagnostics.push(code, Some(path));
+            metrics.skipped = metrics.skipped.saturating_add(1);
+            continue;
+        }
+        let mode = match entry.mode.as_str() {
+            "100644" => SourceFileMode::Regular,
+            "100755" => SourceFileMode::Executable,
+            "120000" => {
+                diagnostics.push("symlink_skipped", Some(path));
+                metrics.skipped = metrics.skipped.saturating_add(1);
+                continue;
+            }
+            "160000" => {
+                diagnostics.push("gitlink_skipped", Some(path));
+                metrics.skipped = metrics.skipped.saturating_add(1);
+                continue;
+            }
+            _ => {
+                diagnostics.push("special_file_skipped", Some(path));
+                metrics.skipped = metrics.skipped.saturating_add(1);
+                continue;
+            }
+        };
+        let size = tree_blob_size(root, &entry.object_id)?;
+        if size > context.limits.max_file_bytes {
+            diagnostics.push("file_too_large", Some(path));
+            metrics.skipped = metrics.skipped.saturating_add(1);
+            continue;
+        }
+        if metrics.total_bytes.saturating_add(size) > context.limits.max_total_bytes {
+            return Err(SourceError::TotalBytesLimitExceeded {
+                limit: context.limits.max_total_bytes,
+            });
+        }
+        let output = run_git(
+            root,
+            &["cat-file", "blob", &entry.object_id],
+            "read pinned baseline blob",
+        )?;
+        if output.stdout.len() as u64 != size {
+            return Err(SourceError::ContentChanged);
+        }
+        metrics.total_bytes = metrics.total_bytes.saturating_add(size);
+        if is_binary(&output.stdout) {
+            diagnostics.push("binary_file_skipped", Some(path));
+            metrics.skipped = metrics.skipped.saturating_add(1);
+            continue;
+        }
+        files.push(SourceFileDescriptor {
+            path,
+            content_identity: sha256_digest(&output.stdout),
+            byte_len: size,
+            file_mode: mode,
+        });
+        metrics.included = metrics.included.saturating_add(1);
+    }
+
+    metrics.directories = directories.len() as u64 + 1;
+    metrics.suppressed_diagnostics = diagnostics.suppressed;
+    let source_manifest_digest = manifest_digest(&files, &context.source_policy_digest);
+    let revision = SourceRevision {
+        id: revision_id(
+            &context.repository,
+            SourceKind::TaskBaseline,
+            Some(&tree),
+            &source_manifest_digest,
+            &context.analysis_config_digest,
+            false,
+            false,
+        ),
+        repository: context.repository.clone(),
+        source_kind: SourceKind::TaskBaseline,
+        base_revision: Some(tree),
+        manifest_digest: source_manifest_digest,
+        analysis_config_digest: context.analysis_config_digest.clone(),
+        dirty: false,
+        includes_untracked: false,
+    };
+    Ok(SourceManifest {
+        revision,
+        extractor_set_digest: context.extractor_set_digest.clone(),
+        files,
+        diagnostics: diagnostics.diagnostics,
+        metrics,
+    })
+}
+
+fn tree_blob_size(root: &Path, object_id: &str) -> Result<u64, SourceError> {
+    let output = run_git(
+        root,
+        &["cat-file", "-s", object_id],
+        "inspect pinned baseline blob",
+    )?;
+    std::str::from_utf8(trim_ascii(&output.stdout))
+        .ok()
+        .and_then(|size| size.parse().ok())
+        .ok_or(SourceError::GitCommand {
+            operation: "parse pinned baseline blob size",
+        })
+}
+
+fn record_tree_parent_directories(
+    path: &RepoPath,
+    directories: &mut BTreeSet<String>,
+    max_directories: u64,
+) -> Result<(), SourceError> {
+    let mut components = path.as_str().split('/').peekable();
+    let mut parent = String::new();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if !parent.is_empty() {
+            parent.push('/');
+        }
+        parent.push_str(component);
+        directories.insert(parent.clone());
+        if directories.len() as u64 >= max_directories {
+            return Err(SourceError::DirectoryLimitExceeded {
+                limit: max_directories,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn read_tree_descriptor_verified(

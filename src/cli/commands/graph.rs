@@ -189,6 +189,7 @@ struct IndexOutput {
 
 async fn index(full: bool, json: bool) -> Result<()> {
     let context = LocalGraphContext::load(true).await?;
+    let refresh_guard = project::canonical_graph_refresh_guard().await?;
     // Indexing always publishes the canonical view. A managed Executor may invoke
     // the CLI from its task worktree, but unapproved task contents must remain in
     // that task's overlay publication until approval.
@@ -215,19 +216,24 @@ async fn index(full: bool, json: bool) -> Result<()> {
         source_revision_id: source.manifest().revision.id.clone(),
         manifest_digest: source.manifest().revision.manifest_digest.clone(),
     };
-    if let Err(error) = project::record_canonical_graph_refresh(
+    match project::record_canonical_graph_refresh(
         None,
         None,
+        refresh_guard,
         &source_identity,
         &outcome.snapshot.id,
         &outcome.build_id,
     )
     .await
     {
-        tracing::warn!(
+        Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+        Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::warn!(
+            "canonical graph was indexed but a newer source invalidation remains pending"
+        ),
+        Err(error) => tracing::warn!(
             error = ?error,
             "canonical graph indexed but durable freshness state was not updated"
-        );
+        ),
     }
     crate::repository_graph_runtime::maintain_graph_best_effort().await;
     if json {

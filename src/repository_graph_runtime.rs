@@ -36,7 +36,7 @@ use repository_graph::{
         snapshot_file_descriptors,
     },
     source::{
-        GitTreeSnapshotContent, GitWorktreeInventory, LocalRepositorySource, LocalSnapshotContent,
+        GitTreeSnapshotContent, LocalRepositorySource, LocalSnapshotContent,
         SourceDiscoveryContext, TaskBaselineSource, TaskOverlaySource, capture_worktree_tree,
         parse_git_tree_digest,
     },
@@ -587,21 +587,27 @@ pub(crate) fn schedule_canonical_refresh_after_approval(
     tokio::spawn(async move {
         match refresh_canonical_graph_at(&project_root).await {
             Ok(None) => {}
-            Ok(Some((source, snapshot_id, build_id))) => {
-                if let Err(error) = project::record_canonical_graph_refresh(
+            Ok(Some((guard, source, snapshot_id, build_id))) => {
+                match project::record_canonical_graph_refresh(
                     Some(&task_id),
                     run_id.as_deref(),
+                    guard,
                     &source,
                     &snapshot_id,
                     &build_id,
                 )
                 .await
                 {
-                    tracing::warn!(
+                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
+                        task_id,
+                        "canonical graph refresh was superseded by a newer invalidation"
+                    ),
+                    Err(error) => tracing::warn!(
                         task_id,
                         error = ?error,
                         "canonical graph refreshed but durable freshness state was not updated"
-                    );
+                    ),
                 }
                 maintain_graph_best_effort().await;
             }
@@ -631,11 +637,16 @@ async fn refresh_canonical_graph_at(
     project_root: &Path,
 ) -> Result<
     Option<(
+        project::CanonicalGraphRefreshGuard,
         project::CanonicalSourceIdentity,
         repository_graph::domain::SnapshotId,
         BuildId,
     )>,
 > {
+    // Observe the invalidation generation before source discovery. A later
+    // approval may invalidate canonical content while this build is running;
+    // its durable stale marker must win over this older publication.
+    let refresh_guard = project::canonical_graph_refresh_guard().await?;
     let Some((config, repository, source)) = canonical_source_at(project_root).await? else {
         return Ok(None);
     };
@@ -685,6 +696,7 @@ async fn refresh_canonical_graph_at(
     .await??;
     debug_assert_eq!(outcome.snapshot.repository, repository);
     Ok(Some((
+        refresh_guard,
         source_identity,
         outcome.snapshot.id,
         outcome.build_id,
@@ -1120,10 +1132,6 @@ async fn resolve_task_baseline(
         let identities = active_extractor_identities(&config)?;
         let discovery =
             SourceDiscoveryContext::from_config(repository.clone(), &config, &identities)?;
-        let inventory = GitWorktreeInventory::discover(&workspace_root, baseline_tree.clone())?;
-        if !inventory.changes().is_empty() {
-            anyhow::bail!("managed worktree no longer matches its pinned baseline tree");
-        }
         let source = TaskBaselineSource::discover(&workspace_root, discovery, baseline_tree)?;
         let mut sidecar = match open_for_build_at(&sidecar_path)? {
             OpenSidecarResult::Ready(sidecar) => sidecar,
@@ -2223,7 +2231,7 @@ mod tests {
             if project::task_repository_view("t-003")
                 .await
                 .unwrap()
-                .is_some_and(|view| view.status == project::RepositoryViewStatus::Failed)
+                .is_some_and(|view| view.status == project::RepositoryViewStatus::Available)
             {
                 break;
             }
@@ -2235,9 +2243,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             changed_worktree_view.status,
-            project::RepositoryViewStatus::Failed
+            project::RepositoryViewStatus::Available
         );
-        assert!(changed_worktree_view.baseline_snapshot_id.is_none());
+        assert!(changed_worktree_view.baseline_snapshot_id.is_some());
         assert_eq!(
             project::list_tasks()
                 .await
