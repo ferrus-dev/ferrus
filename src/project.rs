@@ -1896,6 +1896,46 @@ pub(crate) async fn record_task_repository_view_at(
     record_repository_view_at(database_path, "tasks", task_id, repository_view).await
 }
 
+pub(crate) async fn compare_and_record_task_repository_view_at(
+    database_path: &Path,
+    task_id: &str,
+    expected: &RepositoryViewReference,
+    repository_view: &RepositoryViewReference,
+) -> Result<bool> {
+    expected.validate()?;
+    repository_view.validate()?;
+    let database_path = database_path.to_path_buf();
+    let task_id = task_id.to_string();
+    let expected = expected.clone();
+    let repository_view = repository_view.clone();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                r#"
+            SELECT baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                   repository_view_tree_algorithm, repository_view_tree_digest,
+                   repository_view_lifecycle, repository_view_status
+            FROM tasks
+            WHERE id = ?1
+            "#,
+                [&task_id],
+                |row| repository_view_reference_from_row(row, 0),
+            )
+            .optional()?
+            .context("Cannot record repository view: tasks row does not exist")?;
+        if current != expected {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        record_repository_view_in_transaction(&transaction, "tasks", &task_id, &repository_view)?;
+        transaction.commit()?;
+        Ok(true)
+    })
+    .await?
+}
+
 #[allow(dead_code)]
 pub async fn record_run_repository_view(
     run_id: &str,
@@ -1915,87 +1955,104 @@ async fn record_repository_view_at(
     repository_view.validate()?;
     let database_path = database_path.to_path_buf();
     let owner_id = owner_id.to_string();
+    let repository_view = repository_view.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        record_repository_view_in_transaction(
+            &transaction,
+            owner_table,
+            &owner_id,
+            &repository_view,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+fn record_repository_view_in_transaction(
+    transaction: &Transaction<'_>,
+    owner_table: &'static str,
+    owner_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
     let baseline_snapshot_id = repository_view
         .baseline_snapshot_id
         .as_ref()
-        .map(|identity| identity.as_str().to_string());
+        .map(SnapshotId::as_str);
     let overlay_revision_id = repository_view
         .overlay_revision_id
         .as_ref()
-        .map(|identity| identity.as_str().to_string());
+        .map(OverlayRevisionId::as_str);
     let view_snapshot_id = repository_view
         .view_snapshot_id
         .as_ref()
-        .map(|identity| identity.as_str().to_string());
+        .map(SnapshotId::as_str);
     let tree_algorithm = repository_view
         .frozen_source_tree
         .as_ref()
-        .map(|identity| identity.algorithm().to_string());
+        .map(Digest::algorithm);
     let tree_digest = repository_view
         .frozen_source_tree
         .as_ref()
-        .map(|identity| identity.value().to_string());
+        .map(Digest::value);
     let lifecycle = match repository_view.lifecycle {
         TaskViewLifecycle::Mutable => "mutable",
         TaskViewLifecycle::FrozenSubmitted => "frozen_submitted",
     };
     let status = repository_view.status.as_str();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sql = format!(
-            "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
-             repository_view_snapshot_id = ?3, repository_view_tree_algorithm = ?4, \
-             repository_view_tree_digest = ?5, repository_view_lifecycle = ?6, \
-             repository_view_status = ?7 WHERE id = ?8"
-        );
-        let updated = transaction.execute(
-            &sql,
+    let sql = format!(
+        "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
+         repository_view_snapshot_id = ?3, repository_view_tree_algorithm = ?4, \
+         repository_view_tree_digest = ?5, repository_view_lifecycle = ?6, \
+         repository_view_status = ?7 WHERE id = ?8"
+    );
+    let updated = transaction.execute(
+        &sql,
+        params![
+            baseline_snapshot_id,
+            overlay_revision_id,
+            view_snapshot_id,
+            tree_algorithm,
+            tree_digest,
+            lifecycle,
+            status,
+            owner_id,
+        ],
+    )?;
+    if updated == 0 {
+        anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
+    }
+    if owner_table == "tasks" {
+        transaction.execute(
+            r#"
+            UPDATE runs
+            SET baseline_snapshot_id = ?1,
+                overlay_revision_id = ?2,
+                repository_view_snapshot_id = ?3,
+                repository_view_tree_algorithm = ?4,
+                repository_view_tree_digest = ?5,
+                repository_view_lifecycle = ?6,
+                repository_view_status = ?7
+            WHERE task_id = ?8
+              AND baseline_snapshot_id IS NULL
+              AND repository_view_status IN ('not_built', 'unavailable', 'failed')
+            "#,
             params![
-                baseline_snapshot_id.as_deref(),
-                overlay_revision_id.as_deref(),
-                view_snapshot_id.as_deref(),
-                tree_algorithm.as_deref(),
-                tree_digest.as_deref(),
+                baseline_snapshot_id,
+                overlay_revision_id,
+                view_snapshot_id,
+                tree_algorithm,
+                tree_digest,
                 lifecycle,
                 status,
-                owner_id
+                owner_id,
             ],
         )?;
-        if updated == 0 {
-            anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
-        }
-        if owner_table == "tasks" {
-            transaction.execute(
-                r#"
-                UPDATE runs
-                SET baseline_snapshot_id = ?1,
-                    overlay_revision_id = ?2,
-                    repository_view_snapshot_id = ?3,
-                    repository_view_tree_algorithm = ?4,
-                    repository_view_tree_digest = ?5,
-                    repository_view_lifecycle = ?6,
-                    repository_view_status = ?7
-                WHERE task_id = ?8
-                  AND baseline_snapshot_id IS NULL
-                  AND repository_view_status IN ('not_built', 'unavailable', 'failed')
-                "#,
-                params![
-                    baseline_snapshot_id,
-                    overlay_revision_id,
-                    view_snapshot_id,
-                    tree_algorithm,
-                    tree_digest,
-                    lifecycle,
-                    status,
-                    owner_id
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    })
-    .await?
+    }
+    Ok(())
 }
 
 type RepositoryViewDatabaseValues = (
@@ -6476,6 +6533,47 @@ mod tests {
             run_repository_view("r-late-pin").await.unwrap(),
             Some(repository_view)
         );
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn task_repository_view_compare_and_set_rejects_stale_refresh() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let database_path = current_database_path().await.unwrap();
+        let expected = RepositoryViewReference::default();
+        let newer = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-newer").unwrap(),
+            Some(OverlayRevisionId::new("overlay-newer").unwrap()),
+            SnapshotId::new("view-newer").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        let older = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-older").unwrap(),
+            Some(OverlayRevisionId::new("overlay-older").unwrap()),
+            SnapshotId::new("view-older").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+
+        assert!(
+            compare_and_record_task_repository_view_at(&database_path, "t-001", &expected, &newer,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !compare_and_record_task_repository_view_at(
+                &database_path,
+                "t-001",
+                &expected,
+                &older,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(task_repository_view("t-001").await.unwrap(), Some(newer));
+
         teardown(previous);
     }
 

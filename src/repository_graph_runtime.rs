@@ -990,19 +990,52 @@ pub(crate) async fn refresh_task_overlay(
         Ok(Err(error)) => {
             let mut stale = existing.clone().mutable_successor();
             stale.status = project::RepositoryViewStatus::Stale;
-            project::record_task_repository_view_at(&database_path, &task_id, &stale).await?;
+            if !project::compare_and_record_task_repository_view_at(
+                &database_path,
+                &task_id,
+                &existing,
+                &stale,
+            )
+            .await?
+            {
+                return current_task_repository_view(&task_id).await;
+            }
             return Err(error);
         }
         Err(error) => {
-            let mut stale = existing.mutable_successor();
+            let mut stale = existing.clone().mutable_successor();
             stale.status = project::RepositoryViewStatus::Stale;
-            project::record_task_repository_view_at(&database_path, &task_id, &stale).await?;
+            if !project::compare_and_record_task_repository_view_at(
+                &database_path,
+                &task_id,
+                &existing,
+                &stale,
+            )
+            .await?
+            {
+                return current_task_repository_view(&task_id).await;
+            }
             return Err(error.into());
         }
     };
-    project::record_task_repository_view_at(&database_path, &task_id, &repository_view).await?;
+    if !project::compare_and_record_task_repository_view_at(
+        &database_path,
+        &task_id,
+        &existing,
+        &repository_view,
+    )
+    .await?
+    {
+        return current_task_repository_view(&task_id).await;
+    }
     maintain_graph_best_effort().await;
     Ok(repository_view)
+}
+
+async fn current_task_repository_view(task_id: &str) -> Result<project::RepositoryViewReference> {
+    project::task_repository_view(task_id)
+        .await?
+        .context("task repository view disappeared during refresh")
 }
 
 fn resolved_repository_view(
