@@ -3472,10 +3472,33 @@ pub async fn renew_claimed_task_lease(agent_id: &str, ttl_secs: u64) -> Result<L
 }
 
 pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<RuntimeTaskContext>> {
+    runtime_task_context_for_agent_with_open_mode(agent_id, false).await
+}
+
+pub(crate) async fn runtime_task_context_for_agent_read_only(
+    agent_id: &str,
+) -> Result<Option<RuntimeTaskContext>> {
+    runtime_task_context_for_agent_with_open_mode(agent_id, true).await
+}
+
+async fn runtime_task_context_for_agent_with_open_mode(
+    agent_id: &str,
+    read_only: bool,
+) -> Result<Option<RuntimeTaskContext>> {
     let database_path = current_database_path().await?;
     let agent_id = agent_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<Option<RuntimeTaskContext>> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = if read_only {
+            let connection =
+                Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| {
+                        format!("Failed to open {} read-only", database_path.display())
+                    })?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection
+        } else {
+            open_runtime_database(&database_path)?
+        };
         if let Some((
             task_id,
             task_path,
@@ -7488,6 +7511,67 @@ mod tests {
         assert_eq!(context.run_dir, ".ferrus/runs/t-002");
         assert_eq!(context.status, "executing");
         assert!(context.run_id.is_none());
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn read_only_runtime_context_does_not_import_legacy_metadata() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        claim_task("t-002", ".ferrus/tasks/t-002.md", "executor:codex:2", 60)
+            .await
+            .unwrap();
+        let database_path = current_database_path().await.unwrap();
+        {
+            let connection = Connection::open(&database_path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE runtime_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO runtime_metadata (key, value, updated_at)
+                    VALUES ('selected_spec', 'docs/specs/legacy.md', 'legacy');
+                    UPDATE project_runtime_state
+                    SET selected_spec = NULL,
+                        updated_at = 'read-only-sentinel'
+                    WHERE row_id = 1;
+                    "#,
+                )
+                .unwrap();
+        }
+        let original_permissions = std::fs::metadata(&database_path).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&database_path, read_only_permissions).unwrap();
+
+        let context = runtime_task_context_for_agent_read_only("executor:codex:2")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(context.task_id, "t-002");
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let state = connection
+            .query_row(
+                "SELECT selected_spec, updated_at FROM project_runtime_state WHERE row_id = 1",
+                [],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (None, "read-only-sentinel".to_string()));
+        std::fs::set_permissions(&database_path, original_permissions).unwrap();
 
         teardown(previous);
     }

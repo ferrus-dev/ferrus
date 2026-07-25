@@ -95,7 +95,7 @@ impl LocalGraphContext {
             .ok()
             .filter(|value| !value.trim().is_empty());
         let runtime_context = match agent_id.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(agent_id) => project::runtime_task_context_for_agent(agent_id).await?,
+            Some(agent_id) => project::runtime_task_context_for_agent_read_only(agent_id).await?,
             None => None,
         };
         if let Some(requested_task_id) = requested_task_id.as_deref() {
