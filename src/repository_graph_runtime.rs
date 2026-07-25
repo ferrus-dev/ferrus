@@ -50,7 +50,7 @@ pub(crate) const CANONICAL_VIEW: &str = "canonical";
 static TASK_BASELINE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TASK_OVERLAY_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_REFRESH_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
-const REFRESH_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const REFRESH_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, thiserror::Error)]
 #[error("repository graph refresh is already in progress for this view")]
@@ -193,7 +193,11 @@ impl LocalGraphContext {
                     .clone()
                     .expect("checked baseline snapshot identity"),
             ),
-            _ => SnapshotSelector::Published(
+            (Some(view), _) => anyhow::bail!(
+                "repository graph is unavailable for the current task view ({})",
+                view.status.as_str()
+            ),
+            (None, _) => SnapshotSelector::Published(
                 PublishedViewName::new(CANONICAL_VIEW)
                     .expect("canonical published view name is non-empty"),
             ),
@@ -213,6 +217,7 @@ impl LocalGraphContext {
                 status.as_str(),
                 RetrievalAction::Index,
             )?;
+            response.data.published_view = None;
             self.attach_task_view_to_status(&mut response);
             return Ok(response);
         }
@@ -759,20 +764,45 @@ pub(crate) async fn schedule_task_baseline_pin(
             existing.as_ref(),
         )
         .await;
-        let repository_view = resolved_repository_view(&task_id, existing, resolved);
-        if let Err(error) =
-            project::record_task_repository_view_at(&database_path, &task_id, &repository_view)
-                .await
+        let repository_view = resolved_repository_view(&task_id, existing.clone(), resolved);
+        match compare_and_record_task_baseline_at(
+            &database_path,
+            &task_id,
+            existing.as_ref(),
+            &repository_view,
+        )
+        .await
         {
-            tracing::warn!(
+            Ok(true) => maintain_graph_best_effort().await,
+            Ok(false) => tracing::debug!(
+                task_id,
+                "task repository graph baseline was superseded by a newer task view"
+            ),
+            Err(error) => tracing::warn!(
                 task_id,
                 error = ?error,
                 "failed to persist task repository graph baseline; dispatch already continued"
-            );
-        } else {
-            maintain_graph_best_effort().await;
+            ),
         }
     });
+}
+
+async fn compare_and_record_task_baseline_at(
+    database_path: &Path,
+    task_id: &str,
+    expected: Option<&project::RepositoryViewReference>,
+    repository_view: &project::RepositoryViewReference,
+) -> Result<bool> {
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    project::compare_and_record_task_repository_view_at(
+        database_path,
+        task_id,
+        expected,
+        repository_view,
+    )
+    .await
 }
 
 /// Explicitly refreshes the mutable task overlay without coupling graph
@@ -1206,6 +1236,17 @@ pub(crate) fn status_response_at(
     sidecar_path: &Path,
     freshness_comparison: Option<FreshnessComparison>,
 ) -> Result<StatusResponse> {
+    if let Some(status) = context.unavailable_task_view_status() {
+        let mut response = unavailable_status(
+            context.repository.clone(),
+            Availability::NotBuilt,
+            status.as_str(),
+            RetrievalAction::Index,
+        )?;
+        response.data.published_view = None;
+        context.attach_task_view_to_status(&mut response);
+        return Ok(response);
+    }
     match open_for_query_at(sidecar_path) {
         Ok(OpenQuerySidecarResult::Ready(sidecar)) => {
             let query = SqliteGraphQuery::new(
@@ -1768,6 +1809,7 @@ mod tests {
     #[test]
     fn unavailable_task_status_exposes_binding_and_direct_source_fallback() {
         let directory = tempfile::tempdir().unwrap();
+        let sidecar = directory.path().join(SIDECAR_FILE_NAME);
         let mut context = context(directory.path());
         context.repository_view = Some(
             project::RepositoryViewReference::new(
@@ -1778,17 +1820,11 @@ mod tests {
             .unwrap(),
         );
         context.task_view_id = Some(TaskViewId::new("t-001").unwrap());
-        let mut response = unavailable_status(
-            context.repository.clone(),
-            Availability::NotBuilt,
-            "unavailable",
-            RetrievalAction::Index,
-        )
-        .unwrap();
-
-        context.attach_task_view_to_status(&mut response);
+        let response = status_response_at(&context, &sidecar, None).unwrap();
 
         assert_eq!(response.task_view, None);
+        assert_eq!(response.data.availability, Availability::NotBuilt);
+        assert_eq!(response.data.published_view, None);
         assert_eq!(
             response.data.task_view_status,
             Some(TaskViewStatus::Unavailable)
@@ -1797,6 +1833,14 @@ mod tests {
             response.data.fallback,
             Some(RetrievalFallback::DirectSourceInspection)
         );
+        assert!(
+            context
+                .scope(default_budget(&context.config.query_limits).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("current task view")
+        );
+        assert!(!sidecar.exists());
     }
 
     #[test]
@@ -2255,6 +2299,27 @@ mod tests {
                 .unwrap()
                 .status,
             project::TaskStatus::Executing.as_str()
+        );
+        let expected_pin = changed_worktree_view.clone();
+        let frozen = changed_worktree_view
+            .frozen(capture_worktree_tree(root).unwrap())
+            .unwrap();
+        project::record_task_repository_view("t-003", &frozen)
+            .await
+            .unwrap();
+        assert!(
+            !compare_and_record_task_baseline_at(
+                &data_dir.join("ferrus.db"),
+                "t-003",
+                Some(&expected_pin),
+                &expected_pin,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            project::task_repository_view("t-003").await.unwrap(),
+            Some(frozen)
         );
         let previous_agent = std::env::var_os(ENV_AGENT_ID);
         let previous_task = std::env::var_os(ENV_TASK_ID);

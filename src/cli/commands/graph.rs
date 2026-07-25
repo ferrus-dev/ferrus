@@ -19,6 +19,7 @@ use crate::{
         },
         health::{SidecarHealth, inspect_health_at},
         index::{IndexCoordinator, IndexOutcome, IndexRequest},
+        maintenance::RefreshLeaseOutcome,
         ports::GraphQuery,
         query::{
             ContextPolicy, ContextRequest, ContextSeed, DiagnosticsEnvelope, EdgeDirection,
@@ -30,9 +31,10 @@ use crate::{
             OpenQuerySidecarResult, OpenSidecarResult, Sidecar, open_for_build_at,
             open_for_query_at,
         },
+        store::PublicationOutcome,
     },
     repository_graph_runtime::{
-        CANONICAL_VIEW, LocalGraphContext, sidecar_path, status_response_at,
+        CANONICAL_VIEW, LocalGraphContext, REFRESH_LEASE_TTL, sidecar_path, status_response_at,
     },
 };
 
@@ -203,49 +205,86 @@ async fn index(full: bool, json: bool) -> Result<()> {
             reason.reason
         ),
     };
-    let outcome = IndexCoordinator::new(&mut sidecar).index(
+    let build_id = next_build_id();
+    let view_name = PublishedViewName::new(CANONICAL_VIEW)?;
+    if sidecar.acquire_refresh_lease(
+        &context.repository,
+        &view_name,
+        build_id.as_str(),
+        REFRESH_LEASE_TTL,
+    )? == RefreshLeaseOutcome::Busy
+    {
+        anyhow::bail!("canonical repository graph refresh is already in progress");
+    }
+    let indexed = IndexCoordinator::new(&mut sidecar).index(
         &source,
         &context.config,
         IndexRequest {
-            build_id: next_build_id(),
-            view_name: PublishedViewName::new(CANONICAL_VIEW)?,
+            build_id: build_id.clone(),
+            view_name: view_name.clone(),
             force_full: full,
         },
-    )?;
+    );
+    let outcome = match indexed {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ =
+                sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str());
+            return Err(error.into());
+        }
+    };
     let source_identity = project::CanonicalSourceIdentity {
         source_revision_id: source.manifest().revision.id.clone(),
         manifest_digest: source.manifest().revision.manifest_digest.clone(),
     };
-    match project::record_canonical_graph_refresh(
-        None,
-        None,
-        refresh_guard,
-        &source_identity,
-        &outcome.snapshot.id,
-        &outcome.build_id,
-    )
-    .await
-    {
-        Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
-        Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::warn!(
-            "canonical graph was indexed but a newer source invalidation remains pending"
-        ),
-        Err(error) => tracing::warn!(
-            error = ?error,
-            "canonical graph indexed but durable freshness state was not updated"
-        ),
+    let publication_won = publication_matches_snapshot(&outcome.publication, &outcome.snapshot.id);
+    if publication_won {
+        match project::record_canonical_graph_refresh(
+            None,
+            None,
+            refresh_guard,
+            &source_identity,
+            &outcome.snapshot.id,
+            &outcome.build_id,
+        )
+        .await
+        {
+            Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+            Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::warn!(
+                "canonical graph was indexed but a newer source invalidation remains pending"
+            ),
+            Err(error) => tracing::warn!(
+                error = ?error,
+                "canonical graph indexed but durable freshness state was not updated"
+            ),
+        }
+    } else {
+        tracing::warn!(
+            "canonical graph index was superseded; durable freshness state was left unchanged"
+        );
     }
+    if !sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str())? {
+        anyhow::bail!("canonical repository graph refresh lease was lost");
+    }
+    let freshness = if publication_won {
+        Freshness::Fresh
+    } else {
+        Freshness::Unknown
+    };
     crate::repository_graph_runtime::maintain_graph_best_effort().await;
     if json {
         print_json(&IndexOutput {
             status: "indexed",
-            freshness: Freshness::Fresh,
+            freshness,
             outcome,
         })?;
     } else {
         println!("Indexed repository graph");
         println!("Snapshot: {}", outcome.snapshot.id);
-        println!("Freshness: fresh");
+        println!(
+            "Freshness: {}",
+            if publication_won { "fresh" } else { "unknown" }
+        );
         println!(
             "Files: {} discovered, {} reused, {} parsed, {} skipped, {} failed",
             outcome.metrics.discovered_files,
@@ -264,6 +303,16 @@ async fn index(full: bool, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn publication_matches_snapshot(
+    publication: &PublicationOutcome,
+    snapshot_id: &crate::repository_graph::domain::SnapshotId,
+) -> bool {
+    matches!(
+        publication,
+        PublicationOutcome::Published { view } if &view.snapshot_id == snapshot_id
+    )
 }
 
 #[derive(Serialize)]
@@ -698,6 +747,35 @@ mod tests {
         assert!(requested_budget(&config, Some(0), None, None).is_err());
         assert!(requested_budget(&config, None, Some(0), None).is_err());
         assert!(requested_budget(&config, None, None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn only_the_published_snapshot_can_record_canonical_freshness() {
+        let repository = crate::repository_graph::domain::RepositoryRef {
+            namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")
+                .unwrap(),
+            repository_id: crate::repository_graph::domain::RepositoryId::new("root").unwrap(),
+        };
+        let published_snapshot =
+            crate::repository_graph::domain::SnapshotId::new("snapshot-published").unwrap();
+        let losing_snapshot =
+            crate::repository_graph::domain::SnapshotId::new("snapshot-losing").unwrap();
+        let view = crate::repository_graph::store::PublishedView {
+            repository,
+            view_name: PublishedViewName::new(CANONICAL_VIEW).unwrap(),
+            snapshot_id: published_snapshot.clone(),
+            build_id: BuildId::new("build-published").unwrap(),
+            generation: 2,
+        };
+
+        assert!(publication_matches_snapshot(
+            &PublicationOutcome::Published { view: view.clone() },
+            &published_snapshot,
+        ));
+        assert!(!publication_matches_snapshot(
+            &PublicationOutcome::Superseded { current: view },
+            &losing_snapshot,
+        ));
     }
 
     #[test]
