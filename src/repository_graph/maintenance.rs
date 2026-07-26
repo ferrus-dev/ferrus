@@ -533,7 +533,7 @@ mod tests {
         };
         let repository = repository();
         let view = PublishedViewName::new("task-overlay:t-001").unwrap();
-        let ttl = Duration::from_millis(120);
+        let ttl = Duration::from_secs(3);
 
         assert_eq!(
             sidecar
@@ -541,10 +541,46 @@ mod tests {
                 .unwrap(),
             RefreshLeaseOutcome::Acquired
         );
+        let initial_expiration = sidecar
+            .connection()
+            .query_row(
+                "SELECT expires_at_ms FROM graph_refresh_leases \
+                 WHERE repository_namespace = ?1 AND repository_id = ?2 AND view_name = ?3",
+                params![
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                    view.as_str(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
         let heartbeat = sidecar
             .start_refresh_lease_heartbeat(&repository, &view, "owner-1", ttl)
             .unwrap();
-        thread::sleep(Duration::from_millis(320));
+        let wait_started = Instant::now();
+        loop {
+            let renewed_expiration = sidecar
+                .connection()
+                .query_row(
+                    "SELECT expires_at_ms FROM graph_refresh_leases \
+                     WHERE repository_namespace = ?1 AND repository_id = ?2 AND view_name = ?3",
+                    params![
+                        repository.namespace.as_str(),
+                        repository.repository_id.as_str(),
+                        view.as_str(),
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            if renewed_expiration > initial_expiration {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(8),
+                "refresh lease heartbeat did not extend its expiration"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
 
         assert_eq!(
             sidecar
