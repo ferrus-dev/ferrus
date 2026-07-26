@@ -19,7 +19,7 @@ use super::{
     ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err,
 };
 
-pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing → Complete. \
+pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing -> Complete. \
      Must be called after /review_pending.";
 
 pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
@@ -73,7 +73,7 @@ async fn run(agent_id: &str) -> Result<String> {
     )
     .await;
 
-    info!("Task approved, state → Complete");
+    info!("Task approved, state -> Complete");
     Ok("Task approved. State: Complete. Well done!".to_string())
 }
 

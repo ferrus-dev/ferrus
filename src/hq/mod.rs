@@ -279,7 +279,7 @@ async fn dispatch_with_human_question_target(
         if allow_fifo_fallback && ctx.has_pending_human_question().await? {
             return ctx.answer(line.to_string()).await;
         }
-        anyhow::bail!("Commands must start with '/' — try /status, /task, /quit");
+        anyhow::bail!("Commands must start with '/' -- try /status, /task, /quit");
     }
 
     match parse_command(line)? {
@@ -306,7 +306,7 @@ async fn dispatch_with_human_question_target(
                         "exited"
                     };
                     lines.push(format!(
-                        "  {name} ({status}) — tail logs: {}",
+                        "  {name} ({status}) -- tail logs: {}",
                         handle.log_path.display()
                     ));
                 }
@@ -388,7 +388,7 @@ async fn dispatch_with_human_question_target(
             if let Some(handle) = ctx.headless.get(&name) {
                 let log = handle.log_path.display().to_string();
                 ctx.display.info(format!(
-                    "{name} runs headlessly — no terminal to attach.\n\
+                    "{name} runs headlessly -- no terminal to attach.\n\
                      Tail its log to observe: tail -f {log}"
                 ));
             } else {
@@ -586,7 +586,7 @@ impl ModelTarget {
 pub(crate) struct HqContext {
     pub(crate) supervisor: Option<std::sync::Arc<dyn SupervisorAgent>>,
     pub(crate) executor: Option<std::sync::Arc<dyn ExecutorAgent>>,
-    /// Headless agent handles — executor and reviewer both run without a PTY.
+    /// Headless agent handles -- executor and reviewer both run without a PTY.
     pub(crate) headless: std::collections::HashMap<String, agent_manager::HeadlessHandle>,
     debug: bool,
     state_rx: watch::Receiver<Option<WatchedState>>,
@@ -804,7 +804,7 @@ impl HqContext {
 
     fn store_headless_handle(&mut self, name: &str, handle: agent_manager::HeadlessHandle) {
         self.display.muted(format!(
-            "  • Started {name}…\n  ╰─ Logs: {}\n\n",
+            "  • Started {name}...\n  ╰─ Logs: {}\n\n",
             handle.log_path.display()
         ));
         self.headless.insert(name.to_string(), handle);
@@ -1195,7 +1195,7 @@ impl HqContext {
                 prompt,
                 existing_task_ids,
                 1,
-                "Task enqueued — returning to HQ…",
+                "Task enqueued -- returning to HQ...",
             )
             .await?
             .into_iter()
@@ -1327,7 +1327,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for free-form planning…",
+            "Spawning supervisor ({}) for free-form planning...",
             agent.name()
         ));
 
@@ -1362,7 +1362,7 @@ impl HqContext {
         );
 
         self.display
-            .info(format!("Spawning supervisor ({})…", supervisor.name()));
+            .info(format!("Spawning supervisor ({})...", supervisor.name()));
         if selected.is_none() {
             self.display
                 .info("Collaborate with the supervisor to define the task.");
@@ -1467,7 +1467,7 @@ impl HqContext {
         let prompt = agent_manager::supervisor_batch_task_prompt(&context, selected_count);
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for batch task preparation…",
+            "Spawning supervisor ({}) for batch task preparation...",
             supervisor.name()
         ));
         self.display.tip(
@@ -1485,7 +1485,7 @@ impl HqContext {
             &prompt,
             &existing_task_ids,
             selected_count,
-            "Batch tasks enqueued — returning to HQ…",
+            "Batch tasks enqueued -- returning to HQ...",
         )
         .await?;
         self.display
@@ -2012,7 +2012,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for specification drafting…",
+            "Spawning supervisor ({}) for specification drafting...",
             supervisor.name()
         ));
         self.display
@@ -2068,7 +2068,7 @@ impl HqContext {
                         created_path = Some(path);
                         self.stop_interactive_child(
                             &mut child,
-                            "Spec created — waiting for supervisor to exit…",
+                            "Spec created -- waiting for supervisor to exit...",
                         )
                         .await?;
                         break;
@@ -2212,7 +2212,7 @@ impl HqContext {
         let prompt = agent_manager::supervisor_archive_spec_prompt(&context);
 
         self.display.muted(format!(
-            "\n  • Spawning supervisor ({}) for spec archival…\n",
+            "\n  • Spawning supervisor ({}) for spec archival...\n",
             supervisor.name()
         ));
 
@@ -2315,7 +2315,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) interactively…",
+            "Spawning supervisor ({}) interactively...",
             agent.name()
         ));
 
@@ -2333,7 +2333,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning executor ({}) interactively…",
+            "Spawning executor ({}) interactively...",
             agent.name()
         ));
 
@@ -2395,7 +2395,7 @@ impl HqContext {
         if agent_alive {
             let owner = owner.as_deref().unwrap_or("agent");
             self.display.info(format!(
-                "Waiting for {owner} to receive it via /wait_for_answer…"
+                "Waiting for {owner} to receive it via /wait_for_answer..."
             ));
             return Ok(());
         }

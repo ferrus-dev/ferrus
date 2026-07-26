@@ -112,11 +112,11 @@ pub enum ShellCommand {
     Help,
 }
 
-/// Parse `/command [args…]` into a `ShellCommand`.
+/// Parse `/command [args...]` into a `ShellCommand`.
 pub fn parse_command(input: &str) -> Result<ShellCommand> {
     let input = input.trim();
     if !input.starts_with('/') {
-        bail!("Commands must start with '/' — try /status, /task, /quit");
+        bail!("Commands must start with '/' -- try /status, /task, /quit");
     }
     let tokens = shlex::split(&input[1..])
         .ok_or_else(|| anyhow::anyhow!("Failed to tokenize command (unterminated quote?)"))?;

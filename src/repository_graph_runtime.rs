@@ -82,7 +82,7 @@ impl LocalGraphContext {
         let root = project::canonical_project_root().await?;
         let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
             .await
-            .context("ferrus.toml not found — run ferrus init first")?;
+            .context("ferrus.toml not found -- run ferrus init first")?;
         let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
             .context("Invalid [repository_graph] configuration")?;
         if require_enabled && !config.enabled {

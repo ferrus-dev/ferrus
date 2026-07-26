@@ -46,7 +46,7 @@ async fn run(description: String) -> Result<String> {
 
     info!(
         task_id = artifact.id,
-        "Task created through compatibility tool, DB task → pending"
+        "Task created through compatibility tool, DB task -> pending"
     );
     Ok(format!(
         "Task {} created. State: pending. Artifact: {}",

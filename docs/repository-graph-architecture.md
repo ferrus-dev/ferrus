@@ -182,7 +182,7 @@ Every graph fact carries:
 - confidence or exactness classification;
 - optional typed properties.
 
-Absence of a node or edge means “not known by this snapshot and its capabilities,” not proof that the entity or
+Absence of a node or edge means "not known by this snapshot and its capabilities," not proof that the entity or
 relationship does not exist.
 
 ### Task repository view
@@ -245,9 +245,9 @@ Availability, build execution, publication, and freshness are orthogonal and mus
   snapshot or overlay;
 - `stale`: a comparable current input differs;
 - `unknown`: the source cannot be inspected sufficiently to compare;
-- `not_applicable`: used for an immutable pinned source that no longer has a mutable “current” counterpart.
+- `not_applicable`: used for an immutable pinned source that no longer has a mutable "current" counterpart.
 
-A status response may therefore report “published snapshot is stale; refresh build failed” without losing the
+A status response may therefore report "published snapshot is stale; refresh build failed" without losing the
 published snapshot.
 
 Freshness is computed from actual source state, not lifecycle events alone:
@@ -329,7 +329,7 @@ Later implementation must preserve all of these statements:
 6. Partial or failed builds never replace the last published view.
 7. Freshness is computed against actual effective inputs, not inferred only from events.
 8. Operational configuration and secrets do not change structural snapshot identity.
-9. Missing graph capability never blocks the Supervisor–Executor state machine.
+9. Missing graph capability never blocks the Supervisor-Executor state machine.
 10. Every fact is evidence-backed and capability-scoped; missing facts never prove absence.
 
 ## Rejected Alternatives

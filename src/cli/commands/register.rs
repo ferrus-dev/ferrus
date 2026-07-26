@@ -512,7 +512,7 @@ async fn append_to_agents_md(role: &str) -> Result<()> {
     };
 
     if existing.contains(&marker) {
-        return Ok(()); // already present — don't duplicate
+        return Ok(()); // already present -- don't duplicate
     }
 
     let section = agents_md_section(role, &marker);
@@ -894,7 +894,7 @@ fn agents_md_section(role: &str, marker: &str) -> String {
             "\n{marker}\n\
              ## Ferrus Supervisor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
-             The Supervisor runs in multiple modes — check your initial prompt:\n\n\
+             The Supervisor runs in multiple modes -- check your initial prompt:\n\n\
              Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),
@@ -918,7 +918,7 @@ async fn append_to_claude_md(role: &str) -> Result<()> {
     };
 
     if existing.contains(&marker) {
-        return Ok(()); // already present — don't duplicate
+        return Ok(()); // already present -- don't duplicate
     }
 
     let section = claude_md_section(role, &marker);
@@ -966,7 +966,7 @@ fn claude_md_section(role: &str, marker: &str) -> String {
             "\n{marker}\n\
              ## Ferrus Supervisor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
-             The Supervisor runs in multiple modes — check your initial prompt:\n\n\
+             The Supervisor runs in multiple modes -- check your initial prompt:\n\n\
              Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),

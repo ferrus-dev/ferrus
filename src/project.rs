@@ -647,7 +647,7 @@ async fn migrate_legacy_project_selection(state: &legacy_state::LegacyStateData)
 pub async fn touch_current_project() -> Result<ProjectRegistration> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     tokio::fs::create_dir_all(data_dir.join("logs"))
@@ -746,7 +746,7 @@ pub async fn canonical_project_root() -> Result<PathBuf> {
 pub async fn current_project_data_dir() -> Result<PathBuf> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     let metadata_path = data_dir.join("project.toml");
@@ -768,7 +768,7 @@ pub async fn current_project_data_dir() -> Result<PathBuf> {
 pub async fn current_project_id() -> Result<String> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = current_project_data_dir().await?;
     let metadata = read_project_metadata_from(&data_dir.join("project.toml")).await?;
@@ -956,7 +956,7 @@ async fn remove_path_if_exists(path: &Path, directory: bool) -> Result<()> {
 pub async fn doctor_current_project() -> Result<DoctorReport> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     let metadata_path = data_dir.join("project.toml");
     let metadata = read_project_metadata_from(&metadata_path)
@@ -4865,7 +4865,7 @@ async fn read_task_records_from_database(path: &Path) -> Result<Vec<TaskRecord>>
 async fn current_database_path() -> Result<PathBuf> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found -- run `ferrus migrate`")?;
     Ok(PathBuf::from(local_ref.data_dir).join("ferrus.db"))
 }
 

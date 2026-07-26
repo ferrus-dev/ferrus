@@ -28,7 +28,7 @@ pub fn load_claude_mcp_isolation() -> ClaudeMcpIsolation {
 pub async fn ensure_claude_mcp_isolation_default() -> Result<()> {
     let contents = tokio::fs::read_to_string("ferrus.toml")
         .await
-        .context("ferrus.toml not found — run `ferrus init` first")?;
+        .context("ferrus.toml not found -- run `ferrus init` first")?;
     let mut doc = contents
         .parse::<DocumentMut>()
         .context("Failed to parse ferrus.toml")?;

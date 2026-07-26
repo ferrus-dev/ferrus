@@ -12,7 +12,7 @@ What does this change do and why?
 - [ ] Breaking change
 
 ## Workflow impact (if applicable)
-Does this change affect the Supervisor → Executor → Reviewer flow?
+Does this change affect the Supervisor -> Executor -> Reviewer flow?
 
 - [ ] No impact
 - [ ] Minor change (does not alter lifecycle semantics)

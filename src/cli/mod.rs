@@ -8,7 +8,7 @@ pub mod commands;
 #[derive(Parser)]
 #[command(
     name = "ferrus",
-    about = "AI orchestration MCP server — coordinates Supervisor + Executor agents",
+    about = "AI orchestration MCP server -- coordinates Supervisor + Executor agents",
     version = env!("CARGO_PKG_VERSION"),
 )]
 pub struct Cli {

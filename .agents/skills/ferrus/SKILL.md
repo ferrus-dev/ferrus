@@ -1,11 +1,11 @@
 ---
 name: ferrus
-description: "Use when working on a project that uses ferrus for AI agent orchestration — full tool reference, state machine, resources, prompts, and config"
+description: "Use when working on a project that uses ferrus for AI agent orchestration -- full tool reference, state machine, resources, prompts, and config"
 ---
 
 # Ferrus
 
-ferrus is an MCP server that coordinates AI agents in a **Supervisor–Executor** workflow.
+ferrus is an MCP server that coordinates AI agents in a **Supervisor-Executor** workflow.
 
 This file is supporting context only.
 Runtime behavior is defined by the active initial prompt and Ferrus MCP tools.
@@ -52,16 +52,16 @@ workflow, only DB-backed:
 
 ```text
 pending
- └─► executing      ← /wait_for_task claim
-       ├─► addressing ← /reject (Supervisor) → work loop
-       ├─► consultation ← /consult (Executor)
-       │     └─► (restore paused status) ← /wait_for_consult
-       ├─► awaiting_human ← /ask_human
-       │     └─► (restore paused status) ← /wait_for_answer
-       ├─► reviewing ← /submit final gate pass (Executor)
-       │     ├─► addressing → work loop
-       │     └─► complete ← /approve (Supervisor)
-       └─► failed ← /check, /submit, or /reject hits retry/cycle limit
+ +-> executing      <- /wait_for_task claim
+       +-> addressing <- /reject (Supervisor) -> work loop
+       +-> consultation <- /consult (Executor)
+       |     +-> (restore paused status) <- /wait_for_consult
+       +-> awaiting_human <- /ask_human
+       |     +-> (restore paused status) <- /wait_for_answer
+       +-> reviewing <- /submit final gate pass (Executor)
+       |     +-> addressing -> work loop
+       |     +-> complete <- /approve (Supervisor)
+       +-> failed <- /check, /submit, or /reject hits retry/cycle limit
 ```
 
 ## CLI
@@ -116,15 +116,15 @@ Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
 ### Supervisor
 | Tool | From state | Description |
 |---|---|---|
-| `create_task` | — | Compatibility alias for queued task creation on unfiltered servers |
-| `enqueue_task` | — | Write numbered task artifact and DB `pending` row |
+| `create_task` | -- | Compatibility alias for queued task creation on unfiltered servers |
+| `enqueue_task` | -- | Write numbered task artifact and DB `pending` row |
 | `create_spec` | any | Write approved Markdown spec to the configured spec directory |
 | `archive_spec` | any | Write approved `## Outcome` project memory and archive completed spec task/run artifacts |
-| `wait_for_review` | — | Long-poll until state is Reviewing |
+| `wait_for_review` | -- | Long-poll until state is Reviewing |
 | `review_pending` | Reviewing | Read task + submission context |
 | `approve` | Reviewing | Accept; moves to Complete |
 | `reject` | Reviewing | Reject with notes; moves to Addressing |
-| `wait_for_consultation` | — | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
+| `wait_for_consultation` | -- | Long-poll until an Executor consultation request is ready and attach this Supervisor run to it |
 | `respond_consult` | Consultation | Record the consultation response and let the Executor resume via `/wait_for_consult` |
 
 `create_task` remains a compatibility tool only on an unfiltered `ferrus serve` instance; role-scoped
@@ -133,7 +133,7 @@ Supervisor sessions use `enqueue_task` for task creation and `archive_spec` for 
 ### Executor
 | Tool | From state | Description |
 |---|---|---|
-| `wait_for_task` | — | Long-poll until Executing or Addressing |
+| `wait_for_task` | -- | Long-poll until Executing or Addressing |
 | `check` | Executing, Addressing | Run all configured checks; use it freely during development and again immediately before final `/submit` |
 | `consult` | Executing, Addressing | Ask the Supervisor for guidance; moves to Consultation |
 | `wait_for_consult` | Consultation | Block until the Supervisor responds; restores previous state |
@@ -154,7 +154,7 @@ Both roles can use the optional read-only `repository_graph_status`, `repository
 `repository_context` tools without a task lease. Check status first when availability is unknown, use search for
 exact path/symbol discovery, then request a small bounded context packet. Ask for snippets only when source text is
 needed; snippets are hash-verified against the returned snapshot. Graph use is optional, and a missing relationship
-means only “not known by this index,” not proof that the relationship does not exist. These tools never build or
+means only "not known by this index," not proof that the relationship does not exist. These tools never build or
 mutate the index and graph output is not injected into task or review prompts.
 
 ## MCP resources
@@ -189,7 +189,7 @@ commands = ["cargo clippy -- -D warnings", "cargo fmt --check", "cargo test"]
 
 [limits]
 max_check_retries = 20   # check failures before Failed
-max_review_cycles = 3    # reject→fix cycles before Failed
+max_review_cycles = 3    # reject->fix cycles before Failed
 max_feedback_lines = 30  # lines per command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call; agents should call again after timeout
 max_parallel_tasks = 1   # max concurrent executor sessions

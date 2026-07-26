@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/RomanEmreis/ferrus"
 readme = "README.md"
 homepage = "https://ferrus.dev"
-description = "AI agent orchestrator - drives a Supervisor–Executor workflow for autonomous software development"
+description = "AI agent orchestrator - drives a Supervisor-Executor workflow for autonomous software development"
 exclude = [
     ".agents/**",
     ".github/**",

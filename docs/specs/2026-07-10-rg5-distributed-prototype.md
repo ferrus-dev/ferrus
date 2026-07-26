@@ -46,7 +46,7 @@ worktree overlays, project memory federation, versioned wire DTOs, and adapter c
 
 Ferrus runtime coordination remains separate. `ferrus.db` continues to own tasks, runs, events, leases, and
 scheduler state. The cloud prototype is an optional derived context data plane and must never become a hidden
-dependency of the local Supervisor–Executor state machine.
+dependency of the local Supervisor-Executor state machine.
 
 A distributed build can be duplicated, delayed, retried, cancelled, or executed by multiple workers. Exactly-once
 execution is not assumed. Correctness depends on immutable input, deterministic identities, idempotent writes,

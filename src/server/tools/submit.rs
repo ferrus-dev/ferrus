@@ -28,8 +28,8 @@ use super::{
 pub const DESCRIPTION: &str = "\
 Run the final check gate and, if it passes, submit work for Supervisor review. \
 Can be called from Executing or Addressing. \
-On pass: state → Reviewing. On fail: stay in the current work state (or state \
-→ Failed if the retry limit is exhausted).
+On pass: state -> Reviewing. On fail: stay in the current work state (or state \
+-> Failed if the retry limit is exhausted).
 
 The `content` parameter must be a Markdown document with the following sections:
 
@@ -121,7 +121,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
             )
             .await;
 
-            info!("Work submitted for review, state → Reviewing");
+            info!("Work submitted for review, state -> Reviewing");
             Ok(
                 "Submitted for review. State: Reviewing. The Supervisor can now call /review_pending."
                     .to_string(),

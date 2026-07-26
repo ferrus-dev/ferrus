@@ -10,7 +10,7 @@
 
 Ferrus turns coding agents into controlled, repeatable workers.
 
-It runs a Supervisor → Executor → Reviewer loop over your repository — not as a chat, but as a **state machine**.  
+It runs a Supervisor -> Executor -> Reviewer loop over your repository -- not as a chat, but as a **state machine**.
 Tasks are planned, implemented, checked, and reviewed in a structured, restart-safe flow. Unlike chat-based agents, ferrus enforces structure and lifecycle.
 
 Everything is explicit:
@@ -27,14 +27,14 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
-- **goose** (experimental) — MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever — raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
-- **opencode** (experimental) — convenient for running local models. ⚠️ The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
+- **goose** (experimental) -- MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever -- raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
+- **opencode** (experimental) -- convenient for running local models. Warning: The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
 
-Agents are treated as interchangeable workers — ferrus provides the runtime, coordination, and state.
+Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 
 Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, `opencode/`, and `goose/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
 
-> 💡 **Status**: ferrus is currently in alpha and not ready for production.
+>  **Status**: ferrus is currently in alpha and not ready for production.
 
 [Tutorial](https://ferrus.dev) | [Roadmap](https://github.com/RomanEmreis/ferrus/blob/main/docs/milestones.md)
 
@@ -44,17 +44,17 @@ Internally, agent support is normalized through `src/agents/`: `mod.rs` defines 
 
 ```
   you
-   │
-   └─► ferrus HQ
-         │
-         ├─► Supervisor (Claude Code or Codex) — plans tasks
-         │         │ exits after task created;
-         │
-         ├─► Executor (Claude Code or Codex)   — implements, checks, submits
-         │         │ runs headlessly
-         │
-         └─► Reviewer (Claude Code or Codex)   — spawned automatically on submission
-                   │ exits after approve/reject; runs headlessly
+   |
+   +-> ferrus HQ
+         |
+         +-> Supervisor (Claude Code or Codex) -- plans tasks
+         |         | exits after task created;
+         |
+         +-> Executor (Claude Code or Codex)   -- implements, checks, submits
+         |         | runs headlessly
+         |
+         +-> Reviewer (Claude Code or Codex)   -- spawned automatically on submission
+                   | exits after approve/reject; runs headlessly
 ```
 
 HQ watches state transitions and spawns the right agent at the right time.
@@ -86,7 +86,7 @@ ferrus register --supervisor claude-code --executor codex  # write agent configs
 ferrus                                                     # enter HQ
 ```
 
-Then type `/task` — a supervisor spawns, you describe what you want, and the full loop runs automatically.
+Then type `/task` -- a supervisor spawns, you describe what you want, and the full loop runs automatically.
 
 On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads the matching release binary into `~/.local/bin` by default. On Windows, `install.ps1` installs `ferrus.exe` into `%LOCALAPPDATA%\ferrus\bin` by default. Release archives are verified with published SHA-256 checksums before installation. Set `FERRUS_INSTALL_DIR` to override the destination, or `FERRUS_INSTALL_VERSION=vX.Y.Z` to install a specific release tag.
 
@@ -99,7 +99,7 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | Command | Description |
 |---|---|
 | `/plan` | Free-form planning session with the supervisor (no task created) |
-| `/task` | Define a task from the selected milestone, then run the executor→review loop automatically |
+| `/task` | Define a task from the selected milestone, then run the executor->review loop automatically |
 | `/task --manual` | Define a free-form task without selected milestone context |
 | `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
 | `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
@@ -133,11 +133,11 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 
 ```
 ferrus> /task
-  └─ supervisor spawns → you describe the task → supervisor calls enqueue_task
-       └─ executor spawns (headless) → implements → check → submit
-            └─ reviewer spawns (headless) → reads submission → approve or reject
-                 ├─ approved → Complete
-                 └─ rejected → executor re-spawns with feedback
+  +- supervisor spawns -> you describe the task -> supervisor calls enqueue_task
+       +- executor spawns (headless) -> implements -> check -> submit
+            +- reviewer spawns (headless) -> reads submission -> approve or reject
+                 +- approved -> Complete
+                 +- rejected -> executor re-spawns with feedback
 ```
 
 Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task row and scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`; each spawn exits when its job is done.
@@ -148,16 +148,16 @@ Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task
 
 ```
 pending
- └─► executing      ← /wait_for_task claim
-       ├─► addressing ← /reject → work loop
-       ├─► consultation ← /consult
-       │     └─► (restore paused status) ← /wait_for_consult
-       ├─► awaiting_human ← /ask_human
-       │     └─► (restore paused status) ← /wait_for_answer
-       ├─► reviewing ← /submit final gate pass
-       │     ├─► addressing ← /reject
-       │     └─► complete ← /approve
-       └─► failed ← retry, review-cycle, or executor-dispatch limit
+ +-> executing      <- /wait_for_task claim
+       +-> addressing <- /reject -> work loop
+       +-> consultation <- /consult
+       |     +-> (restore paused status) <- /wait_for_consult
+       +-> awaiting_human <- /ask_human
+       |     +-> (restore paused status) <- /wait_for_answer
+       +-> reviewing <- /submit final gate pass
+       |     +-> addressing <- /reject
+       |     +-> complete <- /approve
+       +-> failed <- retry, review-cycle, or executor-dispatch limit
 ```
 
 Any active Executor work state (Executing, Addressing) can pause to `Consultation` via `/consult`. HQ spawns the configured Supervisor in consultation mode, and the executor immediately calls `/wait_for_consult` to block until the Supervisor answers via `/respond_consult`.
@@ -183,7 +183,7 @@ Scaffolds ferrus in the current project (default `--agents-path .agents`):
 - Creates `~/.ferrus/projects/<project-id>/ferrus.db` with `tasks`, `runs`, and `events` tables
 - Creates `docs/specs/` for approved feature specifications
 - Creates skill files agents load to understand their role:
-  - `<agents-path>/skills/ferrus/SKILL.md` — general overview
+  - `<agents-path>/skills/ferrus/SKILL.md` -- general overview
   - `<agents-path>/skills/ferrus-supervisor/SKILL.md` + `ROLE.md`
   - `<agents-path>/skills/ferrus-executor/SKILL.md` + `ROLE.md`
 - Adds `.ferrus/` to `.gitignore`
@@ -214,7 +214,7 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 | `codex` | `.codex/config.toml` |
 | `qwen-code` | `.qwen/settings.json` |
 | `opencode` | `opencode.json` |
-| `goose` | none — the Ferrus MCP server is attached at launch via `--with-extension` |
+| `goose` | none -- the Ferrus MCP server is attached at launch via `--with-extension` |
 
 ### `ferrus doctor`
 
@@ -332,12 +332,12 @@ commands = [
 ]
 
 [limits]
-max_check_retries = 20   # consecutive check failures before state → Failed
-max_review_cycles = 3    # reject→fix cycles before state → Failed
+max_check_retries = 20   # consecutive check failures before state -> Failed
+max_review_cycles = 3    # reject->fix cycles before state -> Failed
 max_feedback_lines = 30  # trailing lines per failing command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call before it returns timeout so the agent can poll again
 max_parallel_tasks = 1   # maximum number of concurrent executor sessions
-max_executor_dispatches = 6 # headless executor sessions per work phase before state → Failed; 0 disables
+max_executor_dispatches = 6 # headless executor sessions per work phase before state -> Failed; 0 disables
 
 [lease]
 ttl_secs = 90                  # how long a claimed lease is valid without renewal
@@ -351,7 +351,7 @@ agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex
 model = ""             # optional override; empty = agent default
 
 [hq.executor]
-agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable — see Supported agents
+agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable -- see Supported agents
 model = ""             # optional override; empty = agent default
 ```
 
@@ -407,7 +407,7 @@ SQLite is the runtime source of truth. `ferrus.db` stores task status, claims an
 
 Ferrus is partially developed using its own orchestration workflow.
 
-This repository is used to validate the Supervisor → Executor → Reviewer loop in real development scenarios.
+This repository is used to validate the Supervisor -> Executor -> Reviewer loop in real development scenarios.
 
 ---
 

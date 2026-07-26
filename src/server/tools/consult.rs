@@ -61,7 +61,7 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
     project::record_task_consultation_requested(&context.task_id, current_status).await?;
     let paused = context.status.clone();
 
-    info!(paused, "Task → Consultation");
+    info!(paused, "Task -> Consultation");
     Ok(format!(
         "Consultation requested in `{}/CONSULT_REQUEST.md`.\n\
          State is now Consultation (paused from {paused}).\n\
