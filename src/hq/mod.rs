@@ -1103,6 +1103,10 @@ impl HqContext {
         agents::write_agents(&reg).await?;
 
         for task in &resettable {
+            crate::repository_graph_runtime::release_submitted_tree_pin_for_task_best_effort(
+                &task.id,
+            )
+            .await;
             store::clear_scoped_task_artifacts(&task.path, &format!(".ferrus/runs/{}", task.id))
                 .await?;
             crate::project::record_task_status_with_origin(
@@ -3815,6 +3819,39 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&crate::project::ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: dir.path().to_string_lossy().into_owned(),
+                ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+                vcs: Some("git".to_string()),
+                origin_repo: None,
+                default_branch: None,
+                current_head: None,
+                created_at: "2026-07-26T00:00:00Z".to_string(),
+                last_opened_at: "2026-07-26T00:00:00Z".to_string(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::fs::write("seed.txt", "submitted content\n")
+            .await
+            .unwrap();
+        let submitted_tree =
+            crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
+        crate::repository_graph::source::pin_submitted_tree(dir.path(), "t-004", &submitted_tree)
+            .unwrap();
         crate::project::record_task_status(
             "t-001",
             ".ferrus/tasks/t-001.md",
@@ -3836,6 +3873,13 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::project::record_task_status(
+            "t-004",
+            ".ferrus/tasks/t-004.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
         tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
         tokio::fs::create_dir_all(".ferrus/runs/t-001")
             .await
@@ -3844,6 +3888,9 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::create_dir_all(".ferrus/runs/t-003")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-004")
             .await
             .unwrap();
         tokio::fs::write(".ferrus/tasks/t-001.md", "pending task")
@@ -3855,6 +3902,9 @@ mod tests {
         tokio::fs::write(".ferrus/tasks/t-003.md", "complete task")
             .await
             .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-004.md", "reviewing task")
+            .await
+            .unwrap();
         tokio::fs::write(".ferrus/runs/t-001/QUESTION.md", "stale question")
             .await
             .unwrap();
@@ -3864,6 +3914,20 @@ mod tests {
         tokio::fs::write(".ferrus/runs/t-003/SUBMISSION.md", "complete submission")
             .await
             .unwrap();
+        tokio::fs::write(".ferrus/runs/t-004/SUBMISSION.md", "abandoned submission")
+            .await
+            .unwrap();
+        let pinned_review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(pinned_review_refs.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&pinned_review_refs.stdout)
+                .lines()
+                .count(),
+            1
+        );
 
         let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3881,12 +3945,21 @@ mod tests {
         assert_eq!(status("t-001"), Some("reset"));
         assert_eq!(status("t-002"), Some("reset"));
         assert_eq!(status("t-003"), Some("complete"));
+        assert_eq!(status("t-004"), Some("reset"));
         assert!(!std::path::Path::new(".ferrus/tasks/t-001.md").exists());
         assert!(!std::path::Path::new(".ferrus/tasks/t-002.md").exists());
         assert!(std::path::Path::new(".ferrus/tasks/t-003.md").exists());
+        assert!(!std::path::Path::new(".ferrus/tasks/t-004.md").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-001").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-002").exists());
         assert!(std::path::Path::new(".ferrus/runs/t-003/SUBMISSION.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-004").exists());
+        let review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(review_refs.status.success());
+        assert!(review_refs.stdout.is_empty());
 
         std::env::set_current_dir(previous).unwrap();
     }

@@ -1026,29 +1026,35 @@ pub(crate) async fn prepare_submitted_repository_view(
 }
 
 pub(crate) async fn release_submitted_tree_pin_best_effort(runtime: &project::RuntimeTaskContext) {
+    release_submitted_tree_pin_for_task_best_effort(&runtime.task_id).await;
+}
+
+pub(crate) async fn release_submitted_tree_pin_for_task_best_effort(task_id: &str) {
     let project_root = match project::canonical_project_root().await {
         Ok(root) => root,
         Err(error) => {
             tracing::warn!(
-                task_id = runtime.task_id,
+                task_id,
                 error = ?error,
                 "failed to resolve project root while releasing submitted tree pin"
             );
             return;
         }
     };
-    let task_id = runtime.task_id.clone();
-    match tokio::task::spawn_blocking(move || release_submitted_tree_pin(&project_root, &task_id))
-        .await
+    let owned_task_id = task_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        release_submitted_tree_pin(&project_root, &owned_task_id)
+    })
+    .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(
-            task_id = runtime.task_id,
+            task_id,
             error = ?error,
             "failed to release submitted tree pin"
         ),
         Err(error) => tracing::warn!(
-            task_id = runtime.task_id,
+            task_id,
             error = ?error,
             "submitted tree pin release task failed"
         ),
