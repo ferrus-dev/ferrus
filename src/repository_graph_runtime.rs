@@ -17,13 +17,13 @@ use repository_graph::{
     QUERY_WIRE_VERSION,
     config::RepositoryGraphConfig,
     domain::{
-        Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Freshness,
-        PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace, RepositoryRef,
-        TaskViewId, TaskViewLifecycle, WorkspaceRef,
+        Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Digest,
+        Freshness, PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace,
+        RepositoryRef, TaskViewId, TaskViewLifecycle, WorkspaceRef,
     },
     index::{IndexCoordinator, IndexRequest, active_extractor_identities},
     maintenance::{GraphMaintenanceReport, RefreshLeaseOutcome, RetentionProtection},
-    ports::{GraphQuery, SnapshotContent},
+    ports::{GraphQuery, RepositorySource, SnapshotContent},
     query::{
         ContentRequest, ContextRequest, ContextResponse, ContextSnippet, DiagnosticSummary,
         DiagnosticsEnvelope, FreshnessEnvelope, PageInfo, QueryDiagnostic, QueryError,
@@ -844,6 +844,76 @@ pub(crate) enum RepositoryViewFreeze {
     Failed,
 }
 
+fn frozen_tree_matches_snapshot(
+    sidecar_path: &Path,
+    workspace_root: &Path,
+    repository: RepositoryRef,
+    config: &RepositoryGraphConfig,
+    source_tree: Digest,
+    snapshot_id: &repository_graph::domain::SnapshotId,
+) -> Result<bool> {
+    let identities = active_extractor_identities(config)?;
+    let discovery = SourceDiscoveryContext::from_config(repository, config, &identities)?;
+    let source = TaskBaselineSource::discover(workspace_root, discovery, source_tree)?;
+    let sidecar = match open_for_query_at(sidecar_path)? {
+        OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+        OpenQuerySidecarResult::Absent => {
+            anyhow::bail!("repository graph sidecar is unavailable")
+        }
+        OpenQuerySidecarResult::NeedsMigration {
+            found_schema_version,
+        } => anyhow::bail!(
+            "repository graph sidecar schema {found_schema_version} requires migration"
+        ),
+        OpenQuerySidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+            "repository graph sidecar schema {} is incompatible with {}",
+            reason.found_schema_version,
+            reason.supported_schema_version
+        ),
+    };
+    let snapshot = sidecar
+        .snapshot(snapshot_id)?
+        .context("submitted repository graph snapshot is no longer retained")?;
+    let snapshot_files = all_snapshot_file_descriptors(&sidecar, snapshot_id)?;
+    Ok(snapshot.repository == source.manifest().revision.repository
+        && snapshot.analysis_config_digest == source.manifest().revision.analysis_config_digest
+        && snapshot.extractor_set_digest == source.manifest().extractor_set_digest
+        && snapshot_files == source.manifest().files)
+}
+
+fn capture_matching_submitted_tree(
+    sidecar_path: &Path,
+    workspace_root: &Path,
+    task_id: &str,
+    repository: RepositoryRef,
+    config: &RepositoryGraphConfig,
+    snapshot_id: &repository_graph::domain::SnapshotId,
+) -> Result<Digest> {
+    let source_tree = capture_worktree_tree(workspace_root)?;
+    pin_submitted_tree(workspace_root, task_id, &source_tree)?;
+    let matches = frozen_tree_matches_snapshot(
+        sidecar_path,
+        workspace_root,
+        repository,
+        config,
+        source_tree.clone(),
+        snapshot_id,
+    );
+    match matches {
+        Ok(true) => Ok(source_tree),
+        result => {
+            release_submitted_tree_pin(workspace_root, task_id)?;
+            match result {
+                Ok(false) => {
+                    anyhow::bail!("submitted source tree does not match the indexed task view")
+                }
+                Ok(true) => unreachable!("matching submitted tree returned above"),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
 /// Prepares the immutable graph/source identity persisted by the submit
 /// transaction. Git writes only content-addressed objects through an isolated
 /// temporary index; it never changes the task's real index or lifecycle row.
@@ -871,7 +941,17 @@ pub(crate) async fn prepare_submitted_repository_view(
             return RepositoryViewFreeze::Failed;
         }
     };
-    drop(graph_context);
+    let sidecar_path = match sidecar_path().await {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to resolve repository graph sidecar; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
 
     let mutable_view = match refresh_task_overlay(
         &runtime.task_id,
@@ -890,12 +970,26 @@ pub(crate) async fn prepare_submitted_repository_view(
             return RepositoryViewFreeze::Failed;
         }
     };
+    let Some(view_snapshot_id) = mutable_view.view_snapshot_id.clone() else {
+        tracing::warn!(
+            task_id = runtime.task_id,
+            "submitted repository view was not materialized; submit will continue"
+        );
+        return RepositoryViewFreeze::Failed;
+    };
     let workspace_root = std::path::PathBuf::from(workspace_root);
     let task_id = runtime.task_id.clone();
+    let repository = graph_context.repository;
+    let config = graph_context.config;
     let source_tree = match tokio::task::spawn_blocking(move || {
-        let tree = capture_worktree_tree(&workspace_root)?;
-        pin_submitted_tree(&workspace_root, &task_id, &tree)?;
-        Ok::<_, repository_graph::source::SourceError>(tree)
+        capture_matching_submitted_tree(
+            &sidecar_path,
+            &workspace_root,
+            &task_id,
+            repository,
+            &config,
+            &view_snapshot_id,
+        )
     })
     .await
     {
@@ -1803,6 +1897,84 @@ mod tests {
                 .revision
                 .manifest_digest
         );
+    }
+
+    #[test]
+    fn submitted_tree_freeze_rejects_content_newer_than_the_indexed_snapshot() {
+        let repository = tempfile::tempdir().unwrap();
+        let sidecar_directory = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .arg("--quiet")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct Indexed;\n").unwrap();
+
+        let mut graph_context = context(root);
+        graph_context.config.enabled = true;
+        let source = graph_context.discover().unwrap();
+        let sidecar_path = sidecar_directory.path().join(SIDECAR_FILE_NAME);
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        let indexed = IndexCoordinator::new(&mut sidecar)
+            .index(
+                &source,
+                &graph_context.config,
+                IndexRequest {
+                    build_id: BuildId::new("submitted-freeze-build").unwrap(),
+                    view_name: PublishedViewName::new("task:test").unwrap(),
+                    force_full: false,
+                },
+            )
+            .unwrap();
+        drop(sidecar);
+
+        let matching_tree = capture_matching_submitted_tree(
+            &sidecar_path,
+            root,
+            "task-match",
+            graph_context.repository.clone(),
+            &graph_context.config,
+            &indexed.snapshot.id,
+        )
+        .unwrap();
+        assert!(matching_tree.value().len() >= 40);
+        release_submitted_tree_pin(root, "task-match").unwrap();
+
+        std::fs::write(root.join("src/lib.rs"), "pub struct NewerEdit;\n").unwrap();
+        let error = capture_matching_submitted_tree(
+            &sidecar_path,
+            root,
+            "task-race",
+            graph_context.repository.clone(),
+            &graph_context.config,
+            &indexed.snapshot.id,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the indexed task view")
+        );
+        let references = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("show-ref")
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&references.stdout).contains("refs/ferrus/reviews/"));
     }
 
     #[test]

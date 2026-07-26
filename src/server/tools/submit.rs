@@ -178,13 +178,24 @@ async fn write_submission(context: &RuntimeTaskContext, content: &str) -> Result
     store::write_submission_for_run_dir(&context.run_dir, content).await
 }
 
-async fn write_submission_patch(context: &RuntimeTaskContext) -> Result<()> {
+async fn write_submission_patch(
+    context: &RuntimeTaskContext,
+    freeze: &crate::repository_graph_runtime::RepositoryViewFreeze,
+) -> Result<()> {
     if !is_isolated_executor_workspace(context).await {
         store::clear_patch_for_run_dir(&context.run_dir).await?;
         return Ok(());
     }
 
-    let patch = workspace_patch(context).await?;
+    let patch = match freeze {
+        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => {
+            let source_tree = view.frozen_source_tree.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("frozen repository view is missing its source tree")
+            })?;
+            frozen_tree_patch(context, source_tree).await?
+        }
+        _ => workspace_patch(context).await?,
+    };
     store::write_patch_for_run_dir(&context.run_dir, &patch).await
 }
 
@@ -251,6 +262,48 @@ async fn equivalent_paths(left: &Path, right: &Path) -> bool {
 async fn workspace_patch(context: &RuntimeTaskContext) -> Result<String> {
     let baseline = baseline_tree(context).unwrap_or_else(|| "HEAD".to_string());
     workspace_patch_against_baseline(&baseline).await
+}
+
+async fn frozen_tree_patch(
+    context: &RuntimeTaskContext,
+    source_tree: &crate::repository_graph::domain::Digest,
+) -> Result<String> {
+    let baseline = baseline_tree(context).unwrap_or_else(|| "HEAD".to_string());
+    let baseline = parse_git_tree_digest(&baseline)?;
+    let workspace_root = context
+        .workspace_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    tree_patch_between(&workspace_root, &baseline, source_tree).await
+}
+
+async fn tree_patch_between(
+    workspace_root: &Path,
+    baseline: &crate::repository_graph::domain::Digest,
+    source_tree: &crate::repository_graph::domain::Digest,
+) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["diff", "--binary"])
+        .arg(baseline.value())
+        .arg(source_tree.value())
+        .arg("--")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture frozen executor patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn baseline_tree(context: &RuntimeTaskContext) -> Option<String> {
@@ -502,7 +555,7 @@ async fn persist_submission(
     let mut pin_cleanup = SubmittedTreePinCleanup::new(context, &freeze);
     project::record_task_check_passed(&context.task_id).await?;
     write_submission(context, content).await?;
-    write_submission_patch(context).await?;
+    write_submission_patch(context, &freeze).await?;
     record_submission(context, freeze).await?;
     pin_cleanup.disarm();
     Ok(())
@@ -628,6 +681,34 @@ mod tests {
             .output()
             .unwrap();
         assert!(!output.status.success());
+    }
+
+    #[tokio::test]
+    async fn frozen_tree_patch_ignores_later_worktree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .arg("--quiet")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("submitted.rs"), "pub struct Baseline;\n").unwrap();
+        let baseline = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        std::fs::write(root.join("submitted.rs"), "pub struct Submitted;\n").unwrap();
+        let submitted = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        std::fs::write(root.join("submitted.rs"), "pub struct LaterEdit;\n").unwrap();
+
+        let patch = tree_patch_between(root, &baseline, &submitted)
+            .await
+            .unwrap();
+
+        assert!(patch.contains("+pub struct Submitted;"));
+        assert!(!patch.contains("LaterEdit"));
     }
 
     async fn setup() -> (TempDir, std::path::PathBuf) {
