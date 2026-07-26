@@ -38,7 +38,7 @@ use repository_graph::{
     source::{
         GitTreeSnapshotContent, LocalRepositorySource, LocalSnapshotContent,
         SourceDiscoveryContext, TaskBaselineSource, TaskOverlaySource, capture_worktree_tree,
-        parse_git_tree_digest,
+        parse_git_tree_digest, pin_submitted_tree, release_submitted_tree_pin,
     },
     sqlite::{
         OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, open_for_build_at,
@@ -681,6 +681,12 @@ async fn refresh_canonical_graph_at(
         {
             return Err(RefreshAlreadyInProgress.into());
         }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &indexed_repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
         let indexed = IndexCoordinator::new(&mut sidecar).index(
             &source,
             &config,
@@ -690,10 +696,11 @@ async fn refresh_canonical_graph_at(
                 force_full: false,
             },
         );
+        let lease_healthy = heartbeat.finish();
         let released =
             sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
         let outcome = indexed?;
-        if !released? {
+        if !lease_healthy || !released? {
             anyhow::bail!("canonical repository graph refresh lease was lost");
         }
         Ok(outcome)
@@ -889,29 +896,36 @@ pub(crate) async fn prepare_submitted_repository_view(
         }
     };
     let workspace_root = std::path::PathBuf::from(workspace_root);
-    let source_tree =
-        match tokio::task::spawn_blocking(move || capture_worktree_tree(&workspace_root)).await {
-            Ok(Ok(tree)) => tree,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    task_id = runtime.task_id,
-                    error = ?error,
-                    "failed to capture submitted source tree; submit will continue"
-                );
-                return RepositoryViewFreeze::Failed;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    task_id = runtime.task_id,
-                    error = ?error,
-                    "submitted source capture task failed; submit will continue"
-                );
-                return RepositoryViewFreeze::Failed;
-            }
-        };
+    let task_id = runtime.task_id.clone();
+    let source_tree = match tokio::task::spawn_blocking(move || {
+        let tree = capture_worktree_tree(&workspace_root)?;
+        pin_submitted_tree(&workspace_root, &task_id, &tree)?;
+        Ok::<_, repository_graph::source::SourceError>(tree)
+    })
+    .await
+    {
+        Ok(Ok(tree)) => tree,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to capture submitted source tree; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "submitted source capture task failed; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
     match mutable_view.frozen(source_tree) {
         Ok(view) => RepositoryViewFreeze::Frozen(view),
         Err(error) => {
+            release_submitted_tree_pin_best_effort(runtime).await;
             tracing::warn!(
                 task_id = runtime.task_id,
                 error = ?error,
@@ -919,6 +933,36 @@ pub(crate) async fn prepare_submitted_repository_view(
             );
             RepositoryViewFreeze::Failed
         }
+    }
+}
+
+pub(crate) async fn release_submitted_tree_pin_best_effort(runtime: &project::RuntimeTaskContext) {
+    let project_root = match project::canonical_project_root().await {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to resolve project root while releasing submitted tree pin"
+            );
+            return;
+        }
+    };
+    let task_id = runtime.task_id.clone();
+    match tokio::task::spawn_blocking(move || release_submitted_tree_pin(&project_root, &task_id))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            task_id = runtime.task_id,
+            error = ?error,
+            "failed to release submitted tree pin"
+        ),
+        Err(error) => tracing::warn!(
+            task_id = runtime.task_id,
+            error = ?error,
+            "submitted tree pin release task failed"
+        ),
     }
 }
 
@@ -976,6 +1020,12 @@ pub(crate) async fn refresh_task_overlay(
         {
             return Err(RefreshAlreadyInProgress.into());
         }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
         let refreshed = (|| -> Result<_> {
             let source = TaskOverlaySource::discover(
                 &workspace_root,
@@ -1002,9 +1052,10 @@ pub(crate) async fn refresh_task_overlay(
             )?;
             Ok(Some((overlay_revision_id, outcome.snapshot.id)))
         })();
+        let lease_healthy = heartbeat.finish();
         let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
         let refreshed = refreshed?;
-        if !released? {
+        if !lease_healthy || !released? {
             anyhow::bail!("task repository graph refresh lease was lost");
         }
         Ok(refreshed)
@@ -1182,6 +1233,12 @@ async fn resolve_task_baseline(
         {
             return Err(RefreshAlreadyInProgress.into());
         }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
         let indexed = IndexCoordinator::new(&mut sidecar).index(
             &source,
             &config,
@@ -1191,9 +1248,10 @@ async fn resolve_task_baseline(
                 force_full: false,
             },
         );
+        let lease_healthy = heartbeat.finish();
         let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
         let outcome = indexed?;
-        if !released? {
+        if !lease_healthy || !released? {
             anyhow::bail!("task baseline repository graph refresh lease was lost");
         }
         Ok(outcome.snapshot.id)

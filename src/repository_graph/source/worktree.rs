@@ -517,6 +517,47 @@ pub fn capture_worktree_tree(root: impl AsRef<Path>) -> Result<Digest, SourceErr
     )
 }
 
+/// Keeps a submitted tree and all of its blobs reachable while the task is in
+/// review. The ref is task-scoped because there can only be one active frozen
+/// submission per task, and the reviewing run has a different run identity
+/// from the Executor that created the tree.
+pub fn pin_submitted_tree(
+    root: impl AsRef<Path>,
+    task_id: &str,
+    tree: &Digest,
+) -> Result<(), SourceError> {
+    validate_git_tree_digest(tree)?;
+    let root = canonical_root(root.as_ref())?;
+    ensure_worktree_root(&root)?;
+    let reference = submitted_tree_ref(task_id);
+    run_git(
+        &root,
+        &["update-ref", &reference, tree.value()],
+        "pin submitted tree",
+    )?;
+    Ok(())
+}
+
+pub fn release_submitted_tree_pin(
+    root: impl AsRef<Path>,
+    task_id: &str,
+) -> Result<(), SourceError> {
+    let root = canonical_root(root.as_ref())?;
+    ensure_worktree_root(&root)?;
+    let reference = submitted_tree_ref(task_id);
+    run_git(
+        &root,
+        &["update-ref", "-d", &reference],
+        "release submitted tree pin",
+    )?;
+    Ok(())
+}
+
+fn submitted_tree_ref(task_id: &str) -> String {
+    let digest = sha256_digest(task_id.as_bytes());
+    format!("refs/ferrus/reviews/{}", digest.value())
+}
+
 fn verify_tree(root: &Path, baseline: &Digest) -> Result<(), SourceError> {
     let tree = format!("{}^{{tree}}", baseline.value());
     run_git(root, &["cat-file", "-e", &tree], "verify baseline tree").map(|_| ())
@@ -1166,6 +1207,35 @@ mod tests {
             "seeded"
         );
         assert!(inventory.changes().is_empty());
+    }
+
+    #[test]
+    fn submitted_tree_pin_keeps_captured_objects_reachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        initialize(root);
+        fs::write(root.join("submitted.rs"), "pub struct Submitted;\n").unwrap();
+
+        let captured = capture_worktree_tree(root).unwrap();
+        pin_submitted_tree(root, "task/with unsafe ref chars", &captured).unwrap();
+        let reference = submitted_tree_ref("task/with unsafe ref chars");
+
+        assert_eq!(
+            git(root, &["rev-parse", &reference]),
+            captured.value().to_string()
+        );
+        git(root, &["reflog", "expire", "--expire=now", "--all"]);
+        git(root, &["gc", "--prune=now"]);
+        assert_eq!(git(root, &["cat-file", "-t", captured.value()]), "tree");
+
+        release_submitted_tree_pin(root, "task/with unsafe ref chars").unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show-ref", "--verify", "--quiet", &reference])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
     }
 
     #[test]

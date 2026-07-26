@@ -61,6 +61,7 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     integration_result?;
 
+    crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
     cleanup_approved_workspace_best_effort(&context, &project_root).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),

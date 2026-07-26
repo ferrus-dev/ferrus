@@ -483,19 +483,27 @@ async fn record_submission(
     context: &RuntimeTaskContext,
     freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
 ) -> Result<()> {
+    let tree_was_pinned = matches!(
+        freeze,
+        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(_)
+    );
     let (frozen_view, failed) = match &freeze {
         crate::repository_graph_runtime::RepositoryViewFreeze::NotAttempted => (None, false),
         crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => (Some(view), false),
         crate::repository_graph_runtime::RepositoryViewFreeze::Failed => (None, true),
     };
-    project::record_task_submitted(
+    let result = project::record_task_submitted(
         &context.task_id,
         &context.task_path,
         context.run_id.as_deref(),
         frozen_view,
         failed,
     )
-    .await
+    .await;
+    if result.is_err() && tree_was_pinned {
+        crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(context).await;
+    }
+    result
 }
 
 #[cfg(test)]

@@ -216,6 +216,12 @@ async fn index(full: bool, json: bool) -> Result<()> {
     {
         anyhow::bail!("canonical repository graph refresh is already in progress");
     }
+    let heartbeat = sidecar.start_refresh_lease_heartbeat(
+        &context.repository,
+        &view_name,
+        build_id.as_str(),
+        REFRESH_LEASE_TTL,
+    )?;
     let indexed = IndexCoordinator::new(&mut sidecar).index(
         &source,
         &context.config,
@@ -228,6 +234,7 @@ async fn index(full: bool, json: bool) -> Result<()> {
     let outcome = match indexed {
         Ok(outcome) => outcome,
         Err(error) => {
+            let _ = heartbeat.finish();
             let _ =
                 sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str());
             return Err(error.into());
@@ -263,7 +270,10 @@ async fn index(full: bool, json: bool) -> Result<()> {
             "canonical graph index was superseded; durable freshness state was left unchanged"
         );
     }
-    if !sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str())? {
+    let lease_healthy = heartbeat.finish();
+    if !lease_healthy
+        || !sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str())?
+    {
         anyhow::bail!("canonical repository graph refresh lease was lost");
     }
     let freshness = if publication_won {

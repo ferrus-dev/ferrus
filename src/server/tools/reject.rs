@@ -50,9 +50,12 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
 
     write_review(&context, &notes).await?;
 
-    match project::record_task_review_rejected(&context.task_id, config.limits.max_review_cycles)
-        .await?
-    {
+    let rejection =
+        project::record_task_review_rejected(&context.task_id, config.limits.max_review_cycles)
+            .await?;
+    crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
+
+    match rejection {
         TaskReviewRejection::Addressing { cycles } => {
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),

@@ -6,11 +6,18 @@
 
 use std::{
     collections::BTreeSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::Serialize;
 
 use super::{
@@ -47,6 +54,36 @@ impl GraphMaintenanceReport {
 pub enum RefreshLeaseOutcome {
     Acquired,
     Busy,
+}
+
+pub struct RefreshLeaseHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+    healthy: Arc<AtomicBool>,
+}
+
+impl RefreshLeaseHeartbeat {
+    pub fn finish(mut self) -> bool {
+        self.stop_worker();
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            self.healthy.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for RefreshLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop_worker();
+    }
 }
 
 impl Sidecar {
@@ -112,6 +149,49 @@ impl Sidecar {
                 owner_token,
             ],
         )? == 1)
+    }
+
+    pub fn start_refresh_lease_heartbeat(
+        &self,
+        repository: &RepositoryRef,
+        view_name: &PublishedViewName,
+        owner_token: &str,
+        ttl: Duration,
+    ) -> Result<RefreshLeaseHeartbeat> {
+        let path = self.path().to_path_buf();
+        let repository = repository.clone();
+        let view_name = view_name.clone();
+        let owner_token = owner_token.to_string();
+        let interval = (ttl / 3).max(Duration::from_millis(1));
+        let (stop, stopped) = mpsc::channel();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let worker_health = Arc::clone(&healthy);
+        let worker = thread::Builder::new()
+            .name("ferrus-graph-lease".to_string())
+            .spawn(move || {
+                let mut last_renewal = Instant::now();
+                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
+                    match renew_refresh_lease_at(&path, &repository, &view_name, &owner_token, ttl)
+                    {
+                        Ok(true) => last_renewal = Instant::now(),
+                        Ok(false) => {
+                            worker_health.store(false, Ordering::Release);
+                            break;
+                        }
+                        Err(_) if last_renewal.elapsed() < ttl => {}
+                        Err(_) => {
+                            worker_health.store(false, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("failed to start repository graph lease heartbeat")?;
+        Ok(RefreshLeaseHeartbeat {
+            stop: Some(stop),
+            worker: Some(worker),
+            healthy,
+        })
     }
 
     pub fn preview_recovery(&self) -> Result<GraphMaintenanceReport> {
@@ -342,6 +422,39 @@ impl Sidecar {
     }
 }
 
+fn renew_refresh_lease_at(
+    path: &Path,
+    repository: &RepositoryRef,
+    view_name: &PublishedViewName,
+    owner_token: &str,
+    ttl: Duration,
+) -> Result<bool> {
+    let now = unix_millis()?;
+    let ttl_ms = i64::try_from(ttl.as_millis()).context("refresh lease TTL is too large")?;
+    let expires_at = now
+        .checked_add(ttl_ms)
+        .context("refresh lease expiration overflow")?;
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let updated = transaction.execute(
+        "UPDATE graph_refresh_leases \
+         SET expires_at_ms = ?1 \
+         WHERE repository_namespace = ?2 AND repository_id = ?3 \
+           AND view_name = ?4 AND owner_token = ?5 AND expires_at_ms > ?6",
+        params![
+            expires_at,
+            repository.namespace.as_str(),
+            repository.repository_id.as_str(),
+            view_name.as_str(),
+            owner_token,
+            now,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(updated == 1)
+}
+
 fn unix_millis() -> Result<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -408,6 +521,42 @@ mod tests {
                 .acquire_refresh_lease(&repository, &first, "owner-2", Duration::from_secs(30))
                 .unwrap(),
             RefreshLeaseOutcome::Acquired
+        );
+    }
+
+    #[test]
+    fn refresh_lease_heartbeat_prevents_reclaim_during_long_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repo-graph.db");
+        let OpenSidecarResult::Ready(mut sidecar) = open_for_build_at(&path).unwrap() else {
+            panic!("sidecar should be ready");
+        };
+        let repository = repository();
+        let view = PublishedViewName::new("task-overlay:t-001").unwrap();
+        let ttl = Duration::from_millis(120);
+
+        assert_eq!(
+            sidecar
+                .acquire_refresh_lease(&repository, &view, "owner-1", ttl)
+                .unwrap(),
+            RefreshLeaseOutcome::Acquired
+        );
+        let heartbeat = sidecar
+            .start_refresh_lease_heartbeat(&repository, &view, "owner-1", ttl)
+            .unwrap();
+        thread::sleep(Duration::from_millis(320));
+
+        assert_eq!(
+            sidecar
+                .acquire_refresh_lease(&repository, &view, "owner-2", ttl)
+                .unwrap(),
+            RefreshLeaseOutcome::Busy
+        );
+        assert!(heartbeat.finish());
+        assert!(
+            sidecar
+                .release_refresh_lease(&repository, &view, "owner-1")
+                .unwrap()
         );
     }
 

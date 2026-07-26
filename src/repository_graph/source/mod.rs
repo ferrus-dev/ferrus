@@ -49,7 +49,7 @@ pub use filesystem::FilesystemRepositorySource;
 pub use git::GitRepositorySource;
 pub use worktree::{
     GitWorktreeChange, GitWorktreeInventory, TaskOverlaySource, TaskWorktreeOverlay,
-    capture_worktree_tree, parse_git_tree_digest,
+    capture_worktree_tree, parse_git_tree_digest, pin_submitted_tree, release_submitted_tree_pin,
 };
 
 const SOURCE_MANIFEST_VERSION: u32 = 1;
