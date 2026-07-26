@@ -584,58 +584,53 @@ pub(crate) async fn canonical_source_identity_at(
         }))
 }
 
-pub(crate) fn schedule_canonical_refresh_after_approval(
+pub(crate) async fn refresh_canonical_graph_after_approval(
     project_root: std::path::PathBuf,
     task_id: String,
     run_id: Option<String>,
 ) {
-    tokio::spawn(async move {
-        match refresh_canonical_graph_at(&project_root).await {
-            Ok(None) => {}
-            Ok(Some((guard, source, snapshot_id, build_id))) => {
-                match project::record_canonical_graph_refresh(
-                    Some(&task_id),
-                    run_id.as_deref(),
-                    guard,
-                    &source,
-                    &snapshot_id,
-                    &build_id,
-                )
-                .await
-                {
-                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
-                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
-                        task_id,
-                        "canonical graph refresh was superseded by a newer invalidation"
-                    ),
-                    Err(error) => tracing::warn!(
-                        task_id,
-                        error = ?error,
-                        "canonical graph refreshed but durable freshness state was not updated"
-                    ),
-                }
-                maintain_graph_best_effort().await;
-            }
-            Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
-                tracing::debug!(
+    match refresh_canonical_graph_at(&project_root).await {
+        Ok(None) => {}
+        Ok(Some((guard, source, snapshot_id, build_id))) => {
+            match project::record_canonical_graph_refresh(
+                Some(&task_id),
+                run_id.as_deref(),
+                guard,
+                &source,
+                &snapshot_id,
+                &build_id,
+            )
+            .await
+            {
+                Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+                Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
                     task_id,
-                    "canonical repository graph refresh was deduplicated"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
+                    "canonical graph refresh was superseded by a newer invalidation"
+                ),
+                Err(error) => tracing::warn!(
                     task_id,
                     error = ?error,
-                    "best-effort canonical graph refresh failed after approval"
-                );
-                project::record_canonical_graph_refresh_failed_best_effort(
-                    &task_id,
-                    run_id.as_deref(),
-                )
-                .await;
+                    "canonical graph refreshed but durable freshness state was not updated"
+                ),
             }
+            maintain_graph_best_effort().await;
         }
-    });
+        Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+            tracing::debug!(
+                task_id,
+                "canonical repository graph refresh was deduplicated"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id,
+                error = ?error,
+                "best-effort canonical graph refresh failed after approval"
+            );
+            project::record_canonical_graph_refresh_failed_best_effort(&task_id, run_id.as_deref())
+                .await;
+        }
+    }
 }
 
 async fn refresh_canonical_graph_at(

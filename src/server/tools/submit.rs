@@ -12,7 +12,9 @@ use crate::{
     agent_id::{ENV_BASELINE_TREE, ENV_PROJECT_ROOT},
     config::Config,
     project::{self, RuntimeTaskContext, TaskCheckFailure},
-    repository_graph::source::{GitWorktreeInventory, parse_git_tree_digest},
+    repository_graph::source::{
+        GitWorktreeInventory, parse_git_tree_digest, release_submitted_tree_pin,
+    },
     state::store,
 };
 
@@ -86,10 +88,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         info!("No check commands configured; treating final check gate as pass");
         let frozen_view =
             crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
-        project::record_task_check_passed(&context.task_id).await?;
-        write_submission(&context, &content).await?;
-        write_submission_patch(&context).await?;
-        record_submission(&context, frozen_view).await?;
+        persist_submission(&context, &content, frozen_view).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
             "submitted",
@@ -114,10 +113,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         CheckGateResult::Passed => {
             let frozen_view =
                 crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
-            project::record_task_check_passed(&context.task_id).await?;
-            write_submission(&context, &content).await?;
-            write_submission_patch(&context).await?;
-            record_submission(&context, frozen_view).await?;
+            persist_submission(&context, &content, frozen_view).await?;
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
                 "submitted",
@@ -483,27 +479,81 @@ async fn record_submission(
     context: &RuntimeTaskContext,
     freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
 ) -> Result<()> {
-    let tree_was_pinned = matches!(
-        freeze,
-        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(_)
-    );
     let (frozen_view, failed) = match &freeze {
         crate::repository_graph_runtime::RepositoryViewFreeze::NotAttempted => (None, false),
         crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => (Some(view), false),
         crate::repository_graph_runtime::RepositoryViewFreeze::Failed => (None, true),
     };
-    let result = project::record_task_submitted(
+    project::record_task_submitted(
         &context.task_id,
         &context.task_path,
         context.run_id.as_deref(),
         frozen_view,
         failed,
     )
-    .await;
-    if result.is_err() && tree_was_pinned {
-        crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(context).await;
+    .await
+}
+
+async fn persist_submission(
+    context: &RuntimeTaskContext,
+    content: &str,
+    freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
+) -> Result<()> {
+    let mut pin_cleanup = SubmittedTreePinCleanup::new(context, &freeze);
+    project::record_task_check_passed(&context.task_id).await?;
+    write_submission(context, content).await?;
+    write_submission_patch(context).await?;
+    record_submission(context, freeze).await?;
+    pin_cleanup.disarm();
+    Ok(())
+}
+
+struct SubmittedTreePinCleanup {
+    workspace_root: Option<PathBuf>,
+    task_id: String,
+    armed: bool,
+}
+
+impl SubmittedTreePinCleanup {
+    fn new(
+        context: &RuntimeTaskContext,
+        freeze: &crate::repository_graph_runtime::RepositoryViewFreeze,
+    ) -> Self {
+        Self {
+            workspace_root: context.workspace_path.as_deref().map(PathBuf::from),
+            task_id: context.task_id.clone(),
+            armed: matches!(
+                freeze,
+                crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(_)
+            ),
+        }
     }
-    result
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubmittedTreePinCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(workspace_root) = self.workspace_root.as_deref() else {
+            tracing::warn!(
+                task_id = self.task_id,
+                "cannot release abandoned submitted tree pin without a workspace"
+            );
+            return;
+        };
+        if let Err(error) = release_submitted_tree_pin(workspace_root, &self.task_id) {
+            tracing::warn!(
+                task_id = self.task_id,
+                error = ?error,
+                "failed to release abandoned submitted tree pin"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +590,44 @@ mod tests {
         let tracked = vec!["y".repeat(PATHSPEC_ARGV_BUDGET * 2)];
         let batches = tracked_pathspec_batches(&tracked);
         assert_eq!(batches, vec![tracked.as_slice()]);
+    }
+
+    #[test]
+    fn abandoned_submission_releases_its_tree_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("submitted.rs"), "pub struct Submitted;\n").unwrap();
+        let tree = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        crate::repository_graph::source::pin_submitted_tree(root, "t-abandoned", &tree).unwrap();
+        let references = git_output(root, ["show-ref"]);
+        let reference = references
+            .split_ascii_whitespace()
+            .find(|value| value.starts_with("refs/ferrus/reviews/"))
+            .unwrap()
+            .to_string();
+
+        drop(SubmittedTreePinCleanup {
+            workspace_root: Some(root.to_path_buf()),
+            task_id: "t-abandoned".to_string(),
+            armed: true,
+        });
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show-ref", "--verify", "--quiet", &reference])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
     }
 
     async fn setup() -> (TempDir, std::path::PathBuf) {

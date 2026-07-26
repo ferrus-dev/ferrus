@@ -53,11 +53,12 @@ async fn run(agent_id: &str) -> Result<String> {
         (integration_result, refresh_canonical_graph)
     };
     if refresh_canonical_graph {
-        crate::repository_graph_runtime::schedule_canonical_refresh_after_approval(
+        crate::repository_graph_runtime::refresh_canonical_graph_after_approval(
             project_root.clone(),
             context.task_id.clone(),
             context.run_id.clone(),
-        );
+        )
+        .await;
     }
     integration_result?;
 
@@ -892,17 +893,6 @@ mod tests {
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
         assert_eq!(task.status, "complete");
-        for _ in 0..100 {
-            if crate::project::canonical_graph_reference()
-                .await
-                .unwrap()
-                .status
-                == crate::project::CanonicalGraphStatus::Fresh
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         let canonical = crate::project::canonical_graph_reference().await.unwrap();
         assert_eq!(
             canonical.status,
