@@ -52,6 +52,10 @@ async fn run(agent_id: &str) -> Result<String> {
             .await;
         (integration_result, refresh_canonical_graph)
     };
+    if integration_result.is_ok() {
+        crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
+        cleanup_approved_workspace_best_effort(&context, &project_root).await;
+    }
     if refresh_canonical_graph {
         crate::repository_graph_runtime::refresh_canonical_graph_after_approval(
             project_root.clone(),
@@ -62,8 +66,6 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     integration_result?;
 
-    crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
-    cleanup_approved_workspace_best_effort(&context, &project_root).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),
         "approved",

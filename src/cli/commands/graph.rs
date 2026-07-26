@@ -159,6 +159,7 @@ impl From<Direction> for EdgeDirection {
 }
 
 pub async fn run(command: GraphCommand) -> Result<()> {
+    project::prepare_runtime_database_for_read_only_operations().await?;
     match command {
         GraphCommand::Index { full, json } => index(full, json).await,
         GraphCommand::Status { json } => status(json).await,
@@ -240,6 +241,12 @@ async fn index(full: bool, json: bool) -> Result<()> {
             return Err(error.into());
         }
     };
+    let lease_healthy = heartbeat.finish();
+    if !lease_healthy
+        || !sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str())?
+    {
+        anyhow::bail!("canonical repository graph refresh lease was lost");
+    }
     let source_identity = project::CanonicalSourceIdentity {
         source_revision_id: source.manifest().revision.id.clone(),
         manifest_digest: source.manifest().revision.manifest_digest.clone(),
@@ -269,12 +276,6 @@ async fn index(full: bool, json: bool) -> Result<()> {
         tracing::warn!(
             "canonical graph index was superseded; durable freshness state was left unchanged"
         );
-    }
-    let lease_healthy = heartbeat.finish();
-    if !lease_healthy
-        || !sidecar.release_refresh_lease(&context.repository, &view_name, build_id.as_str())?
-    {
-        anyhow::bail!("canonical repository graph refresh lease was lost");
     }
     let freshness = if publication_won {
         Freshness::Fresh

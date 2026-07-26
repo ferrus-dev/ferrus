@@ -1279,13 +1279,11 @@ async fn resolve_task_baseline(
                 .is_some(),
             _ => false,
         };
-        let mut retained_view = existing.clone().mutable_successor();
-        retained_view.status = if retained {
-            existing.status
-        } else {
-            project::RepositoryViewStatus::Stale
-        };
-        return Ok(retained_view);
+        if retained {
+            let mut retained_view = existing.clone().mutable_successor();
+            retained_view.status = existing.status;
+            return Ok(retained_view);
+        }
     }
     if !context.config.enabled || baseline_tree.is_none() {
         return project::RepositoryViewReference::new(
@@ -2275,6 +2273,33 @@ mod tests {
             project::list_tasks().await.unwrap()[0].status,
             project::TaskStatus::Executing.as_str()
         );
+
+        std::fs::remove_file(data_dir.join(SIDECAR_FILE_NAME)).unwrap();
+        let rebuilt_view = resolve_task_baseline(
+            LocalGraphContext::load(false).await.unwrap(),
+            data_dir.join(SIDECAR_FILE_NAME),
+            "t-001",
+            root,
+            Some(&baseline_tree),
+            Some(&repository_view),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rebuilt_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        let rebuilt_sidecar = match open_for_query_at(&data_dir.join(SIDECAR_FILE_NAME)).unwrap() {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+            _ => panic!("rebuilt baseline sidecar must be queryable"),
+        };
+        assert!(
+            rebuilt_sidecar
+                .snapshot(rebuilt_view.baseline_snapshot_id.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        drop(rebuilt_sidecar);
 
         std::fs::write(
             root.join("src/lib.rs"),

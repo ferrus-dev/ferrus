@@ -4893,6 +4893,19 @@ fn open_runtime_database(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+pub(crate) async fn prepare_runtime_database_for_read_only_operations() -> Result<()> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || {
+        prepare_runtime_database_for_read_only_operations_at(&database_path)
+    })
+    .await?
+}
+
+fn prepare_runtime_database_for_read_only_operations_at(path: &Path) -> Result<()> {
+    drop(open_runtime_database(path)?);
+    Ok(())
+}
+
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     migrate_runtime_schema(connection)?;
@@ -6312,6 +6325,44 @@ mod tests {
 
     fn teardown(previous: PathBuf) {
         std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn startup_prepares_runtime_schema_for_read_only_graph_queries() {
+        let dir = TempDir::new().unwrap();
+        let database_path = dir.path().join("ferrus.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TABLE runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                "#,
+            )
+            .unwrap();
+
+        prepare_runtime_database_for_read_only_operations_at(&database_path).unwrap();
+
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let state = connection
+            .query_row(
+                r#"
+                SELECT canonical_graph_status, canonical_graph_snapshot_id
+                FROM project_runtime_state
+                WHERE row_id = 1
+                "#,
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("unknown".to_string(), None));
+        assert_eq!(
+            runtime_schema_version(&connection).unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
     }
 
     #[test]

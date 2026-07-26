@@ -65,6 +65,7 @@ impl ServerContext {
 pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> Result<()> {
     platform::set_serve_process_name();
     platform::install_serve_parent_lifecycle_hooks();
+    crate::project::prepare_runtime_database_for_read_only_operations().await?;
 
     let role_str = match &role {
         Some(Role::Supervisor) => ROLE_SUPERVISOR,
