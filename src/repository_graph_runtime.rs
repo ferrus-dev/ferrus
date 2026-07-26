@@ -999,9 +999,10 @@ pub(crate) async fn refresh_task_overlay(
                 reason.supported_schema_version
             ),
         };
-        if sidecar.snapshot(&indexed_baseline_snapshot_id)?.is_none() {
-            anyhow::bail!("task repository graph baseline snapshot is no longer retained");
-        }
+        let baseline_snapshot = sidecar
+            .snapshot(&indexed_baseline_snapshot_id)?
+            .context("task repository graph baseline snapshot is no longer retained")?;
+        let baseline_analysis_config_digest = baseline_snapshot.analysis_config_digest;
         let baseline_files =
             all_snapshot_file_descriptors(&sidecar, &indexed_baseline_snapshot_id)?;
         let view_name = task_overlay_view_name(&task_view_id)?;
@@ -1030,9 +1031,10 @@ pub(crate) async fn refresh_task_overlay(
                     baseline_revision,
                 },
                 discovery,
+                baseline_analysis_config_digest,
                 baseline_files,
             )?;
-            if source.overlay_manifest().changes.is_empty() {
+            if !source.requires_index() {
                 return Ok(None);
             }
             let overlay_revision_id = source.overlay_manifest().revision_id.clone();

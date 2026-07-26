@@ -131,6 +131,7 @@ pub struct TaskOverlaySource {
     overlay: TaskWorktreeOverlay,
     manifest: SourceManifest,
     baseline_files: BTreeMap<RepoPath, SourceFileDescriptor>,
+    baseline_manifest_rebuilt: bool,
 }
 
 impl TaskOverlaySource {
@@ -138,11 +139,28 @@ impl TaskOverlaySource {
         root: impl AsRef<Path>,
         workspace: WorkspaceRef,
         context: SourceDiscoveryContext,
+        baseline_analysis_config_digest: Digest,
         baseline_files: Vec<SourceFileDescriptor>,
     ) -> Result<Self, SourceError> {
         let inventory =
             GitWorktreeInventory::discover(root.as_ref(), workspace.baseline_revision.clone())?;
         let overlay = TaskWorktreeOverlay::discover(root, workspace.clone(), context.clone())?;
+        // Source policy is part of the analysis configuration identity. Once
+        // that identity changes, the stored baseline descriptor set may omit
+        // newly included paths or retain newly sensitive ones, so derive it
+        // again from the immutable tree under the current policy.
+        let baseline_manifest_rebuilt =
+            baseline_analysis_config_digest != *context.analysis_config_digest();
+        let baseline_files = if baseline_manifest_rebuilt {
+            discover_tree_manifest(
+                inventory.root(),
+                &context,
+                workspace.baseline_revision.clone(),
+            )?
+            .files
+        } else {
+            baseline_files
+        };
         let baseline_files = baseline_files
             .into_iter()
             .map(|file| (file.path.clone(), file))
@@ -218,11 +236,16 @@ impl TaskOverlaySource {
             overlay,
             manifest,
             baseline_files,
+            baseline_manifest_rebuilt,
         })
     }
 
     pub fn overlay_manifest(&self) -> &WorkspaceOverlayManifest {
         self.overlay.manifest()
+    }
+
+    pub fn requires_index(&self) -> bool {
+        self.baseline_manifest_rebuilt || !self.overlay.manifest().changes.is_empty()
     }
 
     fn read_baseline_verified(
@@ -1316,6 +1339,11 @@ mod tests {
         let baseline_source = LocalRepositorySource::discover(root, context.clone()).unwrap();
         let baseline_manifest_digest = baseline_source.manifest().revision.manifest_digest.clone();
         let baseline_files = baseline_source.manifest().files.clone();
+        let baseline_analysis_config_digest = baseline_source
+            .manifest()
+            .revision
+            .analysis_config_digest
+            .clone();
 
         fs::write(root.join("changed.rs"), "pub struct After;\n").unwrap();
         fs::remove_file(root.join("deleted.rs")).unwrap();
@@ -1324,6 +1352,7 @@ mod tests {
             root,
             workspace("task-composed", baseline.clone()),
             context,
+            baseline_analysis_config_digest,
             baseline_files,
         )
         .unwrap();
@@ -1375,5 +1404,70 @@ mod tests {
 
         fs::write(root.join("unchanged.rs"), "pub struct NowChanged;\n").unwrap();
         assert!(!composed.revalidate().unwrap());
+    }
+
+    #[test]
+    fn composed_overlay_reapplies_changed_source_policy_to_the_baseline_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        initialize(root);
+        fs::create_dir(root.join("old")).unwrap();
+        fs::create_dir(root.join("new")).unwrap();
+        fs::write(root.join("old/changed.rs"), "pub struct Before;\n").unwrap();
+        fs::write(root.join("old/keep.rs"), "pub struct Keep;\n").unwrap();
+        fs::write(root.join("old/secret.rs"), "pub struct Secret;\n").unwrap();
+        fs::write(root.join("new/included.rs"), "pub struct Included;\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "baseline"]);
+        let baseline = parse_git_tree_digest(&git(root, &["rev-parse", "HEAD^{tree}"])).unwrap();
+
+        let mut baseline_config = RepositoryGraphConfig::default();
+        baseline_config.source.include = ["old/**".to_string()].into_iter().collect();
+        let baseline_context =
+            SourceDiscoveryContext::from_config(repository(), &baseline_config, &[]).unwrap();
+        let baseline_manifest =
+            discover_tree_manifest(root, &baseline_context, baseline.clone()).unwrap();
+        let baseline_files = baseline_manifest.files;
+
+        fs::write(root.join("old/changed.rs"), "pub struct After;\n").unwrap();
+        let mut current_config = baseline_config;
+        current_config.source.include = ["new/**".to_string(), "old/**".to_string()]
+            .into_iter()
+            .collect();
+        current_config.source.sensitive = ["old/secret.rs".to_string()].into_iter().collect();
+        let current_context =
+            SourceDiscoveryContext::from_config(repository(), &current_config, &[]).unwrap();
+        let composed = TaskOverlaySource::discover(
+            root,
+            workspace("task-policy-change", baseline),
+            current_context,
+            baseline_context.analysis_config_digest().clone(),
+            baseline_files,
+        )
+        .unwrap();
+
+        let files = composed
+            .manifest()
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(composed.baseline_manifest_rebuilt);
+        assert!(composed.requires_index());
+        assert!(files.contains(&"old/changed.rs"));
+        assert!(files.contains(&"old/keep.rs"));
+        assert!(files.contains(&"new/included.rs"));
+        assert!(!files.contains(&"old/secret.rs"));
+
+        let newly_included = composed
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == "new/included.rs")
+            .unwrap();
+        assert_eq!(
+            composed.read_verified(newly_included).unwrap().bytes,
+            b"pub struct Included;\n"
+        );
     }
 }
