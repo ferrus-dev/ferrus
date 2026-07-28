@@ -766,7 +766,7 @@ pub(crate) async fn schedule_task_baseline_pin(
     task_id: &str,
     workspace_root: &Path,
     baseline_tree: Option<&str>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let existing = project::task_repository_view(task_id).await.ok().flatten();
     let prepared = match (
         LocalGraphContext::load(false).await,
@@ -791,13 +791,11 @@ pub(crate) async fn schedule_task_baseline_pin(
             None
         }
     };
-    let Some((context, sidecar_path, database_path)) = prepared else {
-        return;
-    };
+    let (context, sidecar_path, database_path) = prepared?;
     let task_id = task_id.to_string();
     let workspace_root = workspace_root.to_path_buf();
     let baseline_tree = baseline_tree.map(str::to_string);
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let resolved = resolve_task_baseline(
             context,
             sidecar_path,
@@ -827,7 +825,7 @@ pub(crate) async fn schedule_task_baseline_pin(
                 "failed to persist task repository graph baseline; dispatch already continued"
             ),
         }
-    });
+    }))
 }
 
 async fn compare_and_record_task_baseline_at(
@@ -1850,6 +1848,36 @@ fn unavailable_task_view_error(status: project::RepositoryViewStatus) -> QueryEr
 mod tests {
     use super::*;
 
+    struct CurrentDirGuard {
+        previous: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn remove_sqlite_file_set(path: &Path) {
+        for suffix in ["-wal", "-shm", ""] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            match std::fs::remove_file(std::path::PathBuf::from(candidate)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to remove SQLite sidecar file: {error}"),
+            }
+        }
+    }
+
     fn indexed_context(root: &Path, sidecar_path: &Path) -> (LocalGraphContext, ContextRequest) {
         let mut context = context(root);
         context.config.enabled = true;
@@ -2154,7 +2182,6 @@ mod tests {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let previous = std::env::current_dir().unwrap();
         let data_dir = root.join(".ferrus/projects/test-project");
         std::fs::create_dir_all(root.join(".ferrus")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -2194,7 +2221,7 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_current_dir(root).unwrap();
+        let _cwd = CurrentDirGuard::change_to(root);
         project::record_task_status(
             "t-approval",
             ".ferrus/tasks/t-approval.md",
@@ -2261,8 +2288,6 @@ mod tests {
         let reference = project::canonical_graph_reference().await.unwrap();
         assert_eq!(reference.status, project::CanonicalGraphStatus::Fresh);
         assert!(reference.snapshot_id.is_some());
-
-        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]
@@ -2342,7 +2367,6 @@ mod tests {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let previous = std::env::current_dir().unwrap();
         std::fs::create_dir_all(root.join(".ferrus/projects/test-project")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -2403,7 +2427,7 @@ mod tests {
         git(&["commit", "-m", "baseline"]);
         let baseline_tree = git(&["rev-parse", "HEAD^{tree}"]);
 
-        std::env::set_current_dir(root).unwrap();
+        let _cwd = CurrentDirGuard::change_to(root);
         project::record_task_status(
             "t-001",
             ".ferrus/tasks/t-001.md",
@@ -2411,17 +2435,11 @@ mod tests {
         )
         .await
         .unwrap();
-        schedule_task_baseline_pin("t-001", root, Some(&baseline_tree)).await;
-        for _ in 0..100 {
-            if project::task_repository_view("t-001")
-                .await
-                .unwrap()
-                .is_some_and(|view| view.status == project::RepositoryViewStatus::Available)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        schedule_task_baseline_pin("t-001", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
 
         let repository_view = project::task_repository_view("t-001")
             .await
@@ -2437,7 +2455,7 @@ mod tests {
             project::TaskStatus::Executing.as_str()
         );
 
-        std::fs::remove_file(data_dir.join(SIDECAR_FILE_NAME)).unwrap();
+        remove_sqlite_file_set(&data_dir.join(SIDECAR_FILE_NAME));
         let rebuilt_view = resolve_task_baseline(
             LocalGraphContext::load(false).await.unwrap(),
             data_dir.join(SIDECAR_FILE_NAME),
@@ -2633,17 +2651,11 @@ mod tests {
         )
         .await
         .unwrap();
-        schedule_task_baseline_pin("t-002", root, Some("invalid-tree")).await;
-        for _ in 0..100 {
-            if project::task_repository_view("t-002")
-                .await
-                .unwrap()
-                .is_some_and(|view| view.status == project::RepositoryViewStatus::Failed)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        schedule_task_baseline_pin("t-002", root, Some("invalid-tree"))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
         assert_eq!(
             project::task_repository_view("t-002")
                 .await
@@ -2666,17 +2678,11 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub struct BaselineSymbol;\n").unwrap();
         std::fs::write(root.join("src/deleted.rs"), "pub struct DeletedSymbol;\n").unwrap();
         std::fs::remove_file(root.join("src/added.rs")).unwrap();
-        schedule_task_baseline_pin("t-002", root, Some(&baseline_tree)).await;
-        for _ in 0..100 {
-            if project::task_repository_view("t-002")
-                .await
-                .unwrap()
-                .is_some_and(|view| view.status == project::RepositoryViewStatus::Available)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        schedule_task_baseline_pin("t-002", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
         let retried_view = project::task_repository_view("t-002")
             .await
             .unwrap()
@@ -2695,17 +2701,11 @@ mod tests {
         )
         .await
         .unwrap();
-        schedule_task_baseline_pin("t-003", root, Some(&baseline_tree)).await;
-        for _ in 0..100 {
-            if project::task_repository_view("t-003")
-                .await
-                .unwrap()
-                .is_some_and(|view| view.status == project::RepositoryViewStatus::Available)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        schedule_task_baseline_pin("t-003", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
         let changed_worktree_view = project::task_repository_view("t-003")
             .await
             .unwrap()
@@ -2769,7 +2769,6 @@ mod tests {
                 None => std::env::remove_var(ENV_TASK_ID),
             }
         }
-        std::env::set_current_dir(previous).unwrap();
     }
 
     #[test]
