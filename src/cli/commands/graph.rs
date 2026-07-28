@@ -252,7 +252,7 @@ async fn index(full: bool, json: bool) -> Result<()> {
         manifest_digest: source.manifest().revision.manifest_digest.clone(),
     };
     let publication_won = publication_matches_snapshot(&outcome.publication, &outcome.snapshot.id);
-    if publication_won {
+    let durable_refresh_recorded = if publication_won {
         match project::record_canonical_graph_refresh(
             None,
             None,
@@ -263,25 +263,28 @@ async fn index(full: bool, json: bool) -> Result<()> {
         )
         .await
         {
-            Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
-            Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::warn!(
-                "canonical graph was indexed but a newer source invalidation remains pending"
-            ),
-            Err(error) => tracing::warn!(
-                error = ?error,
-                "canonical graph indexed but durable freshness state was not updated"
-            ),
+            Ok(project::CanonicalGraphRefreshOutcome::Recorded) => true,
+            Ok(project::CanonicalGraphRefreshOutcome::Superseded) => {
+                tracing::warn!(
+                    "canonical graph was indexed but a newer source invalidation remains pending"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    "canonical graph indexed but durable freshness state was not updated"
+                );
+                false
+            }
         }
     } else {
         tracing::warn!(
             "canonical graph index was superseded; durable freshness state was left unchanged"
         );
-    }
-    let freshness = if publication_won {
-        Freshness::Fresh
-    } else {
-        Freshness::Unknown
+        false
     };
+    let freshness = reported_index_freshness(publication_won, durable_refresh_recorded);
     crate::repository_graph_runtime::maintain_graph_best_effort().await;
     if json {
         print_json(&IndexOutput {
@@ -294,7 +297,11 @@ async fn index(full: bool, json: bool) -> Result<()> {
         println!("Snapshot: {}", outcome.snapshot.id);
         println!(
             "Freshness: {}",
-            if publication_won { "fresh" } else { "unknown" }
+            if freshness == Freshness::Fresh {
+                "fresh"
+            } else {
+                "unknown"
+            }
         );
         println!(
             "Files: {} discovered, {} reused, {} parsed, {} skipped, {} failed",
@@ -314,6 +321,14 @@ async fn index(full: bool, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn reported_index_freshness(publication_won: bool, durable_refresh_recorded: bool) -> Freshness {
+    if publication_won && durable_refresh_recorded {
+        Freshness::Fresh
+    } else {
+        Freshness::Unknown
+    }
 }
 
 fn publication_matches_snapshot(
@@ -787,6 +802,9 @@ mod tests {
             &PublicationOutcome::Superseded { current: view },
             &losing_snapshot,
         ));
+        assert_eq!(reported_index_freshness(true, true), Freshness::Fresh);
+        assert_eq!(reported_index_freshness(true, false), Freshness::Unknown);
+        assert_eq!(reported_index_freshness(false, false), Freshness::Unknown);
     }
 
     #[test]
