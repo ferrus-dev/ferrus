@@ -104,6 +104,7 @@ pub struct CanonicalGraphReference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalGraphRefreshGuard {
     invalidation_event_id: i64,
+    refresh_event_id: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1658,6 +1659,7 @@ pub async fn canonical_graph_refresh_guard() -> Result<CanonicalGraphRefreshGuar
         connection.busy_timeout(Duration::from_secs(5))?;
         Ok(CanonicalGraphRefreshGuard {
             invalidation_event_id: latest_canonical_graph_invalidation_event_id(&connection)?,
+            refresh_event_id: latest_canonical_graph_refresh_event_id(&connection)?,
         })
     })
     .await?
@@ -1771,6 +1773,11 @@ pub async fn record_canonical_graph_refresh(
                     FROM events
                     WHERE type = 'canonical_graph_invalidated'
                   ) = ?6
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_refreshed'
+                  ) = ?7
             "#,
             params![
                 source.source_revision_id.as_str(),
@@ -1779,6 +1786,7 @@ pub async fn record_canonical_graph_refresh(
                 snapshot_id.as_str(),
                 timestamp(),
                 guard.invalidation_event_id,
+                guard.refresh_event_id,
             ],
         )?;
         if updated == 0 {
@@ -1814,9 +1822,22 @@ fn latest_canonical_graph_invalidation_event_id(connection: &Connection) -> Resu
     )?)
 }
 
+fn latest_canonical_graph_refresh_event_id(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        r#"
+        SELECT COALESCE(MAX(id), 0)
+        FROM events
+        WHERE type = 'canonical_graph_refreshed'
+        "#,
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 pub async fn record_canonical_graph_refresh_failed_best_effort(
     task_id: &str,
     run_id: Option<&str>,
+    guard: CanonicalGraphRefreshGuard,
 ) {
     let database_path = match current_database_path().await {
         Ok(path) => path,
@@ -1832,15 +1853,29 @@ pub async fn record_canonical_graph_refresh_failed_best_effort(
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_project_runtime_state_row(&transaction)?;
-        transaction.execute(
+        let state_updated = transaction.execute(
             r#"
             UPDATE project_runtime_state
             SET canonical_graph_status = 'stale',
                 canonical_graph_updated_at = ?1,
                 updated_at = ?1
             WHERE row_id = 1
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_invalidated'
+                  ) = ?2
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_refreshed'
+                  ) = ?3
             "#,
-            [timestamp()],
+            params![
+                timestamp(),
+                guard.invalidation_event_id,
+                guard.refresh_event_id,
+            ],
         )?;
         insert_event_in_transaction(
             &transaction,
@@ -1849,6 +1884,7 @@ pub async fn record_canonical_graph_refresh_failed_best_effort(
             &serde_json::json!({
                 "task_id": task_id,
                 "failure_code": "canonical_refresh_failed",
+                "state_updated": state_updated == 1,
             }),
         )?;
         transaction.commit()?;
@@ -6907,6 +6943,55 @@ mod tests {
                 source: Some(newer_source),
                 snapshot_id: None,
                 status: CanonicalGraphStatus::Stale,
+            }
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn failed_canonical_refresh_does_not_overwrite_a_newer_success() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        let failed_refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        let successful_refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        let snapshot = SnapshotId::new("canonical-snapshot-1").unwrap();
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                successful_refresh_guard,
+                &source,
+                &snapshot,
+                &BuildId::new("canonical-build-1").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Recorded
+        );
+
+        record_canonical_graph_refresh_failed_best_effort("t-001", None, failed_refresh_guard)
+            .await;
+
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source),
+                snapshot_id: Some(snapshot),
+                status: CanonicalGraphStatus::Fresh,
             }
         );
 

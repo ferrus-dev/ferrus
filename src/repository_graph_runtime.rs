@@ -589,9 +589,20 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
     task_id: String,
     run_id: Option<String>,
 ) {
+    let guard = match project::canonical_graph_refresh_guard().await {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(
+                task_id,
+                error = ?error,
+                "failed to capture canonical graph refresh generation"
+            );
+            return;
+        }
+    };
     match refresh_canonical_graph_at(&project_root).await {
         Ok(None) => {}
-        Ok(Some((guard, source, snapshot_id, build_id))) => {
+        Ok(Some((source, snapshot_id, build_id))) => {
             match project::record_canonical_graph_refresh(
                 Some(&task_id),
                 run_id.as_deref(),
@@ -627,8 +638,12 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
                 error = ?error,
                 "best-effort canonical graph refresh failed after approval"
             );
-            project::record_canonical_graph_refresh_failed_best_effort(&task_id, run_id.as_deref())
-                .await;
+            project::record_canonical_graph_refresh_failed_best_effort(
+                &task_id,
+                run_id.as_deref(),
+                guard,
+            )
+            .await;
         }
     }
 }
@@ -637,16 +652,11 @@ async fn refresh_canonical_graph_at(
     project_root: &Path,
 ) -> Result<
     Option<(
-        project::CanonicalGraphRefreshGuard,
         project::CanonicalSourceIdentity,
         repository_graph::domain::SnapshotId,
         BuildId,
     )>,
 > {
-    // Observe the invalidation generation before source discovery. A later
-    // approval may invalidate canonical content while this build is running;
-    // its durable stale marker must win over this older publication.
-    let refresh_guard = project::canonical_graph_refresh_guard().await?;
     let Some((config, repository, source)) = canonical_source_at(project_root).await? else {
         return Ok(None);
     };
@@ -703,7 +713,6 @@ async fn refresh_canonical_graph_at(
     .await??;
     debug_assert_eq!(outcome.snapshot.repository, repository);
     Ok(Some((
-        refresh_guard,
         source_identity,
         outcome.snapshot.id,
         outcome.build_id,
