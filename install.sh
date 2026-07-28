@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${FERRUS_INSTALL_REPO:-RomanEmreis/ferrus}"
+REPO="${FERRUS_INSTALL_REPO:-ferrus-dev/ferrus}"
 VERSION="${FERRUS_INSTALL_VERSION:-latest}"
 TARGET=""
 ARCHIVE=""
