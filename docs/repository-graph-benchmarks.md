@@ -30,7 +30,7 @@ point estimates; compilation and per-iteration setup are excluded.
 | Medium fixture cold build (302 files) | 97.0 ms | 302 | 0 | 1,816 nodes / 2,115 edges |
 | Medium fixture no-op build | 49.1 ms | 0 | 302 | same snapshot |
 | Medium fixture one-file change | 84.0 ms | 1 | 301 | new snapshot |
-| Medium fixture indexed symbol search | 238 µs | — | — | 1 hit |
+| Medium fixture indexed symbol search | 238 us | -- | -- | 1 hit |
 
 ## Ferrus dogfood recorded 2026-07-14
 

@@ -114,7 +114,7 @@ repository snapshot identity and a memory revision identity with separate freshn
 - Successful spec archive or outcome update must invalidate memory freshness and may schedule a best-effort
   incremental memory refresh outside the archive critical path.
 - Memory indexing and query failures must never change task/run/lease/review/archive state or block the core
-  Supervisor–Executor state machine.
+  Supervisor-Executor state machine.
 - Record privacy-safe counts, durations, source categories, revision IDs, stale-link counts, and errors without
   source bodies, raw memory text, secrets, or absolute local paths.
 - Incompatible derived memory schemas must support a rebuild rather than requiring lossless migration of every

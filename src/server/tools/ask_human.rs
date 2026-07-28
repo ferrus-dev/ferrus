@@ -12,7 +12,7 @@ use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_er
 pub const DESCRIPTION: &str = "Ask the human a question. \
      Writes the question to the task-scoped run directory, transitions state to AwaitingHuman, \
      and returns immediately. You MUST call /wait_for_answer immediately after \
-     to block until the human responds — do not call any other tools in between. \
+     to block until the human responds -- do not call any other tools in between. \
      Can be called from Executing, Addressing, Consultation, or Reviewing state.";
 
 pub const INPUT_SCHEMA: &str = r#"{
@@ -59,7 +59,7 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
     let paused = context.status.clone();
     let question_path = format!("{}/QUESTION.md", context.run_dir.trim_end_matches('/'));
 
-    info!(paused, "Task → AwaitingHuman");
+    info!(paused, "Task -> AwaitingHuman");
     Ok(format!(
         "Your question has been written to `{question_path}`.\n\
          State is now AwaitingHuman (paused from {paused}).\n\

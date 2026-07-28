@@ -183,13 +183,13 @@ mod tests {
         tokio::fs::write(&runtime_db, sentinel).await.unwrap();
 
         let status = repository_graph_status::run().await.unwrap();
-        let search = repository_search::handler(serde_json::json!({
+        let search = repository_search::run_without_agent(serde_json::json!({
             "query": "RuntimeTaskContext",
             "max_results": 5
         }))
         .await
         .unwrap();
-        let context = repository_context::handler(serde_json::json!({
+        let context = repository_context::run_without_agent(serde_json::json!({
             "seeds": [{"type": "path", "value": "src/lib.rs"}],
             "max_results": 5
         }))
@@ -212,6 +212,68 @@ mod tests {
         assert!(!data_dir.join("repo-graph.db").exists());
         assert!(!std::path::Path::new(".ferrus/tasks").exists());
 
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn repository_status_routes_with_the_server_agent_id_without_env() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_runtime_project().await;
+        tokio::fs::write("ferrus.toml", "[repository_graph]\nenabled = true\n")
+            .await
+            .unwrap();
+        crate::project::record_task_status(
+            "t-graph",
+            ".ferrus/tasks/t-graph.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        let view = crate::project::RepositoryViewReference::materialized(
+            crate::repository_graph::domain::SnapshotId::new("baseline-task").unwrap(),
+            Some(crate::repository_graph::domain::OverlayRevisionId::new("overlay-task").unwrap()),
+            crate::repository_graph::domain::SnapshotId::new("snapshot-task").unwrap(),
+            crate::project::RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        crate::project::record_task_repository_view("t-graph", &view)
+            .await
+            .unwrap();
+        crate::project::claim_task(
+            "t-graph",
+            ".ferrus/tasks/t-graph.md",
+            "executor:codex:7",
+            60,
+        )
+        .await
+        .unwrap();
+        let previous_agent_id = std::env::var_os(crate::agent_id::ENV_AGENT_ID);
+        let previous_task_id = std::env::var_os(crate::agent_id::ENV_TASK_ID);
+        // SAFETY: cwd_lock serializes tests that mutate Ferrus process-global context.
+        unsafe {
+            std::env::remove_var(crate::agent_id::ENV_AGENT_ID);
+            std::env::remove_var(crate::agent_id::ENV_TASK_ID);
+        }
+
+        let status = repository_graph_status::handler_for_agent("executor:codex:7")
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+
+        assert_eq!(status["task_view"]["task_view_id"], "t-graph");
+        assert_eq!(status["task_view"]["baseline_snapshot_id"], "baseline-task");
+        assert_eq!(status["task_view"]["overlay_revision_id"], "overlay-task");
+        // SAFETY: the same lock remains held while the prior environment is restored.
+        unsafe {
+            match previous_agent_id {
+                Some(value) => std::env::set_var(crate::agent_id::ENV_AGENT_ID, value),
+                None => std::env::remove_var(crate::agent_id::ENV_AGENT_ID),
+            }
+            match previous_task_id {
+                Some(value) => std::env::set_var(crate::agent_id::ENV_TASK_ID, value),
+                None => std::env::remove_var(crate::agent_id::ENV_TASK_ID),
+            }
+        }
         teardown(previous);
     }
 }

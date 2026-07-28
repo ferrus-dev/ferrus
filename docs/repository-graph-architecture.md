@@ -182,12 +182,12 @@ Every graph fact carries:
 - confidence or exactness classification;
 - optional typed properties.
 
-Absence of a node or edge means “not known by this snapshot and its capabilities,” not proof that the entity or
+Absence of a node or edge means "not known by this snapshot and its capabilities," not proof that the entity or
 relationship does not exist.
 
 ### Task repository view
 
-`TaskRepositoryView` is not a mutable alias to canonical `latest`. It contains:
+`TaskRepositoryView` is not a mutable alias to canonical `latest`. An available view contains:
 
 - task/run authorization scope;
 - immutable baseline snapshot ID;
@@ -195,6 +195,16 @@ relationship does not exist.
 - overlay source-manifest digest;
 - view lifecycle: mutable task view or frozen submitted view;
 - freshness for baseline and overlay separately.
+
+Its explicit state distinguishes baseline-only, baseline-plus-overlay, stale, unavailable, and failed views, so a
+caller never falls back to canonical context merely because a task view could not be built.
+
+`WorkspaceRef` carries only repository identity, task-view namespace, and pinned Git tree identity. The local
+worktree path belongs to the machine-local source adapter and is never part of a portable view identity.
+
+`WorkspaceOverlayManifest` is the deterministic, policy-aware changed-file input for overlay construction. It
+records additions, modifications, deletions, and rename evidence (as delete plus add), while source descriptors and
+content identities are present only for paths that remain indexable under the effective source policy.
 
 The overlay revision is derived from the pinned baseline plus the task's included changed, added, and deleted
 content under the same source policy. Two tasks never share an overlay namespace merely because their content
@@ -235,9 +245,9 @@ Availability, build execution, publication, and freshness are orthogonal and mus
   snapshot or overlay;
 - `stale`: a comparable current input differs;
 - `unknown`: the source cannot be inspected sufficiently to compare;
-- `not_applicable`: used for an immutable pinned source that no longer has a mutable “current” counterpart.
+- `not_applicable`: used for an immutable pinned source that no longer has a mutable "current" counterpart.
 
-A status response may therefore report “published snapshot is stale; refresh build failed” without losing the
+A status response may therefore report "published snapshot is stale; refresh build failed" without losing the
 published snapshot.
 
 Freshness is computed from actual source state, not lifecycle events alone:
@@ -319,7 +329,7 @@ Later implementation must preserve all of these statements:
 6. Partial or failed builds never replace the last published view.
 7. Freshness is computed against actual effective inputs, not inferred only from events.
 8. Operational configuration and secrets do not change structural snapshot identity.
-9. Missing graph capability never blocks the Supervisor–Executor state machine.
+9. Missing graph capability never blocks the Supervisor-Executor state machine.
 10. Every fact is evidence-backed and capability-scoped; missing facts never prove absence.
 
 ## Rejected Alternatives

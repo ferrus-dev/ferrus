@@ -10,7 +10,7 @@
 
 Ferrus turns coding agents into controlled, repeatable workers.
 
-It runs a Supervisor → Executor → Reviewer loop over your repository — not as a chat, but as a **state machine**.  
+It runs a Supervisor -> Executor -> Reviewer loop over your repository -- not as a chat, but as a **state machine**.
 Tasks are planned, implemented, checked, and reviewed in a structured, restart-safe flow. Unlike chat-based agents, ferrus enforces structure and lifecycle.
 
 Everything is explicit:
@@ -27,14 +27,14 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
-- **goose** (experimental) — MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever — raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
-- **opencode** (experimental) — convenient for running local models. ⚠️ The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
+- **goose** (experimental) -- MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever -- raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
+- **opencode** (experimental) -- convenient for running local models. Warning: The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
 
-Agents are treated as interchangeable workers — ferrus provides the runtime, coordination, and state.
+Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 
 Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, `opencode/`, and `goose/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
 
-> 💡 **Status**: ferrus is currently in alpha and not ready for production.
+>  **Status**: ferrus is currently in alpha and not ready for production.
 
 [Tutorial](https://ferrus.dev) | [Roadmap](https://github.com/RomanEmreis/ferrus/blob/main/docs/milestones.md)
 
@@ -44,17 +44,17 @@ Internally, agent support is normalized through `src/agents/`: `mod.rs` defines 
 
 ```
   you
-   │
-   └─► ferrus HQ
-         │
-         ├─► Supervisor (Claude Code or Codex) — plans tasks
-         │         │ exits after task created;
-         │
-         ├─► Executor (Claude Code or Codex)   — implements, checks, submits
-         │         │ runs headlessly
-         │
-         └─► Reviewer (Claude Code or Codex)   — spawned automatically on submission
-                   │ exits after approve/reject; runs headlessly
+   |
+   +-> ferrus HQ
+         |
+         +-> Supervisor (Claude Code or Codex) -- plans tasks
+         |         | exits after task created;
+         |
+         +-> Executor (Claude Code or Codex)   -- implements, checks, submits
+         |         | runs headlessly
+         |
+         +-> Reviewer (Claude Code or Codex)   -- spawned automatically on submission
+                   | exits after approve/reject; runs headlessly
 ```
 
 HQ watches state transitions and spawns the right agent at the right time.
@@ -86,7 +86,7 @@ ferrus register --supervisor claude-code --executor codex  # write agent configs
 ferrus                                                     # enter HQ
 ```
 
-Then type `/task` — a supervisor spawns, you describe what you want, and the full loop runs automatically.
+Then type `/task` -- a supervisor spawns, you describe what you want, and the full loop runs automatically.
 
 On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads the matching release binary into `~/.local/bin` by default. On Windows, `install.ps1` installs `ferrus.exe` into `%LOCALAPPDATA%\ferrus\bin` by default. Release archives are verified with published SHA-256 checksums before installation. Set `FERRUS_INSTALL_DIR` to override the destination, or `FERRUS_INSTALL_VERSION=vX.Y.Z` to install a specific release tag.
 
@@ -99,7 +99,7 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 | Command | Description |
 |---|---|
 | `/plan` | Free-form planning session with the supervisor (no task created) |
-| `/task` | Define a task from the selected milestone, then run the executor→review loop automatically |
+| `/task` | Define a task from the selected milestone, then run the executor->review loop automatically |
 | `/task --manual` | Define a free-form task without selected milestone context |
 | `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
 | `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
@@ -133,11 +133,11 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 
 ```
 ferrus> /task
-  └─ supervisor spawns → you describe the task → supervisor calls enqueue_task
-       └─ executor spawns (headless) → implements → check → submit
-            └─ reviewer spawns (headless) → reads submission → approve or reject
-                 ├─ approved → Complete
-                 └─ rejected → executor re-spawns with feedback
+  +- supervisor spawns -> you describe the task -> supervisor calls enqueue_task
+       +- executor spawns (headless) -> implements -> check -> submit
+            +- reviewer spawns (headless) -> reads submission -> approve or reject
+                 +- approved -> Complete
+                 +- rejected -> executor re-spawns with feedback
 ```
 
 Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task row and scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`; each spawn exits when its job is done.
@@ -148,16 +148,16 @@ Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task
 
 ```
 pending
- └─► executing      ← /wait_for_task claim
-       ├─► addressing ← /reject → work loop
-       ├─► consultation ← /consult
-       │     └─► (restore paused status) ← /wait_for_consult
-       ├─► awaiting_human ← /ask_human
-       │     └─► (restore paused status) ← /wait_for_answer
-       ├─► reviewing ← /submit final gate pass
-       │     ├─► addressing ← /reject
-       │     └─► complete ← /approve
-       └─► failed ← retry, review-cycle, or executor-dispatch limit
+ +-> executing      <- /wait_for_task claim
+       +-> addressing <- /reject -> work loop
+       +-> consultation <- /consult
+       |     +-> (restore paused status) <- /wait_for_consult
+       +-> awaiting_human <- /ask_human
+       |     +-> (restore paused status) <- /wait_for_answer
+       +-> reviewing <- /submit final gate pass
+       |     +-> addressing <- /reject
+       |     +-> complete <- /approve
+       +-> failed <- retry, review-cycle, or executor-dispatch limit
 ```
 
 Any active Executor work state (Executing, Addressing) can pause to `Consultation` via `/consult`. HQ spawns the configured Supervisor in consultation mode, and the executor immediately calls `/wait_for_consult` to block until the Supervisor answers via `/respond_consult`.
@@ -183,7 +183,7 @@ Scaffolds ferrus in the current project (default `--agents-path .agents`):
 - Creates `~/.ferrus/projects/<project-id>/ferrus.db` with `tasks`, `runs`, and `events` tables
 - Creates `docs/specs/` for approved feature specifications
 - Creates skill files agents load to understand their role:
-  - `<agents-path>/skills/ferrus/SKILL.md` — general overview
+  - `<agents-path>/skills/ferrus/SKILL.md` -- general overview
   - `<agents-path>/skills/ferrus-supervisor/SKILL.md` + `ROLE.md`
   - `<agents-path>/skills/ferrus-executor/SKILL.md` + `ROLE.md`
 - Adds `.ferrus/` to `.gitignore`
@@ -214,7 +214,7 @@ Writes agent config files so they automatically load `ferrus serve` as a tool se
 | `codex` | `.codex/config.toml` |
 | `qwen-code` | `.qwen/settings.json` |
 | `opencode` | `opencode.json` |
-| `goose` | none — the Ferrus MCP server is attached at launch via `--with-extension` |
+| `goose` | none -- the Ferrus MCP server is attached at launch via `--with-extension` |
 
 ### `ferrus doctor`
 
@@ -252,6 +252,35 @@ repository-relative evidence spans, provenance, and any truncation. CLI limits a
 `[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
 `ferrus.db`; it stores structural facts and content identities, not source bodies.
 
+Managed Executor worktrees use a task-owned graph view pinned to the dispatch baseline. `/check` and the final
+submit gate refresh its changed-file overlay best-effort: unchanged fragments are reused, changed and added files
+replace or extend the view, and deleted paths hide baseline facts. Task-view responses include both the baseline
+snapshot, overlay revision, and mutable/frozen lifecycle; a graph refresh failure never changes task lifecycle
+state. Submit freezes the successfully materialized view with an immutable Git tree in the same runtime
+transaction as the Reviewing handoff. Reviewers and recovery sessions therefore reopen the exact submitted graph
+and hash-verified snippets after the Executor worktree disappears; rejection preserves that run history while the
+task resumes a mutable successor view.
+
+Runtime identity selects the view explicitly: taskless/manual sessions use canonical, Executors use their mutable
+task overlay, Consultants use the attached task view and Executor workspace, and Reviewers use the frozen view on
+their review run. An invalid task binding or unavailable submitted freeze is reported instead of silently falling
+back to canonical context.
+
+Approval compares the actual canonical source manifest before and after patch application, integration checks,
+spec updates, and any rollback. A changed post-operation manifest is durably marked stale with its source revision
+and manifest identity. A clean rollback records no proposed integration; partial mutations remain stale and are
+refreshed from the files actually left in canonical. Best-effort incremental indexing starts only after the
+canonical approval lock is released, and its success or failure never changes the task approval outcome. A manual
+`ferrus graph index` clears the same durable invalidation after publishing its verified snapshot.
+
+Canonical and task refreshes are coordinated by expiring SQLite leases scoped to the exact published view, so
+concurrent tasks cannot publish into one another's namespace and duplicate refreshes are suppressed across Ferrus
+processes. Ordinary maintenance keeps every snapshot referenced by a non-terminal task/run (including frozen
+review views) plus all published canonical snapshots. Completed-task publications and unreferenced snapshots age
+out under `[repository_graph.retention]`; deleting a managed worktree never deletes a retained immutable baseline.
+Interrupted builds never expose partial facts: `ferrus recover` marks only unfinished attempts failed, reclaims
+expired graph refresh leases, and garbage-collects safe candidates without changing task lifecycle state.
+
 Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
 Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically
@@ -269,7 +298,7 @@ Lists projects registered under `~/.ferrus/projects`, including project id, name
 
 ### `ferrus recover`
 
-Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled.
+Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled. It also recovers unfinished repository-graph builds, expired view-refresh leases, and safe retention candidates when the optional sidecar is available; graph recovery failure is reported but does not undo runtime recovery.
 
 Use `ferrus recover --dry-run` to print the pending recovery counters without changing runtime state.
 Use `ferrus recover --worktrees` to also remove orphaned managed task worktrees that no active task or active run still owns. Combine it with `--dry-run` to preview the orphan count without removing anything.
@@ -303,12 +332,12 @@ commands = [
 ]
 
 [limits]
-max_check_retries = 20   # consecutive check failures before state → Failed
-max_review_cycles = 3    # reject→fix cycles before state → Failed
+max_check_retries = 20   # consecutive check failures before state -> Failed
+max_review_cycles = 3    # reject->fix cycles before state -> Failed
 max_feedback_lines = 30  # trailing lines per failing command shown in /check and /submit output
 wait_timeout_secs = 60   # max duration of one wait_* tool call before it returns timeout so the agent can poll again
 max_parallel_tasks = 1   # maximum number of concurrent executor sessions
-max_executor_dispatches = 6 # headless executor sessions per work phase before state → Failed; 0 disables
+max_executor_dispatches = 6 # headless executor sessions per work phase before state -> Failed; 0 disables
 
 [lease]
 ttl_secs = 90                  # how long a claimed lease is valid without renewal
@@ -322,7 +351,7 @@ agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex
 model = ""             # optional override; empty = agent default
 
 [hq.executor]
-agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable — see Supported agents
+agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable -- see Supported agents
 model = ""             # optional override; empty = agent default
 ```
 
@@ -378,7 +407,7 @@ SQLite is the runtime source of truth. `ferrus.db` stores task status, claims an
 
 Ferrus is partially developed using its own orchestration workflow.
 
-This repository is used to validate the Supervisor → Executor → Reviewer loop in real development scenarios.
+This repository is used to validate the Supervisor -> Executor -> Reviewer loop in real development scenarios.
 
 ---
 

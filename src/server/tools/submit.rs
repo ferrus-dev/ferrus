@@ -12,6 +12,9 @@ use crate::{
     agent_id::{ENV_BASELINE_TREE, ENV_PROJECT_ROOT},
     config::Config,
     project::{self, RuntimeTaskContext, TaskCheckFailure},
+    repository_graph::source::{
+        GitWorktreeInventory, parse_git_tree_digest, release_submitted_tree_pin,
+    },
     state::store,
 };
 
@@ -25,8 +28,8 @@ use super::{
 pub const DESCRIPTION: &str = "\
 Run the final check gate and, if it passes, submit work for Supervisor review. \
 Can be called from Executing or Addressing. \
-On pass: state → Reviewing. On fail: stay in the current work state (or state \
-→ Failed if the retry limit is exhausted).
+On pass: state -> Reviewing. On fail: stay in the current work state (or state \
+-> Failed if the retry limit is exhausted).
 
 The `content` parameter must be a Markdown document with the following sections:
 
@@ -83,10 +86,9 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
 
     if config.checks.commands.is_empty() {
         info!("No check commands configured; treating final check gate as pass");
-        project::record_task_check_passed(&context.task_id).await?;
-        write_submission(&context, &content).await?;
-        write_submission_patch(&context).await?;
-        record_task_status(&context, project::TaskStatus::Reviewing).await?;
+        let frozen_view =
+            crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
+        persist_submission(&context, &content, frozen_view).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
             "submitted",
@@ -106,12 +108,12 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         .run_id
         .as_deref()
         .unwrap_or(context.task_id.as_str());
-    match check_gate::run(&config, attempt, log_scope).await? {
+    let gate = check_gate::run(&config, attempt, log_scope).await?;
+    match gate {
         CheckGateResult::Passed => {
-            project::record_task_check_passed(&context.task_id).await?;
-            write_submission(&context, &content).await?;
-            write_submission_patch(&context).await?;
-            record_task_status(&context, project::TaskStatus::Reviewing).await?;
+            let frozen_view =
+                crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
+            persist_submission(&context, &content, frozen_view).await?;
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
                 "submitted",
@@ -119,7 +121,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
             )
             .await;
 
-            info!("Work submitted for review, state → Reviewing");
+            info!("Work submitted for review, state -> Reviewing");
             Ok(
                 "Submitted for review. State: Reviewing. The Supervisor can now call /review_pending."
                     .to_string(),
@@ -176,13 +178,24 @@ async fn write_submission(context: &RuntimeTaskContext, content: &str) -> Result
     store::write_submission_for_run_dir(&context.run_dir, content).await
 }
 
-async fn write_submission_patch(context: &RuntimeTaskContext) -> Result<()> {
+async fn write_submission_patch(
+    context: &RuntimeTaskContext,
+    freeze: &crate::repository_graph_runtime::RepositoryViewFreeze,
+) -> Result<()> {
     if !is_isolated_executor_workspace(context).await {
         store::clear_patch_for_run_dir(&context.run_dir).await?;
         return Ok(());
     }
 
-    let patch = workspace_patch(context).await?;
+    let patch = match freeze {
+        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => {
+            let source_tree = view.frozen_source_tree.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("frozen repository view is missing its source tree")
+            })?;
+            frozen_tree_patch(context, source_tree).await?
+        }
+        _ => workspace_patch(context).await?,
+    };
     store::write_patch_for_run_dir(&context.run_dir, &patch).await
 }
 
@@ -251,6 +264,48 @@ async fn workspace_patch(context: &RuntimeTaskContext) -> Result<String> {
     workspace_patch_against_baseline(&baseline).await
 }
 
+async fn frozen_tree_patch(
+    context: &RuntimeTaskContext,
+    source_tree: &crate::repository_graph::domain::Digest,
+) -> Result<String> {
+    let baseline = baseline_tree(context).unwrap_or_else(|| "HEAD".to_string());
+    let baseline = parse_git_tree_digest(&baseline)?;
+    let workspace_root = context
+        .workspace_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    tree_patch_between(&workspace_root, &baseline, source_tree).await
+}
+
+async fn tree_patch_between(
+    workspace_root: &Path,
+    baseline: &crate::repository_graph::domain::Digest,
+    source_tree: &crate::repository_graph::domain::Digest,
+) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["diff", "--binary"])
+        .arg(baseline.value())
+        .arg(source_tree.value())
+        .arg("--")
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Failed to capture frozen executor patch: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn baseline_tree(context: &RuntimeTaskContext) -> Option<String> {
     baseline_tree_from_env().or_else(|| baseline_tree_from_project_data(&context.task_id))
 }
@@ -276,9 +331,22 @@ fn baseline_tree_from_project_data(task_id: &str) -> Option<String> {
 }
 
 async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
-    let tracked = tracked_files().await?;
+    let root = std::env::current_dir()?;
+    let baseline_digest = parse_git_tree_digest(baseline)?;
+    let inventory =
+        tokio::task::spawn_blocking(move || GitWorktreeInventory::discover(root, baseline_digest))
+            .await??;
+    let tracked = inventory
+        .tracked_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
     let tracked_set = tracked.iter().cloned().collect::<HashSet<_>>();
-    let baseline_files = baseline_files(baseline).await?;
+    let baseline_files = inventory
+        .baseline_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
     let baseline_set = baseline_files.iter().cloned().collect::<HashSet<_>>();
     let mut patch = tracked_workspace_patch(baseline, &tracked).await?;
 
@@ -289,7 +357,11 @@ async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
         patch.push_str(&baseline_untracked_path_patch(baseline, &path).await?);
     }
 
-    for path in untracked_files().await? {
+    for path in inventory
+        .untracked_paths()
+        .iter()
+        .map(|path| path.as_str().to_string())
+    {
         if baseline_set.contains(&path) {
             continue;
         }
@@ -352,72 +424,6 @@ fn tracked_pathspec_batches(tracked: &[String]) -> Vec<&[String]> {
     }
     batches.push(&tracked[start..]);
     batches
-}
-
-async fn tracked_files() -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "-z"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-async fn baseline_files(baseline: &str) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-tree", "-r", "-z", "--name-only"])
-        .arg(baseline)
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-async fn untracked_files() -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace patch: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-    Ok(split_nul_paths(&output.stdout))
-}
-
-fn split_nul_paths(output: &[u8]) -> Vec<String> {
-    output
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| String::from_utf8_lossy(path).into_owned())
-        .collect()
 }
 
 async fn baseline_untracked_path_patch(baseline: &str, path: &str) -> Result<String> {
@@ -522,11 +528,85 @@ fn temporary_file_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{counter}", std::process::id()))
 }
 
-async fn record_task_status(
+async fn record_submission(
     context: &RuntimeTaskContext,
-    status: project::TaskStatus,
+    freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
 ) -> Result<()> {
-    project::record_task_status(&context.task_id, &context.task_path, status).await
+    let (frozen_view, failed) = match &freeze {
+        crate::repository_graph_runtime::RepositoryViewFreeze::NotAttempted => (None, false),
+        crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(view) => (Some(view), false),
+        crate::repository_graph_runtime::RepositoryViewFreeze::Failed => (None, true),
+    };
+    project::record_task_submitted(
+        &context.task_id,
+        &context.task_path,
+        context.run_id.as_deref(),
+        frozen_view,
+        failed,
+    )
+    .await
+}
+
+async fn persist_submission(
+    context: &RuntimeTaskContext,
+    content: &str,
+    freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
+) -> Result<()> {
+    let mut pin_cleanup = SubmittedTreePinCleanup::new(context, &freeze);
+    project::record_task_check_passed(&context.task_id).await?;
+    write_submission(context, content).await?;
+    write_submission_patch(context, &freeze).await?;
+    record_submission(context, freeze).await?;
+    pin_cleanup.disarm();
+    Ok(())
+}
+
+struct SubmittedTreePinCleanup {
+    workspace_root: Option<PathBuf>,
+    task_id: String,
+    armed: bool,
+}
+
+impl SubmittedTreePinCleanup {
+    fn new(
+        context: &RuntimeTaskContext,
+        freeze: &crate::repository_graph_runtime::RepositoryViewFreeze,
+    ) -> Self {
+        Self {
+            workspace_root: context.workspace_path.as_deref().map(PathBuf::from),
+            task_id: context.task_id.clone(),
+            armed: matches!(
+                freeze,
+                crate::repository_graph_runtime::RepositoryViewFreeze::Frozen(_)
+            ),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubmittedTreePinCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(workspace_root) = self.workspace_root.as_deref() else {
+            tracing::warn!(
+                task_id = self.task_id,
+                "cannot release abandoned submitted tree pin without a workspace"
+            );
+            return;
+        };
+        if let Err(error) = release_submitted_tree_pin(workspace_root, &self.task_id) {
+            tracing::warn!(
+                task_id = self.task_id,
+                error = ?error,
+                "failed to release abandoned submitted tree pin"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +643,72 @@ mod tests {
         let tracked = vec!["y".repeat(PATHSPEC_ARGV_BUDGET * 2)];
         let batches = tracked_pathspec_batches(&tracked);
         assert_eq!(batches, vec![tracked.as_slice()]);
+    }
+
+    #[test]
+    fn abandoned_submission_releases_its_tree_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("submitted.rs"), "pub struct Submitted;\n").unwrap();
+        let tree = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        crate::repository_graph::source::pin_submitted_tree(root, "t-abandoned", &tree).unwrap();
+        let references = git_output(root, ["show-ref"]);
+        let reference = references
+            .split_ascii_whitespace()
+            .find(|value| value.starts_with("refs/ferrus/reviews/"))
+            .unwrap()
+            .to_string();
+
+        drop(SubmittedTreePinCleanup {
+            workspace_root: Some(root.to_path_buf()),
+            task_id: "t-abandoned".to_string(),
+            armed: true,
+        });
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show-ref", "--verify", "--quiet", &reference])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[tokio::test]
+    async fn frozen_tree_patch_ignores_later_worktree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .arg("--quiet")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("submitted.rs"), "pub struct Baseline;\n").unwrap();
+        let baseline = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        std::fs::write(root.join("submitted.rs"), "pub struct Submitted;\n").unwrap();
+        let submitted = crate::repository_graph::source::capture_worktree_tree(root).unwrap();
+        std::fs::write(root.join("submitted.rs"), "pub struct LaterEdit;\n").unwrap();
+
+        let patch = tree_patch_between(root, &baseline, &submitted)
+            .await
+            .unwrap();
+
+        assert!(patch.contains("+pub struct Submitted;"));
+        assert!(!patch.contains("LaterEdit"));
     }
 
     async fn setup() -> (TempDir, std::path::PathBuf) {
@@ -1144,7 +1290,10 @@ mod tests {
             review_cycles: 0,
             failure_reason: None,
             run_id: None,
+            run_role: Some("executor".to_string()),
             workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            repository_workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            repository_view: project::RepositoryViewReference::default(),
         }
     }
 

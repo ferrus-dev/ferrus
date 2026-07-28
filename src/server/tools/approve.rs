@@ -19,7 +19,7 @@ use super::{
     ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err,
 };
 
-pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing → Complete. \
+pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing -> Complete. \
      Must be called after /review_pending.";
 
 pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
@@ -43,68 +43,29 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
-    {
+    let (integration_result, refresh_canonical_graph) = {
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
-
-        let patch_applied = apply_approved_patch(&context, &project_root).await?;
-        if patch_applied {
-            // The approved patch may have changed ferrus.toml, so run the integration
-            // gate against the configuration as it exists in the post-apply repository
-            // state rather than the config loaded before the patch was applied.
-            let post_apply_config = match Config::load_from(&project_root).await {
-                Ok(config) => config,
-                Err(err) => {
-                    if let Err(rollback_err) =
-                        rollback_approved_patch(&context, &project_root).await
-                    {
-                        anyhow::bail!(
-                            "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
-                        );
-                    }
-                    return Err(err);
-                }
-            };
-            let integration_checks =
-                run_post_apply_integration_checks(&context, &post_apply_config, &project_root)
-                    .await;
-            if let Err(err) = integration_checks {
-                if let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await {
-                    anyhow::bail!(
-                        "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
-                    );
-                }
-                return Err(err);
-            }
-        }
-        let transition = async {
-            if let (Some(spec_path), Some(milestone_id)) = (
-                context.spec_path.as_deref(),
-                context.milestone_id.as_deref(),
-            ) {
-                let spec_path = canonical_approval_path(&project_root, spec_path);
-                specs::complete_milestone(&spec_path.to_string_lossy(), milestone_id).await?;
-            }
-            project::record_task_status(
-                &context.task_id,
-                &context.task_path,
-                project::TaskStatus::Complete,
-            )
-            .await
-        }
-        .await;
-        if let Err(err) = transition {
-            if patch_applied
-                && let Err(rollback_err) = rollback_approved_patch(&context, &project_root).await
-            {
-                anyhow::bail!(
-                    "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
-                );
-            }
-            return Err(err);
-        }
+        let observer = CanonicalIntegrationObserver::capture(&project_root).await;
+        let integration_result = integrate_approved_task(&context, &project_root).await;
+        let refresh_canonical_graph = observer
+            .finish(&context, &project_root, integration_result.is_ok())
+            .await;
+        (integration_result, refresh_canonical_graph)
+    };
+    if integration_result.is_ok() {
+        crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
+        cleanup_approved_workspace_best_effort(&context, &project_root).await;
     }
+    if refresh_canonical_graph {
+        crate::repository_graph_runtime::refresh_canonical_graph_after_approval(
+            project_root.clone(),
+            context.task_id.clone(),
+            context.run_id.clone(),
+        )
+        .await;
+    }
+    integration_result?;
 
-    cleanup_approved_workspace_best_effort(&context, &project_root).await;
     project::record_runtime_event_best_effort(
         context.run_id.clone(),
         "approved",
@@ -114,8 +75,141 @@ async fn run(agent_id: &str) -> Result<String> {
     )
     .await;
 
-    info!("Task approved, state → Complete");
+    info!("Task approved, state -> Complete");
     Ok("Task approved. State: Complete. Well done!".to_string())
+}
+
+async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Path) -> Result<()> {
+    let patch_applied = apply_approved_patch(context, project_root).await?;
+    if patch_applied {
+        // The approved patch may have changed ferrus.toml, so run the integration
+        // gate against the configuration as it exists in the post-apply repository
+        // state rather than the config loaded before the patch was applied.
+        let post_apply_config = match Config::load_from(project_root).await {
+            Ok(config) => config,
+            Err(err) => {
+                if let Err(rollback_err) = rollback_approved_patch(context, project_root).await {
+                    anyhow::bail!(
+                        "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        let integration_checks =
+            run_post_apply_integration_checks(context, &post_apply_config, project_root).await;
+        if let Err(err) = integration_checks {
+            if let Err(rollback_err) = rollback_approved_patch(context, project_root).await {
+                anyhow::bail!(
+                    "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+                );
+            }
+            return Err(err);
+        }
+    }
+    let transition = async {
+        if let (Some(spec_path), Some(milestone_id)) = (
+            context.spec_path.as_deref(),
+            context.milestone_id.as_deref(),
+        ) {
+            let spec_path = canonical_approval_path(project_root, spec_path);
+            specs::complete_milestone(&spec_path.to_string_lossy(), milestone_id).await?;
+        }
+        project::record_task_status(
+            &context.task_id,
+            &context.task_path,
+            project::TaskStatus::Complete,
+        )
+        .await
+    }
+    .await;
+    if let Err(err) = transition {
+        if patch_applied
+            && let Err(rollback_err) = rollback_approved_patch(context, project_root).await
+        {
+            anyhow::bail!(
+                "{err}\n\nAdditionally failed to roll back the already-applied task patch: {rollback_err}"
+            );
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum CanonicalSourceObservation {
+    Disabled,
+    Observed(project::CanonicalSourceIdentity),
+    Unavailable,
+}
+
+struct CanonicalIntegrationObserver {
+    before: CanonicalSourceObservation,
+}
+
+impl CanonicalIntegrationObserver {
+    async fn capture(project_root: &Path) -> Self {
+        Self {
+            before: observe_canonical_source(project_root).await,
+        }
+    }
+
+    async fn finish(
+        self,
+        context: &RuntimeTaskContext,
+        project_root: &Path,
+        integration_succeeded: bool,
+    ) -> bool {
+        let after = observe_canonical_source(project_root).await;
+        if matches!(
+            (&self.before, &after),
+            (
+                CanonicalSourceObservation::Observed(before),
+                CanonicalSourceObservation::Observed(after)
+            ) if before == after
+        ) || matches!(
+            (&self.before, &after),
+            (
+                CanonicalSourceObservation::Disabled,
+                CanonicalSourceObservation::Disabled
+            )
+        ) {
+            return false;
+        }
+
+        let source = match &after {
+            CanonicalSourceObservation::Observed(source) => Some(source),
+            CanonicalSourceObservation::Disabled | CanonicalSourceObservation::Unavailable => None,
+        };
+        let reason = match (integration_succeeded, source.is_some()) {
+            (true, true) => project::CanonicalInvalidationReason::ApprovedIntegration,
+            (false, true) => project::CanonicalInvalidationReason::PartialMutation,
+            (_, false) => project::CanonicalInvalidationReason::SourceComparisonUnavailable,
+        };
+        project::record_canonical_graph_invalidation_best_effort(
+            &context.task_id,
+            context.run_id.as_deref(),
+            source,
+            reason,
+        )
+        .await;
+
+        !matches!(after, CanonicalSourceObservation::Disabled)
+    }
+}
+
+async fn observe_canonical_source(project_root: &Path) -> CanonicalSourceObservation {
+    match crate::repository_graph_runtime::canonical_source_identity_at(project_root).await {
+        Ok(Some(source)) => CanonicalSourceObservation::Observed(source),
+        Ok(None) => CanonicalSourceObservation::Disabled,
+        Err(error) => {
+            tracing::warn!(
+                error = ?error,
+                "canonical source manifest could not be observed during approval"
+            );
+            CanonicalSourceObservation::Unavailable
+        }
+    }
 }
 
 async fn apply_approved_patch(context: &RuntimeTaskContext, project_root: &Path) -> Result<bool> {
@@ -773,6 +867,12 @@ mod tests {
         let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
         tokio::fs::write("file.txt", "old\n").await.unwrap();
         assert!(!patch.trim().is_empty());
+        tokio::fs::write(
+            "ferrus.toml",
+            "[repository_graph]\nenabled = true\n\n[checks]\ncommands = []\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+        )
+        .await
+        .unwrap();
 
         store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
             .await
@@ -795,6 +895,13 @@ mod tests {
         let tasks = crate::project::list_tasks().await.unwrap();
         let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
         assert_eq!(task.status, "complete");
+        let canonical = crate::project::canonical_graph_reference().await.unwrap();
+        assert_eq!(
+            canonical.status,
+            crate::project::CanonicalGraphStatus::Fresh
+        );
+        assert!(canonical.source.is_some());
+        assert!(canonical.snapshot_id.is_some());
 
         teardown(previous);
     }
@@ -976,7 +1083,7 @@ mod tests {
         let (dir, previous) = setup().await;
         tokio::fs::write(
             "ferrus.toml",
-            "[checks]\ncommands = [\"git grep -q base -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+            "[repository_graph]\nenabled = true\n\n[checks]\ncommands = [\"git grep -q base -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
         )
         .await
         .unwrap();
@@ -984,6 +1091,10 @@ mod tests {
             teardown(previous);
             return;
         }
+        // Keep the rollback byte-exact on Windows too. Otherwise Git's global
+        // autocrlf setting can turn the restored LF source into CRLF, correctly
+        // making the canonical source manifest stale after the rollback.
+        assert!(git(dir.path(), ["config", "core.autocrlf", "false"]).success());
         tokio::fs::write("file.txt", "base\n").await.unwrap();
         assert!(git(dir.path(), ["add", "file.txt"]).success());
         assert!(
@@ -1041,6 +1152,62 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| { reason.contains("Commands failed") })
         );
+        assert_eq!(
+            crate::project::canonical_graph_reference()
+                .await
+                .unwrap()
+                .status,
+            crate::project::CanonicalGraphStatus::Unknown
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn failed_integration_marks_actual_partial_canonical_manifest_stale() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (dir, previous) = setup().await;
+        tokio::fs::write(
+            "ferrus.toml",
+            "[repository_graph]\nenabled = true\n\n[checks]\ncommands = []\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write("stable.txt", "stable\n").await.unwrap();
+        crate::project::record_task_status(
+            "t-007",
+            ".ferrus/tasks/t-007.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+            .await
+            .unwrap();
+        let context = crate::project::runtime_task_context_for_agent("supervisor:codex:7")
+            .await
+            .unwrap()
+            .unwrap();
+        let observer = CanonicalIntegrationObserver::capture(dir.path()).await;
+
+        tokio::fs::write("partial.txt", "left behind\n")
+            .await
+            .unwrap();
+        assert!(observer.finish(&context, dir.path(), false).await);
+
+        let canonical = crate::project::canonical_graph_reference().await.unwrap();
+        assert_eq!(
+            canonical.status,
+            crate::project::CanonicalGraphStatus::Stale
+        );
+        assert!(canonical.source.is_some());
+        let task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-007")
+            .unwrap();
+        assert_eq!(task.status, crate::project::TaskStatus::Reviewing.as_str());
 
         teardown(previous);
     }

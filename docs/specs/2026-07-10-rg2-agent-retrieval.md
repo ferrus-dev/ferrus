@@ -8,7 +8,7 @@ freshness and evidence reporting, safe on-demand snippets, and evaluation toolin
 context actually reduces navigation work, latency, and context volume.
 
 The graph remains optional. Missing, stale, or failed indexes must be visible and actionable without weakening
-the Supervisor–Executor workflow or mutating task state.
+the Supervisor-Executor workflow or mutating task state.
 
 ## Goals
 
@@ -92,7 +92,7 @@ not optional polish.
   paths according to the index policy.
 - Agent prompts and generated skill guidance may advertise the retrieval tools and recommend status-first usage,
   but must not embed repository summaries or require graph use for every task.
-- Tool descriptions must explain that absence of a relationship means “not known by this index,” not proof that
+- Tool descriptions must explain that absence of a relationship means "not known by this index," not proof that
   no relationship exists.
 - Record privacy-safe query metrics: tool, snapshot, freshness, duration, result count, response bytes,
   truncation, diagnostics count, and error category. Do not record search text, source snippets, or source bodies

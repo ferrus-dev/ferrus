@@ -58,7 +58,7 @@ pub struct LeaseConfig {
     /// How long (in seconds) a claimed lease is valid without renewal.
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
-    /// How often (in seconds) agents should call /heartbeat. Informational — not enforced server-side.
+    /// How often (in seconds) agents should call /heartbeat. Informational -- not enforced server-side.
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
 }
@@ -254,7 +254,7 @@ impl Config {
         let path = project_root.join("ferrus.toml");
         let contents = tokio::fs::read_to_string(&path)
             .await
-            .with_context(|| format!("{} not found — run `ferrus init` first", path.display()))?;
+            .with_context(|| format!("{} not found -- run `ferrus init` first", path.display()))?;
         Self::from_toml(&contents)
     }
 
@@ -271,7 +271,7 @@ pub async fn update_hq_agent_config(
 ) -> Result<()> {
     let contents = tokio::fs::read_to_string("ferrus.toml")
         .await
-        .context("ferrus.toml not found — run `ferrus init` first")?;
+        .context("ferrus.toml not found -- run `ferrus init` first")?;
     let updated = update_hq_agent_config_in_contents(&contents, role, agent, model)?;
     tokio::fs::write("ferrus.toml", updated)
         .await

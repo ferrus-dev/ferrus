@@ -279,7 +279,7 @@ async fn dispatch_with_human_question_target(
         if allow_fifo_fallback && ctx.has_pending_human_question().await? {
             return ctx.answer(line.to_string()).await;
         }
-        anyhow::bail!("Commands must start with '/' — try /status, /task, /quit");
+        anyhow::bail!("Commands must start with '/' -- try /status, /task, /quit");
     }
 
     match parse_command(line)? {
@@ -306,7 +306,7 @@ async fn dispatch_with_human_question_target(
                         "exited"
                     };
                     lines.push(format!(
-                        "  {name} ({status}) — tail logs: {}",
+                        "  {name} ({status}) -- tail logs: {}",
                         handle.log_path.display()
                     ));
                 }
@@ -388,7 +388,7 @@ async fn dispatch_with_human_question_target(
             if let Some(handle) = ctx.headless.get(&name) {
                 let log = handle.log_path.display().to_string();
                 ctx.display.info(format!(
-                    "{name} runs headlessly — no terminal to attach.\n\
+                    "{name} runs headlessly -- no terminal to attach.\n\
                      Tail its log to observe: tail -f {log}"
                 ));
             } else {
@@ -586,7 +586,7 @@ impl ModelTarget {
 pub(crate) struct HqContext {
     pub(crate) supervisor: Option<std::sync::Arc<dyn SupervisorAgent>>,
     pub(crate) executor: Option<std::sync::Arc<dyn ExecutorAgent>>,
-    /// Headless agent handles — executor and reviewer both run without a PTY.
+    /// Headless agent handles -- executor and reviewer both run without a PTY.
     pub(crate) headless: std::collections::HashMap<String, agent_manager::HeadlessHandle>,
     debug: bool,
     state_rx: watch::Receiver<Option<WatchedState>>,
@@ -804,7 +804,7 @@ impl HqContext {
 
     fn store_headless_handle(&mut self, name: &str, handle: agent_manager::HeadlessHandle) {
         self.display.muted(format!(
-            "  • Started {name}…\n  ╰─ Logs: {}\n\n",
+            "  • Started {name}...\n  ╰─ Logs: {}\n\n",
             handle.log_path.display()
         ));
         self.headless.insert(name.to_string(), handle);
@@ -938,6 +938,12 @@ impl HqContext {
         }
 
         let workspace = prepare_executor_workspace(task_id).await?;
+        let _ = crate::repository_graph_runtime::schedule_task_baseline_pin(
+            task_id,
+            &workspace.workspace_dir,
+            workspace.baseline_tree.as_deref(),
+        )
+        .await;
         let mut env = vec![
             (ENV_AGENT_ID, name.to_string()),
             (ENV_TASK_ID, task_id.to_string()),
@@ -1107,6 +1113,10 @@ impl HqContext {
                 task.milestone_id.as_deref(),
             )
             .await?;
+            crate::repository_graph_runtime::release_submitted_tree_pin_for_task_best_effort(
+                &task.id,
+            )
+            .await;
         }
         crate::project::record_runtime_event_best_effort(
             None,
@@ -1189,7 +1199,7 @@ impl HqContext {
                 prompt,
                 existing_task_ids,
                 1,
-                "Task enqueued — returning to HQ…",
+                "Task enqueued -- returning to HQ...",
             )
             .await?
             .into_iter()
@@ -1321,7 +1331,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for free-form planning…",
+            "Spawning supervisor ({}) for free-form planning...",
             agent.name()
         ));
 
@@ -1356,7 +1366,7 @@ impl HqContext {
         );
 
         self.display
-            .info(format!("Spawning supervisor ({})…", supervisor.name()));
+            .info(format!("Spawning supervisor ({})...", supervisor.name()));
         if selected.is_none() {
             self.display
                 .info("Collaborate with the supervisor to define the task.");
@@ -1461,7 +1471,7 @@ impl HqContext {
         let prompt = agent_manager::supervisor_batch_task_prompt(&context, selected_count);
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for batch task preparation…",
+            "Spawning supervisor ({}) for batch task preparation...",
             supervisor.name()
         ));
         self.display.tip(
@@ -1479,7 +1489,7 @@ impl HqContext {
             &prompt,
             &existing_task_ids,
             selected_count,
-            "Batch tasks enqueued — returning to HQ…",
+            "Batch tasks enqueued -- returning to HQ...",
         )
         .await?;
         self.display
@@ -2006,7 +2016,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) for specification drafting…",
+            "Spawning supervisor ({}) for specification drafting...",
             supervisor.name()
         ));
         self.display
@@ -2062,7 +2072,7 @@ impl HqContext {
                         created_path = Some(path);
                         self.stop_interactive_child(
                             &mut child,
-                            "Spec created — waiting for supervisor to exit…",
+                            "Spec created -- waiting for supervisor to exit...",
                         )
                         .await?;
                         break;
@@ -2206,7 +2216,7 @@ impl HqContext {
         let prompt = agent_manager::supervisor_archive_spec_prompt(&context);
 
         self.display.muted(format!(
-            "\n  • Spawning supervisor ({}) for spec archival…\n",
+            "\n  • Spawning supervisor ({}) for spec archival...\n",
             supervisor.name()
         ));
 
@@ -2309,7 +2319,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning supervisor ({}) interactively…",
+            "Spawning supervisor ({}) interactively...",
             agent.name()
         ));
 
@@ -2327,7 +2337,7 @@ impl HqContext {
         );
 
         self.display.info(format!(
-            "Spawning executor ({}) interactively…",
+            "Spawning executor ({}) interactively...",
             agent.name()
         ));
 
@@ -2389,7 +2399,7 @@ impl HqContext {
         if agent_alive {
             let owner = owner.as_deref().unwrap_or("agent");
             self.display.info(format!(
-                "Waiting for {owner} to receive it via /wait_for_answer…"
+                "Waiting for {owner} to receive it via /wait_for_answer..."
             ));
             return Ok(());
         }
@@ -2849,73 +2859,12 @@ async fn persist_executor_workspace_baseline(
 }
 
 async fn capture_executor_workspace_baseline_tree(workspace_dir: &Path) -> Result<String> {
-    let add = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .args(["add", "-A", "."])
-        .output()
-        .await
-        .context("Failed to stage executor workspace baseline")?;
-    if !add.status.success() {
-        let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to stage executor workspace baseline at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                add.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    let tree = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .arg("write-tree")
-        .output()
-        .await
-        .context("Failed to capture executor workspace baseline tree")?;
-    if !tree.status.success() {
-        let stderr = String::from_utf8_lossy(&tree.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to capture executor workspace baseline tree at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                tree.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    let mut reset_index = Command::new("git");
-    reset_index.arg("-C").arg(workspace_dir).arg("read-tree");
-    if git_has_head(workspace_dir).await {
-        reset_index.arg("HEAD");
-    } else {
-        reset_index.arg("--empty");
-    }
-    let reset_index = reset_index
-        .output()
-        .await
-        .context("Failed to restore executor workspace index")?;
-    if !reset_index.status.success() {
-        let stderr = String::from_utf8_lossy(&reset_index.stderr)
-            .trim()
-            .to_string();
-        anyhow::bail!(
-            "Failed to restore executor workspace index at {}: {}",
-            workspace_dir.display(),
-            if stderr.is_empty() {
-                reset_index.status.to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&tree.stdout).trim().to_string())
+    let workspace_dir = workspace_dir.to_path_buf();
+    let tree = tokio::task::spawn_blocking(move || {
+        crate::repository_graph::source::capture_worktree_tree(workspace_dir)
+    })
+    .await??;
+    Ok(tree.value().to_string())
 }
 
 async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path) -> Result<()> {
@@ -3870,6 +3819,39 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string_pretty(&crate::project::ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: dir.path().to_string_lossy().into_owned(),
+                ferrus_dir: dir.path().join(".ferrus").to_string_lossy().into_owned(),
+                vcs: Some("git".to_string()),
+                origin_repo: None,
+                default_branch: None,
+                current_head: None,
+                created_at: "2026-07-26T00:00:00Z".to_string(),
+                last_opened_at: "2026-07-26T00:00:00Z".to_string(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::fs::write("seed.txt", "submitted content\n")
+            .await
+            .unwrap();
+        let submitted_tree =
+            crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
+        crate::repository_graph::source::pin_submitted_tree(dir.path(), "t-004", &submitted_tree)
+            .unwrap();
         crate::project::record_task_status(
             "t-001",
             ".ferrus/tasks/t-001.md",
@@ -3891,6 +3873,13 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::project::record_task_status(
+            "t-004",
+            ".ferrus/tasks/t-004.md",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
         tokio::fs::create_dir_all(".ferrus/tasks").await.unwrap();
         tokio::fs::create_dir_all(".ferrus/runs/t-001")
             .await
@@ -3899,6 +3888,9 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::create_dir_all(".ferrus/runs/t-003")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(".ferrus/runs/t-004")
             .await
             .unwrap();
         tokio::fs::write(".ferrus/tasks/t-001.md", "pending task")
@@ -3910,6 +3902,9 @@ mod tests {
         tokio::fs::write(".ferrus/tasks/t-003.md", "complete task")
             .await
             .unwrap();
+        tokio::fs::write(".ferrus/tasks/t-004.md", "reviewing task")
+            .await
+            .unwrap();
         tokio::fs::write(".ferrus/runs/t-001/QUESTION.md", "stale question")
             .await
             .unwrap();
@@ -3919,6 +3914,20 @@ mod tests {
         tokio::fs::write(".ferrus/runs/t-003/SUBMISSION.md", "complete submission")
             .await
             .unwrap();
+        tokio::fs::write(".ferrus/runs/t-004/SUBMISSION.md", "abandoned submission")
+            .await
+            .unwrap();
+        let pinned_review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(pinned_review_refs.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&pinned_review_refs.stdout)
+                .lines()
+                .count(),
+            1
+        );
 
         let (_state_tx, state_rx) = watch::channel::<Option<WatchedState>>(None);
         let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3936,12 +3945,62 @@ mod tests {
         assert_eq!(status("t-001"), Some("reset"));
         assert_eq!(status("t-002"), Some("reset"));
         assert_eq!(status("t-003"), Some("complete"));
+        assert_eq!(status("t-004"), Some("reset"));
         assert!(!std::path::Path::new(".ferrus/tasks/t-001.md").exists());
         assert!(!std::path::Path::new(".ferrus/tasks/t-002.md").exists());
         assert!(std::path::Path::new(".ferrus/tasks/t-003.md").exists());
+        assert!(!std::path::Path::new(".ferrus/tasks/t-004.md").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-001").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-002").exists());
         assert!(std::path::Path::new(".ferrus/runs/t-003/SUBMISSION.md").exists());
+        assert!(!std::path::Path::new(".ferrus/runs/t-004").exists());
+        let review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(review_refs.status.success());
+        assert!(review_refs.stdout.is_empty());
+
+        crate::repository_graph::source::pin_submitted_tree(
+            dir.path(),
+            "t-failed-reset",
+            &submitted_tree,
+        )
+        .unwrap();
+        crate::project::record_task_status(
+            "t-failed-reset",
+            ".ferrus/tasks/t-failed-reset",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".ferrus/tasks/t-failed-reset")
+            .await
+            .unwrap();
+
+        ctx.do_reset(false).await.unwrap_err();
+
+        let failed_reset_task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-failed-reset")
+            .unwrap();
+        assert_eq!(
+            failed_reset_task.status,
+            crate::project::TaskStatus::Reviewing.as_str()
+        );
+        let retained_review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(retained_review_refs.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&retained_review_refs.stdout)
+                .lines()
+                .count(),
+            1
+        );
 
         std::env::set_current_dir(previous).unwrap();
     }

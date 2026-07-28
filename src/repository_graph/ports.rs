@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::domain::{
     BuildId, DiagnosticCode, Digest, GraphBuild, GraphDiagnostic, GraphEdge, GraphNode,
-    GraphSnapshot, RepoPath, RepositoryRef, SnapshotId, SourceRevision,
+    GraphSnapshot, OverlayRevisionId, RepoPath, RepositoryRef, SnapshotId, SourceRevision,
+    WorkspaceRef,
 };
 use super::{
     diagnostics::GraphLifecycleEvent,
@@ -52,6 +53,42 @@ pub struct SourceManifest {
     pub revision: SourceRevision,
     pub extractor_set_digest: Digest,
     pub files: Vec<SourceFileDescriptor>,
+    pub diagnostics: Vec<SourceDiagnostic>,
+    pub metrics: SourceDiscoveryMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// One path-level worktree delta after applying the repository graph source
+/// policy. Renames are represented as a deletion plus an addition whose
+/// `renamed_from` points at the deleted path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayFileChange {
+    pub path: RepoPath,
+    pub kind: OverlayChangeKind,
+    pub renamed_from: Option<RepoPath>,
+    /// Present only when the current path is indexable under the effective
+    /// source, sensitive-path, binary, size, and file-kind policy.
+    pub current_file: Option<SourceFileDescriptor>,
+}
+
+/// Changed-file manifest for a task worktree relative to its pinned Git tree.
+/// It contains no source bodies or machine-local paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOverlayManifest {
+    pub workspace: WorkspaceRef,
+    pub revision_id: OverlayRevisionId,
+    pub manifest_digest: Digest,
+    pub analysis_config_digest: Digest,
+    pub source_policy_digest: Digest,
+    pub extractor_set_digest: Digest,
+    pub changes: Vec<OverlayFileChange>,
     pub diagnostics: Vec<SourceDiagnostic>,
     pub metrics: SourceDiscoveryMetrics,
 }

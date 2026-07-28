@@ -265,6 +265,7 @@ impl<'a> SqliteGraphQuery<'a> {
                     repository: request.scope.repository.clone(),
                     snapshot_id: None,
                     source_revision: None,
+                    task_view: None,
                     freshness: FreshnessEnvelope {
                         freshness: Freshness::NotApplicable,
                         compared_manifest: self
@@ -297,6 +298,8 @@ impl<'a> SqliteGraphQuery<'a> {
                             QueryErrorCode::IndexFailed => RetrievalAction::RetryIndex,
                             _ => RetrievalAction::Index,
                         }),
+                        task_view_status: None,
+                        fallback: None,
                     },
                 });
             }
@@ -971,6 +974,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
             source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            task_view: None,
             freshness: scope.freshness,
             diagnostics,
             page,
@@ -1036,6 +1040,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
             source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            task_view: None,
             freshness: scope.freshness,
             diagnostics,
             page,
@@ -1218,6 +1223,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
             source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            task_view: None,
             freshness: scope.freshness,
             diagnostics,
             page,
@@ -1312,6 +1318,7 @@ impl GraphQuery for SqliteGraphQuery<'_> {
             repository: scope.repository,
             snapshot_id: scope.snapshot.id.clone(),
             source_revision: source_revision(&scope.snapshot, &scope.source_revision_id),
+            task_view: None,
             freshness: scope.freshness,
             diagnostics,
             page,
@@ -1465,6 +1472,7 @@ fn available_status_response(
             &resolved.snapshot,
             &resolved.source_revision_id,
         )),
+        task_view: None,
         freshness: resolved.freshness.clone(),
         diagnostics,
         page: PageInfo {
@@ -1484,6 +1492,8 @@ fn available_status_response(
             graph_model_version: Some(resolved.snapshot.graph_model_version),
             statistics,
             recommended_action: status_action(latest_build, resolved.freshness.freshness),
+            task_view_status: None,
+            fallback: None,
         },
     }
 }
@@ -2392,6 +2402,48 @@ pub fn snapshot_file_descriptors(
             content_identity: Digest::new(algorithm, value).map_err(|_| backend_error())?,
             byte_len,
             file_mode,
+        });
+    }
+    Ok(files)
+}
+
+/// Loads the complete immutable file manifest for a snapshot. Overlay
+/// composition uses this as the baseline descriptor set; source bodies remain
+/// outside SQLite and are read only through a verified repository source.
+pub fn all_snapshot_file_descriptors(
+    sidecar: &Sidecar,
+    snapshot_id: &SnapshotId,
+) -> Result<Vec<SourceFileDescriptor>, QueryError> {
+    let mut statement = sidecar
+        .connection()
+        .prepare(
+            "SELECT path, content_algorithm, content_digest, byte_length, file_mode \
+             FROM files WHERE snapshot_id = ?1 ORDER BY path",
+        )
+        .map_err(|_| backend_error())?;
+    let rows = statement
+        .query_map([snapshot_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|_| backend_error())?;
+    let mut files = Vec::new();
+    for row in rows {
+        let (path, algorithm, value, byte_len, file_mode) = row.map_err(|_| backend_error())?;
+        files.push(SourceFileDescriptor {
+            path: RepoPath::new(path).map_err(|_| backend_error())?,
+            content_identity: Digest::new(algorithm, value).map_err(|_| backend_error())?,
+            byte_len: u64::try_from(byte_len).map_err(|_| backend_error())?,
+            file_mode: match file_mode {
+                0 => SourceFileMode::Regular,
+                1 => SourceFileMode::Executable,
+                _ => return Err(backend_error()),
+            },
         });
     }
     Ok(files)

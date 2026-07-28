@@ -2583,7 +2583,7 @@ fn print_status_line(
 
     // When the executor is waiting for a human answer, show a prominent hint.
     if status.task_state == "AwaitingHuman" {
-        let hint = "  ← type your answer and press Enter";
+        let hint = "  <- type your answer and press Enter";
         let hint_text = truncate_to_width(hint, remaining);
         if !hint_text.is_empty() {
             queue!(
@@ -2599,7 +2599,7 @@ fn print_status_line(
             remaining = remaining.saturating_sub(hint_width);
         }
     } else if status.task_state == "Consultation" {
-        let hint = "  ← consulting supervisor";
+        let hint = "  <- consulting supervisor";
         let hint_text = truncate_to_width(hint, remaining);
         if !hint_text.is_empty() {
             queue!(
@@ -3488,7 +3488,7 @@ mod tui_tests {
     fn activity_area_keeps_latest_multiline_message_start_when_tight() {
         let mut app = App::new();
         app.messages.extend(split_transcript(
-            "  • Started supervisor:codex:t-006…\n  ╰─ Logs: .ferrus/logs/supervisor.log",
+            "  • Started supervisor:codex:t-006...\n  ╰─ Logs: .ferrus/logs/supervisor.log",
             TranscriptKind::Muted,
         ));
 

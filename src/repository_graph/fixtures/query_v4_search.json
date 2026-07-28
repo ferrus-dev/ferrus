@@ -1,6 +1,6 @@
 {
   "scope": {
-    "wire_version": 2,
+    "wire_version": 4,
     "repository": {
       "namespace": "local:test",
       "repository_id": "root"

@@ -18,7 +18,7 @@ pub const DESCRIPTION: &str = "Block until a task is ready to work on, then atom
      Returns a JSON object: {\"status\":\"claimed\", \"claimed_by\":\"...\", \"lease_until\":\"...\", \
      \"state\":\"...\", \"task\":\"...\", \"review\":\"...\"} when a task is \
      claimed, or {\"status\":\"timeout\", \"state\":\"...\"} on timeout. \
-     On timeout, inspect the state field — call wait_for_task again only if the state is \
+     On timeout, inspect the state field -- call wait_for_task again only if the state is \
      Executing or Addressing. \
      Each call waits up to `wait_timeout_secs` (see ferrus.toml), then returns timeout so the \
      agent can poll again. \

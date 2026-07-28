@@ -97,7 +97,7 @@ async fn run(
     )
     .await;
 
-    info!(task_id = artifact.id, "Task enqueued, DB task → pending");
+    info!(task_id = artifact.id, "Task enqueued, DB task -> pending");
     Ok(format!(
         "Task {} enqueued. State: pending. Artifact: {}",
         artifact.id, artifact.path

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 pub const SIDECAR_FILE_NAME: &str = "repo-graph.db";
-pub const SIDECAR_SCHEMA_VERSION: u32 = 5;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 6;
 const SIDECAR_APPLICATION_ID: u32 = 0x4652_4731; // "FRG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +358,22 @@ const MIGRATIONS: &[Migration] = &[
         SELECT id, completed_by_build_id FROM snapshots;
     "#,
     },
+    Migration {
+        version: 6,
+        sql: r#"
+        CREATE TABLE graph_refresh_leases (
+            repository_namespace TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            view_name TEXT NOT NULL,
+            owner_token TEXT NOT NULL,
+            acquired_at_ms INTEGER NOT NULL CHECK (acquired_at_ms >= 0),
+            expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= acquired_at_ms),
+            PRIMARY KEY (repository_namespace, repository_id, view_name)
+        ) STRICT;
+        CREATE INDEX graph_refresh_leases_expiry_idx
+            ON graph_refresh_leases(expires_at_ms);
+    "#,
+    },
 ];
 
 pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
@@ -587,12 +603,12 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN (\
                  'schema_migrations', 'index_builds', 'snapshots', 'published_views', \
                  'files', 'nodes', 'edges', 'diagnostics', 'fragment_cache', 'build_metrics', \
-                 'snapshot_diagnostic_sets')",
+                 'snapshot_diagnostic_sets', 'graph_refresh_leases')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 11);
+        assert_eq!(table_count, 12);
     }
 
     #[test]
@@ -866,7 +882,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             actual,
-            include_str!("fixtures/schema_v5_objects.txt")
+            include_str!("fixtures/schema_v6_objects.txt")
                 .trim()
                 .replace("\r\n", "\n")
         );

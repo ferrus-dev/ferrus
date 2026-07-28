@@ -119,7 +119,7 @@ cross-process contract.
 
 ## Milestones
 
-- [ ] #3.0 Add explicit runtime schema migrations for repository view references
+- [x] #3.0 Add explicit runtime schema migrations for repository view references
 
 ID: rg3.0
 Depends on: none
@@ -128,7 +128,11 @@ Introduce versioned `ferrus.db` migrations, adopt existing databases safely, and
 snapshot, overlay revision, and repository-view status for tasks or runs without changing existing lifecycle
 semantics.
 
-- [ ] #3.1 Pin task and run context to baseline repository snapshots
+Implemented in `src/project.rs` with ordered transactional runtime migrations, durable migration history and
+schema version validation, plus typed task/run repository-view persistence. Existing rows are adopted as
+`not_built` without changing task or run lifecycle fields.
+
+- [x] #3.1 Pin task and run context to baseline repository snapshots
 
 ID: rg3.1
 Depends on: rg3.0
@@ -136,7 +140,13 @@ Depends on: rg3.0
 Resolve Ferrus baseline Git trees during dispatch, find or build matching graph snapshots best-effort, persist the
 association, pass it through runtime context, and keep task queries pinned when canonical `latest` advances.
 
-- [ ] #3.2 Implement task worktree overlay manifests and invalidation
+Implemented across `src/hq/mod.rs`, `src/project.rs`, `src/repository_graph/source/mod.rs`, and
+`src/repository_graph_runtime.rs`: managed-worktree dispatch schedules a non-blocking, best-effort baseline build
+against the pinned Git tree; task and run records retain the resulting snapshot association; runtime retrieval
+selects that immutable snapshot directly even after canonical publication advances. Missing, changed, or failed
+baseline sources remain explicit graph-view states and do not alter task lifecycle state.
+
+- [x] #3.2 Implement task worktree overlay manifests and invalidation
 
 ID: rg3.2
 Depends on: rg3.1
@@ -144,7 +154,13 @@ Depends on: rg3.1
 Create shared Git/source primitives that compute changed, added, deleted, renamed, policy, and content-identity
 information relative to the pinned baseline without duplicating task patch logic.
 
-- [ ] #3.3 Compose baseline and overlay graph views
+Implemented in `src/repository_graph/source/worktree.rs` with portable `WorkspaceRef` and validated
+`TaskRepositoryView` contracts, a read-only baseline-relative Git inventory, deterministic task-scoped overlay
+revisions, effective-policy source descriptors, hash-verified changed-file reads, and revalidation. HQ baseline
+capture, graph baseline validation, and submission patch inventory now share these primitives without mutating the
+Executor's real Git index. Overlay graph composition and query routing remain scoped to rg3.3.
+
+- [x] #3.3 Compose baseline and overlay graph views
 
 ID: rg3.3
 Depends on: rg3.2
@@ -152,7 +168,14 @@ Depends on: rg3.2
 Analyze changed fragments, hide deleted baseline facts, re-resolve affected edges, provide task-scoped search,
 context, and verified snippets, and return explicit baseline and overlay identities.
 
-- [ ] #3.4 Freeze submitted views and route role-specific retrieval
+Implemented with an effective `TaskOverlaySource` that combines pinned baseline descriptors with the
+policy-filtered worktree delta, reads unchanged bytes from immutable Git objects, and lets the content-addressed
+fragment cache avoid reparsing unchanged files before complete-view relationship resolution. Task-owned
+publications are isolated by `TaskViewId`; `/check` and the final submit gate refresh them best-effort without
+coupling failures to task lifecycle, while retrieval remains read-only. Search, context, status, and verified
+snippets route through the composed snapshot and return the explicit baseline snapshot plus overlay revision.
+
+- [x] #3.4 Freeze submitted views and route role-specific retrieval
 
 ID: rg3.4
 Depends on: rg3.3
@@ -160,7 +183,15 @@ Depends on: rg3.3
 Resolve taskless, Executor, Consultant, and Reviewer views from runtime identity; best-effort freeze submitted
 views; reopen them for review/recovery; and resume a mutable successor after rejection without weakening submit.
 
-- [ ] #3.5 Integrate manifest-driven canonical invalidation with approval
+Implemented with a versioned `ferrus.db` migration that persists the materialized graph snapshot, submitted Git
+tree, and mutable/frozen lifecycle on task and run records. Submit refreshes and prepares the view best-effort,
+then freezes it atomically with the normal Reviewing transition; bounded freeze failures are recorded without
+changing submit eligibility. Runtime retrieval now routes taskless sessions to canonical, Executors to their
+mutable worktree view, Consultants to the attached task view and Executor workspace, and Reviewers to their exact
+frozen run view. Frozen snippets read hash-verified Git blobs after worktree changes/removal, while rejection
+clears only the task's frozen source identity and preserves reviewer history as it resumes a mutable successor.
+
+- [x] #3.5 Integrate manifest-driven canonical invalidation with approval
 
 ID: rg3.5
 Depends on: rg3.1
@@ -169,7 +200,15 @@ Compare actual canonical manifests around integration, record successful integra
 rollback-failed mutations honestly, schedule refresh outside the approval critical section, and keep graph refresh
 outcomes separate from task approval outcomes.
 
-- [ ] #3.6 Add concurrent-view isolation, retention, recovery, and observability
+Implemented with before/after canonical source observations around the existing approval lock and a versioned
+`ferrus.db` canonical-graph state containing only source revision, manifest, snapshot, and freshness identities.
+A clean rollback that restores the original manifest records no proposed integration; successful or partial
+canonical mutations record the actual post-operation identity as stale. Incremental canonical indexing is spawned
+only after releasing the approval lock, preserves the last published graph on failure, and records its outcome
+without changing Complete/Reviewing, leases, retries, or review cycles. Explicit `ferrus graph index` also clears
+the durable invalidation, while ordinary exact manifest comparisons continue detecting external edits.
+
+- [x] #3.6 Add concurrent-view isolation, retention, recovery, and observability
 
 ID: rg3.6
 Depends on: rg3.4, rg3.5
@@ -177,6 +216,17 @@ Depends on: rg3.4, rg3.5
 Protect task namespaces, deduplicate refreshes, retain referenced and frozen snapshots, garbage-collect safe
 candidates, recover interrupted overlay builds, expose canonical/task-view status and privacy-safe metrics, and add
 multi-worktree fixtures, restart/failure tests, lifecycle documentation, and pinned-versus-canonical evaluations.
+
+Implemented with sidecar schema v6 refresh leases keyed by repository and published-view identity, so concurrent
+canonical or task refreshes are deduplicated without sharing task namespaces. `ferrus.db` supplies a read-only
+protection set for all non-terminal task/run baseline and materialized snapshots; maintenance retains those plus
+published canonical views, removes expired completed-task publications and unreferenced snapshots within the
+configured limits, prunes orphan fragments/builds, and never derives ownership from paths or PIDs. `ferrus
+recover` marks only genuinely unfinished graph builds failed and reclaims expired refresh leases, while completed
+snapshot transactions remain reusable. Task status exposes unavailable/stale fallback explicitly, doctor reports
+durable canonical staleness and pending graph recovery, and telemetry contains only bounded identity/counter
+fields. Existing multi-worktree overlay, freeze/restart, deletion/rename, cross-task isolation, and
+pinned-versus-canonical fixtures are complemented by lease, recovery, retention, and runtime-reference tests.
 
 ## Acceptance Criteria
 

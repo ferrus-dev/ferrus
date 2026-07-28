@@ -21,15 +21,210 @@ use crate::{
     agent_id::ENV_PROJECT_ROOT,
     legacy_state::{self, LegacyTaskState},
     platform,
+    repository_graph::domain::{
+        BuildId, Digest, OverlayRevisionId, PublishedViewName, SnapshotId, SourceRevisionId,
+        TaskViewLifecycle,
+    },
 };
 
 const PROJECT_VERSION: u32 = 1;
+const RUNTIME_SCHEMA_VERSION: u32 = 4;
 const LOCAL_PROJECT_TOML: &str = ".ferrus/project.toml";
 const CURRENT_TASK_ID: &str = "current";
 const CURRENT_TASK_PATH: &str = ".ferrus/TASK.md";
 const BASELINE_WORKTREE_METADATA_DIR: &str = ".baseline-trees";
 const BASELINE_REF_PREFIX: &str = "refs/ferrus/baselines";
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RepositoryViewStatus {
+    #[default]
+    NotBuilt,
+    Available,
+    Stale,
+    Unavailable,
+    Failed,
+}
+
+impl RepositoryViewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBuilt => "not_built",
+            Self::Available => "available",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "not_built" => Ok(Self::NotBuilt),
+            "available" => Ok(Self::Available),
+            "stale" => Ok(Self::Stale),
+            "unavailable" => Ok(Self::Unavailable),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("Unknown repository view status in ferrus.db: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CanonicalGraphStatus {
+    #[default]
+    Unknown,
+    Stale,
+    Fresh,
+}
+
+impl CanonicalGraphStatus {
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "unknown" => Ok(Self::Unknown),
+            "stale" => Ok(Self::Stale),
+            "fresh" => Ok(Self::Fresh),
+            _ => anyhow::bail!("Unknown canonical graph status in ferrus.db: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSourceIdentity {
+    pub source_revision_id: SourceRevisionId,
+    pub manifest_digest: Digest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanonicalGraphReference {
+    pub source: Option<CanonicalSourceIdentity>,
+    pub snapshot_id: Option<SnapshotId>,
+    pub status: CanonicalGraphStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalGraphRefreshGuard {
+    invalidation_event_id: i64,
+    refresh_event_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalGraphRefreshOutcome {
+    Recorded,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryGraphRetentionReferences {
+    pub snapshot_ids: std::collections::BTreeSet<SnapshotId>,
+    pub view_names: std::collections::BTreeSet<PublishedViewName>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalInvalidationReason {
+    ApprovedIntegration,
+    PartialMutation,
+    SourceComparisonUnavailable,
+}
+
+impl CanonicalInvalidationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ApprovedIntegration => "approved_integration",
+            Self::PartialMutation => "partial_mutation",
+            Self::SourceComparisonUnavailable => "source_comparison_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryViewReference {
+    pub baseline_snapshot_id: Option<SnapshotId>,
+    pub overlay_revision_id: Option<OverlayRevisionId>,
+    pub view_snapshot_id: Option<SnapshotId>,
+    pub frozen_source_tree: Option<Digest>,
+    pub lifecycle: TaskViewLifecycle,
+    pub status: RepositoryViewStatus,
+}
+
+impl RepositoryViewReference {
+    pub fn new(
+        baseline_snapshot_id: Option<SnapshotId>,
+        overlay_revision_id: Option<OverlayRevisionId>,
+        status: RepositoryViewStatus,
+    ) -> Result<Self> {
+        if overlay_revision_id.is_some() && baseline_snapshot_id.is_none() {
+            anyhow::bail!("A repository overlay revision requires a baseline snapshot");
+        }
+        if status == RepositoryViewStatus::Available && baseline_snapshot_id.is_none() {
+            anyhow::bail!("An available repository view requires a baseline snapshot");
+        }
+        Ok(Self {
+            baseline_snapshot_id,
+            overlay_revision_id,
+            view_snapshot_id: None,
+            frozen_source_tree: None,
+            lifecycle: TaskViewLifecycle::Mutable,
+            status,
+        })
+    }
+
+    pub fn materialized(
+        baseline_snapshot_id: SnapshotId,
+        overlay_revision_id: Option<OverlayRevisionId>,
+        view_snapshot_id: SnapshotId,
+        status: RepositoryViewStatus,
+    ) -> Result<Self> {
+        if status == RepositoryViewStatus::NotBuilt {
+            anyhow::bail!("A materialized repository view cannot be not_built");
+        }
+        Ok(Self {
+            baseline_snapshot_id: Some(baseline_snapshot_id),
+            overlay_revision_id,
+            view_snapshot_id: Some(view_snapshot_id),
+            frozen_source_tree: None,
+            lifecycle: TaskViewLifecycle::Mutable,
+            status,
+        })
+    }
+
+    pub fn frozen(mut self, source_tree: Digest) -> Result<Self> {
+        if self.baseline_snapshot_id.is_none() || self.view_snapshot_id.is_none() {
+            anyhow::bail!(
+                "A frozen repository view requires materialized baseline and view snapshots"
+            );
+        }
+        self.lifecycle = TaskViewLifecycle::FrozenSubmitted;
+        self.frozen_source_tree = Some(source_tree);
+        Ok(self)
+    }
+
+    pub fn mutable_successor(mut self) -> Self {
+        self.lifecycle = TaskViewLifecycle::Mutable;
+        self.frozen_source_tree = None;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.overlay_revision_id.is_some() && self.baseline_snapshot_id.is_none() {
+            anyhow::bail!("A repository overlay revision requires a baseline snapshot");
+        }
+        if self.status == RepositoryViewStatus::Available && self.baseline_snapshot_id.is_none() {
+            anyhow::bail!("An available repository view requires a baseline snapshot");
+        }
+        match self.lifecycle {
+            TaskViewLifecycle::Mutable if self.frozen_source_tree.is_some() => {
+                anyhow::bail!("A mutable repository view cannot retain a frozen source tree");
+            }
+            TaskViewLifecycle::FrozenSubmitted
+                if self.view_snapshot_id.is_none() || self.frozen_source_tree.is_none() =>
+            {
+                anyhow::bail!("A frozen repository view requires a snapshot and source tree");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalProjectRef {
@@ -175,7 +370,10 @@ pub struct RuntimeTaskContext {
     pub review_cycles: u32,
     pub failure_reason: Option<String>,
     pub run_id: Option<String>,
+    pub run_role: Option<String>,
     pub workspace_path: Option<String>,
+    pub repository_workspace_path: Option<String>,
+    pub repository_view: RepositoryViewReference,
 }
 
 #[derive(Debug, Clone)]
@@ -450,7 +648,7 @@ async fn migrate_legacy_project_selection(state: &legacy_state::LegacyStateData)
 pub async fn touch_current_project() -> Result<ProjectRegistration> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     tokio::fs::create_dir_all(data_dir.join("logs"))
@@ -549,7 +747,7 @@ pub async fn canonical_project_root() -> Result<PathBuf> {
 pub async fn current_project_data_dir() -> Result<PathBuf> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     let metadata_path = data_dir.join("project.toml");
@@ -571,7 +769,7 @@ pub async fn current_project_data_dir() -> Result<PathBuf> {
 pub async fn current_project_id() -> Result<String> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     validate_project_id(&local_ref.project_id)?;
     let data_dir = current_project_data_dir().await?;
     let metadata = read_project_metadata_from(&data_dir.join("project.toml")).await?;
@@ -759,7 +957,7 @@ async fn remove_path_if_exists(path: &Path, directory: bool) -> Result<()> {
 pub async fn doctor_current_project() -> Result<DoctorReport> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found or invalid — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found or invalid -- run `ferrus migrate`")?;
     let data_dir = PathBuf::from(&local_ref.data_dir);
     let metadata_path = data_dir.join("project.toml");
     let metadata = read_project_metadata_from(&metadata_path)
@@ -1351,6 +1549,673 @@ pub async fn list_runs(limit: usize) -> Result<Vec<RunRecord>> {
     .await?
 }
 
+#[allow(dead_code)]
+pub async fn task_repository_view(task_id: &str) -> Result<Option<RepositoryViewReference>> {
+    read_repository_view("tasks", task_id).await
+}
+
+#[allow(dead_code)]
+pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewReference>> {
+    read_repository_view("runs", run_id).await
+}
+
+/// Returns the graph identities that ordinary sidecar garbage collection must
+/// preserve. Non-terminal tasks and runs retain their publications indefinitely;
+/// completed task and run snapshots age out through configured sidecar retention.
+pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRetentionReferences> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<RepositoryGraphRetentionReferences> {
+        let connection = open_runtime_database(&database_path)?;
+        let mut references = RepositoryGraphRetentionReferences::default();
+        let mut statement = connection.prepare(
+            r#"
+            SELECT tasks.id,
+                   tasks.baseline_snapshot_id, tasks.repository_view_snapshot_id,
+                   runs.baseline_snapshot_id, runs.repository_view_snapshot_id
+            FROM tasks
+            LEFT JOIN runs ON runs.task_id = tasks.id
+            WHERE tasks.status NOT IN ('complete', 'failed', 'reset')
+               OR runs.status NOT IN ('completed', 'failed', 'interrupted')
+            ORDER BY tasks.id, runs.id
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (task_id, task_baseline, task_view, run_baseline, run_view) = row?;
+            for snapshot in [task_baseline, task_view, run_baseline, run_view]
+                .into_iter()
+                .flatten()
+            {
+                references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
+            }
+            references
+                .view_names
+                .insert(PublishedViewName::new(format!("task-baseline:{task_id}"))?);
+            references
+                .view_names
+                .insert(PublishedViewName::new(format!("task-overlay:{task_id}"))?);
+        }
+        let canonical_snapshot = connection
+            .query_row(
+                "SELECT canonical_graph_snapshot_id FROM project_runtime_state WHERE row_id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(snapshot) = canonical_snapshot {
+            references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
+        }
+        Ok(references)
+    })
+    .await?
+}
+
+pub async fn canonical_graph_reference() -> Result<CanonicalGraphReference> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphReference> {
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("Failed to open {} read-only", database_path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let values = connection.query_row(
+            r#"
+            SELECT canonical_source_revision_id,
+                   canonical_manifest_algorithm, canonical_manifest_digest,
+                   canonical_graph_snapshot_id, canonical_graph_status
+            FROM project_runtime_state
+            WHERE row_id = 1
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        canonical_graph_reference_from_database(values)
+    })
+    .await?
+}
+
+pub async fn canonical_graph_refresh_guard() -> Result<CanonicalGraphRefreshGuard> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphRefreshGuard> {
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("Failed to open {} read-only", database_path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(CanonicalGraphRefreshGuard {
+            invalidation_event_id: latest_canonical_graph_invalidation_event_id(&connection)?,
+            refresh_event_id: latest_canonical_graph_refresh_event_id(&connection)?,
+        })
+    })
+    .await?
+}
+
+pub async fn record_canonical_graph_invalidation(
+    task_id: &str,
+    run_id: Option<&str>,
+    source: Option<&CanonicalSourceIdentity>,
+    reason: CanonicalInvalidationReason,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    let run_id = run_id.map(str::to_string);
+    let source = source.cloned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_source_revision_id = ?1,
+                canonical_manifest_algorithm = ?2,
+                canonical_manifest_digest = ?3,
+                canonical_graph_status = 'stale',
+                canonical_graph_updated_at = ?4,
+                updated_at = ?4
+            WHERE row_id = 1
+            "#,
+            params![
+                source
+                    .as_ref()
+                    .map(|identity| identity.source_revision_id.as_str()),
+                source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.algorithm()),
+                source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.value()),
+                timestamp(),
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_invalidated",
+            &serde_json::json!({
+                "task_id": task_id,
+                "reason": reason.as_str(),
+                "source_revision_id": source
+                    .as_ref()
+                    .map(|identity| identity.source_revision_id.as_str()),
+                "manifest_digest": source
+                    .as_ref()
+                    .map(|identity| identity.manifest_digest.value()),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn record_canonical_graph_invalidation_best_effort(
+    task_id: &str,
+    run_id: Option<&str>,
+    source: Option<&CanonicalSourceIdentity>,
+    reason: CanonicalInvalidationReason,
+) {
+    if let Err(error) = record_canonical_graph_invalidation(task_id, run_id, source, reason).await {
+        warn!(
+            task_id,
+            error = ?error,
+            "failed to record canonical repository graph invalidation"
+        );
+    }
+}
+
+pub async fn record_canonical_graph_refresh(
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    guard: CanonicalGraphRefreshGuard,
+    source: &CanonicalSourceIdentity,
+    snapshot_id: &SnapshotId,
+    build_id: &BuildId,
+) -> Result<CanonicalGraphRefreshOutcome> {
+    let database_path = current_database_path().await?;
+    let task_id = task_id.map(str::to_string);
+    let run_id = run_id.map(str::to_string);
+    let source = source.clone();
+    let snapshot_id = snapshot_id.clone();
+    let build_id = build_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<CanonicalGraphRefreshOutcome> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        let updated = transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_source_revision_id = ?1,
+                canonical_manifest_algorithm = ?2,
+                canonical_manifest_digest = ?3,
+                canonical_graph_snapshot_id = ?4,
+                canonical_graph_status = 'fresh',
+                canonical_graph_updated_at = ?5,
+                updated_at = ?5
+            WHERE row_id = 1
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_invalidated'
+                  ) = ?6
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_refreshed'
+                  ) = ?7
+            "#,
+            params![
+                source.source_revision_id.as_str(),
+                source.manifest_digest.algorithm(),
+                source.manifest_digest.value(),
+                snapshot_id.as_str(),
+                timestamp(),
+                guard.invalidation_event_id,
+                guard.refresh_event_id,
+            ],
+        )?;
+        if updated == 0 {
+            transaction.commit()?;
+            return Ok(CanonicalGraphRefreshOutcome::Superseded);
+        }
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_refreshed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "source_revision_id": source.source_revision_id.as_str(),
+                "snapshot_id": snapshot_id.as_str(),
+                "build_id": build_id.as_str(),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(CanonicalGraphRefreshOutcome::Recorded)
+    })
+    .await?
+}
+
+fn latest_canonical_graph_invalidation_event_id(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        r#"
+        SELECT COALESCE(MAX(id), 0)
+        FROM events
+        WHERE type = 'canonical_graph_invalidated'
+        "#,
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn latest_canonical_graph_refresh_event_id(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        r#"
+        SELECT COALESCE(MAX(id), 0)
+        FROM events
+        WHERE type = 'canonical_graph_refreshed'
+        "#,
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+pub async fn record_canonical_graph_refresh_failed_best_effort(
+    task_id: &str,
+    run_id: Option<&str>,
+    guard: CanonicalGraphRefreshGuard,
+) {
+    let database_path = match current_database_path().await {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(task_id, error = ?error, "failed to resolve canonical graph state database");
+            return;
+        }
+    };
+    let task_id = task_id.to_string();
+    let task_id_for_log = task_id.clone();
+    let run_id = run_id.map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_project_runtime_state_row(&transaction)?;
+        let state_updated = transaction.execute(
+            r#"
+            UPDATE project_runtime_state
+            SET canonical_graph_status = 'stale',
+                canonical_graph_updated_at = ?1,
+                updated_at = ?1
+            WHERE row_id = 1
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_invalidated'
+                  ) = ?2
+              AND (
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM events
+                    WHERE type = 'canonical_graph_refreshed'
+                  ) = ?3
+            "#,
+            params![
+                timestamp(),
+                guard.invalidation_event_id,
+                guard.refresh_event_id,
+            ],
+        )?;
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "canonical_graph_refresh_failed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "failure_code": "canonical_refresh_failed",
+                "state_updated": state_updated == 1,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await;
+    if let Err(error) = result.unwrap_or_else(|error| Err(error.into())) {
+        warn!(task_id = task_id_for_log, error = ?error, "failed to record canonical graph refresh failure");
+    }
+}
+
+type CanonicalGraphDatabaseValues = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn canonical_graph_reference_from_database(
+    values: CanonicalGraphDatabaseValues,
+) -> Result<CanonicalGraphReference> {
+    let (source_revision_id, algorithm, digest, snapshot_id, status) = values;
+    let source = match (source_revision_id, algorithm, digest) {
+        (Some(revision), Some(algorithm), Some(value)) => Some(CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new(revision)
+                .context("Invalid canonical source revision in ferrus.db")?,
+            manifest_digest: Digest::new(algorithm, value)
+                .context("Invalid canonical manifest digest in ferrus.db")?,
+        }),
+        (None, None, None) => None,
+        _ => anyhow::bail!("Incomplete canonical source identity in ferrus.db"),
+    };
+    Ok(CanonicalGraphReference {
+        source,
+        snapshot_id: snapshot_id
+            .map(SnapshotId::new)
+            .transpose()
+            .context("Invalid canonical graph snapshot in ferrus.db")?,
+        status: CanonicalGraphStatus::from_database(&status)?,
+    })
+}
+
+async fn read_repository_view(
+    owner_table: &'static str,
+    owner_id: &str,
+) -> Result<Option<RepositoryViewReference>> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    let database_path = current_database_path().await?;
+    let owner_id = owner_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Option<RepositoryViewReference>> {
+        let connection = open_runtime_database(&database_path)?;
+        let sql = format!(
+            "SELECT baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id, \
+                    repository_view_tree_algorithm, repository_view_tree_digest, \
+                    repository_view_lifecycle, repository_view_status \
+             FROM {owner_table} WHERE id = ?1"
+        );
+        let values = connection
+            .query_row(&sql, [&owner_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .optional()?;
+        values
+            .map(repository_view_reference_from_database)
+            .transpose()
+    })
+    .await?
+}
+
+#[allow(dead_code)]
+pub async fn record_task_repository_view(
+    task_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    record_task_repository_view_at(&database_path, task_id, repository_view).await
+}
+
+pub(crate) async fn record_task_repository_view_at(
+    database_path: &Path,
+    task_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    record_repository_view_at(database_path, "tasks", task_id, repository_view).await
+}
+
+pub(crate) async fn compare_and_record_task_repository_view_at(
+    database_path: &Path,
+    task_id: &str,
+    expected: &RepositoryViewReference,
+    repository_view: &RepositoryViewReference,
+) -> Result<bool> {
+    expected.validate()?;
+    repository_view.validate()?;
+    let database_path = database_path.to_path_buf();
+    let task_id = task_id.to_string();
+    let expected = expected.clone();
+    let repository_view = repository_view.clone();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                r#"
+            SELECT baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                   repository_view_tree_algorithm, repository_view_tree_digest,
+                   repository_view_lifecycle, repository_view_status
+            FROM tasks
+            WHERE id = ?1
+            "#,
+                [&task_id],
+                |row| repository_view_reference_from_row(row, 0),
+            )
+            .optional()?
+            .context("Cannot record repository view: tasks row does not exist")?;
+        if current != expected {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        record_repository_view_in_transaction(&transaction, "tasks", &task_id, &repository_view)?;
+        transaction.commit()?;
+        Ok(true)
+    })
+    .await?
+}
+
+#[allow(dead_code)]
+pub async fn record_run_repository_view(
+    run_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    let database_path = current_database_path().await?;
+    record_repository_view_at(&database_path, "runs", run_id, repository_view).await
+}
+
+async fn record_repository_view_at(
+    database_path: &Path,
+    owner_table: &'static str,
+    owner_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    repository_view.validate()?;
+    let database_path = database_path.to_path_buf();
+    let owner_id = owner_id.to_string();
+    let repository_view = repository_view.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        record_repository_view_in_transaction(
+            &transaction,
+            owner_table,
+            &owner_id,
+            &repository_view,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+fn record_repository_view_in_transaction(
+    transaction: &Transaction<'_>,
+    owner_table: &'static str,
+    owner_id: &str,
+    repository_view: &RepositoryViewReference,
+) -> Result<()> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    let baseline_snapshot_id = repository_view
+        .baseline_snapshot_id
+        .as_ref()
+        .map(SnapshotId::as_str);
+    let overlay_revision_id = repository_view
+        .overlay_revision_id
+        .as_ref()
+        .map(OverlayRevisionId::as_str);
+    let view_snapshot_id = repository_view
+        .view_snapshot_id
+        .as_ref()
+        .map(SnapshotId::as_str);
+    let tree_algorithm = repository_view
+        .frozen_source_tree
+        .as_ref()
+        .map(Digest::algorithm);
+    let tree_digest = repository_view
+        .frozen_source_tree
+        .as_ref()
+        .map(Digest::value);
+    let lifecycle = match repository_view.lifecycle {
+        TaskViewLifecycle::Mutable => "mutable",
+        TaskViewLifecycle::FrozenSubmitted => "frozen_submitted",
+    };
+    let status = repository_view.status.as_str();
+    let sql = format!(
+        "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
+         repository_view_snapshot_id = ?3, repository_view_tree_algorithm = ?4, \
+         repository_view_tree_digest = ?5, repository_view_lifecycle = ?6, \
+         repository_view_status = ?7 WHERE id = ?8"
+    );
+    let updated = transaction.execute(
+        &sql,
+        params![
+            baseline_snapshot_id,
+            overlay_revision_id,
+            view_snapshot_id,
+            tree_algorithm,
+            tree_digest,
+            lifecycle,
+            status,
+            owner_id,
+        ],
+    )?;
+    if updated == 0 {
+        anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
+    }
+    if owner_table == "tasks" {
+        transaction.execute(
+            r#"
+            UPDATE runs
+            SET baseline_snapshot_id = ?1,
+                overlay_revision_id = ?2,
+                repository_view_snapshot_id = ?3,
+                repository_view_tree_algorithm = ?4,
+                repository_view_tree_digest = ?5,
+                repository_view_lifecycle = ?6,
+                repository_view_status = ?7
+            WHERE task_id = ?8
+              AND baseline_snapshot_id IS NULL
+              AND repository_view_status IN ('not_built', 'unavailable', 'failed')
+            "#,
+            params![
+                baseline_snapshot_id,
+                overlay_revision_id,
+                view_snapshot_id,
+                tree_algorithm,
+                tree_digest,
+                lifecycle,
+                status,
+                owner_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+type RepositoryViewDatabaseValues = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn repository_view_reference_from_database(
+    values: RepositoryViewDatabaseValues,
+) -> Result<RepositoryViewReference> {
+    let (
+        baseline_snapshot_id,
+        overlay_revision_id,
+        view_snapshot_id,
+        tree_algorithm,
+        tree_digest,
+        lifecycle,
+        status,
+    ) = values;
+    let baseline_snapshot_id = baseline_snapshot_id
+        .map(SnapshotId::new)
+        .transpose()
+        .context("Invalid baseline snapshot identity in ferrus.db")?;
+    let overlay_revision_id = overlay_revision_id
+        .map(OverlayRevisionId::new)
+        .transpose()
+        .context("Invalid overlay revision identity in ferrus.db")?;
+    let view_snapshot_id = view_snapshot_id
+        .map(SnapshotId::new)
+        .transpose()
+        .context("Invalid materialized repository view snapshot in ferrus.db")?;
+    let frozen_source_tree = match (tree_algorithm, tree_digest) {
+        (Some(algorithm), Some(value)) => Some(
+            Digest::new(algorithm, value)
+                .context("Invalid frozen repository source tree in ferrus.db")?,
+        ),
+        (None, None) => None,
+        _ => anyhow::bail!("Incomplete frozen repository source tree in ferrus.db"),
+    };
+    let lifecycle = match lifecycle.as_str() {
+        "mutable" => TaskViewLifecycle::Mutable,
+        "frozen_submitted" => TaskViewLifecycle::FrozenSubmitted,
+        _ => anyhow::bail!("Unknown repository view lifecycle in ferrus.db: {lifecycle:?}"),
+    };
+    let reference = RepositoryViewReference {
+        baseline_snapshot_id,
+        overlay_revision_id,
+        view_snapshot_id,
+        frozen_source_tree,
+        lifecycle,
+        status: RepositoryViewStatus::from_database(&status)?,
+    };
+    reference.validate()?;
+    Ok(reference)
+}
+
+fn repository_view_reference_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RepositoryViewReference> {
+    repository_view_reference_from_database((
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+    ))
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(offset, rusqlite::types::Type::Text, error.into())
+    })
+}
+
 pub async fn list_events(limit: usize, run_id: Option<String>) -> Result<Vec<EventRecord>> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || -> Result<Vec<EventRecord>> {
@@ -1556,6 +2421,114 @@ pub async fn record_task_status_with_origin(
         Ok(())
     })
     .await?
+}
+
+/// Completes the normal submit transition and, when available, pins the exact
+/// materialized graph/source pair in the same runtime transaction. A graph
+/// freeze failure is diagnostic-only: it is recorded without changing submit
+/// eligibility, retries, or review-cycle accounting.
+pub async fn record_task_submitted(
+    task_id: &str,
+    task_path: &str,
+    run_id: Option<&str>,
+    frozen_view: Option<&RepositoryViewReference>,
+    freeze_failed: bool,
+) -> Result<()> {
+    if let Some(view) = frozen_view {
+        view.validate()?;
+        if view.lifecycle != TaskViewLifecycle::FrozenSubmitted {
+            anyhow::bail!("A submitted repository view must be frozen");
+        }
+    }
+    let database_path = current_database_path().await?;
+    let task_id = task_id.to_string();
+    let task_path = task_path.to_string();
+    let run_id = run_id.map(str::to_string);
+    let frozen_view = frozen_view.cloned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_task(
+            &transaction,
+            &task_id,
+            &task_path,
+            TaskStatus::Reviewing,
+            None,
+            None,
+        )?;
+        clear_task_lease(&transaction, &task_id)?;
+        if let Some(view) = frozen_view.as_ref() {
+            update_repository_view_in_transaction(&transaction, "tasks", &task_id, view)?;
+            if let Some(run_id) = run_id.as_deref() {
+                update_repository_view_in_transaction(&transaction, "runs", run_id, view)?;
+            }
+            insert_event_in_transaction(
+                &transaction,
+                run_id.as_deref(),
+                "repository_view_frozen",
+                &serde_json::json!({
+                    "task_id": task_id,
+                    "snapshot_id": view.view_snapshot_id.as_ref().map(SnapshotId::as_str),
+                }),
+            )?;
+        } else if freeze_failed {
+            insert_event_in_transaction(
+                &transaction,
+                run_id.as_deref(),
+                "repository_view_freeze_failed",
+                &serde_json::json!({ "task_id": task_id }),
+            )?;
+        }
+        insert_event_in_transaction(
+            &transaction,
+            run_id.as_deref(),
+            "task_status_changed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "status": TaskStatus::Reviewing.as_str(),
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+    .await?
+}
+
+fn update_repository_view_in_transaction(
+    transaction: &Transaction<'_>,
+    owner_table: &'static str,
+    owner_id: &str,
+    view: &RepositoryViewReference,
+) -> Result<()> {
+    debug_assert!(matches!(owner_table, "tasks" | "runs"));
+    let sql = format!(
+        "UPDATE {owner_table} SET baseline_snapshot_id = ?1, overlay_revision_id = ?2, \
+         repository_view_snapshot_id = ?3, repository_view_tree_algorithm = ?4, \
+         repository_view_tree_digest = ?5, repository_view_lifecycle = ?6, \
+         repository_view_status = ?7 WHERE id = ?8"
+    );
+    let updated = transaction.execute(
+        &sql,
+        params![
+            view.baseline_snapshot_id.as_ref().map(SnapshotId::as_str),
+            view.overlay_revision_id
+                .as_ref()
+                .map(OverlayRevisionId::as_str),
+            view.view_snapshot_id.as_ref().map(SnapshotId::as_str),
+            view.frozen_source_tree.as_ref().map(Digest::algorithm),
+            view.frozen_source_tree.as_ref().map(Digest::value),
+            match view.lifecycle {
+                TaskViewLifecycle::Mutable => "mutable",
+                TaskViewLifecycle::FrozenSubmitted => "frozen_submitted",
+            },
+            view.status.as_str(),
+            owner_id,
+        ],
+    )?;
+    if updated == 0 {
+        anyhow::bail!("Cannot record submitted repository view: {owner_table} row does not exist");
+    }
+    Ok(())
 }
 
 pub async fn record_task_check_passed(task_id: &str) -> Result<()> {
@@ -1769,6 +2742,9 @@ pub async fn record_task_review_rejected(
                 SET status = ?1, review_cycles = ?2, check_retries = 0,
                     executor_dispatches = 0,
                     failure_reason = NULL,
+                    repository_view_tree_algorithm = NULL,
+                    repository_view_tree_digest = NULL,
+                    repository_view_lifecycle = 'mutable',
                     claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
                 WHERE id = ?3
                 "#,
@@ -2532,10 +3508,33 @@ pub async fn renew_claimed_task_lease(agent_id: &str, ttl_secs: u64) -> Result<L
 }
 
 pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<RuntimeTaskContext>> {
+    runtime_task_context_for_agent_with_open_mode(agent_id, false).await
+}
+
+pub(crate) async fn runtime_task_context_for_agent_read_only(
+    agent_id: &str,
+) -> Result<Option<RuntimeTaskContext>> {
+    runtime_task_context_for_agent_with_open_mode(agent_id, true).await
+}
+
+async fn runtime_task_context_for_agent_with_open_mode(
+    agent_id: &str,
+    read_only: bool,
+) -> Result<Option<RuntimeTaskContext>> {
     let database_path = current_database_path().await?;
     let agent_id = agent_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<Option<RuntimeTaskContext>> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = if read_only {
+            let connection =
+                Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| {
+                        format!("Failed to open {} read-only", database_path.display())
+                    })?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection
+        } else {
+            open_runtime_database(&database_path)?
+        };
         if let Some((
             task_id,
             task_path,
@@ -2546,11 +3545,15 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
             check_retries,
             review_cycles,
             failure_reason,
+            repository_view,
         )) = connection
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                       repository_view_tree_algorithm, repository_view_tree_digest,
+                       repository_view_lifecycle, repository_view_status
                 FROM tasks
                 WHERE claimed_by = ?1
                 ORDER BY
@@ -2571,12 +3574,30 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                         row.get::<_, i64>(6)? as u32,
                         row.get::<_, i64>(7)? as u32,
                         row.get::<_, Option<String>>(8)?,
+                        repository_view_reference_from_row(row, 9)?,
                     ))
                 },
             )
             .optional()?
         {
             let run = latest_run_for_agent_task(&connection, &agent_id, &task_id)?;
+            let run_role = run.as_ref().map(|run| run.role.clone());
+            let workspace_path = run.as_ref().map(|run| run.workspace_path.clone());
+            let repository_workspace_path = match run_role.as_deref() {
+                Some("executor") => workspace_path.clone(),
+                Some("supervisor") if status != TaskStatus::Reviewing.as_str() => {
+                    latest_executor_workspace_for_task(&connection, &task_id)?
+                }
+                _ => None,
+            };
+            let repository_view = match run.as_ref() {
+                Some(run)
+                    if run.role == "supervisor" && status == TaskStatus::Reviewing.as_str() =>
+                {
+                    run.repository_view.clone()
+                }
+                _ => repository_view,
+            };
             return Ok(Some(RuntimeTaskContext {
                 run_dir: run_dir_for_task(&task_id),
                 task_id,
@@ -2589,17 +3610,25 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                 review_cycles,
                 failure_reason,
                 run_id: run.as_ref().map(|run| run.id.clone()),
-                workspace_path: run.map(|run| run.workspace_path),
+                run_role,
+                workspace_path,
+                repository_workspace_path,
+                repository_view,
             }));
         }
 
         let context = connection
             .query_row(
                 r#"
-                SELECT runs.id, runs.workspace_path,
+                SELECT runs.id, runs.role, runs.workspace_path,
                        tasks.id, tasks.path, tasks.spec_path, tasks.milestone_id,
                        tasks.status, tasks.paused_status,
-                       tasks.check_retries, tasks.review_cycles, tasks.failure_reason
+                       tasks.check_retries, tasks.review_cycles, tasks.failure_reason,
+                       runs.baseline_snapshot_id, runs.overlay_revision_id,
+                       runs.repository_view_snapshot_id,
+                       runs.repository_view_tree_algorithm,
+                       runs.repository_view_tree_digest,
+                       runs.repository_view_lifecycle, runs.repository_view_status
                 FROM runs
                 JOIN tasks ON tasks.id = runs.task_id
                 WHERE runs.agent = ?1 AND runs.status IN ('running', 'checking', 'reviewing')
@@ -2609,21 +3638,34 @@ pub async fn runtime_task_context_for_agent(agent_id: &str) -> Result<Option<Run
                 [&agent_id],
                 |row| {
                     let run_id = row.get::<_, String>(0)?;
-                    let workspace_path = row.get::<_, String>(1)?;
-                    let task_id = row.get::<_, String>(2)?;
+                    let run_role = row.get::<_, String>(1)?;
+                    let workspace_path = row.get::<_, String>(2)?;
+                    let task_id = row.get::<_, String>(3)?;
+                    let repository_workspace_path = if run_role == "executor" {
+                        Some(workspace_path.clone())
+                    } else if run_role == "supervisor"
+                        && row.get::<_, String>(7)? != TaskStatus::Reviewing.as_str()
+                    {
+                        latest_executor_workspace_for_task(&connection, &task_id)?
+                    } else {
+                        None
+                    };
                     Ok(RuntimeTaskContext {
                         run_dir: run_dir_for_task(&task_id),
                         task_id,
-                        task_path: row.get(3)?,
-                        spec_path: row.get(4)?,
-                        milestone_id: row.get(5)?,
-                        status: row.get(6)?,
-                        paused_status: row.get(7)?,
-                        check_retries: row.get::<_, i64>(8)? as u32,
-                        review_cycles: row.get::<_, i64>(9)? as u32,
-                        failure_reason: row.get(10)?,
+                        task_path: row.get(4)?,
+                        spec_path: row.get(5)?,
+                        milestone_id: row.get(6)?,
+                        status: row.get(7)?,
+                        paused_status: row.get(8)?,
+                        check_retries: row.get::<_, i64>(9)? as u32,
+                        review_cycles: row.get::<_, i64>(10)? as u32,
+                        failure_reason: row.get(11)?,
                         run_id: Some(run_id),
+                        run_role: Some(run_role),
                         workspace_path: Some(workspace_path),
+                        repository_workspace_path,
+                        repository_view: repository_view_reference_from_row(row, 12)?,
                     })
                 },
             )
@@ -2672,7 +3714,9 @@ fn renew_task_lease_in_transaction(
 #[derive(Debug, Clone)]
 struct RuntimeRunIdentity {
     id: String,
+    role: String,
     workspace_path: String,
+    repository_view: RepositoryViewReference,
 }
 
 fn latest_run_for_agent_task(
@@ -2683,7 +3727,10 @@ fn latest_run_for_agent_task(
     Ok(connection
         .query_row(
             r#"
-            SELECT id, workspace_path
+            SELECT id, role, workspace_path,
+                   baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                   repository_view_tree_algorithm, repository_view_tree_digest,
+                   repository_view_lifecycle, repository_view_status
             FROM runs
             WHERE agent = ?1 AND task_id = ?2
             ORDER BY updated_at DESC, started_at DESC, id DESC
@@ -2693,11 +3740,32 @@ fn latest_run_for_agent_task(
             |row| {
                 Ok(RuntimeRunIdentity {
                     id: row.get(0)?,
-                    workspace_path: row.get(1)?,
+                    role: row.get(1)?,
+                    workspace_path: row.get(2)?,
+                    repository_view: repository_view_reference_from_row(row, 3)?,
                 })
             },
         )
         .optional()?)
+}
+
+fn latest_executor_workspace_for_task(
+    connection: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    connection
+        .query_row(
+            r#"
+            SELECT workspace_path
+            FROM runs
+            WHERE task_id = ?1 AND role = 'executor' AND workspace_path <> ''
+            ORDER BY updated_at DESC, started_at DESC, id DESC
+            LIMIT 1
+            "#,
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 fn latest_active_run_for_agent(connection: &Connection, agent_id: &str) -> Result<Option<String>> {
@@ -2725,7 +3793,12 @@ fn consultation_context_for_run(
             r#"
             SELECT tasks.id, tasks.path, tasks.spec_path, tasks.milestone_id,
                    tasks.status, tasks.paused_status,
-                   tasks.check_retries, tasks.review_cycles, tasks.failure_reason
+                   tasks.check_retries, tasks.review_cycles, tasks.failure_reason,
+                   tasks.baseline_snapshot_id, tasks.overlay_revision_id,
+                   tasks.repository_view_snapshot_id,
+                   tasks.repository_view_tree_algorithm,
+                   tasks.repository_view_tree_digest,
+                   tasks.repository_view_lifecycle, tasks.repository_view_status
             FROM runs
             JOIN tasks ON tasks.id = runs.task_id
             WHERE runs.id = ?1 AND tasks.status = ?2
@@ -2734,6 +3807,8 @@ fn consultation_context_for_run(
             params![run_id, TaskStatus::Consultation.as_str()],
             |row| {
                 let task_id = row.get::<_, String>(0)?;
+                let repository_workspace_path =
+                    latest_executor_workspace_for_task(connection, &task_id)?;
                 Ok(RuntimeTaskContext {
                     run_dir: run_dir_for_task(&task_id),
                     task_id,
@@ -2746,7 +3821,10 @@ fn consultation_context_for_run(
                     review_cycles: row.get::<_, i64>(7)? as u32,
                     failure_reason: row.get(8)?,
                     run_id: Some(run_id.to_string()),
+                    run_role: Some("supervisor".to_string()),
                     workspace_path: None,
+                    repository_workspace_path,
+                    repository_view: repository_view_reference_from_row(row, 9)?,
                 })
             },
         )
@@ -2862,14 +3940,29 @@ pub async fn record_run_started_for_task_with_workspace(
         connection.execute(
             r#"
             INSERT INTO runs (
-                id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path
+                id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path,
+                baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                repository_view_tree_algorithm, repository_view_tree_digest,
+                repository_view_lifecycle, repository_view_status
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                   baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                   repository_view_tree_algorithm, repository_view_tree_digest,
+                   repository_view_lifecycle, repository_view_status
+            FROM tasks
+            WHERE id = ?2
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 updated_at = excluded.updated_at,
                 pid = excluded.pid,
-                workspace_path = excluded.workspace_path
+                workspace_path = excluded.workspace_path,
+                baseline_snapshot_id = excluded.baseline_snapshot_id,
+                overlay_revision_id = excluded.overlay_revision_id,
+                repository_view_snapshot_id = excluded.repository_view_snapshot_id,
+                repository_view_tree_algorithm = excluded.repository_view_tree_algorithm,
+                repository_view_tree_digest = excluded.repository_view_tree_digest,
+                repository_view_lifecycle = excluded.repository_view_lifecycle,
+                repository_view_status = excluded.repository_view_status
             "#,
             params![
                 record_for_insert.id,
@@ -2955,7 +4048,29 @@ pub async fn attach_running_run_to_task(
         };
 
         connection.execute(
-            "UPDATE runs SET task_id = ?1, updated_at = ?2 WHERE id = ?3",
+            r#"
+            UPDATE runs
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_snapshot_id = (
+                    SELECT repository_view_snapshot_id FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_algorithm = (
+                    SELECT repository_view_tree_algorithm FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_digest = (
+                    SELECT repository_view_tree_digest FROM tasks WHERE id = ?1
+                ),
+                repository_view_lifecycle = (
+                    SELECT repository_view_lifecycle FROM tasks WHERE id = ?1
+                ),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
+            WHERE id = ?3
+            "#,
             params![task_id, timestamp(), run_id],
         )?;
         insert_event(
@@ -3009,7 +4124,10 @@ pub async fn attach_running_run_to_next_consultation(
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                       repository_view_tree_algorithm, repository_view_tree_digest,
+                       repository_view_lifecycle, repository_view_status
                 FROM tasks
                 WHERE status = ?1
                   AND NOT EXISTS (
@@ -3036,7 +4154,13 @@ pub async fn attach_running_run_to_next_consultation(
                         review_cycles: row.get::<_, i64>(7)? as u32,
                         failure_reason: row.get(8)?,
                         run_id: Some(run_id.clone()),
+                        run_role: Some("supervisor".to_string()),
                         workspace_path: None,
+                        repository_workspace_path: latest_executor_workspace_for_task(
+                            &transaction,
+                            &row.get::<_, String>(0)?,
+                        )?,
+                        repository_view: repository_view_reference_from_row(row, 9)?,
                     })
                 },
             )
@@ -3050,7 +4174,25 @@ pub async fn attach_running_run_to_next_consultation(
         let attached = transaction.execute(
             r#"
             UPDATE runs
-            SET task_id = ?1, updated_at = ?2
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_snapshot_id = (
+                    SELECT repository_view_snapshot_id FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_algorithm = (
+                    SELECT repository_view_tree_algorithm FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_digest = (
+                    SELECT repository_view_tree_digest FROM tasks WHERE id = ?1
+                ),
+                repository_view_lifecycle = (
+                    SELECT repository_view_lifecycle FROM tasks WHERE id = ?1
+                ),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
             WHERE id = ?3
               AND NOT EXISTS (
                   SELECT 1
@@ -3106,7 +4248,10 @@ pub async fn attach_running_run_to_consultation(
             .query_row(
                 r#"
                 SELECT id, path, spec_path, milestone_id, status, paused_status,
-                       check_retries, review_cycles, failure_reason
+                       check_retries, review_cycles, failure_reason,
+                       baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id,
+                       repository_view_tree_algorithm, repository_view_tree_digest,
+                       repository_view_lifecycle, repository_view_status
                 FROM tasks
                 WHERE id = ?1
                   AND status = ?2
@@ -3133,7 +4278,13 @@ pub async fn attach_running_run_to_consultation(
                         review_cycles: row.get::<_, i64>(7)? as u32,
                         failure_reason: row.get(8)?,
                         run_id: Some(run_id.clone()),
+                        run_role: Some("supervisor".to_string()),
                         workspace_path: None,
+                        repository_workspace_path: latest_executor_workspace_for_task(
+                            &transaction,
+                            &row.get::<_, String>(0)?,
+                        )?,
+                        repository_view: repository_view_reference_from_row(row, 9)?,
                     })
                 },
             )
@@ -3147,7 +4298,25 @@ pub async fn attach_running_run_to_consultation(
         let attached = transaction.execute(
             r#"
             UPDATE runs
-            SET task_id = ?1, updated_at = ?2
+            SET task_id = ?1,
+                updated_at = ?2,
+                baseline_snapshot_id = (SELECT baseline_snapshot_id FROM tasks WHERE id = ?1),
+                overlay_revision_id = (SELECT overlay_revision_id FROM tasks WHERE id = ?1),
+                repository_view_snapshot_id = (
+                    SELECT repository_view_snapshot_id FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_algorithm = (
+                    SELECT repository_view_tree_algorithm FROM tasks WHERE id = ?1
+                ),
+                repository_view_tree_digest = (
+                    SELECT repository_view_tree_digest FROM tasks WHERE id = ?1
+                ),
+                repository_view_lifecycle = (
+                    SELECT repository_view_lifecycle FROM tasks WHERE id = ?1
+                ),
+                repository_view_status = (
+                    SELECT repository_view_status FROM tasks WHERE id = ?1
+                )
             WHERE id = ?3
               AND NOT EXISTS (
                   SELECT 1
@@ -3597,9 +4766,9 @@ async fn preview_expired_task_leases(database_path: &Path) -> Result<usize> {
 async fn initialize_database(path: &Path) -> Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        initialize_schema(&connection)?;
+        initialize_schema(&mut connection)?;
         Ok(())
     })
     .await?
@@ -3610,7 +4779,12 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
     tokio::task::spawn_blocking(move || -> Result<bool> {
         let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        for table in ["tasks", "runs", "events"] {
+        if runtime_schema_version(&connection)? != RUNTIME_SCHEMA_VERSION
+            || validate_runtime_migration_history(&connection).is_err()
+        {
+            return Ok(false);
+        }
+        for table in ["tasks", "runs", "events", "runtime_schema_migrations"] {
             let exists: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 [table],
@@ -3630,8 +4804,40 @@ async fn validate_database_schema(path: &Path) -> Result<bool> {
             "failure_reason",
             "awaiting_human_by",
             "awaiting_human_status",
+            "baseline_snapshot_id",
+            "overlay_revision_id",
+            "repository_view_snapshot_id",
+            "repository_view_tree_algorithm",
+            "repository_view_tree_digest",
+            "repository_view_lifecycle",
+            "repository_view_status",
         ] {
             if !column_exists(&connection, "tasks", column)? {
+                return Ok(false);
+            }
+        }
+        for column in [
+            "baseline_snapshot_id",
+            "overlay_revision_id",
+            "repository_view_snapshot_id",
+            "repository_view_tree_algorithm",
+            "repository_view_tree_digest",
+            "repository_view_lifecycle",
+            "repository_view_status",
+        ] {
+            if !column_exists(&connection, "runs", column)? {
+                return Ok(false);
+            }
+        }
+        for column in [
+            "canonical_source_revision_id",
+            "canonical_manifest_algorithm",
+            "canonical_manifest_digest",
+            "canonical_graph_snapshot_id",
+            "canonical_graph_status",
+            "canonical_graph_updated_at",
+        ] {
+            if !column_exists(&connection, "project_runtime_state", column)? {
                 return Ok(false);
             }
         }
@@ -3695,7 +4901,7 @@ async fn read_task_records_from_database(path: &Path) -> Result<Vec<TaskRecord>>
 async fn current_database_path() -> Result<PathBuf> {
     let local_ref = read_local_project_ref()
         .await
-        .context(".ferrus/project.toml not found — run `ferrus migrate`")?;
+        .context(".ferrus/project.toml not found -- run `ferrus migrate`")?;
     Ok(PathBuf::from(local_ref.data_dir).join("ferrus.db"))
 }
 
@@ -3716,17 +4922,149 @@ async fn current_task_identity() -> (String, String) {
 }
 
 fn open_runtime_database(path: &Path) -> Result<Connection> {
-    let connection =
+    let mut connection =
         Connection::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
-    initialize_schema(&connection)?;
+    initialize_schema(&mut connection)?;
     Ok(connection)
 }
 
-fn initialize_schema(connection: &Connection) -> Result<()> {
+pub(crate) async fn prepare_runtime_database_for_read_only_operations() -> Result<()> {
+    let database_path = current_database_path().await?;
+    tokio::task::spawn_blocking(move || {
+        prepare_runtime_database_for_read_only_operations_at(&database_path)
+    })
+    .await?
+}
+
+fn prepare_runtime_database_for_read_only_operations_at(path: &Path) -> Result<()> {
+    drop(open_runtime_database(path)?);
+    Ok(())
+}
+
+fn initialize_schema(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    migrate_runtime_schema(connection)?;
+    // Some pre-migration installations wrote this compatibility table lazily.
+    // Keep importing it idempotently even after the schema baseline is adopted.
+    migrate_legacy_runtime_metadata(connection)
+}
+
+struct RuntimeMigration {
+    version: u32,
+    name: &'static str,
+    apply: fn(&Transaction<'_>) -> Result<()>,
+}
+
+const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
+    RuntimeMigration {
+        version: 1,
+        name: "adopt_legacy_runtime_schema",
+        apply: adopt_legacy_runtime_schema,
+    },
+    RuntimeMigration {
+        version: 2,
+        name: "repository_view_references",
+        apply: add_repository_view_references,
+    },
+    RuntimeMigration {
+        version: 3,
+        name: "frozen_repository_views",
+        apply: add_frozen_repository_views,
+    },
+    RuntimeMigration {
+        version: 4,
+        name: "canonical_graph_state",
+        apply: add_canonical_graph_state,
+    },
+];
+
+fn migrate_runtime_schema(connection: &mut Connection) -> Result<()> {
+    validate_runtime_migration_history(connection)?;
+
+    for migration in RUNTIME_MIGRATIONS {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_version = runtime_schema_version(&transaction)?;
+        if current_version >= migration.version {
+            transaction.commit()?;
+            continue;
+        }
+        if current_version + 1 != migration.version {
+            anyhow::bail!(
+                "Cannot apply ferrus.db migration {} after schema version {}",
+                migration.version,
+                current_version
+            );
+        }
+
+        (migration.apply)(&transaction).with_context(|| {
+            format!(
+                "Failed to apply ferrus.db migration {} ({})",
+                migration.version, migration.name
+            )
+        })?;
+        transaction.execute(
+            r#"
+            INSERT INTO runtime_schema_migrations (version, name, applied_at)
+            VALUES (?1, ?2, ?3)
+            "#,
+            params![migration.version, migration.name, timestamp()],
+        )?;
+        transaction.pragma_update(None, "user_version", migration.version)?;
+        transaction.commit()?;
+    }
+
+    validate_runtime_migration_history(connection)
+}
+
+fn validate_runtime_migration_history(connection: &Connection) -> Result<()> {
+    let version = runtime_schema_version(connection)?;
+    if version > RUNTIME_SCHEMA_VERSION {
+        anyhow::bail!(
+            "ferrus.db schema version {version} is newer than supported version {RUNTIME_SCHEMA_VERSION}"
+        );
+    }
+
+    if !table_exists(connection, "runtime_schema_migrations")? {
+        if version == 0 {
+            return Ok(());
+        }
+        anyhow::bail!("ferrus.db migration history is missing for schema version {version}");
+    }
+
+    let mut statement = connection
+        .prepare("SELECT version, name FROM runtime_schema_migrations ORDER BY version")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let history = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if history.len() != version as usize {
+        anyhow::bail!("ferrus.db migration history is incomplete for schema version {version}");
+    }
+    for (index, (applied_version, applied_name)) in history.iter().enumerate() {
+        let expected = &RUNTIME_MIGRATIONS[index];
+        if *applied_version != expected.version || applied_name != expected.name {
+            anyhow::bail!(
+                "ferrus.db migration history diverges at version {}",
+                expected.version
+            );
+        }
+    }
+    Ok(())
+}
+
+fn runtime_schema_version(connection: &Connection) -> Result<u32> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn adopt_legacy_runtime_schema(connection: &Transaction<'_>) -> Result<()> {
     connection.execute_batch(
         r#"
-        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS runtime_schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            applied_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
@@ -3838,6 +5176,93 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "TEXT",
     )?;
     migrate_legacy_runtime_metadata(connection)?;
+    Ok(())
+}
+
+fn add_repository_view_references(connection: &Transaction<'_>) -> Result<()> {
+    const STATUS_COLUMN: &str = "TEXT NOT NULL DEFAULT 'not_built' CHECK \
+        (repository_view_status IN ('not_built', 'available', 'stale', 'unavailable', 'failed'))";
+
+    for table in ["tasks", "runs"] {
+        ensure_column(connection, table, "baseline_snapshot_id", "TEXT")?;
+        ensure_column(connection, table, "overlay_revision_id", "TEXT")?;
+        ensure_column(connection, table, "repository_view_status", STATUS_COLUMN)?;
+    }
+    connection.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tasks_repository_view_baseline
+            ON tasks(baseline_snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_repository_view_baseline
+            ON runs(baseline_snapshot_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_frozen_repository_views(connection: &Transaction<'_>) -> Result<()> {
+    const LIFECYCLE_COLUMN: &str = "TEXT NOT NULL DEFAULT 'mutable' CHECK \
+        (repository_view_lifecycle IN ('mutable', 'frozen_submitted'))";
+
+    for table in ["tasks", "runs"] {
+        ensure_column(connection, table, "repository_view_snapshot_id", "TEXT")?;
+        ensure_column(connection, table, "repository_view_tree_algorithm", "TEXT")?;
+        ensure_column(connection, table, "repository_view_tree_digest", "TEXT")?;
+        ensure_column(
+            connection,
+            table,
+            "repository_view_lifecycle",
+            LIFECYCLE_COLUMN,
+        )?;
+    }
+    connection.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tasks_repository_view_snapshot
+            ON tasks(repository_view_snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_repository_view_snapshot
+            ON runs(repository_view_snapshot_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_canonical_graph_state(connection: &Transaction<'_>) -> Result<()> {
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_source_revision_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_manifest_algorithm",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_manifest_digest",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_snapshot_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_status",
+        "TEXT NOT NULL DEFAULT 'unknown' CHECK (canonical_graph_status IN ('unknown', 'stale', 'fresh'))",
+    )?;
+    ensure_column(
+        connection,
+        "project_runtime_state",
+        "canonical_graph_updated_at",
+        "TEXT",
+    )?;
+    ensure_project_runtime_state_row(connection)?;
     Ok(())
 }
 
@@ -4939,6 +6364,652 @@ mod tests {
     }
 
     #[test]
+    fn startup_prepares_runtime_schema_for_read_only_graph_queries() {
+        let dir = TempDir::new().unwrap();
+        let database_path = dir.path().join("ferrus.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TABLE runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                "#,
+            )
+            .unwrap();
+
+        prepare_runtime_database_for_read_only_operations_at(&database_path).unwrap();
+
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let state = connection
+            .query_row(
+                r#"
+                SELECT canonical_graph_status, canonical_graph_snapshot_id
+                FROM project_runtime_state
+                WHERE row_id = 1
+                "#,
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("unknown".to_string(), None));
+        assert_eq!(
+            runtime_schema_version(&connection).unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn runtime_schema_migrations_adopt_legacy_database_without_data_loss() {
+        let dir = TempDir::new().unwrap();
+        let database_path = dir.path().join("ferrus.db");
+        let mut connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pid INTEGER,
+                    workspace_path TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id)
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+                CREATE TABLE runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                INSERT INTO tasks (id, path, status)
+                VALUES ('t-007', '.ferrus/tasks/t-007.md', 'reviewing');
+                INSERT INTO runs (
+                    id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path
+                ) VALUES (
+                    'r-007', 't-007', 'executor', 'codex', 'reviewing',
+                    '2026-07-19T00:00:00Z', '2026-07-19T00:01:00Z', 42, '/tmp/worktree'
+                );
+                INSERT INTO events (run_id, type, payload_json, created_at)
+                VALUES ('r-007', 'submission_recorded', '{}', '2026-07-19T00:01:00Z');
+                INSERT INTO runtime_metadata (key, value)
+                VALUES ('selected_spec', 'docs/specs/legacy.md');
+                "#,
+            )
+            .unwrap();
+
+        initialize_schema(&mut connection).unwrap();
+
+        assert_eq!(
+            runtime_schema_version(&connection).unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
+        let migrations: Vec<(u32, String)> = connection
+            .prepare("SELECT version, name FROM runtime_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            migrations,
+            vec![
+                (1, "adopt_legacy_runtime_schema".to_string()),
+                (2, "repository_view_references".to_string()),
+                (3, "frozen_repository_views".to_string()),
+                (4, "canonical_graph_state".to_string()),
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT status FROM tasks WHERE id = 't-007'", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "reviewing"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT workspace_path FROM runs WHERE id = 'r-007'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "/tmp/worktree"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_project_selection_from_database(&connection)
+                .unwrap()
+                .selected_spec
+                .as_deref(),
+            Some("docs/specs/legacy.md")
+        );
+        for table in ["tasks", "runs"] {
+            let status = connection
+                .query_row(
+                    &format!("SELECT repository_view_status FROM {table} WHERE id = ?1"),
+                    [if table == "tasks" { "t-007" } else { "r-007" }],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(status, "not_built");
+            let lifecycle = connection
+                .query_row(
+                    &format!("SELECT repository_view_lifecycle FROM {table} WHERE id = ?1"),
+                    [if table == "tasks" { "t-007" } else { "r-007" }],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(lifecycle, "mutable");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT canonical_graph_status FROM project_runtime_state WHERE row_id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "unknown"
+        );
+
+        initialize_schema(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_schema_migrations",
+                    [],
+                    |row| { row.get::<_, u32>(0) }
+                )
+                .unwrap(),
+            RUNTIME_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_schema_migration_rolls_back_a_failed_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, path TEXT NOT NULL, status TEXT NOT NULL);
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pid INTEGER,
+                    workspace_path TEXT NOT NULL
+                );
+                CREATE TABLE idx_tasks_repository_view_baseline (value TEXT);
+                "#,
+            )
+            .unwrap();
+        let mut connection = connection;
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+
+        assert!(error.to_string().contains("migration 2"));
+        assert_eq!(runtime_schema_version(&connection).unwrap(), 1);
+        assert!(!column_exists(&connection, "tasks", "baseline_snapshot_id").unwrap());
+        assert!(!column_exists(&connection, "runs", "baseline_snapshot_id").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_schema_migrations WHERE version = 2",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_schema_rejects_newer_versions_without_mutation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+
+        assert!(error.to_string().contains("newer than supported"));
+        assert_eq!(runtime_schema_version(&connection).unwrap(), 99);
+        assert!(!table_exists(&connection, "runtime_schema_migrations").unwrap());
+    }
+
+    #[tokio::test]
+    async fn repository_view_references_round_trip_for_tasks_and_runs() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let repository_view = RepositoryViewReference::new(
+            Some(SnapshotId::new("snapshot-baseline").unwrap()),
+            Some(OverlayRevisionId::new("overlay-1").unwrap()),
+            RepositoryViewStatus::Stale,
+        )
+        .unwrap();
+        record_task_repository_view("t-001", &repository_view)
+            .await
+            .unwrap();
+        claim_task(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            "executor:codex:t-001",
+            60,
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-view",
+            "executor",
+            "executor:codex:t-001",
+            42,
+            Some("t-001"),
+            "/tmp/worktree".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            task_repository_view("t-001").await.unwrap(),
+            Some(repository_view.clone())
+        );
+        assert_eq!(
+            run_repository_view("r-view").await.unwrap(),
+            Some(repository_view.clone())
+        );
+        assert_eq!(
+            runtime_task_context_for_agent("executor:codex:t-001")
+                .await
+                .unwrap()
+                .unwrap()
+                .repository_view,
+            repository_view
+        );
+
+        record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-late-pin",
+            "executor",
+            "executor:codex:t-002",
+            43,
+            Some("t-002"),
+            "/tmp/worktree-2".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_repository_view("r-late-pin")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RepositoryViewStatus::NotBuilt
+        );
+        record_task_repository_view("t-002", &repository_view)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_repository_view("r-late-pin").await.unwrap(),
+            Some(repository_view)
+        );
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn task_repository_view_compare_and_set_rejects_stale_refresh() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let database_path = current_database_path().await.unwrap();
+        let expected = RepositoryViewReference::default();
+        let newer = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-newer").unwrap(),
+            Some(OverlayRevisionId::new("overlay-newer").unwrap()),
+            SnapshotId::new("view-newer").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        let older = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-older").unwrap(),
+            Some(OverlayRevisionId::new("overlay-older").unwrap()),
+            SnapshotId::new("view-older").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+
+        assert!(
+            compare_and_record_task_repository_view_at(&database_path, "t-001", &expected, &newer,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !compare_and_record_task_repository_view_at(
+                &database_path,
+                "t-001",
+                &expected,
+                &older,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(task_repository_view("t-001").await.unwrap(), Some(newer));
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn submitted_view_is_frozen_for_reviewer_and_rejection_resumes_mutable_task_view() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let mutable = RepositoryViewReference::materialized(
+            SnapshotId::new("snapshot-baseline").unwrap(),
+            Some(OverlayRevisionId::new("overlay-1").unwrap()),
+            SnapshotId::new("snapshot-composed").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        record_task_repository_view("t-001", &mutable)
+            .await
+            .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-executor",
+            "executor",
+            "executor:codex:t-001",
+            42,
+            Some("t-001"),
+            "/tmp/worktree".to_string(),
+        )
+        .await
+        .unwrap();
+        let frozen = mutable
+            .frozen(
+                Digest::new("git-tree-sha1", "0123456789abcdef0123456789abcdef01234567").unwrap(),
+            )
+            .unwrap();
+
+        record_task_submitted(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            Some("r-executor"),
+            Some(&frozen),
+            false,
+        )
+        .await
+        .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-reviewer",
+            "supervisor",
+            "supervisor:codex:t-001",
+            43,
+            Some("t-001"),
+            "/tmp/canonical".to_string(),
+        )
+        .await
+        .unwrap();
+        claim_review_task_by_id("t-001", "supervisor:codex:t-001", 60)
+            .await
+            .unwrap();
+
+        let reviewer = runtime_task_context_for_agent("supervisor:codex:t-001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reviewer.run_role.as_deref(), Some("supervisor"));
+        assert_eq!(reviewer.repository_workspace_path, None);
+        assert_eq!(reviewer.repository_view, frozen);
+
+        assert!(matches!(
+            record_task_review_rejected("t-001", 3).await.unwrap(),
+            TaskReviewRejection::Addressing { cycles: 1 }
+        ));
+        assert_eq!(
+            task_repository_view("t-001")
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            TaskViewLifecycle::Mutable
+        );
+        assert_eq!(
+            run_repository_view("r-reviewer")
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            TaskViewLifecycle::FrozenSubmitted
+        );
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn canonical_graph_invalidation_and_refresh_round_trip_without_task_mutation() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference::default()
+        );
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source.clone()),
+                snapshot_id: None,
+                status: CanonicalGraphStatus::Stale,
+            }
+        );
+
+        let snapshot = SnapshotId::new("canonical-snapshot-1").unwrap();
+        let guard = canonical_graph_refresh_guard().await.unwrap();
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                guard,
+                &source,
+                &snapshot,
+                &BuildId::new("canonical-build-1").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Recorded
+        );
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source),
+                snapshot_id: Some(snapshot.clone()),
+                status: CanonicalGraphStatus::Fresh,
+            }
+        );
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            None,
+            CanonicalInvalidationReason::SourceComparisonUnavailable,
+        )
+        .await
+        .unwrap();
+        let stale = canonical_graph_reference().await.unwrap();
+        assert_eq!(stale.status, CanonicalGraphStatus::Stale);
+        assert_eq!(stale.source, None);
+        assert_eq!(stale.snapshot_id, Some(snapshot));
+        assert_eq!(
+            list_tasks().await.unwrap()[0].status,
+            TaskStatus::Executing.as_str()
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn canonical_graph_refresh_does_not_overwrite_a_newer_invalidation() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let first_source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+        let newer_source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-2").unwrap(),
+            manifest_digest: Digest::new("sha256", "bb").unwrap(),
+        };
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&first_source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        let refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&newer_source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                refresh_guard,
+                &first_source,
+                &SnapshotId::new("older-snapshot").unwrap(),
+                &BuildId::new("older-build").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Superseded
+        );
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(newer_source),
+                snapshot_id: None,
+                status: CanonicalGraphStatus::Stale,
+            }
+        );
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn failed_canonical_refresh_does_not_overwrite_a_newer_success() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        let source = CanonicalSourceIdentity {
+            source_revision_id: SourceRevisionId::new("canonical-revision-1").unwrap(),
+            manifest_digest: Digest::new("sha256", "aa").unwrap(),
+        };
+
+        record_canonical_graph_invalidation(
+            "t-001",
+            None,
+            Some(&source),
+            CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+        let failed_refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        let successful_refresh_guard = canonical_graph_refresh_guard().await.unwrap();
+        let snapshot = SnapshotId::new("canonical-snapshot-1").unwrap();
+        assert_eq!(
+            record_canonical_graph_refresh(
+                Some("t-001"),
+                None,
+                successful_refresh_guard,
+                &source,
+                &snapshot,
+                &BuildId::new("canonical-build-1").unwrap(),
+            )
+            .await
+            .unwrap(),
+            CanonicalGraphRefreshOutcome::Recorded
+        );
+
+        record_canonical_graph_refresh_failed_best_effort("t-001", None, failed_refresh_guard)
+            .await;
+
+        assert_eq!(
+            canonical_graph_reference().await.unwrap(),
+            CanonicalGraphReference {
+                source: Some(source),
+                snapshot_id: Some(snapshot),
+                status: CanonicalGraphStatus::Fresh,
+            }
+        );
+
+        teardown(previous);
+    }
+
+    #[test]
+    fn repository_view_reference_rejects_overlay_without_baseline() {
+        let result = RepositoryViewReference::new(
+            None,
+            Some(OverlayRevisionId::new("overlay-1").unwrap()),
+            RepositoryViewStatus::Available,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn archive_staging_copies_before_cleanup() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
@@ -4985,6 +7056,118 @@ mod tests {
 
         assert!(!std::path::Path::new(".ferrus/tasks/t-007.md").exists());
         assert!(!std::path::Path::new(".ferrus/runs/t-007").exists());
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_references_include_active_tasks_and_runs() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_status(
+            "t-active",
+            ".ferrus/tasks/t-active.md",
+            TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        record_task_status(
+            "t-complete",
+            ".ferrus/tasks/t-complete.md",
+            TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        record_task_status(
+            "t-live-run",
+            ".ferrus/tasks/t-live-run.md",
+            TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        let active = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-active").unwrap(),
+            Some(OverlayRevisionId::new("overlay-active").unwrap()),
+            SnapshotId::new("view-active").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        let completed = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-complete").unwrap(),
+            Some(OverlayRevisionId::new("overlay-complete").unwrap()),
+            SnapshotId::new("view-complete").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        let live_run = RepositoryViewReference::materialized(
+            SnapshotId::new("baseline-live-run").unwrap(),
+            Some(OverlayRevisionId::new("overlay-live-run").unwrap()),
+            SnapshotId::new("view-live-run").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        record_task_repository_view("t-active", &active)
+            .await
+            .unwrap();
+        record_task_repository_view("t-complete", &completed)
+            .await
+            .unwrap();
+        record_task_repository_view("t-live-run", &live_run)
+            .await
+            .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-live",
+            "supervisor",
+            "supervisor:codex:t-live-run",
+            std::process::id(),
+            Some("t-live-run"),
+            "/tmp/canonical".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let references = repository_graph_retention_references().await.unwrap();
+
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("baseline-active").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-active").unwrap())
+        );
+        assert!(
+            references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-active").unwrap())
+        );
+        assert!(
+            !references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-complete").unwrap())
+        );
+        assert!(
+            !references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-complete").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("baseline-live-run").unwrap())
+        );
+        assert!(
+            references
+                .snapshot_ids
+                .contains(&SnapshotId::new("view-live-run").unwrap())
+        );
+        assert!(
+            references
+                .view_names
+                .contains(&PublishedViewName::new("task-overlay:t-live-run").unwrap())
+        );
+
         std::env::set_current_dir(previous).unwrap();
     }
 
@@ -5464,6 +7647,67 @@ mod tests {
         assert_eq!(context.run_dir, ".ferrus/runs/t-002");
         assert_eq!(context.status, "executing");
         assert!(context.run_id.is_none());
+
+        teardown(previous);
+    }
+
+    #[tokio::test]
+    async fn read_only_runtime_context_does_not_import_legacy_metadata() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let (_dir, previous) = setup_project().await;
+        record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            crate::project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        claim_task("t-002", ".ferrus/tasks/t-002.md", "executor:codex:2", 60)
+            .await
+            .unwrap();
+        let database_path = current_database_path().await.unwrap();
+        {
+            let connection = Connection::open(&database_path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE runtime_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO runtime_metadata (key, value, updated_at)
+                    VALUES ('selected_spec', 'docs/specs/legacy.md', 'legacy');
+                    UPDATE project_runtime_state
+                    SET selected_spec = NULL,
+                        updated_at = 'read-only-sentinel'
+                    WHERE row_id = 1;
+                    "#,
+                )
+                .unwrap();
+        }
+        let original_permissions = std::fs::metadata(&database_path).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&database_path, read_only_permissions).unwrap();
+
+        let context = runtime_task_context_for_agent_read_only("executor:codex:2")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(context.task_id, "t-002");
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let state = connection
+            .query_row(
+                "SELECT selected_spec, updated_at FROM project_runtime_state WHERE row_id = 1",
+                [],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (None, "read-only-sentinel".to_string()));
+        std::fs::set_permissions(&database_path, original_permissions).unwrap();
 
         teardown(previous);
     }
@@ -6668,6 +8912,26 @@ mod tests {
         )
         .await
         .unwrap();
+        let task_view = RepositoryViewReference::materialized(
+            SnapshotId::new("consultation-baseline").unwrap(),
+            None,
+            SnapshotId::new("consultation-view").unwrap(),
+            RepositoryViewStatus::Available,
+        )
+        .unwrap();
+        record_task_repository_view("t-007", &task_view)
+            .await
+            .unwrap();
+        record_run_started_for_task_with_workspace(
+            "r-consulted-executor",
+            "executor",
+            "executor:codex:t-007",
+            42,
+            Some("t-007"),
+            "/tmp/task-t-007".to_string(),
+        )
+        .await
+        .unwrap();
         record_task_consultation_requested("t-007", crate::project::TaskStatus::Executing)
             .await
             .unwrap();
@@ -6688,6 +8952,16 @@ mod tests {
         assert_eq!(
             first.as_ref().map(|context| context.task_id.as_str()),
             Some("t-007")
+        );
+        assert_eq!(
+            first
+                .as_ref()
+                .and_then(|context| context.repository_workspace_path.as_deref()),
+            Some("/tmp/task-t-007")
+        );
+        assert_eq!(
+            first.as_ref().map(|context| &context.repository_view),
+            Some(&task_view)
         );
         assert!(second.is_none());
 

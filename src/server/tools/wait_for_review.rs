@@ -21,7 +21,7 @@ pub const DESCRIPTION: &str = "Block until the Executor submits work for review,
      when a submission is ready, or {\"status\":\"timeout\", \"state\":\"...\"} on timeout. \
      Each call waits up to `wait_timeout_secs` (see ferrus.toml), then returns timeout so the \
      agent can poll again. \
-     Returns immediately if a submission is already pending — safe to call on restart.";
+     Returns immediately if a submission is already pending -- safe to call on restart.";
 
 pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
     handler_for_agent(ctx.agent_id()).await

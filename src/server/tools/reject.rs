@@ -11,7 +11,7 @@ use crate::{
 use super::{ensure_lease_owner_or_reclaim, require_runtime_task_context, tool_err};
 
 pub const DESCRIPTION: &str = "Reject the current submission with review notes. Writes notes to REVIEW.md and \
-     transitions state Reviewing → Addressing (or Failed if the review cycle limit is \
+     transitions state Reviewing -> Addressing (or Failed if the review cycle limit is \
      exhausted). The Executor's check retry counter is reset for the new cycle.";
 
 pub const INPUT_SCHEMA: &str = r#"{
@@ -50,9 +50,12 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
 
     write_review(&context, &notes).await?;
 
-    match project::record_task_review_rejected(&context.task_id, config.limits.max_review_cycles)
-        .await?
-    {
+    let rejection =
+        project::record_task_review_rejected(&context.task_id, config.limits.max_review_cycles)
+            .await?;
+    crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
+
+    match rejection {
         TaskReviewRejection::Addressing { cycles } => {
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
@@ -68,7 +71,7 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
             info!(
                 review_cycles = cycles,
                 task_id = context.task_id,
-                "Submission rejected, DB task → addressing"
+                "Submission rejected, DB task -> addressing"
             );
             Ok(format!(
                 "Submission rejected (cycle {}/{}).\n\n**Review notes written.** \
@@ -92,7 +95,7 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
             warn!(
                 review_cycles = cycles,
                 task_id = context.task_id,
-                "Review cycle limit reached, DB task → failed"
+                "Review cycle limit reached, DB task -> failed"
             );
             Ok(format!(
                 "Review cycle limit reached ({cycles}/{}).\n\nState is now Failed. \

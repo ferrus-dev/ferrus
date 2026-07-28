@@ -29,8 +29,8 @@ pub(crate) const NAME: &str = "goose";
 const EXECUTABLE: &str = "goose";
 
 /// Default ceiling on agent turns for an unattended (headless) run. Bounds a runaway
-/// agent — for example a weak local model that keeps failing to compile and never
-/// reaches `/submit` — so the run terminates instead of looping indefinitely. Override
+/// agent -- for example a weak local model that keeps failing to compile and never
+/// reaches `/submit` -- so the run terminates instead of looping indefinitely. Override
 /// it by exporting `GOOSE_MAX_TURNS` before launching Ferrus (the flag is skipped when
 /// that variable is set).
 const DEFAULT_MAX_TURNS: u32 = 150;

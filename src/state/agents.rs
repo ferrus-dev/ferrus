@@ -88,7 +88,7 @@ pub async fn write_agents(registry: &AgentsRegistry) -> Result<()> {
     tokio::fs::write(&tmp_path, &json).await?;
     tokio::fs::rename(tmp_path, dst_path)
         .await
-        .context("Failed to rename agents.json.tmp → agents.json")
+        .context("Failed to rename agents.json.tmp -> agents.json")
 }
 
 #[cfg(test)]

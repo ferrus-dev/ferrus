@@ -201,7 +201,7 @@ impl RepositorySource for GitRepositorySource {
     }
 }
 
-fn canonical_root(root: &Path) -> Result<std::path::PathBuf, SourceError> {
+pub(super) fn canonical_root(root: &Path) -> Result<std::path::PathBuf, SourceError> {
     let metadata = fs::metadata(root).map_err(|_| SourceError::InvalidRoot)?;
     if !metadata.is_dir() {
         return Err(SourceError::InvalidRoot);
@@ -209,7 +209,7 @@ fn canonical_root(root: &Path) -> Result<std::path::PathBuf, SourceError> {
     fs::canonicalize(root).map_err(|_| SourceError::InvalidRoot)
 }
 
-fn ensure_worktree_root(root: &Path) -> Result<(), SourceError> {
+pub(super) fn ensure_worktree_root(root: &Path) -> Result<(), SourceError> {
     let inside = run_git(
         root,
         &["rev-parse", "--is-inside-work-tree"],
@@ -480,7 +480,7 @@ fn git_has_output(
     }
 }
 
-fn git_command(root: &Path, arguments: &[&str]) -> Command {
+pub(super) fn git_command(root: &Path, arguments: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -519,7 +519,7 @@ const NULL_DEVICE: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
+pub(super) fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())

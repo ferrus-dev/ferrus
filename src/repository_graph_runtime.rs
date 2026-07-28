@@ -4,46 +4,85 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{project, repository_graph};
+use crate::{
+    agent_id::{ENV_AGENT_ID, ENV_BASELINE_TREE, ENV_TASK_ID},
+    project, repository_graph,
+};
 use anyhow::{Context, Result};
 use repository_graph::{
     QUERY_WIRE_VERSION,
     config::RepositoryGraphConfig,
     domain::{
-        Availability, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Freshness,
-        PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace, RepositoryRef,
+        Availability, BuildId, DiagnosticCode, DiagnosticLocation, DiagnosticSeverity, Digest,
+        Freshness, PublishedViewName, QueryBudget, RepositoryId, RepositoryNamespace,
+        RepositoryRef, TaskViewId, TaskViewLifecycle, WorkspaceRef,
     },
-    index::active_extractor_identities,
-    ports::{GraphQuery, SnapshotContent},
+    index::{IndexCoordinator, IndexRequest, active_extractor_identities},
+    maintenance::{GraphMaintenanceReport, RefreshLeaseOutcome, RetentionProtection},
+    ports::{GraphQuery, RepositorySource, SnapshotContent},
     query::{
         ContentRequest, ContextRequest, ContextResponse, ContextSnippet, DiagnosticSummary,
         DiagnosticsEnvelope, FreshnessEnvelope, PageInfo, QueryDiagnostic, QueryError,
-        QueryErrorCode, RetrievalAction, SearchRequest, SearchResponse, SnapshotSelector,
-        StatusData, StatusRequest, StatusResponse,
+        QueryErrorCode, QueryResponse, RetrievalAction, RetrievalFallback, SearchRequest,
+        SearchResponse, SnapshotSelector, StatusData, StatusRequest, StatusResponse,
+        TaskViewEnvelope, TaskViewStatus,
     },
     query_sqlite::{
-        FreshnessComparison, SqliteGraphQuery, default_budget, snapshot_file_descriptors,
+        FreshnessComparison, SqliteGraphQuery, all_snapshot_file_descriptors, default_budget,
+        snapshot_file_descriptors,
     },
-    source::{LocalRepositorySource, LocalSnapshotContent, SourceDiscoveryContext},
-    sqlite::{OpenQuerySidecarResult, SIDECAR_FILE_NAME, open_for_query_at},
+    source::{
+        GitTreeSnapshotContent, LocalRepositorySource, LocalSnapshotContent,
+        SourceDiscoveryContext, TaskBaselineSource, TaskOverlaySource, capture_worktree_tree,
+        parse_git_tree_digest, pin_submitted_tree, release_submitted_tree_pin,
+    },
+    sqlite::{
+        OpenQuerySidecarResult, OpenSidecarResult, SIDECAR_FILE_NAME, open_for_build_at,
+        open_for_query_at,
+    },
 };
 
 pub(crate) const CANONICAL_VIEW: &str = "canonical";
+static TASK_BASELINE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TASK_OVERLAY_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CANONICAL_REFRESH_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(crate) const REFRESH_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, thiserror::Error)]
+#[error("repository graph refresh is already in progress for this view")]
+struct RefreshAlreadyInProgress;
 
 pub(crate) struct LocalGraphContext {
+    pub(crate) project_root: std::path::PathBuf,
     pub(crate) root: std::path::PathBuf,
     pub(crate) repository: RepositoryRef,
     pub(crate) config: RepositoryGraphConfig,
+    pub(crate) repository_view: Option<project::RepositoryViewReference>,
+    pub(crate) task_view_id: Option<TaskViewId>,
+    pub(crate) run_id: Option<String>,
 }
 
 impl LocalGraphContext {
     pub(crate) async fn load(require_enabled: bool) -> Result<Self> {
+        let agent_id = std::env::var(ENV_AGENT_ID)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Self::load_with_agent(require_enabled, agent_id.as_deref()).await
+    }
+
+    pub(crate) async fn load_for_agent(require_enabled: bool, agent_id: &str) -> Result<Self> {
+        Self::load_with_agent(require_enabled, Some(agent_id)).await
+    }
+
+    async fn load_with_agent(require_enabled: bool, agent_id: Option<&str>) -> Result<Self> {
         let root = project::canonical_project_root().await?;
         let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
             .await
-            .context("ferrus.toml not found — run ferrus init first")?;
+            .context("ferrus.toml not found -- run ferrus init first")?;
         let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
             .context("Invalid [repository_graph] configuration")?;
         if require_enabled && !config.enabled {
@@ -52,29 +91,93 @@ impl LocalGraphContext {
             );
         }
         let project_id = project::current_project_id().await?;
+        let requested_task_id = std::env::var(ENV_TASK_ID)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let runtime_context = match agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(agent_id) => project::runtime_task_context_for_agent_read_only(agent_id).await?,
+            None => None,
+        };
+        if let Some(requested_task_id) = requested_task_id.as_deref() {
+            let Some(runtime) = runtime_context.as_ref() else {
+                anyhow::bail!(
+                    "repository graph task binding {requested_task_id:?} is not attached to the current runtime"
+                );
+            };
+            if runtime.task_id != requested_task_id {
+                anyhow::bail!(
+                    "repository graph task binding does not match the current runtime task"
+                );
+            }
+        }
+        if config.enabled
+            && runtime_context.as_ref().is_some_and(|runtime| {
+                runtime.run_role.as_deref() == Some("supervisor")
+                    && runtime.status == project::TaskStatus::Reviewing.as_str()
+                    && runtime.repository_view.lifecycle != TaskViewLifecycle::FrozenSubmitted
+            })
+        {
+            anyhow::bail!(
+                "the submitted repository view is unavailable for this reviewer; inspect the task source directly"
+            );
+        }
+        let repository_view = runtime_context
+            .as_ref()
+            .map(|context| context.repository_view.clone());
+        let task_view_id = runtime_context
+            .as_ref()
+            .map(|context| TaskViewId::new(&context.task_id))
+            .transpose()?;
+        let run_id = runtime_context
+            .as_ref()
+            .and_then(|context| context.run_id.clone());
+        let source_root = runtime_context
+            .as_ref()
+            .and_then(|context| context.repository_workspace_path.as_ref())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.clone());
         Ok(Self {
-            root,
+            project_root: root,
+            root: source_root,
             repository: RepositoryRef {
                 namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
                 repository_id: RepositoryId::new("root")?,
             },
             config,
+            repository_view,
+            task_view_id,
+            run_id,
         })
     }
 
     pub(crate) fn discover(&self) -> Result<LocalRepositorySource> {
+        self.discover_at(&self.root)
+            .context("Failed to discover the repository source")
+    }
+
+    pub(crate) fn discover_canonical(&self) -> Result<LocalRepositorySource> {
+        self.discover_at(&self.project_root)
+            .context("Failed to discover the canonical repository source")
+    }
+
+    fn discover_at(&self, root: &Path) -> Result<LocalRepositorySource> {
         let identities = active_extractor_identities(&self.config)?;
         let context = SourceDiscoveryContext::from_config(
             self.repository.clone(),
             &self.config,
             &identities,
         )?;
-        LocalRepositorySource::discover(&self.root, context)
-            .context("Failed to discover the canonical repository source")
+        LocalRepositorySource::discover(root, context).map_err(Into::into)
     }
 
     pub(crate) fn freshness_comparison(&self) -> Result<Option<FreshnessComparison>> {
         if !self.config.enabled {
+            return Ok(None);
+        }
+        // Task snapshots use baseline/overlay composition identities rather
+        // than the ordinary worktree manifest identity. Comparing those
+        // different digest domains would report a false stale result.
+        if self.repository_view.is_some() {
             return Ok(None);
         }
         let source = self.discover()?;
@@ -82,20 +185,60 @@ impl LocalGraphContext {
     }
 
     pub(crate) fn scope(&self, budget: QueryBudget) -> Result<repository_graph::query::QueryScope> {
+        let snapshot = match (&self.repository_view, &self.task_view_id) {
+            (Some(view), _) if view.view_snapshot_id.is_some() => SnapshotSelector::Snapshot(
+                view.view_snapshot_id
+                    .clone()
+                    .expect("checked materialized snapshot identity"),
+            ),
+            (Some(view), Some(task_view_id)) if view.overlay_revision_id.is_some() => {
+                SnapshotSelector::Published(task_overlay_view_name(task_view_id)?)
+            }
+            (Some(view), _) if view.baseline_snapshot_id.is_some() => SnapshotSelector::Snapshot(
+                view.baseline_snapshot_id
+                    .clone()
+                    .expect("checked baseline snapshot identity"),
+            ),
+            (Some(view), _) => anyhow::bail!(
+                "repository graph is unavailable for the current task view ({})",
+                view.status.as_str()
+            ),
+            (None, _) => SnapshotSelector::Published(
+                PublishedViewName::new(CANONICAL_VIEW)
+                    .expect("canonical published view name is non-empty"),
+            ),
+        };
         Ok(repository_graph::query::QueryScope::current(
             self.repository.clone(),
-            SnapshotSelector::Published(PublishedViewName::new(CANONICAL_VIEW)?),
+            snapshot,
             budget,
         ))
     }
 
     pub(crate) async fn status(&self) -> Result<StatusResponse> {
+        if let Some(status) = self.unavailable_task_view_status() {
+            let mut response = unavailable_status(
+                self.repository.clone(),
+                Availability::NotBuilt,
+                status.as_str(),
+                RetrievalAction::Index,
+            )?;
+            response.data.published_view = None;
+            self.attach_task_view_to_status(&mut response);
+            return Ok(response);
+        }
         let path = sidecar_path().await?;
         // Discovering the current manifest can walk and hash the repository.
         // MCP retrieval must stay latency-bounded, so without a reliable source
         // mutation token it reports freshness as unknown rather than stale data
         // as fresh. The local CLI uses freshness_comparison() for exact checks.
-        status_response_at(self, &path, None)
+        let mut response = status_response_at(self, &path, None)?;
+        if let Some(reference) = self.canonical_invalidation().await {
+            response.freshness = canonical_stale_freshness(reference);
+            response.data.recommended_action = Some(RetrievalAction::RefreshIndex);
+        }
+        self.attach_task_view_to_status(&mut response);
+        Ok(response)
     }
 
     pub(crate) async fn search(
@@ -110,8 +253,18 @@ impl LocalGraphContext {
                 None,
             )));
         }
+        if let Some(status) = self.unavailable_task_view_status() {
+            return Ok(Err(unavailable_task_view_error(status)));
+        }
         let path = sidecar_path().await?;
-        Ok(search_response_at(self, &path, None, request))
+        let mut response = search_response_at(self, &path, None, request);
+        if let Ok(response) = response.as_mut() {
+            // The durable stale marker is conservative and avoids a full
+            // source scan on latency-bounded MCP reads.
+            self.apply_canonical_invalidation(response).await;
+            self.attach_task_view(response);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn context(
@@ -126,8 +279,16 @@ impl LocalGraphContext {
                 None,
             )));
         }
+        if let Some(status) = self.unavailable_task_view_status() {
+            return Ok(Err(unavailable_task_view_error(status)));
+        }
         let path = sidecar_path().await?;
-        Ok(context_response_at(self, &path, None, request))
+        let mut response = context_response_at(self, &path, None, request);
+        if let Ok(response) = response.as_mut() {
+            self.apply_canonical_invalidation(response).await;
+            self.attach_task_view(response);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn context_with_snippets(
@@ -148,6 +309,84 @@ impl LocalGraphContext {
             requested_snippet_bytes,
         ))
     }
+
+    fn unavailable_task_view_status(&self) -> Option<project::RepositoryViewStatus> {
+        self.repository_view
+            .as_ref()
+            .and_then(|view| view.baseline_snapshot_id.is_none().then_some(view.status))
+    }
+
+    pub(crate) fn task_view_envelope(&self) -> Option<TaskViewEnvelope> {
+        let view = self.repository_view.as_ref()?;
+        Some(TaskViewEnvelope {
+            task_view_id: self.task_view_id.clone()?,
+            baseline_snapshot_id: view.baseline_snapshot_id.clone()?,
+            overlay_revision_id: view.overlay_revision_id.clone(),
+            lifecycle: view.lifecycle,
+        })
+    }
+
+    fn attach_task_view<T>(&self, response: &mut QueryResponse<T>) {
+        response.task_view = self.task_view_envelope();
+    }
+
+    fn attach_task_view_to_status(&self, response: &mut StatusResponse) {
+        response.task_view = self.task_view_envelope();
+        if let Some(view) = self.repository_view.as_ref() {
+            response.data.task_view_status = Some(task_view_status(view.status));
+            response.data.fallback = (view.status != project::RepositoryViewStatus::Available)
+                .then_some(RetrievalFallback::DirectSourceInspection);
+        }
+    }
+
+    async fn apply_canonical_invalidation<T>(&self, response: &mut QueryResponse<T>) {
+        let Some(reference) = self.canonical_invalidation().await else {
+            return;
+        };
+        response.freshness = canonical_stale_freshness(reference);
+    }
+
+    async fn canonical_invalidation(&self) -> Option<project::CanonicalGraphReference> {
+        if self.repository_view.is_some() {
+            return None;
+        }
+        let reference = match project::canonical_graph_reference().await {
+            Ok(reference) => reference,
+            Err(error) => {
+                tracing::warn!(error = ?error, "failed to read canonical graph invalidation state");
+                return None;
+            }
+        };
+        if reference.status != project::CanonicalGraphStatus::Stale {
+            return None;
+        }
+        Some(reference)
+    }
+}
+
+fn task_view_status(status: project::RepositoryViewStatus) -> TaskViewStatus {
+    match status {
+        project::RepositoryViewStatus::NotBuilt => TaskViewStatus::NotBuilt,
+        project::RepositoryViewStatus::Available => TaskViewStatus::Available,
+        project::RepositoryViewStatus::Stale => TaskViewStatus::Stale,
+        project::RepositoryViewStatus::Unavailable => TaskViewStatus::Unavailable,
+        project::RepositoryViewStatus::Failed => TaskViewStatus::Failed,
+    }
+}
+
+fn canonical_stale_freshness(reference: project::CanonicalGraphReference) -> FreshnessEnvelope {
+    FreshnessEnvelope {
+        freshness: Freshness::Stale,
+        compared_manifest: reference.source.map(|source| source.manifest_digest),
+        reason_codes: vec!["canonical_invalidation".to_string()],
+    }
+}
+
+fn task_overlay_view_name(task_view_id: &TaskViewId) -> Result<PublishedViewName> {
+    Ok(PublishedViewName::new(format!(
+        "task-overlay:{}",
+        task_view_id.as_str()
+    ))?)
 }
 
 pub(crate) async fn sidecar_path() -> Result<std::path::PathBuf> {
@@ -156,11 +395,1050 @@ pub(crate) async fn sidecar_path() -> Result<std::path::PathBuf> {
         .join(SIDECAR_FILE_NAME))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphDoctorObservation {
+    pub(crate) healthy: bool,
+    pub(crate) message: String,
+}
+
+pub(crate) async fn maintain_graph_best_effort() {
+    if let Err(error) = maintain_graph().await {
+        tracing::warn!(
+            error = ?error,
+            "repository graph maintenance failed; orchestration lifecycle is unchanged"
+        );
+    }
+}
+
+pub(crate) async fn maintain_graph() -> Result<GraphMaintenanceReport> {
+    let (config, repository, path) = graph_maintenance_context().await?;
+    if !path.exists() {
+        return Ok(GraphMaintenanceReport::default());
+    }
+    let references = project::repository_graph_retention_references().await?;
+    let protection = RetentionProtection {
+        snapshot_ids: references.snapshot_ids,
+        published_views: references.view_names,
+    };
+    let telemetry_enabled = config.telemetry.enabled;
+    let retention = config.retention.clone();
+    let metric_repository = repository.clone();
+    let report = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut sidecar = match open_for_build_at(&path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        let recovery = sidecar.recover_interrupted_builds()?;
+        let retention = sidecar.collect_garbage(&repository, &retention, &protection)?;
+        Ok(GraphMaintenanceReport {
+            interrupted_builds: recovery.interrupted_builds,
+            expired_refresh_leases: recovery.expired_refresh_leases,
+            ..retention
+        })
+    })
+    .await??;
+    if telemetry_enabled {
+        let encoded = serde_json::to_string(&report)
+            .expect("privacy-safe graph maintenance metrics are always serializable");
+        tracing::info!(
+            target: "ferrus::repository_graph::maintenance",
+            repository_namespace = metric_repository.namespace.as_str(),
+            repository_id = metric_repository.repository_id.as_str(),
+            metric = %encoded,
+            "repository graph maintenance"
+        );
+    }
+    Ok(report)
+}
+
+pub(crate) async fn preview_graph_recovery() -> Result<GraphMaintenanceReport> {
+    let (_, _, path) = graph_maintenance_context().await?;
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        match open_for_query_at(&path)? {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar.preview_recovery(),
+            OpenQuerySidecarResult::Absent
+            | OpenQuerySidecarResult::NeedsMigration { .. }
+            | OpenQuerySidecarResult::RequiresRebuild(_) => Ok(GraphMaintenanceReport::default()),
+        }
+    })
+    .await?
+}
+
+pub(crate) async fn recover_graph_state() -> Result<GraphMaintenanceReport> {
+    maintain_graph().await
+}
+
+pub(crate) async fn graph_doctor_observations() -> Vec<GraphDoctorObservation> {
+    match graph_maintenance_context().await {
+        Ok((config, _, _)) if !config.enabled => {
+            return vec![GraphDoctorObservation {
+                healthy: true,
+                message: "optional repository graph is disabled".to_string(),
+            }];
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return vec![GraphDoctorObservation {
+                healthy: false,
+                message: format!("repository graph configuration is unavailable ({error})"),
+            }];
+        }
+    }
+    let mut observations = Vec::new();
+    match project::canonical_graph_reference().await {
+        Ok(reference) => observations.push(GraphDoctorObservation {
+            healthy: reference.status != project::CanonicalGraphStatus::Stale,
+            message: match reference.status {
+                project::CanonicalGraphStatus::Unknown => {
+                    "canonical repository graph freshness has not been recorded".to_string()
+                }
+                project::CanonicalGraphStatus::Stale => {
+                    "canonical repository graph is stale; run `ferrus graph index`".to_string()
+                }
+                project::CanonicalGraphStatus::Fresh => {
+                    "canonical repository graph has a recorded fresh snapshot".to_string()
+                }
+            },
+        }),
+        Err(error) => observations.push(GraphDoctorObservation {
+            healthy: false,
+            message: format!("canonical repository graph state is unreadable ({error})"),
+        }),
+    }
+    match preview_graph_recovery().await {
+        Ok(report) => observations.push(GraphDoctorObservation {
+            healthy: report.pending_recovery() == 0,
+            message: format!(
+                "repository graph recovery pending: {} interrupted builds, {} expired refresh leases{}",
+                report.interrupted_builds,
+                report.expired_refresh_leases,
+                if report.pending_recovery() == 0 {
+                    ""
+                } else {
+                    "; run `ferrus recover`"
+                }
+            ),
+        }),
+        Err(error) => observations.push(GraphDoctorObservation {
+            healthy: false,
+            message: format!("repository graph recovery state is unreadable ({error})"),
+        }),
+    }
+    observations
+}
+
+async fn graph_maintenance_context()
+-> Result<(RepositoryGraphConfig, RepositoryRef, std::path::PathBuf)> {
+    let root = project::canonical_project_root().await?;
+    let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while maintaining repository graph")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
+    };
+    Ok((config, repository, sidecar_path().await?))
+}
+
+async fn canonical_source_at(
+    root: &Path,
+) -> Result<Option<(RepositoryGraphConfig, RepositoryRef, LocalRepositorySource)>> {
+    let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while observing canonical source")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
+    };
+    let root = root.to_path_buf();
+    let discovery_config = config.clone();
+    let discovery_repository = repository.clone();
+    let source = tokio::task::spawn_blocking(move || -> Result<LocalRepositorySource> {
+        let identities = active_extractor_identities(&discovery_config)?;
+        let context = SourceDiscoveryContext::from_config(
+            discovery_repository,
+            &discovery_config,
+            &identities,
+        )?;
+        Ok(LocalRepositorySource::discover(root, context)?)
+    })
+    .await??;
+    Ok(Some((config, repository, source)))
+}
+
+pub(crate) async fn canonical_source_identity_at(
+    root: &Path,
+) -> Result<Option<project::CanonicalSourceIdentity>> {
+    Ok(canonical_source_at(root)
+        .await?
+        .map(|(_, _, source)| project::CanonicalSourceIdentity {
+            source_revision_id: source.manifest().revision.id.clone(),
+            manifest_digest: source.manifest().revision.manifest_digest.clone(),
+        }))
+}
+
+pub(crate) async fn refresh_canonical_graph_after_approval(
+    project_root: std::path::PathBuf,
+    task_id: String,
+    run_id: Option<String>,
+) {
+    loop {
+        let guard = match project::canonical_graph_refresh_guard().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    error = ?error,
+                    "failed to capture canonical graph refresh generation"
+                );
+                return;
+            }
+        };
+        match refresh_canonical_graph_at(&project_root).await {
+            Ok(None) => return,
+            Ok(Some((source, snapshot_id, build_id))) => {
+                match project::record_canonical_graph_refresh(
+                    Some(&task_id),
+                    run_id.as_deref(),
+                    guard,
+                    &source,
+                    &snapshot_id,
+                    &build_id,
+                )
+                .await
+                {
+                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
+                        task_id,
+                        "canonical graph refresh was superseded by a newer invalidation"
+                    ),
+                    Err(error) => tracing::warn!(
+                        task_id,
+                        error = ?error,
+                        "canonical graph refreshed but durable freshness state was not updated"
+                    ),
+                }
+                maintain_graph_best_effort().await;
+                return;
+            }
+            Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+                tracing::debug!(
+                    task_id,
+                    "waiting for the active canonical repository graph refresh"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    error = ?error,
+                    "best-effort canonical graph refresh failed after approval"
+                );
+                project::record_canonical_graph_refresh_failed_best_effort(
+                    &task_id,
+                    run_id.as_deref(),
+                    guard,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn refresh_canonical_graph_at(
+    project_root: &Path,
+) -> Result<
+    Option<(
+        project::CanonicalSourceIdentity,
+        repository_graph::domain::SnapshotId,
+        BuildId,
+    )>,
+> {
+    let contents = tokio::fs::read_to_string(project_root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while refreshing canonical source")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
+    };
+    let sidecar_path = sidecar_path().await?;
+    let indexed_repository = repository.clone();
+    let project_root = project_root.to_path_buf();
+    let (source_identity, outcome) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut sidecar = match open_for_build_at(&sidecar_path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        let build_id = next_canonical_refresh_build_id()?;
+        let view_name = PublishedViewName::new(CANONICAL_VIEW)?;
+        if sidecar.acquire_refresh_lease(
+            &indexed_repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
+        }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &indexed_repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
+        let indexed = (|| -> Result<_> {
+            let identities = active_extractor_identities(&config)?;
+            let context = SourceDiscoveryContext::from_config(
+                indexed_repository.clone(),
+                &config,
+                &identities,
+            )?;
+            let source = LocalRepositorySource::discover(project_root, context)?;
+            let source_identity = project::CanonicalSourceIdentity {
+                source_revision_id: source.manifest().revision.id.clone(),
+                manifest_digest: source.manifest().revision.manifest_digest.clone(),
+            };
+            let outcome = IndexCoordinator::new(&mut sidecar).index(
+                &source,
+                &config,
+                IndexRequest {
+                    build_id: build_id.clone(),
+                    view_name: view_name.clone(),
+                    force_full: false,
+                },
+            )?;
+            Ok((source_identity, outcome))
+        })();
+        let lease_healthy = heartbeat.finish();
+        let released =
+            sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
+        let indexed = indexed?;
+        if !lease_healthy || !released? {
+            anyhow::bail!("canonical repository graph refresh lease was lost");
+        }
+        Ok(indexed)
+    })
+    .await??;
+    debug_assert_eq!(outcome.snapshot.repository, repository);
+    Ok(Some((
+        source_identity,
+        outcome.snapshot.id,
+        outcome.build_id,
+    )))
+}
+
+fn next_canonical_refresh_build_id() -> Result<BuildId> {
+    let sequence = CANONICAL_REFRESH_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(BuildId::new(format!(
+        "canonical-approval:{nanos:x}:{sequence:x}"
+    ))?)
+}
+
+pub(crate) async fn schedule_task_baseline_pin(
+    task_id: &str,
+    workspace_root: &Path,
+    baseline_tree: Option<&str>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let existing = project::task_repository_view(task_id).await.ok().flatten();
+    let prepared = match (
+        LocalGraphContext::load(false).await,
+        project::current_project_data_dir().await,
+    ) {
+        (Ok(context), Ok(data_dir)) => Some((
+            context,
+            data_dir.join(SIDECAR_FILE_NAME),
+            data_dir.join("ferrus.db"),
+        )),
+        (Err(error), _) | (_, Err(error)) => {
+            let repository_view = resolved_repository_view(task_id, existing.clone(), Err(error));
+            if let Err(error) =
+                project::record_task_repository_view(task_id, &repository_view).await
+            {
+                tracing::warn!(
+                    task_id,
+                    error = ?error,
+                    "failed to persist unavailable task repository graph baseline"
+                );
+            }
+            None
+        }
+    };
+    let (context, sidecar_path, database_path) = prepared?;
+    let task_id = task_id.to_string();
+    let workspace_root = workspace_root.to_path_buf();
+    let baseline_tree = baseline_tree.map(str::to_string);
+    Some(tokio::spawn(async move {
+        let resolved = resolve_task_baseline(
+            context,
+            sidecar_path,
+            &task_id,
+            &workspace_root,
+            baseline_tree.as_deref(),
+            existing.as_ref(),
+        )
+        .await;
+        let repository_view = resolved_repository_view(&task_id, existing.clone(), resolved);
+        match compare_and_record_task_baseline_at(
+            &database_path,
+            &task_id,
+            existing.as_ref(),
+            &repository_view,
+        )
+        .await
+        {
+            Ok(true) => maintain_graph_best_effort().await,
+            Ok(false) => tracing::debug!(
+                task_id,
+                "task repository graph baseline was superseded by a newer task view"
+            ),
+            Err(error) => tracing::warn!(
+                task_id,
+                error = ?error,
+                "failed to persist task repository graph baseline; dispatch already continued"
+            ),
+        }
+    }))
+}
+
+async fn compare_and_record_task_baseline_at(
+    database_path: &Path,
+    task_id: &str,
+    expected: Option<&project::RepositoryViewReference>,
+    repository_view: &project::RepositoryViewReference,
+) -> Result<bool> {
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    project::compare_and_record_task_repository_view_at(
+        database_path,
+        task_id,
+        expected,
+        repository_view,
+    )
+    .await
+}
+
+/// Explicitly refreshes the mutable task overlay without coupling graph
+/// failures to the orchestration state machine. `/check` and the final submit
+/// gate call this after source-changing work; retrieval tools remain read-only.
+pub(crate) async fn refresh_task_overlay_best_effort_for_context(
+    runtime: &project::RuntimeTaskContext,
+) {
+    let Some(workspace_root) = runtime.workspace_path.as_deref() else {
+        return;
+    };
+    let Some(baseline_tree) = std::env::var(ENV_BASELINE_TREE)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    if let Err(error) = refresh_task_overlay(
+        &runtime.task_id,
+        Path::new(workspace_root),
+        baseline_tree.trim(),
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = runtime.task_id,
+            error = ?error,
+            "failed to refresh task repository graph overlay; task lifecycle is unchanged"
+        );
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RepositoryViewFreeze {
+    NotAttempted,
+    Frozen(project::RepositoryViewReference),
+    Failed,
+}
+
+fn frozen_tree_matches_snapshot(
+    sidecar_path: &Path,
+    workspace_root: &Path,
+    repository: RepositoryRef,
+    config: &RepositoryGraphConfig,
+    source_tree: Digest,
+    snapshot_id: &repository_graph::domain::SnapshotId,
+) -> Result<bool> {
+    let identities = active_extractor_identities(config)?;
+    let discovery = SourceDiscoveryContext::from_config(repository, config, &identities)?;
+    let source = TaskBaselineSource::discover(workspace_root, discovery, source_tree)?;
+    let sidecar = match open_for_query_at(sidecar_path)? {
+        OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+        OpenQuerySidecarResult::Absent => {
+            anyhow::bail!("repository graph sidecar is unavailable")
+        }
+        OpenQuerySidecarResult::NeedsMigration {
+            found_schema_version,
+        } => anyhow::bail!(
+            "repository graph sidecar schema {found_schema_version} requires migration"
+        ),
+        OpenQuerySidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+            "repository graph sidecar schema {} is incompatible with {}",
+            reason.found_schema_version,
+            reason.supported_schema_version
+        ),
+    };
+    let snapshot = sidecar
+        .snapshot(snapshot_id)?
+        .context("submitted repository graph snapshot is no longer retained")?;
+    let snapshot_files = all_snapshot_file_descriptors(&sidecar, snapshot_id)?;
+    Ok(snapshot.repository == source.manifest().revision.repository
+        && snapshot.analysis_config_digest == source.manifest().revision.analysis_config_digest
+        && snapshot.extractor_set_digest == source.manifest().extractor_set_digest
+        && snapshot_files == source.manifest().files)
+}
+
+fn capture_matching_submitted_tree(
+    sidecar_path: &Path,
+    workspace_root: &Path,
+    task_id: &str,
+    repository: RepositoryRef,
+    config: &RepositoryGraphConfig,
+    snapshot_id: &repository_graph::domain::SnapshotId,
+) -> Result<Digest> {
+    let source_tree = capture_worktree_tree(workspace_root)?;
+    pin_submitted_tree(workspace_root, task_id, &source_tree)?;
+    let matches = frozen_tree_matches_snapshot(
+        sidecar_path,
+        workspace_root,
+        repository,
+        config,
+        source_tree.clone(),
+        snapshot_id,
+    );
+    match matches {
+        Ok(true) => Ok(source_tree),
+        result => {
+            release_submitted_tree_pin(workspace_root, task_id)?;
+            match result {
+                Ok(false) => {
+                    anyhow::bail!("submitted source tree does not match the indexed task view")
+                }
+                Ok(true) => unreachable!("matching submitted tree returned above"),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+/// Prepares the immutable graph/source identity persisted by the submit
+/// transaction. Git writes only content-addressed objects through an isolated
+/// temporary index; it never changes the task's real index or lifecycle row.
+pub(crate) async fn prepare_submitted_repository_view(
+    runtime: &project::RuntimeTaskContext,
+) -> RepositoryViewFreeze {
+    let Some(workspace_root) = runtime.workspace_path.as_deref() else {
+        return RepositoryViewFreeze::NotAttempted;
+    };
+    let Some(baseline_tree) = std::env::var(ENV_BASELINE_TREE)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return RepositoryViewFreeze::NotAttempted;
+    };
+    let graph_context = match LocalGraphContext::load(false).await {
+        Ok(context) if context.config.enabled => context,
+        Ok(_) => return RepositoryViewFreeze::NotAttempted,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to prepare submitted repository view; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+    let sidecar_path = match sidecar_path().await {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to resolve repository graph sidecar; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+
+    let mutable_view = match refresh_task_overlay(
+        &runtime.task_id,
+        Path::new(workspace_root),
+        baseline_tree.trim(),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to refresh submitted repository view; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+    let Some(view_snapshot_id) = mutable_view.view_snapshot_id.clone() else {
+        tracing::warn!(
+            task_id = runtime.task_id,
+            "submitted repository view was not materialized; submit will continue"
+        );
+        return RepositoryViewFreeze::Failed;
+    };
+    let workspace_root = std::path::PathBuf::from(workspace_root);
+    let task_id = runtime.task_id.clone();
+    let repository = graph_context.repository;
+    let config = graph_context.config;
+    let source_tree = match tokio::task::spawn_blocking(move || {
+        capture_matching_submitted_tree(
+            &sidecar_path,
+            &workspace_root,
+            &task_id,
+            repository,
+            &config,
+            &view_snapshot_id,
+        )
+    })
+    .await
+    {
+        Ok(Ok(tree)) => tree,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "failed to capture submitted source tree; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "submitted source capture task failed; submit will continue"
+            );
+            return RepositoryViewFreeze::Failed;
+        }
+    };
+    match mutable_view.frozen(source_tree) {
+        Ok(view) => RepositoryViewFreeze::Frozen(view),
+        Err(error) => {
+            release_submitted_tree_pin_best_effort(runtime).await;
+            tracing::warn!(
+                task_id = runtime.task_id,
+                error = ?error,
+                "submitted repository view was not materialized; submit will continue"
+            );
+            RepositoryViewFreeze::Failed
+        }
+    }
+}
+
+pub(crate) async fn release_submitted_tree_pin_best_effort(runtime: &project::RuntimeTaskContext) {
+    release_submitted_tree_pin_for_task_best_effort(&runtime.task_id).await;
+}
+
+pub(crate) async fn release_submitted_tree_pin_for_task_best_effort(task_id: &str) {
+    let project_root = match project::canonical_project_root().await {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                task_id,
+                error = ?error,
+                "failed to resolve project root while releasing submitted tree pin"
+            );
+            return;
+        }
+    };
+    let owned_task_id = task_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        release_submitted_tree_pin(&project_root, &owned_task_id)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            task_id,
+            error = ?error,
+            "failed to release submitted tree pin"
+        ),
+        Err(error) => tracing::warn!(
+            task_id,
+            error = ?error,
+            "submitted tree pin release task failed"
+        ),
+    }
+}
+
+pub(crate) async fn refresh_task_overlay(
+    task_id: &str,
+    workspace_root: &Path,
+    baseline_tree: &str,
+) -> Result<project::RepositoryViewReference> {
+    let existing = project::task_repository_view(task_id)
+        .await?
+        .context("task repository view has not been initialized")?;
+    let baseline_snapshot_id = existing
+        .baseline_snapshot_id
+        .clone()
+        .context("task repository graph baseline is unavailable")?;
+    let context = LocalGraphContext::load(false).await?;
+    if !context.config.enabled {
+        return Ok(existing);
+    }
+    let sidecar_path = sidecar_path().await?;
+    let database_path = project::current_project_data_dir().await?.join("ferrus.db");
+    let repository = context.repository.clone();
+    let config = context.config.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    let baseline_revision = parse_git_tree_digest(baseline_tree)?;
+    let task_view_id = TaskViewId::new(task_id)?;
+    let task_id = task_id.to_string();
+    let indexed_baseline_snapshot_id = baseline_snapshot_id.clone();
+
+    let refreshed = tokio::task::spawn_blocking(move || -> Result<_> {
+        let identities = active_extractor_identities(&config)?;
+        let discovery =
+            SourceDiscoveryContext::from_config(repository.clone(), &config, &identities)?;
+        let mut sidecar = match open_for_build_at(&sidecar_path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        let baseline_snapshot = sidecar
+            .snapshot(&indexed_baseline_snapshot_id)?
+            .context("task repository graph baseline snapshot is no longer retained")?;
+        let baseline_analysis_config_digest = baseline_snapshot.analysis_config_digest;
+        let baseline_files =
+            all_snapshot_file_descriptors(&sidecar, &indexed_baseline_snapshot_id)?;
+        let view_name = task_overlay_view_name(&task_view_id)?;
+        let build_id = next_task_overlay_build_id(&task_view_id)?;
+        if sidecar.acquire_refresh_lease(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
+        }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
+        let refreshed = (|| -> Result<_> {
+            let source = TaskOverlaySource::discover(
+                &workspace_root,
+                WorkspaceRef {
+                    repository: repository.clone(),
+                    task_view_id: task_view_id.clone(),
+                    baseline_revision,
+                },
+                discovery,
+                baseline_analysis_config_digest,
+                baseline_files,
+            )?;
+            if !source.requires_index() {
+                return Ok(None);
+            }
+            let overlay_revision_id = source.overlay_manifest().revision_id.clone();
+            let outcome = IndexCoordinator::new(&mut sidecar).index(
+                &source,
+                &config,
+                IndexRequest {
+                    build_id: build_id.clone(),
+                    view_name: view_name.clone(),
+                    force_full: false,
+                },
+            )?;
+            Ok(Some((overlay_revision_id, outcome.snapshot.id)))
+        })();
+        let lease_healthy = heartbeat.finish();
+        let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
+        let refreshed = refreshed?;
+        if !lease_healthy || !released? {
+            anyhow::bail!("task repository graph refresh lease was lost");
+        }
+        Ok(refreshed)
+    })
+    .await;
+
+    let repository_view = match refreshed {
+        Ok(Ok(Some((overlay_revision_id, view_snapshot_id)))) => {
+            project::RepositoryViewReference::materialized(
+                baseline_snapshot_id,
+                Some(overlay_revision_id),
+                view_snapshot_id,
+                project::RepositoryViewStatus::Available,
+            )?
+        }
+        Ok(Ok(None)) => project::RepositoryViewReference::materialized(
+            baseline_snapshot_id.clone(),
+            None,
+            baseline_snapshot_id,
+            project::RepositoryViewStatus::Available,
+        )?,
+        Ok(Err(error)) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+            return Err(error);
+        }
+        Ok(Err(error)) => {
+            let mut stale = existing.clone().mutable_successor();
+            stale.status = project::RepositoryViewStatus::Stale;
+            if !project::compare_and_record_task_repository_view_at(
+                &database_path,
+                &task_id,
+                &existing,
+                &stale,
+            )
+            .await?
+            {
+                return current_task_repository_view(&task_id).await;
+            }
+            return Err(error);
+        }
+        Err(error) => {
+            let mut stale = existing.clone().mutable_successor();
+            stale.status = project::RepositoryViewStatus::Stale;
+            if !project::compare_and_record_task_repository_view_at(
+                &database_path,
+                &task_id,
+                &existing,
+                &stale,
+            )
+            .await?
+            {
+                return current_task_repository_view(&task_id).await;
+            }
+            return Err(error.into());
+        }
+    };
+    if !project::compare_and_record_task_repository_view_at(
+        &database_path,
+        &task_id,
+        &existing,
+        &repository_view,
+    )
+    .await?
+    {
+        return current_task_repository_view(&task_id).await;
+    }
+    maintain_graph_best_effort().await;
+    Ok(repository_view)
+}
+
+async fn current_task_repository_view(task_id: &str) -> Result<project::RepositoryViewReference> {
+    project::task_repository_view(task_id)
+        .await?
+        .context("task repository view disappeared during refresh")
+}
+
+fn resolved_repository_view(
+    task_id: &str,
+    existing: Option<project::RepositoryViewReference>,
+    resolved: Result<project::RepositoryViewReference>,
+) -> project::RepositoryViewReference {
+    match resolved {
+        Ok(repository_view) => repository_view,
+        Err(error) => {
+            if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() {
+                return existing.unwrap_or_default();
+            }
+            tracing::warn!(
+                task_id,
+                error = ?error,
+                "failed to pin task repository graph baseline; dispatch will continue"
+            );
+            match existing {
+                Some(view) if view.baseline_snapshot_id.is_some() => {
+                    let mut view = view.mutable_successor();
+                    view.status = project::RepositoryViewStatus::Stale;
+                    view
+                }
+                None => project::RepositoryViewReference::new(
+                    None,
+                    None,
+                    project::RepositoryViewStatus::Failed,
+                )
+                .expect("a failed unavailable view has no overlay"),
+                Some(_) => project::RepositoryViewReference::new(
+                    None,
+                    None,
+                    project::RepositoryViewStatus::Failed,
+                )
+                .expect("a failed unavailable view has no overlay"),
+            }
+        }
+    }
+}
+
+async fn resolve_task_baseline(
+    context: LocalGraphContext,
+    sidecar_path: std::path::PathBuf,
+    task_id: &str,
+    workspace_root: &Path,
+    baseline_tree: Option<&str>,
+    existing: Option<&project::RepositoryViewReference>,
+) -> Result<project::RepositoryViewReference> {
+    if let Some(existing) = existing
+        && let Some(snapshot_id) = existing.baseline_snapshot_id.as_ref()
+    {
+        let retained = match open_for_query_at(&sidecar_path) {
+            Ok(OpenQuerySidecarResult::Ready(sidecar)) => sidecar
+                .snapshot(snapshot_id)
+                .context("Failed to inspect the pinned baseline snapshot")?
+                .is_some(),
+            _ => false,
+        };
+        if retained {
+            let mut retained_view = existing.clone().mutable_successor();
+            retained_view.status = existing.status;
+            return Ok(retained_view);
+        }
+    }
+    if !context.config.enabled || baseline_tree.is_none() {
+        return project::RepositoryViewReference::new(
+            None,
+            None,
+            project::RepositoryViewStatus::Unavailable,
+        );
+    }
+
+    let baseline_tree = parse_git_tree_digest(baseline_tree.expect("checked above"))?;
+    let workspace_root = workspace_root.to_path_buf();
+    let config = context.config.clone();
+    let repository = context.repository.clone();
+    let task_id = task_id.to_string();
+    let snapshot = tokio::task::spawn_blocking(move || -> Result<_> {
+        let identities = active_extractor_identities(&config)?;
+        let discovery =
+            SourceDiscoveryContext::from_config(repository.clone(), &config, &identities)?;
+        let source = TaskBaselineSource::discover(&workspace_root, discovery, baseline_tree)?;
+        let mut sidecar = match open_for_build_at(&sidecar_path)? {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
+                "repository graph sidecar schema {} is incompatible with {}",
+                reason.found_schema_version,
+                reason.supported_schema_version
+            ),
+        };
+        let build_id = next_task_baseline_build_id(&task_id)?;
+        let view_name = PublishedViewName::new(format!("task-baseline:{task_id}"))?;
+        if sidecar.acquire_refresh_lease(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )? == RefreshLeaseOutcome::Busy
+        {
+            return Err(RefreshAlreadyInProgress.into());
+        }
+        let heartbeat = sidecar.start_refresh_lease_heartbeat(
+            &repository,
+            &view_name,
+            build_id.as_str(),
+            REFRESH_LEASE_TTL,
+        )?;
+        let indexed = IndexCoordinator::new(&mut sidecar).index(
+            &source,
+            &config,
+            IndexRequest {
+                build_id: build_id.clone(),
+                view_name: view_name.clone(),
+                force_full: false,
+            },
+        );
+        let lease_healthy = heartbeat.finish();
+        let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
+        let outcome = indexed?;
+        if !lease_healthy || !released? {
+            anyhow::bail!("task baseline repository graph refresh lease was lost");
+        }
+        Ok(outcome.snapshot.id)
+    })
+    .await??;
+
+    project::RepositoryViewReference::materialized(
+        snapshot.clone(),
+        None,
+        snapshot,
+        project::RepositoryViewStatus::Available,
+    )
+}
+
+fn next_task_baseline_build_id(task_id: &str) -> Result<BuildId> {
+    let sequence = TASK_BASELINE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(BuildId::new(format!(
+        "task-baseline:{task_id}:{nanos:x}:{sequence:x}"
+    ))?)
+}
+
+fn next_task_overlay_build_id(task_view_id: &TaskViewId) -> Result<BuildId> {
+    let sequence = TASK_OVERLAY_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(BuildId::new(format!(
+        "task-overlay:{}:{nanos:x}:{sequence:x}",
+        task_view_id.as_str()
+    ))?)
+}
+
 pub(crate) fn status_response_at(
     context: &LocalGraphContext,
     sidecar_path: &Path,
     freshness_comparison: Option<FreshnessComparison>,
 ) -> Result<StatusResponse> {
+    if let Some(status) = context.unavailable_task_view_status() {
+        let mut response = unavailable_status(
+            context.repository.clone(),
+            Availability::NotBuilt,
+            status.as_str(),
+            RetrievalAction::Index,
+        )?;
+        response.data.published_view = None;
+        context.attach_task_view_to_status(&mut response);
+        return Ok(response);
+    }
     match open_for_query_at(sidecar_path) {
         Ok(OpenQuerySidecarResult::Ready(sidecar)) => {
             let query = SqliteGraphQuery::new(
@@ -324,22 +1602,55 @@ fn attach_snippets_at(
         .collect::<BTreeSet<_>>();
     let files = snapshot_file_descriptors(&sidecar, &response.snapshot_id, &paths)?;
 
-    let content = LocalSnapshotContent::new(
-        &context.root,
-        context.repository.clone(),
-        response.snapshot_id.clone(),
-        &context.config.source,
-        files,
-        hard_limit,
-    )
-    .map_err(|_| {
-        query_error(
-            QueryErrorCode::ContentUnavailable,
-            "repository content boundary could not be initialized",
-            true,
-            None,
-        )
-    })?;
+    let content: Box<dyn SnapshotContent> = match context.repository_view.as_ref() {
+        Some(view) if view.lifecycle == TaskViewLifecycle::FrozenSubmitted => {
+            let tree = view.frozen_source_tree.clone().ok_or_else(|| {
+                query_error(
+                    QueryErrorCode::ContentUnavailable,
+                    "frozen repository view is missing its source tree identity",
+                    false,
+                    None,
+                )
+            })?;
+            Box::new(
+                GitTreeSnapshotContent::new(
+                    &context.project_root,
+                    context.repository.clone(),
+                    response.snapshot_id.clone(),
+                    tree,
+                    &context.config.source,
+                    files,
+                    hard_limit,
+                )
+                .map_err(|_| {
+                    query_error(
+                        QueryErrorCode::ContentUnavailable,
+                        "frozen repository content boundary could not be initialized",
+                        true,
+                        None,
+                    )
+                })?,
+            )
+        }
+        _ => Box::new(
+            LocalSnapshotContent::new(
+                &context.root,
+                context.repository.clone(),
+                response.snapshot_id.clone(),
+                &context.config.source,
+                files,
+                hard_limit,
+            )
+            .map_err(|_| {
+                query_error(
+                    QueryErrorCode::ContentUnavailable,
+                    "repository content boundary could not be initialized",
+                    true,
+                    None,
+                )
+            })?,
+        ),
+    };
 
     let evidence = response
         .data
@@ -471,6 +1782,7 @@ fn unavailable_status(
         repository,
         snapshot_id: None,
         source_revision: None,
+        task_view: None,
         freshness: FreshnessEnvelope {
             freshness: Freshness::NotApplicable,
             compared_manifest: None,
@@ -493,6 +1805,8 @@ fn unavailable_status(
             graph_model_version: None,
             statistics: None,
             recommended_action: Some(action),
+            task_view_status: None,
+            fallback: None,
         },
     })
 }
@@ -513,9 +1827,56 @@ fn query_error(
     }
 }
 
+fn unavailable_task_view_error(status: project::RepositoryViewStatus) -> QueryError {
+    let mut error = query_error(
+        QueryErrorCode::NotBuilt,
+        "repository graph is unavailable for the current task baseline; inspect source directly",
+        matches!(status, project::RepositoryViewStatus::Stale),
+        Some(RetrievalAction::Index),
+    );
+    error
+        .details
+        .insert("task_view_status".to_string(), status.as_str().to_string());
+    error.details.insert(
+        "fallback".to_string(),
+        "direct_source_inspection".to_string(),
+    );
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CurrentDirGuard {
+        previous: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn remove_sqlite_file_set(path: &Path) {
+        for suffix in ["-wal", "-shm", ""] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            match std::fs::remove_file(std::path::PathBuf::from(candidate)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to remove SQLite sidecar file: {error}"),
+            }
+        }
+    }
 
     fn indexed_context(root: &Path, sidecar_path: &Path) -> (LocalGraphContext, ContextRequest) {
         let mut context = context(root);
@@ -561,13 +1922,132 @@ mod tests {
 
     fn context(root: &Path) -> LocalGraphContext {
         LocalGraphContext {
+            project_root: root.to_path_buf(),
             root: root.to_path_buf(),
             repository: RepositoryRef {
                 namespace: RepositoryNamespace::new("local:test").unwrap(),
                 repository_id: RepositoryId::new("root").unwrap(),
             },
             config: RepositoryGraphConfig::default(),
+            repository_view: None,
+            task_view_id: None,
+            run_id: None,
         }
+    }
+
+    #[test]
+    fn canonical_discovery_ignores_a_task_worktree_root() {
+        let canonical = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(canonical.path().join("src")).unwrap();
+        std::fs::create_dir_all(worktree.path().join("src")).unwrap();
+        std::fs::write(
+            canonical.path().join("src/lib.rs"),
+            b"pub struct CanonicalSymbol;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            worktree.path().join("src/lib.rs"),
+            b"pub struct UnapprovedTaskSymbol;\n",
+        )
+        .unwrap();
+        let mut graph_context = context(canonical.path());
+        graph_context.root = worktree.path().to_path_buf();
+
+        let task_source = graph_context.discover().unwrap();
+        let canonical_source = graph_context.discover_canonical().unwrap();
+
+        assert_ne!(
+            task_source.manifest().revision.manifest_digest,
+            canonical_source.manifest().revision.manifest_digest
+        );
+        assert_eq!(
+            canonical_source.manifest().revision.manifest_digest,
+            context(canonical.path())
+                .discover()
+                .unwrap()
+                .manifest()
+                .revision
+                .manifest_digest
+        );
+    }
+
+    #[test]
+    fn submitted_tree_freeze_rejects_content_newer_than_the_indexed_snapshot() {
+        let repository = tempfile::tempdir().unwrap();
+        let sidecar_directory = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .arg("--quiet")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct Indexed;\n").unwrap();
+
+        let mut graph_context = context(root);
+        graph_context.config.enabled = true;
+        let source = graph_context.discover().unwrap();
+        let sidecar_path = sidecar_directory.path().join(SIDECAR_FILE_NAME);
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        let indexed = IndexCoordinator::new(&mut sidecar)
+            .index(
+                &source,
+                &graph_context.config,
+                IndexRequest {
+                    build_id: BuildId::new("submitted-freeze-build").unwrap(),
+                    view_name: PublishedViewName::new("task:test").unwrap(),
+                    force_full: false,
+                },
+            )
+            .unwrap();
+        drop(sidecar);
+
+        let matching_tree = capture_matching_submitted_tree(
+            &sidecar_path,
+            root,
+            "task-match",
+            graph_context.repository.clone(),
+            &graph_context.config,
+            &indexed.snapshot.id,
+        )
+        .unwrap();
+        assert!(matching_tree.value().len() >= 40);
+        release_submitted_tree_pin(root, "task-match").unwrap();
+
+        std::fs::write(root.join("src/lib.rs"), "pub struct NewerEdit;\n").unwrap();
+        let error = capture_matching_submitted_tree(
+            &sidecar_path,
+            root,
+            "task-race",
+            graph_context.repository.clone(),
+            &graph_context.config,
+            &indexed.snapshot.id,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the indexed task view")
+        );
+        let references = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("show-ref")
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&references.stdout).contains("refs/ferrus/reviews/"));
     }
 
     #[test]
@@ -627,6 +2107,43 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_task_status_exposes_binding_and_direct_source_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar = directory.path().join(SIDECAR_FILE_NAME);
+        let mut context = context(directory.path());
+        context.repository_view = Some(
+            project::RepositoryViewReference::new(
+                None,
+                None,
+                project::RepositoryViewStatus::Unavailable,
+            )
+            .unwrap(),
+        );
+        context.task_view_id = Some(TaskViewId::new("t-001").unwrap());
+        let response = status_response_at(&context, &sidecar, None).unwrap();
+
+        assert_eq!(response.task_view, None);
+        assert_eq!(response.data.availability, Availability::NotBuilt);
+        assert_eq!(response.data.published_view, None);
+        assert_eq!(
+            response.data.task_view_status,
+            Some(TaskViewStatus::Unavailable)
+        );
+        assert_eq!(
+            response.data.fallback,
+            Some(RetrievalFallback::DirectSourceInspection)
+        );
+        assert!(
+            context
+                .scope(default_budget(&context.config.query_limits).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("current task view")
+        );
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
     fn unreadable_sidecar_is_distinct_from_a_missing_index() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join(SIDECAR_FILE_NAME);
@@ -658,6 +2175,600 @@ mod tests {
 
         assert_eq!(response.freshness.freshness, Freshness::Unknown);
         assert_eq!(response.freshness.reason_codes, ["source_not_compared"]);
+    }
+
+    #[tokio::test]
+    async fn approval_refresh_waits_for_the_active_canonical_lease_and_retries() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let data_dir = root.join(".ferrus/projects/test-project");
+        std::fs::create_dir_all(root.join(".ferrus")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            root.join("ferrus.toml"),
+            "[repository_graph]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct CanonicalSymbol;\n").unwrap();
+        std::fs::write(
+            root.join(".ferrus/project.toml"),
+            toml::to_string(&project::LocalProjectRef {
+                project_id: "test-project".to_string(),
+                name: "test".to_string(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string(&project::ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: root.to_string_lossy().into_owned(),
+                ferrus_dir: root.join(".ferrus").to_string_lossy().into_owned(),
+                vcs: None,
+                origin_repo: None,
+                default_branch: None,
+                current_head: None,
+                created_at: "2026-07-28T00:00:00Z".to_string(),
+                last_opened_at: "2026-07-28T00:00:00Z".to_string(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let _cwd = CurrentDirGuard::change_to(root);
+        project::record_task_status(
+            "t-approval",
+            ".ferrus/tasks/t-approval.md",
+            project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        project::record_canonical_graph_invalidation(
+            "t-approval",
+            None,
+            None,
+            project::CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+
+        let context = LocalGraphContext::load(false).await.unwrap();
+        let view_name = PublishedViewName::new(CANONICAL_VIEW).unwrap();
+        let sidecar_path = data_dir.join(SIDECAR_FILE_NAME);
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        assert_eq!(
+            sidecar
+                .acquire_refresh_lease(
+                    &context.repository,
+                    &view_name,
+                    "blocking-refresh",
+                    REFRESH_LEASE_TTL,
+                )
+                .unwrap(),
+            RefreshLeaseOutcome::Acquired
+        );
+        drop(sidecar);
+
+        let refresh = tokio::spawn(refresh_canonical_graph_after_approval(
+            root.to_path_buf(),
+            "t-approval".to_string(),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!refresh.is_finished());
+
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        assert!(
+            sidecar
+                .release_refresh_lease(&context.repository, &view_name, "blocking-refresh",)
+                .unwrap()
+        );
+        drop(sidecar);
+
+        tokio::time::timeout(Duration::from_secs(10), refresh)
+            .await
+            .unwrap()
+            .unwrap();
+        let reference = project::canonical_graph_reference().await.unwrap();
+        assert_eq!(reference.status, project::CanonicalGraphStatus::Fresh);
+        assert!(reference.snapshot_id.is_some());
+    }
+
+    #[test]
+    fn task_scope_remains_pinned_when_canonical_publication_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join(SIDECAR_FILE_NAME);
+        let source_root = directory.path().join("repository");
+        std::fs::create_dir(&source_root).unwrap();
+        let (mut context, _) = indexed_context(&source_root, &sidecar_path);
+        let sidecar = match open_for_query_at(&sidecar_path).unwrap() {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+            _ => panic!("indexed sidecar must be queryable"),
+        };
+        let baseline = sidecar
+            .published_view(
+                &context.repository,
+                &PublishedViewName::new(CANONICAL_VIEW).unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .snapshot_id;
+        drop(sidecar);
+        context.repository_view = Some(
+            project::RepositoryViewReference::new(
+                Some(baseline.clone()),
+                None,
+                project::RepositoryViewStatus::Available,
+            )
+            .unwrap(),
+        );
+
+        std::fs::write(
+            source_root.join("src/lib.rs"),
+            b"pub struct CanonicalAdvanced;\n",
+        )
+        .unwrap();
+        let source = context.discover().unwrap();
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => panic!("sidecar unexpectedly incompatible"),
+        };
+        let advanced = IndexCoordinator::new(&mut sidecar)
+            .index(
+                &source,
+                &context.config,
+                IndexRequest {
+                    build_id: BuildId::new("build-advanced").unwrap(),
+                    view_name: PublishedViewName::new(CANONICAL_VIEW).unwrap(),
+                    force_full: false,
+                },
+            )
+            .unwrap();
+        assert_ne!(advanced.snapshot.id, baseline);
+        drop(sidecar);
+
+        let request = SearchRequest {
+            scope: context
+                .scope(default_budget(&context.config.query_limits).unwrap())
+                .unwrap(),
+            text: "RuntimeTaskContext".to_string(),
+            node_kinds: vec![],
+            paths: vec![],
+            page: repository_graph::query::PageRequest { cursor: None },
+        };
+        let response = search_response_at(&context, &sidecar_path, None, &request).unwrap();
+
+        assert_eq!(response.snapshot_id, baseline);
+        assert!(response.data.hits.iter().any(|hit| {
+            hit.semantic_key
+                .as_ref()
+                .is_some_and(|key| key.as_str().contains("RuntimeTaskContext"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_pins_git_baseline_without_changing_task_lifecycle() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join(".ferrus/projects/test-project")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("ferrus.toml"),
+            "[repository_graph]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct BaselineSymbol;\n").unwrap();
+        std::fs::write(root.join("src/deleted.rs"), "pub struct DeletedSymbol;\n").unwrap();
+        let data_dir = root.join(".ferrus/projects/test-project");
+        std::fs::write(
+            root.join(".ferrus/project.toml"),
+            toml::to_string(&project::LocalProjectRef {
+                project_id: "test-project".to_string(),
+                name: "test".to_string(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string(&project::ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: root.to_string_lossy().into_owned(),
+                ferrus_dir: root.join(".ferrus").to_string_lossy().into_owned(),
+                vcs: Some("git".to_string()),
+                origin_repo: None,
+                default_branch: Some("main".to_string()),
+                current_head: None,
+                created_at: "2026-07-22T00:00:00Z".to_string(),
+                last_opened_at: "2026-07-22T00:00:00Z".to_string(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Ferrus Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "ferrus.toml", "src/lib.rs", "src/deleted.rs"]);
+        git(&["commit", "-m", "baseline"]);
+        let baseline_tree = git(&["rev-parse", "HEAD^{tree}"]);
+
+        let _cwd = CurrentDirGuard::change_to(root);
+        project::record_task_status(
+            "t-001",
+            ".ferrus/tasks/t-001.md",
+            project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        schedule_task_baseline_pin("t-001", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let repository_view = project::task_repository_view("t-001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repository_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        assert!(repository_view.baseline_snapshot_id.is_some());
+        assert_eq!(
+            project::list_tasks().await.unwrap()[0].status,
+            project::TaskStatus::Executing.as_str()
+        );
+
+        remove_sqlite_file_set(&data_dir.join(SIDECAR_FILE_NAME));
+        let rebuilt_view = resolve_task_baseline(
+            LocalGraphContext::load(false).await.unwrap(),
+            data_dir.join(SIDECAR_FILE_NAME),
+            "t-001",
+            root,
+            Some(&baseline_tree),
+            Some(&repository_view),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rebuilt_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        let rebuilt_sidecar = match open_for_query_at(&data_dir.join(SIDECAR_FILE_NAME)).unwrap() {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+            _ => panic!("rebuilt baseline sidecar must be queryable"),
+        };
+        assert!(
+            rebuilt_sidecar
+                .snapshot(rebuilt_view.baseline_snapshot_id.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        drop(rebuilt_sidecar);
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod added;\npub struct OverlaySymbol;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/added.rs"), "pub struct AddedSymbol;\n").unwrap();
+        std::fs::remove_file(root.join("src/deleted.rs")).unwrap();
+        let repository_view = refresh_task_overlay("t-001", root, &baseline_tree)
+            .await
+            .unwrap();
+        assert!(repository_view.overlay_revision_id.is_some());
+
+        let overlay_sidecar = match open_for_query_at(&data_dir.join(SIDECAR_FILE_NAME)).unwrap() {
+            OpenQuerySidecarResult::Ready(sidecar) => sidecar,
+            _ => panic!("refreshed task overlay must be queryable"),
+        };
+        let overlay_publication = overlay_sidecar
+            .published_view(
+                &LocalGraphContext::load(false).await.unwrap().repository,
+                &task_overlay_view_name(&TaskViewId::new("t-001").unwrap()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let overlay_metrics = overlay_sidecar
+            .index_build_metrics(&overlay_publication.build_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay_metrics.parsed_files, 2);
+        assert_eq!(overlay_metrics.reused_files, 1);
+        drop(overlay_sidecar);
+
+        let mut task_context = LocalGraphContext::load(false).await.unwrap();
+        task_context.repository_view = Some(repository_view.clone());
+        task_context.task_view_id = Some(TaskViewId::new("t-001").unwrap());
+        task_context.root = root.to_path_buf();
+        let task_freshness = task_context.freshness_comparison().unwrap();
+        assert!(task_freshness.is_none());
+        let task_status = status_response_at(
+            &task_context,
+            &data_dir.join(SIDECAR_FILE_NAME),
+            task_freshness,
+        )
+        .unwrap();
+        assert_eq!(task_status.freshness.freshness, Freshness::Unknown);
+        assert_eq!(task_status.freshness.reason_codes, ["source_not_compared"]);
+        let search = |text: &str| SearchRequest {
+            scope: task_context
+                .scope(default_budget(&task_context.config.query_limits).unwrap())
+                .unwrap(),
+            text: text.to_string(),
+            node_kinds: vec![],
+            paths: vec![],
+            page: repository_graph::query::PageRequest { cursor: None },
+        };
+        let overlay_response = task_context
+            .search(&search("OverlaySymbol"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!overlay_response.data.hits.is_empty());
+        assert_eq!(
+            overlay_response.task_view,
+            Some(TaskViewEnvelope {
+                task_view_id: TaskViewId::new("t-001").unwrap(),
+                baseline_snapshot_id: repository_view.baseline_snapshot_id.clone().unwrap(),
+                overlay_revision_id: repository_view.overlay_revision_id.clone(),
+                lifecycle: TaskViewLifecycle::Mutable,
+            })
+        );
+        assert!(
+            task_context
+                .search(&search("BaselineSymbol"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .hits
+                .is_empty()
+        );
+        assert!(
+            task_context
+                .search(&search("DeletedSymbol"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .hits
+                .is_empty()
+        );
+        assert!(
+            !task_context
+                .search(&search("AddedSymbol"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .hits
+                .is_empty()
+        );
+        let context_request = ContextRequest {
+            scope: task_context
+                .scope(default_budget(&task_context.config.query_limits).unwrap())
+                .unwrap(),
+            seeds: vec![repository_graph::query::ContextSeed::Path(
+                repository_graph::domain::RepoPath::new("src/lib.rs").unwrap(),
+            )],
+            policy: repository_graph::query::ContextPolicy {
+                direction: repository_graph::query::EdgeDirection::Both,
+                edge_kinds: vec![],
+                include_unresolved: false,
+                include_external: false,
+            },
+            page: repository_graph::query::PageRequest { cursor: None },
+        };
+        let context_response = task_context
+            .context_with_snippets(&context_request, NonZeroU64::new(1024).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            context_response
+                .data
+                .snippets
+                .iter()
+                .any(|snippet| snippet.text.contains("OverlaySymbol"))
+        );
+        assert!(
+            context_response
+                .data
+                .items
+                .iter()
+                .any(|item| item.path.as_str() == "src/added.rs")
+        );
+        assert_eq!(context_response.task_view, overlay_response.task_view);
+
+        let frozen_view = repository_view
+            .clone()
+            .frozen(capture_worktree_tree(root).unwrap())
+            .unwrap();
+        task_context.repository_view = Some(frozen_view);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub struct ChangedAfterSubmission;\n",
+        )
+        .unwrap();
+        let frozen_response = task_context
+            .context_with_snippets(&context_request, NonZeroU64::new(1024).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            frozen_response
+                .data
+                .snippets
+                .iter()
+                .any(|snippet| snippet.text.contains("OverlaySymbol"))
+        );
+        assert_eq!(
+            frozen_response.task_view.unwrap().lifecycle,
+            TaskViewLifecycle::FrozenSubmitted
+        );
+
+        project::record_task_status(
+            "t-002",
+            ".ferrus/tasks/t-002.md",
+            project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        schedule_task_baseline_pin("t-002", root, Some("invalid-tree"))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(
+            project::task_repository_view("t-002")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            project::RepositoryViewStatus::Failed
+        );
+        assert_eq!(
+            project::list_tasks()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == "t-002")
+                .unwrap()
+                .status,
+            project::TaskStatus::Executing.as_str()
+        );
+
+        std::fs::write(root.join("src/lib.rs"), "pub struct BaselineSymbol;\n").unwrap();
+        std::fs::write(root.join("src/deleted.rs"), "pub struct DeletedSymbol;\n").unwrap();
+        std::fs::remove_file(root.join("src/added.rs")).unwrap();
+        schedule_task_baseline_pin("t-002", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let retried_view = project::task_repository_view("t-002")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retried_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        assert!(retried_view.baseline_snapshot_id.is_some());
+
+        std::fs::write(root.join("src/lib.rs"), "pub struct AgentEdit;\n").unwrap();
+        project::record_task_status(
+            "t-003",
+            ".ferrus/tasks/t-003.md",
+            project::TaskStatus::Executing,
+        )
+        .await
+        .unwrap();
+        schedule_task_baseline_pin("t-003", root, Some(&baseline_tree))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let changed_worktree_view = project::task_repository_view("t-003")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changed_worktree_view.status,
+            project::RepositoryViewStatus::Available
+        );
+        assert!(changed_worktree_view.baseline_snapshot_id.is_some());
+        assert_eq!(
+            project::list_tasks()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == "t-003")
+                .unwrap()
+                .status,
+            project::TaskStatus::Executing.as_str()
+        );
+        let expected_pin = changed_worktree_view.clone();
+        let frozen = changed_worktree_view
+            .frozen(capture_worktree_tree(root).unwrap())
+            .unwrap();
+        project::record_task_repository_view("t-003", &frozen)
+            .await
+            .unwrap();
+        assert!(
+            !compare_and_record_task_baseline_at(
+                &data_dir.join("ferrus.db"),
+                "t-003",
+                Some(&expected_pin),
+                &expected_pin,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            project::task_repository_view("t-003").await.unwrap(),
+            Some(frozen)
+        );
+        let previous_agent = std::env::var_os(ENV_AGENT_ID);
+        let previous_task = std::env::var_os(ENV_TASK_ID);
+        // SAFETY: cwd_lock serializes Ferrus tests that mutate process-global runtime context.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "executor:codex:missing");
+            std::env::set_var(ENV_TASK_ID, "t-missing");
+        }
+        let invalid_binding = match LocalGraphContext::load(false).await {
+            Ok(_) => panic!("invalid task binding unexpectedly selected canonical context"),
+            Err(error) => error,
+        };
+        assert!(invalid_binding.to_string().contains("not attached"));
+        // SAFETY: the same lock remains held while the prior environment is restored.
+        unsafe {
+            match previous_agent {
+                Some(value) => std::env::set_var(ENV_AGENT_ID, value),
+                None => std::env::remove_var(ENV_AGENT_ID),
+            }
+            match previous_task {
+                Some(value) => std::env::set_var(ENV_TASK_ID, value),
+                None => std::env::remove_var(ENV_TASK_ID),
+            }
+        }
     }
 
     #[test]
