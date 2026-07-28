@@ -2,9 +2,9 @@
 
 [![Ferrus version](https://img.shields.io/badge/ferrus-0.3.1--alpha.1-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/RomanEmreis/ferrus/blob/main/LICENSE)
-[![Rust](https://github.com/RomanEmreis/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/RomanEmreis/ferrus/actions/workflows/rust.yml)
-[![Publish](https://github.com/RomanEmreis/ferrus/actions/workflows/publish.yml/badge.svg)](https://github.com/RomanEmreis/ferrus/actions/workflows/publish.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
+[![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
+[![Publish](https://github.com/ferrus-dev/ferrus/actions/workflows/publish.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/publish.yml)
 
 **Deterministic orchestration of AI agents for real software work.**
 
@@ -36,7 +36,7 @@ Internally, agent support is normalized through `src/agents/`: `mod.rs` defines 
 
 >  **Status**: ferrus is currently in alpha and not ready for production.
 
-[Tutorial](https://ferrus.dev) | [Roadmap](https://github.com/RomanEmreis/ferrus/blob/main/docs/milestones.md)
+[Tutorial](https://ferrus.dev) | [Roadmap](https://github.com/ferrus-dev/ferrus/blob/main/docs/milestones.md)
 
 ---
 
@@ -70,12 +70,12 @@ Install:
 ```sh
 cargo install ferrus
 # or on Linux/macOS:
-curl -fsSL https://github.com/RomanEmreis/ferrus/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/ferrus-dev/ferrus/releases/latest/download/install.sh | sh
 ```
 
 ```powershell
 # or on Windows:
-iwr https://github.com/RomanEmreis/ferrus/releases/latest/download/install.ps1 -useb | iex
+iwr https://github.com/ferrus-dev/ferrus/releases/latest/download/install.ps1 -useb | iex
 ```
 
 Run:

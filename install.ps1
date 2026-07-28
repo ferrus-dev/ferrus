@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:FERRUS_INSTALL_REPO) { $env:FERRUS_INSTALL_REPO } else { "RomanEmreis/ferrus" }
+$Repo = if ($env:FERRUS_INSTALL_REPO) { $env:FERRUS_INSTALL_REPO } else { "ferrus-dev/ferrus" }
 $Version = if ($env:FERRUS_INSTALL_VERSION) { $env:FERRUS_INSTALL_VERSION } else { "latest" }
 $Target = ""
 $Archive = ""
