@@ -174,6 +174,12 @@ impl LocalGraphContext {
         if !self.config.enabled {
             return Ok(None);
         }
+        // Task snapshots use baseline/overlay composition identities rather
+        // than the ordinary worktree manifest identity. Comparing those
+        // different digest domains would report a false stale result.
+        if self.repository_view.is_some() {
+            return Ok(None);
+        }
         let source = self.discover()?;
         Ok(Some(FreshnessComparison::from_manifest(source.manifest())))
     }
@@ -589,61 +595,66 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
     task_id: String,
     run_id: Option<String>,
 ) {
-    let guard = match project::canonical_graph_refresh_guard().await {
-        Ok(guard) => guard,
-        Err(error) => {
-            tracing::warn!(
-                task_id,
-                error = ?error,
-                "failed to capture canonical graph refresh generation"
-            );
-            return;
-        }
-    };
-    match refresh_canonical_graph_at(&project_root).await {
-        Ok(None) => {}
-        Ok(Some((source, snapshot_id, build_id))) => {
-            match project::record_canonical_graph_refresh(
-                Some(&task_id),
-                run_id.as_deref(),
-                guard,
-                &source,
-                &snapshot_id,
-                &build_id,
-            )
-            .await
-            {
-                Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
-                Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
-                    task_id,
-                    "canonical graph refresh was superseded by a newer invalidation"
-                ),
-                Err(error) => tracing::warn!(
+    loop {
+        let guard = match project::canonical_graph_refresh_guard().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(
                     task_id,
                     error = ?error,
-                    "canonical graph refreshed but durable freshness state was not updated"
-                ),
+                    "failed to capture canonical graph refresh generation"
+                );
+                return;
             }
-            maintain_graph_best_effort().await;
-        }
-        Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
-            tracing::debug!(
-                task_id,
-                "canonical repository graph refresh was deduplicated"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                task_id,
-                error = ?error,
-                "best-effort canonical graph refresh failed after approval"
-            );
-            project::record_canonical_graph_refresh_failed_best_effort(
-                &task_id,
-                run_id.as_deref(),
-                guard,
-            )
-            .await;
+        };
+        match refresh_canonical_graph_at(&project_root).await {
+            Ok(None) => return,
+            Ok(Some((source, snapshot_id, build_id))) => {
+                match project::record_canonical_graph_refresh(
+                    Some(&task_id),
+                    run_id.as_deref(),
+                    guard,
+                    &source,
+                    &snapshot_id,
+                    &build_id,
+                )
+                .await
+                {
+                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
+                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
+                        task_id,
+                        "canonical graph refresh was superseded by a newer invalidation"
+                    ),
+                    Err(error) => tracing::warn!(
+                        task_id,
+                        error = ?error,
+                        "canonical graph refreshed but durable freshness state was not updated"
+                    ),
+                }
+                maintain_graph_best_effort().await;
+                return;
+            }
+            Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
+                tracing::debug!(
+                    task_id,
+                    "waiting for the active canonical repository graph refresh"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    error = ?error,
+                    "best-effort canonical graph refresh failed after approval"
+                );
+                project::record_canonical_graph_refresh_failed_best_effort(
+                    &task_id,
+                    run_id.as_deref(),
+                    guard,
+                )
+                .await;
+                return;
+            }
         }
     }
 }
@@ -657,16 +668,23 @@ async fn refresh_canonical_graph_at(
         BuildId,
     )>,
 > {
-    let Some((config, repository, source)) = canonical_source_at(project_root).await? else {
+    let contents = tokio::fs::read_to_string(project_root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found while refreshing canonical source")?;
+    let config = RepositoryGraphConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph] configuration")?;
+    if !config.enabled {
         return Ok(None);
-    };
-    let source_identity = project::CanonicalSourceIdentity {
-        source_revision_id: source.manifest().revision.id.clone(),
-        manifest_digest: source.manifest().revision.manifest_digest.clone(),
+    }
+    let project_id = project::current_project_id().await?;
+    let repository = RepositoryRef {
+        namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+        repository_id: RepositoryId::new("root")?,
     };
     let sidecar_path = sidecar_path().await?;
     let indexed_repository = repository.clone();
-    let outcome = tokio::task::spawn_blocking(move || -> Result<_> {
+    let project_root = project_root.to_path_buf();
+    let (source_identity, outcome) = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut sidecar = match open_for_build_at(&sidecar_path)? {
             OpenSidecarResult::Ready(sidecar) => sidecar,
             OpenSidecarResult::RequiresRebuild(reason) => anyhow::bail!(
@@ -692,23 +710,37 @@ async fn refresh_canonical_graph_at(
             build_id.as_str(),
             REFRESH_LEASE_TTL,
         )?;
-        let indexed = IndexCoordinator::new(&mut sidecar).index(
-            &source,
-            &config,
-            IndexRequest {
-                build_id: build_id.clone(),
-                view_name: view_name.clone(),
-                force_full: false,
-            },
-        );
+        let indexed = (|| -> Result<_> {
+            let identities = active_extractor_identities(&config)?;
+            let context = SourceDiscoveryContext::from_config(
+                indexed_repository.clone(),
+                &config,
+                &identities,
+            )?;
+            let source = LocalRepositorySource::discover(project_root, context)?;
+            let source_identity = project::CanonicalSourceIdentity {
+                source_revision_id: source.manifest().revision.id.clone(),
+                manifest_digest: source.manifest().revision.manifest_digest.clone(),
+            };
+            let outcome = IndexCoordinator::new(&mut sidecar).index(
+                &source,
+                &config,
+                IndexRequest {
+                    build_id: build_id.clone(),
+                    view_name: view_name.clone(),
+                    force_full: false,
+                },
+            )?;
+            Ok((source_identity, outcome))
+        })();
         let lease_healthy = heartbeat.finish();
         let released =
             sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
-        let outcome = indexed?;
+        let indexed = indexed?;
         if !lease_healthy || !released? {
             anyhow::bail!("canonical repository graph refresh lease was lost");
         }
-        Ok(outcome)
+        Ok(indexed)
     })
     .await??;
     debug_assert_eq!(outcome.snapshot.repository, repository);
@@ -2117,6 +2149,122 @@ mod tests {
         assert_eq!(response.freshness.reason_codes, ["source_not_compared"]);
     }
 
+    #[tokio::test]
+    async fn approval_refresh_waits_for_the_active_canonical_lease_and_retries() {
+        let _guard = crate::test_support::cwd_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let previous = std::env::current_dir().unwrap();
+        let data_dir = root.join(".ferrus/projects/test-project");
+        std::fs::create_dir_all(root.join(".ferrus")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            root.join("ferrus.toml"),
+            "[repository_graph]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct CanonicalSymbol;\n").unwrap();
+        std::fs::write(
+            root.join(".ferrus/project.toml"),
+            toml::to_string(&project::LocalProjectRef {
+                project_id: "test-project".to_string(),
+                name: "test".to_string(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("project.toml"),
+            toml::to_string(&project::ProjectMetadata {
+                id: "test-project".to_string(),
+                name: "test".to_string(),
+                workspace_dir: root.to_string_lossy().into_owned(),
+                ferrus_dir: root.join(".ferrus").to_string_lossy().into_owned(),
+                vcs: None,
+                origin_repo: None,
+                default_branch: None,
+                current_head: None,
+                created_at: "2026-07-28T00:00:00Z".to_string(),
+                last_opened_at: "2026-07-28T00:00:00Z".to_string(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        std::env::set_current_dir(root).unwrap();
+        project::record_task_status(
+            "t-approval",
+            ".ferrus/tasks/t-approval.md",
+            project::TaskStatus::Complete,
+        )
+        .await
+        .unwrap();
+        project::record_canonical_graph_invalidation(
+            "t-approval",
+            None,
+            None,
+            project::CanonicalInvalidationReason::ApprovedIntegration,
+        )
+        .await
+        .unwrap();
+
+        let context = LocalGraphContext::load(false).await.unwrap();
+        let view_name = PublishedViewName::new(CANONICAL_VIEW).unwrap();
+        let sidecar_path = data_dir.join(SIDECAR_FILE_NAME);
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        assert_eq!(
+            sidecar
+                .acquire_refresh_lease(
+                    &context.repository,
+                    &view_name,
+                    "blocking-refresh",
+                    REFRESH_LEASE_TTL,
+                )
+                .unwrap(),
+            RefreshLeaseOutcome::Acquired
+        );
+        drop(sidecar);
+
+        let refresh = tokio::spawn(refresh_canonical_graph_after_approval(
+            root.to_path_buf(),
+            "t-approval".to_string(),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!refresh.is_finished());
+
+        let mut sidecar = match open_for_build_at(&sidecar_path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => {
+                panic!("new sidecar unexpectedly requires rebuild")
+            }
+        };
+        assert!(
+            sidecar
+                .release_refresh_lease(&context.repository, &view_name, "blocking-refresh",)
+                .unwrap()
+        );
+        drop(sidecar);
+
+        tokio::time::timeout(Duration::from_secs(10), refresh)
+            .await
+            .unwrap()
+            .unwrap();
+        let reference = project::canonical_graph_reference().await.unwrap();
+        assert_eq!(reference.status, project::CanonicalGraphStatus::Fresh);
+        assert!(reference.snapshot_id.is_some());
+
+        std::env::set_current_dir(previous).unwrap();
+    }
+
     #[test]
     fn task_scope_remains_pinned_when_canonical_publication_advances() {
         let directory = tempfile::tempdir().unwrap();
@@ -2351,6 +2499,16 @@ mod tests {
         task_context.repository_view = Some(repository_view.clone());
         task_context.task_view_id = Some(TaskViewId::new("t-001").unwrap());
         task_context.root = root.to_path_buf();
+        let task_freshness = task_context.freshness_comparison().unwrap();
+        assert!(task_freshness.is_none());
+        let task_status = status_response_at(
+            &task_context,
+            &data_dir.join(SIDECAR_FILE_NAME),
+            task_freshness,
+        )
+        .unwrap();
+        assert_eq!(task_status.freshness.freshness, Freshness::Unknown);
+        assert_eq!(task_status.freshness.reason_codes, ["source_not_compared"]);
         let search = |text: &str| SearchRequest {
             scope: task_context
                 .scope(default_budget(&task_context.config.query_limits).unwrap())

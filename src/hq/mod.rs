@@ -1103,10 +1103,6 @@ impl HqContext {
         agents::write_agents(&reg).await?;
 
         for task in &resettable {
-            crate::repository_graph_runtime::release_submitted_tree_pin_for_task_best_effort(
-                &task.id,
-            )
-            .await;
             store::clear_scoped_task_artifacts(&task.path, &format!(".ferrus/runs/{}", task.id))
                 .await?;
             crate::project::record_task_status_with_origin(
@@ -1117,6 +1113,10 @@ impl HqContext {
                 task.milestone_id.as_deref(),
             )
             .await?;
+            crate::repository_graph_runtime::release_submitted_tree_pin_for_task_best_effort(
+                &task.id,
+            )
+            .await;
         }
         crate::project::record_runtime_event_best_effort(
             None,
@@ -3960,6 +3960,47 @@ mod tests {
             .unwrap();
         assert!(review_refs.status.success());
         assert!(review_refs.stdout.is_empty());
+
+        crate::repository_graph::source::pin_submitted_tree(
+            dir.path(),
+            "t-failed-reset",
+            &submitted_tree,
+        )
+        .unwrap();
+        crate::project::record_task_status(
+            "t-failed-reset",
+            ".ferrus/tasks/t-failed-reset",
+            crate::project::TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(".ferrus/tasks/t-failed-reset")
+            .await
+            .unwrap();
+
+        ctx.do_reset(false).await.unwrap_err();
+
+        let failed_reset_task = crate::project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == "t-failed-reset")
+            .unwrap();
+        assert_eq!(
+            failed_reset_task.status,
+            crate::project::TaskStatus::Reviewing.as_str()
+        );
+        let retained_review_refs = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/ferrus/reviews"])
+            .output()
+            .unwrap();
+        assert!(retained_review_refs.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&retained_review_refs.stdout)
+                .lines()
+                .count(),
+            1
+        );
 
         std::env::set_current_dir(previous).unwrap();
     }
