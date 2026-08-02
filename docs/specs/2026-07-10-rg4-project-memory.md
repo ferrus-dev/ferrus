@@ -122,13 +122,18 @@ repository snapshot identity and a memory revision identity with separate freshn
 
 ## Milestones
 
-- [ ] #4.0 Define project memory, provenance, privacy, and federation contracts
+- [x] #4.0 Define project memory, provenance, privacy, and federation contracts
 
 ID: rg4.0
 Depends on: none
 
 Specify memory entities and relationships, independent revision identity, authorized source categories, privacy
 defaults, link evidence, store/query interfaces, freshness, and federation semantics.
+
+Normative contract: [Project Memory and Federation Contracts](../project-memory-architecture.md).
+
+Implemented in `src/project_memory/` as backend-neutral domain, policy, diagnostics, store/query ports, bounded
+wire DTOs, and explicit repository/memory federation targets. Storage and ingestion remain in later milestones.
 
 - [ ] #4.1 Implement deterministic specification and outcome ingestion
 
