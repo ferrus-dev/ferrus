@@ -71,6 +71,16 @@ pub struct MemoryFreshnessComparison {
     pub extractor_set_digest: Digest,
 }
 
+impl MemoryFreshnessComparison {
+    pub fn from_manifest(manifest: &super::domain::AuthorizedSourceManifest) -> Self {
+        Self {
+            source_set_digest: manifest.source_set_digest.clone(),
+            policy_digest: manifest.policy_digest.clone(),
+            extractor_set_digest: manifest.extractor_set_digest.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryPageRequest {

@@ -137,3 +137,20 @@ selected snapshot, it remains `stale` and retains the historical snapshot target
 that never matched, an unavailable origin, or an ambiguous semantic key remains
 `unresolved`. These states carry bounded diagnostic codes and are never promoted through
 text similarity or LLM inference.
+
+## Local query and federation
+
+`SqliteMemoryQuery` reads one immutable memory revision without creating, migrating, or mutating
+`project-memory.db`. Caller budgets are clamped to the configured service limits. SQLite progress handlers enforce
+the duration deadline during scans and counts; result, byte, snippet, depth, and diagnostic limits are enforced
+again while assembling responses. Memory cursors bind the operation, exact request shape, effective depth, and
+memory revision. Optional snippets are requested only through `MemoryContent` with the stored locator and expected
+fingerprint.
+
+`FederatedContextService` keeps repository and memory queries separate and routes every request according to its
+tagged `repository`, `memory`, or `all` target. Combined search uses deterministic score, domain, and identity
+ordering before applying the common result and byte budget. Combined context resolves the selected repository and
+memory revisions independently, loads only their exact repository link set, and crosses domains only through
+resolved evidence-backed links. The response retains memory relationships, cross-domain link evidence, independent
+freshness and diagnostics, and one cursor bound to both domain revisions. Work across sequential domain calls uses
+the remaining common duration budget rather than restarting the deadline.

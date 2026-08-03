@@ -1,9 +1,15 @@
 //! Versioned SQLite sidecar for rebuildable project-memory revisions.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, Error as SqliteError, ErrorCode, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior, params,
+};
 use thiserror::Error;
 
 use crate::repository_graph::domain::{Digest, RepositoryRef, SnapshotId};
@@ -18,12 +24,38 @@ use super::{
         MemoryRevisionId, MemoryViewName, ProjectId, ProjectNamespace, ProjectRef,
         PublishedMemoryRevision,
     },
-    ports::{MemoryBuildFailure, MemoryLinkStore, MemoryStore},
+    ports::{BoundedMemoryLinks, MemoryBuildFailure, MemoryLinkStore, MemoryStore},
 };
 
 pub const MEMORY_SIDECAR_FILE_NAME: &str = "project-memory.db";
 pub const MEMORY_SIDECAR_SCHEMA_VERSION: u32 = 2;
 const MEMORY_APPLICATION_ID: u32 = 0x4650_4d31; // "FPM1"
+const MEMORY_QUERY_PROGRESS_OPS: i32 = 100;
+
+struct MemoryReadDeadline<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> MemoryReadDeadline<'connection> {
+    fn install(
+        connection: &'connection Connection,
+        started: Instant,
+        max_duration_ms: u64,
+    ) -> Result<Self, MemoryStoreError> {
+        let duration = Duration::from_millis(max_duration_ms);
+        connection.progress_handler(
+            MEMORY_QUERY_PROGRESS_OPS,
+            Some(move || started.elapsed() >= duration),
+        )?;
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for MemoryReadDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum MemoryStoreError {
@@ -56,6 +88,47 @@ pub struct MemorySidecar {
     connection: Connection,
 }
 
+pub enum OpenMemoryQuerySidecarResult {
+    Ready(Box<MemorySidecar>),
+    Absent,
+    NeedsMigration { found_schema_version: u32 },
+    RequiresRebuild,
+}
+
+/// Opens an existing compatible memory sidecar without creating or migrating it.
+pub fn open_for_query_at(path: &Path) -> Result<OpenMemoryQuerySidecarResult, MemoryStoreError> {
+    if !path
+        .try_exists()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+    {
+        return Ok(OpenMemoryQuerySidecarResult::Absent);
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let application_id: u32 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if application_id != MEMORY_APPLICATION_ID || version > MEMORY_SIDECAR_SCHEMA_VERSION {
+        return Ok(OpenMemoryQuerySidecarResult::RequiresRebuild);
+    }
+    if version < MEMORY_SIDECAR_SCHEMA_VERSION {
+        return Ok(OpenMemoryQuerySidecarResult::NeedsMigration {
+            found_schema_version: version,
+        });
+    }
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "query_only", true)?;
+    Ok(OpenMemoryQuerySidecarResult::Ready(Box::new(
+        MemorySidecar {
+            path: path.to_path_buf(),
+            connection,
+        },
+    )))
+}
+
 impl MemorySidecar {
     pub fn open_at(data_dir: &Path) -> Result<Self, MemoryStoreError> {
         Self::open(data_dir.join(MEMORY_SIDECAR_FILE_NAME))
@@ -71,6 +144,10 @@ impl MemorySidecar {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     pub fn entities_for_revision(
@@ -468,6 +545,101 @@ impl MemoryLinkStore for MemorySidecar {
         let rows = statement.query_map([link_set_id.as_str()], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
+
+    fn repository_link_diagnostics(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Vec<MemoryDiagnostic>, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT diagnostic_json FROM memory_repository_link_diagnostics \
+             WHERE link_set_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([link_set_id.as_str()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    fn bounded_repository_links(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+        max_relationships: u32,
+        max_diagnostics: u32,
+        max_duration_ms: u64,
+    ) -> Result<BoundedMemoryLinks, Self::Error> {
+        let started = Instant::now();
+        let deadline =
+            MemoryReadDeadline::install(&self.connection, started, max_duration_ms.max(1))?;
+        let mut relationships = Vec::new();
+        let mut duration_exceeded = false;
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT relationship_json FROM memory_repository_links \
+                 WHERE link_set_id = ?1 ORDER BY relationship_id LIMIT ?2",
+            )?;
+            let mut rows = statement.query(params![
+                link_set_id.as_str(),
+                i64::from(max_relationships.saturating_add(1)),
+            ])?;
+            loop {
+                let row = match rows.next() {
+                    Ok(row) => row,
+                    Err(error) if sqlite_interrupted(&error) => {
+                        duration_exceeded = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let Some(row) = row else {
+                    break;
+                };
+                let encoded = row.get::<_, String>(0)?;
+                relationships.push(serde_json::from_str(&encoded)?);
+            }
+        }
+        let relationship_truncated = relationships.len() > max_relationships as usize;
+        relationships.truncate(max_relationships as usize);
+        let mut diagnostics = Vec::new();
+        if !duration_exceeded {
+            let mut statement = self.connection.prepare(
+                "SELECT diagnostic_json FROM memory_repository_link_diagnostics \
+                 WHERE link_set_id = ?1 ORDER BY sequence LIMIT ?2",
+            )?;
+            let mut rows = statement.query(params![
+                link_set_id.as_str(),
+                i64::from(max_diagnostics.saturating_add(1)),
+            ])?;
+            loop {
+                let row = match rows.next() {
+                    Ok(row) => row,
+                    Err(error) if sqlite_interrupted(&error) => {
+                        duration_exceeded = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let Some(row) = row else {
+                    break;
+                };
+                let encoded = row.get::<_, String>(0)?;
+                diagnostics.push(serde_json::from_str(&encoded)?);
+            }
+        }
+        drop(deadline);
+        let diagnostic_truncated = diagnostics.len() > max_diagnostics as usize;
+        diagnostics.truncate(max_diagnostics as usize);
+        Ok(BoundedMemoryLinks {
+            relationships,
+            diagnostics,
+            truncated: relationship_truncated || diagnostic_truncated,
+            duration_exceeded,
+        })
+    }
+}
+
+fn sqlite_interrupted(error: &SqliteError) -> bool {
+    matches!(
+        error,
+        SqliteError::SqliteFailure(failure, _) if failure.code == ErrorCode::OperationInterrupted
+    )
 }
 
 fn insert_repository_link_commit(
@@ -960,5 +1132,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn query_open_reports_legacy_schema_without_migrating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(MEMORY_SIDECAR_FILE_NAME);
+        drop(MemorySidecar::open(path.clone()).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE memory_repository_link_diagnostics; \
+                 DROP TABLE memory_repository_links; \
+                 DROP TABLE memory_repository_link_sets; \
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_for_query_at(&path).unwrap(),
+            OpenMemoryQuerySidecarResult::NeedsMigration {
+                found_schema_version: 1
+            }
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'memory_repository_link_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }

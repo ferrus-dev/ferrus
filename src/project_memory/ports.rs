@@ -158,6 +158,25 @@ pub trait MemoryLinkStore {
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,
     ) -> Result<Vec<MemoryRelationship>, Self::Error>;
+    fn repository_link_diagnostics(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Vec<MemoryDiagnostic>, Self::Error>;
+    fn bounded_repository_links(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+        max_relationships: u32,
+        max_diagnostics: u32,
+        max_duration_ms: u64,
+    ) -> Result<BoundedMemoryLinks, Self::Error>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundedMemoryLinks {
+    pub relationships: Vec<MemoryRelationship>,
+    pub diagnostics: Vec<MemoryDiagnostic>,
+    pub truncated: bool,
+    pub duration_exceeded: bool,
 }
 
 pub trait MemoryQuery {

@@ -10,11 +10,13 @@ mod documents;
 pub mod domain;
 pub mod extractors;
 pub mod federation;
+pub mod federation_service;
 pub mod index;
 pub mod links;
 pub mod policy;
 pub mod ports;
 pub mod query;
+pub mod query_sqlite;
 pub mod source;
 pub mod sqlite;
 

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::repository_graph::{
     domain::{RepoPath, RepositoryRef, SnapshotId},
     query::{
-        ContextItem, ContextPolicy, ContextSeed, DiagnosticsEnvelope, FreshnessEnvelope, PageInfo,
-        SearchHit, SnapshotSelector, TaskViewEnvelope,
+        ContextItem, ContextPolicy, ContextSeed, ContextSnippet, DiagnosticsEnvelope,
+        FreshnessEnvelope, PageInfo, SearchHit, SnapshotSelector, TaskViewEnvelope,
     },
 };
 
@@ -14,12 +14,12 @@ use super::{
     FEDERATION_WIRE_VERSION,
     diagnostics::MemoryDiagnostic,
     domain::{
-        FederationPageCursor, MemoryEntityKind, MemoryQueryText, MemoryRecordId, MemoryRevisionId,
-        MemorySourceCategory, MemoryStatusToken, ProjectRef,
+        FederationPageCursor, MemoryEntityKind, MemoryQueryText, MemoryRecordId,
+        MemoryRelationship, MemoryRevisionId, MemorySourceCategory, MemoryStatusToken, ProjectRef,
     },
     query::{
-        MemoryContextItem, MemoryContextPolicy, MemoryFreshnessEnvelope, MemoryPageInfo,
-        MemoryQueryBudget, MemoryRevisionSelector, MemorySearchHit, MemoryTruncation,
+        MemoryContextItem, MemoryContextPolicy, MemoryFreshnessEnvelope, MemoryQueryBudget,
+        MemoryRevisionSelector, MemorySearchHit, MemoryTruncation,
     },
 };
 
@@ -182,8 +182,14 @@ pub struct FederatedContextResponse {
     pub repository: Option<RepositoryDomainState>,
     pub memory: Option<MemoryDomainState>,
     pub federation_diagnostics: Vec<MemoryDiagnostic>,
-    pub page: MemoryPageInfo,
+    pub page: FederatedPageInfo,
     pub items: Vec<FederatedContextItem>,
+    #[serde(default)]
+    pub memory_relationships: Vec<MemoryRelationship>,
+    #[serde(default)]
+    pub cross_domain_links: Vec<MemoryRelationship>,
+    #[serde(default)]
+    pub repository_snippets: Vec<ContextSnippet>,
 }
 
 #[cfg(test)]

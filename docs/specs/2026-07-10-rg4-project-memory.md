@@ -170,13 +170,19 @@ tracked/archive paths, explicit `` `path:...` `` and `` `symbol:...` `` referenc
 authorized baseline/submitted graph snapshot identities. Exact matches target immutable snapshots; missing prior
 matches remain stale, while never-resolved or ambiguous references remain unresolved with bounded diagnostics.
 
-- [ ] #4.4 Implement bounded federated search and context assembly
+- [x] #4.4 Implement bounded federated search and context assembly
 
 ID: rg4.4
 Depends on: rg4.3
 
 Add repository-only, memory-only, and combined search/context scopes, deterministic ranking and deduplication,
 independent freshness, evidence-preserving cross-link expansion, and hard query budgets.
+
+Implemented by the read-only SQLite memory query backend and backend-neutral federated context service in
+`src/project_memory/`. Queries clamp caller budgets to service limits, bind cursors to exact request and revision
+identities, interrupt SQLite work at the duration deadline, and verify optional snippets through `MemoryContent`.
+Combined context crosses domains only through the exact repository link set for the selected memory revision and
+repository snapshot, preserves the link records as evidence, and reports freshness for both domains independently.
 
 - [ ] #4.5 Expose memory lifecycle and federation through CLI and read-only MCP
 
