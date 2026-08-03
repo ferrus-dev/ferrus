@@ -135,7 +135,7 @@ Normative contract: [Project Memory and Federation Contracts](../project-memory-
 Implemented in `src/project_memory/` as backend-neutral domain, policy, diagnostics, store/query ports, bounded
 wire DTOs, and explicit repository/memory federation targets. Storage and ingestion remain in later milestones.
 
-- [ ] #4.1 Implement deterministic specification and outcome ingestion
+- [x] #4.1 Implement deterministic specification and outcome ingestion
 
 ID: rg4.1
 Depends on: rg4.0
@@ -143,13 +143,19 @@ Depends on: rg4.0
 Parse tracked specs, stable milestones, completion state, and approved `## Outcome` sections into revisioned memory
 records with incremental reuse, deletion/tombstone handling, and atomic publication.
 
-- [ ] #4.2 Add archive manifest and runtime provenance adapters
+Implemented by the tracked-spec source, deterministic specification extractor, incremental fragment cache, and
+atomic `project-memory.db` revision publication in `src/project_memory/`.
+
+- [x] #4.2 Add archive manifest and runtime provenance adapters
 
 ID: rg4.2
 Depends on: rg4.0
 
 Read project-scoped machine-local archive manifests and the minimum authorized task/run/status/check metadata
 needed for citations without importing raw artifact bodies.
+
+Implemented by registered-project discovery plus sanitized archive and read-only `ferrus.db` adapters. Runtime
+payloads are reduced to task, run, milestone, status, and check-event identities before extraction.
 
 - [ ] #4.3 Build evidence-backed links between memory and repository context
 

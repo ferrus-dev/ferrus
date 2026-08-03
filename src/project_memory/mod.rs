@@ -6,11 +6,16 @@
 //! share a physical sidecar, but that choice must not leak into these APIs.
 
 pub mod diagnostics;
+mod documents;
 pub mod domain;
+pub mod extractors;
 pub mod federation;
+pub mod index;
 pub mod policy;
 pub mod ports;
 pub mod query;
+pub mod source;
+pub mod sqlite;
 
 #[cfg(test)]
 mod contracts;

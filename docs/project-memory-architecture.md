@@ -89,3 +89,25 @@ only through evidence-backed links and stays within the common hard budget.
 These contracts support a local in-process implementation first. Stable project,
 repository, snapshot, revision, and request identities allow a future service to partition
 storage and stateless workers by tenant and project without changing domain semantics.
+
+## Local ingestion
+
+The local implementation stores rebuildable memory in the registered project data directory
+as `project-memory.db`. It is separate from `ferrus.db` and `repo-graph.db`. A build discovers
+the complete authorized source manifest, reuses fragments whose category, locator,
+fingerprint, policy, and extractor identity are unchanged, and publishes a completed
+revision through generation-based compare and set. Removed sources are absent from the next
+revision. A failed or racing build cannot replace the previous publication.
+
+Tracked specifications expose structure and approved Outcome as separate fingerprinted
+sources. This lets an Outcome-only edit reuse unchanged specification and milestone facts.
+The extractor records the H1 specification title, stable milestone IDs and completion,
+approved Outcome content, and explicitly titled decision, deviation, validation, and
+follow-up subsections. It never writes to the specification.
+
+Archive discovery starts only from the registered project data directory. Archive manifests
+are sanitized to archive identity, repository-relative spec path, timestamp, counts, task
+IDs, and milestone IDs before extraction. Runtime provenance opens the registered
+`ferrus.db` read-only and retains only terminal task IDs, milestone IDs, statuses, run IDs,
+run statuses, and bounded check-event identities. Raw payloads, task paths, agents, PIDs,
+workspace paths, failure reasons, and archived artifact bodies do not cross the adapter.

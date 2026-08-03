@@ -250,8 +250,9 @@ pub enum MemoryEntityData {
         text: MemoryText,
     },
     ValidationEvidence {
-        text: MemoryText,
+        text: Option<MemoryText>,
         check_id: Option<MemoryRecordId>,
+        status: Option<MemoryStatusToken>,
     },
     FollowUpWork {
         text: MemoryText,
@@ -269,6 +270,13 @@ pub enum MemoryEntityData {
         #[serde(default)]
         check_ids: Vec<MemoryRecordId>,
     },
+    ArchiveReference {
+        archive_id: MemoryRecordId,
+        spec_path: RepoPath,
+        archived_at: MemoryStatusToken,
+        task_count: u64,
+        run_count: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +291,7 @@ pub enum MemoryEntityKind {
     FollowUpWork,
     TaskReference,
     RunReference,
+    ArchiveReference,
 }
 
 impl MemoryEntityData {
@@ -297,6 +306,24 @@ impl MemoryEntityData {
             Self::FollowUpWork { .. } => MemoryEntityKind::FollowUpWork,
             Self::TaskReference { .. } => MemoryEntityKind::TaskReference,
             Self::RunReference { .. } => MemoryEntityKind::RunReference,
+            Self::ArchiveReference { .. } => MemoryEntityKind::ArchiveReference,
+        }
+    }
+}
+
+impl MemoryEntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Specification => "specification",
+            Self::Milestone => "milestone",
+            Self::Outcome => "outcome",
+            Self::Decision => "decision",
+            Self::Deviation => "deviation",
+            Self::ValidationEvidence => "validation_evidence",
+            Self::FollowUpWork => "follow_up_work",
+            Self::TaskReference => "task_reference",
+            Self::RunReference => "run_reference",
+            Self::ArchiveReference => "archive_reference",
         }
     }
 }
@@ -320,6 +347,20 @@ pub enum MemoryRelationshipKind {
     Concerns,
     Touches,
     FollowsUp,
+}
+
+impl MemoryRelationshipKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contains => "contains",
+            Self::Implements => "implements",
+            Self::Validates => "validates",
+            Self::Supersedes => "supersedes",
+            Self::Concerns => "concerns",
+            Self::Touches => "touches",
+            Self::FollowsUp => "follows_up",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +609,7 @@ pub struct MemoryCommit {
     pub entities: Vec<MemoryEntity>,
     pub relationships: Vec<MemoryRelationship>,
     pub cache_writes: Vec<CachedMemoryFragment>,
+    pub diagnostics: Vec<super::diagnostics::MemoryDiagnostic>,
     pub metrics: MemoryBuildMetrics,
 }
 

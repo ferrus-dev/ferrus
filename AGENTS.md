@@ -75,6 +75,7 @@ src/
   cli/                        # clap entry and command implementations
   config/mod.rs               # ferrus.toml deserialization and updates
   config/claude.rs            # Claude MCP isolation config helpers
+  project_memory/             # project-memory contracts and local ingestion backend
   repository_graph/           # backend-neutral graph contracts and local backend
   repository_graph_runtime.rs # project-local graph CLI/MCP adapter
   templates.rs                # embedded Markdown templates
@@ -105,6 +106,13 @@ identities, requests, responses, and ports under `src/repository_graph/`. Keep p
 path, config, sidecar, freshness, and verified-content adaptation in
 `src/repository_graph_runtime.rs`. Core config loading must remain lenient toward graph
 settings; graph operations validate `[repository_graph]` strictly only when invoked.
+
+**Project memory boundary**: project memory is independently revisioned derived state in
+`project-memory.db`. Its default sources are tracked specification structure, approved Outcome
+content, sanitized archive manifest metadata, and read-only terminal task/run/check provenance.
+Never import raw task, submission, review, patch, log, question, answer, consultation, or
+integration-error bodies through the default adapters. Memory indexing must not mutate
+`ferrus.db`, specifications, archives, or repository graph publications.
 
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They

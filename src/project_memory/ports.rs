@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Utc};
+
 use super::{
     diagnostics::{MemoryDiagnostic, MemoryDiagnosticCode, MemoryLifecycleEvent},
     domain::{
@@ -52,6 +54,7 @@ pub struct MemoryExtractionContext {
     pub project: ProjectRef,
     pub revision_id: MemoryRevisionId,
     pub build_id: MemoryBuildId,
+    pub indexed_at: DateTime<Utc>,
     pub max_entities_per_source: u64,
     pub max_relationships_per_source: u64,
     pub max_parser_duration_ms: u64,
@@ -99,18 +102,18 @@ pub struct MemoryBuildFailure {
 pub trait MemoryStore {
     type Error;
 
-    fn start_build(&self, build: &MemoryBuild) -> Result<(), Self::Error>;
+    fn start_build(&mut self, build: &MemoryBuild) -> Result<(), Self::Error>;
     fn fail_build(
-        &self,
+        &mut self,
         build_id: &MemoryBuildId,
         failure: &MemoryBuildFailure,
     ) -> Result<(), Self::Error>;
-    fn complete_build(&self, commit: &MemoryCommit) -> Result<(), Self::Error>;
+    fn complete_build(&mut self, commit: &MemoryCommit) -> Result<(), Self::Error>;
     fn publish(
-        &self,
+        &mut self,
         request: &MemoryPublishRequest,
     ) -> Result<MemoryPublicationOutcome, Self::Error>;
-    fn supersede_build(&self, build_id: &MemoryBuildId) -> Result<(), Self::Error>;
+    fn supersede_build(&mut self, build_id: &MemoryBuildId) -> Result<(), Self::Error>;
     fn build(&self, build_id: &MemoryBuildId) -> Result<Option<MemoryBuild>, Self::Error>;
     fn revision(
         &self,
