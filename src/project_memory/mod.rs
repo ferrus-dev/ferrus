@@ -11,6 +11,7 @@ pub mod domain;
 pub mod extractors;
 pub mod federation;
 pub mod index;
+pub mod links;
 pub mod policy;
 pub mod ports;
 pub mod query;

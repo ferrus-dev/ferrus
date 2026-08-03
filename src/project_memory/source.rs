@@ -434,18 +434,32 @@ fn discover_runtime(
     let mut task_ids = BTreeSet::new();
     {
         let mut statement = connection.prepare(
-            "SELECT id, milestone_id, status FROM tasks \
+            "SELECT id, milestone_id, status, baseline_snapshot_id, \
+                    repository_view_snapshot_id FROM tasks \
              WHERE spec_path IS NOT NULL AND status IN ('complete', 'failed') ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(RuntimeTaskDocument {
-                id: row.get(0)?,
-                milestone_id: row.get(1)?,
-                status: row.get(2)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?;
         for row in rows {
-            let task = row?;
+            let (id, milestone_id, status, baseline_snapshot_id, repository_snapshot_id) = row?;
+            let task = RuntimeTaskDocument {
+                id,
+                milestone_id,
+                status,
+                baseline_snapshot_id: baseline_snapshot_id
+                    .map(crate::repository_graph::domain::SnapshotId::new)
+                    .transpose()?,
+                repository_snapshot_id: repository_snapshot_id
+                    .map(crate::repository_graph::domain::SnapshotId::new)
+                    .transpose()?,
+            };
             task_ids.insert(task.id.clone());
             tasks.push(task);
             if tasks.len() > MAX_RUNTIME_RECORDS {
@@ -459,21 +473,35 @@ fn discover_runtime(
     let mut runs = Vec::new();
     {
         let mut statement = connection.prepare(
-            "SELECT runs.id, runs.task_id, runs.status FROM runs \
+            "SELECT runs.id, runs.task_id, runs.status, runs.baseline_snapshot_id, \
+                    runs.repository_view_snapshot_id FROM runs \
              JOIN tasks ON tasks.id = runs.task_id \
              WHERE tasks.spec_path IS NOT NULL AND tasks.status IN ('complete', 'failed') \
              ORDER BY runs.id",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(RuntimeRunDocument {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                status: row.get(2)?,
-                check_ids: Vec::new(),
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?;
         for row in rows {
-            runs.push(row?);
+            let (id, task_id, status, baseline_snapshot_id, repository_snapshot_id) = row?;
+            runs.push(RuntimeRunDocument {
+                id,
+                task_id,
+                status,
+                check_ids: Vec::new(),
+                baseline_snapshot_id: baseline_snapshot_id
+                    .map(crate::repository_graph::domain::SnapshotId::new)
+                    .transpose()?,
+                repository_snapshot_id: repository_snapshot_id
+                    .map(crate::repository_graph::domain::SnapshotId::new)
+                    .transpose()?,
+            });
             if runs.len() > MAX_RUNTIME_RECORDS {
                 anyhow::bail!("runtime run provenance exceeds the record budget");
             }
@@ -714,21 +742,23 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE tasks(id TEXT, milestone_id TEXT, status TEXT, spec_path TEXT, \
-                    failure_reason TEXT); \
+                    failure_reason TEXT, baseline_snapshot_id TEXT, \
+                    repository_view_snapshot_id TEXT); \
                  CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT, agent TEXT, pid INTEGER, \
-                    workspace_path TEXT); \
+                    workspace_path TEXT, baseline_snapshot_id TEXT, \
+                    repository_view_snapshot_id TEXT); \
                  CREATE TABLE events(id INTEGER, run_id TEXT, type TEXT, payload_json TEXT);",
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO tasks VALUES (?1, ?2, 'complete', ?3, ?4)",
+                "INSERT INTO tasks VALUES (?1, ?2, 'complete', ?3, ?4, NULL, NULL)",
                 params!["t-1", "one", "docs/specs/example.md", "do not persist"],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO runs VALUES (?1, ?2, 'completed', ?3, 999, ?4)",
+                "INSERT INTO runs VALUES (?1, ?2, 'completed', ?3, 999, ?4, NULL, NULL)",
                 params!["run-1", "t-1", "private-agent", "/private/worktree"],
             )
             .unwrap();

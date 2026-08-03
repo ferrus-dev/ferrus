@@ -170,8 +170,8 @@ pub struct FederatedSearchResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "domain", content = "item", rename_all = "snake_case")]
 pub enum FederatedContextItem {
-    Repository(ContextItem),
-    Memory(MemoryContextItem),
+    Repository(Box<ContextItem>),
+    Memory(Box<MemoryContextItem>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

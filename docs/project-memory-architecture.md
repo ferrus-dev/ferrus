@@ -111,3 +111,29 @@ IDs, and milestone IDs before extraction. Runtime provenance opens the registere
 `ferrus.db` read-only and retains only terminal task IDs, milestone IDs, statuses, run IDs,
 run statuses, and bounded check-event identities. Raw payloads, task paths, agents, PIDs,
 workspace paths, failure reasons, and archived artifact bodies do not cross the adapter.
+
+## Repository link resolution
+
+Repository links are stored in immutable link sets separate from semantic memory revisions.
+Each set is identified by the memory revision, repository, selected repository snapshot, and
+resolver identity. Reindexing unchanged memory against a new repository snapshot therefore
+does not rewrite memory facts or change `memory_revision_id`.
+
+The local resolver accepts only evidence with an explicit authority boundary:
+
+- the tracked specification path carried by source provenance;
+- the repository-relative spec path in an approved archive manifest;
+- curated inline references written as `` `path:src/lib.rs` `` or
+  `` `symbol:rust:function:src/lib.rs:run` ``;
+- baseline and materialized repository snapshot IDs attached to terminal task/run metadata.
+
+Changed-path evidence is calculated from file identities in the two authorized graph
+snapshots. Raw patches and artifact bodies are not read. Task paths are also attributed to
+their stable milestone when the runtime record supplies that origin.
+
+An exact path or unique semantic-key match in the selected snapshot is `resolved`. If the
+evidence resolved in an immutable origin or earlier link set but no longer matches the
+selected snapshot, it remains `stale` and retains the historical snapshot target. A path
+that never matched, an unavailable origin, or an ambiguous semantic key remains
+`unresolved`. These states carry bounded diagnostic codes and are never promoted through
+text similarity or LLM inference.

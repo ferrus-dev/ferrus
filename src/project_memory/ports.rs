@@ -9,7 +9,8 @@ use super::{
     domain::{
         AuthorizedSourceDescriptor, AuthorizedSourceManifest, MemoryBuild, MemoryBuildId,
         MemoryCommit, MemoryExtractorIdentity, MemoryFragment, MemoryFragmentCacheKey,
-        MemoryPublicationOutcome, MemoryPublishRequest, MemoryRevision, MemoryRevisionId,
+        MemoryPublicationOutcome, MemoryPublishRequest, MemoryRelationship,
+        MemoryRepositoryLinkSet, MemoryRepositoryLinkSetId, MemoryRevision, MemoryRevisionId,
         MemorySourceCategory, MemoryViewName, ProjectRef, PublishedMemoryRevision,
     },
     federation::{
@@ -132,6 +133,31 @@ pub trait MemoryStore {
         &self,
         build_id: &MemoryBuildId,
     ) -> Result<Vec<MemoryDiagnostic>, Self::Error>;
+}
+
+/// Read boundary for independently revisioned repository link sets.
+pub trait MemoryLinkStore {
+    type Error;
+
+    fn repository_link_set(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+    fn repository_link_set_for_snapshot(
+        &self,
+        revision_id: &MemoryRevisionId,
+        repository: &crate::repository_graph::domain::RepositoryRef,
+        snapshot_id: Option<&crate::repository_graph::domain::SnapshotId>,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+    fn latest_repository_link_set(
+        &self,
+        revision_id: &MemoryRevisionId,
+        repository: &crate::repository_graph::domain::RepositoryRef,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+    fn repository_links(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Vec<MemoryRelationship>, Self::Error>;
 }
 
 pub trait MemoryQuery {

@@ -55,6 +55,8 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     milestone_id: milestone_id.clone(),
                     status: MemoryStatusToken::new(task.status)
                         .map_err(|_| failure("runtime.invalid_status"))?,
+                    baseline_snapshot_id: task.baseline_snapshot_id,
+                    repository_snapshot_id: task.repository_snapshot_id,
                 },
                 provenance: provenance(&task.id)?,
             });
@@ -97,6 +99,8 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     status: MemoryStatusToken::new(run.status)
                         .map_err(|_| failure("runtime.invalid_status"))?,
                     check_ids,
+                    baseline_snapshot_id: run.baseline_snapshot_id,
+                    repository_snapshot_id: run.repository_snapshot_id,
                 },
                 provenance: provenance(&run.id)?,
             });

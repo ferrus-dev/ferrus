@@ -6,21 +6,23 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
-use crate::repository_graph::domain::Digest;
+use crate::repository_graph::domain::{Digest, RepositoryRef, SnapshotId};
 
 use super::{
     diagnostics::MemoryDiagnostic,
     domain::{
         MemoryBuild, MemoryBuildId, MemoryBuildState, MemoryCommit, MemoryEntity, MemoryFragment,
         MemoryFragmentCacheKey, MemoryPublicationOutcome, MemoryPublicationVersion,
-        MemoryPublishRequest, MemoryRevision, MemoryRevisionId, MemoryViewName, ProjectId,
-        ProjectNamespace, ProjectRef, PublishedMemoryRevision,
+        MemoryPublishRequest, MemoryRelationship, MemoryRepositoryLinkCommit,
+        MemoryRepositoryLinkSet, MemoryRepositoryLinkSetId, MemoryResolutionState, MemoryRevision,
+        MemoryRevisionId, MemoryViewName, ProjectId, ProjectNamespace, ProjectRef,
+        PublishedMemoryRevision,
     },
-    ports::{MemoryBuildFailure, MemoryStore},
+    ports::{MemoryBuildFailure, MemoryLinkStore, MemoryStore},
 };
 
 pub const MEMORY_SIDECAR_FILE_NAME: &str = "project-memory.db";
-pub const MEMORY_SIDECAR_SCHEMA_VERSION: u32 = 1;
+pub const MEMORY_SIDECAR_SCHEMA_VERSION: u32 = 2;
 const MEMORY_APPLICATION_ID: u32 = 0x4650_4d31; // "FPM1"
 
 #[derive(Debug, Error)]
@@ -194,6 +196,9 @@ impl MemoryStore for MemorySidecar {
                     ],
                 )?;
             }
+        }
+        for repository_links in &commit.repository_links {
+            insert_repository_link_commit(&transaction, &commit.revision, repository_links)?;
         }
         transaction.execute(
             "DELETE FROM memory_diagnostics WHERE build_id = ?1",
@@ -387,6 +392,198 @@ impl MemoryStore for MemorySidecar {
     }
 }
 
+impl MemoryLinkStore for MemorySidecar {
+    type Error = MemoryStoreError;
+
+    fn repository_link_set(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT link_set_json FROM memory_repository_link_sets WHERE id = ?1",
+                [link_set_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    fn repository_link_set_for_snapshot(
+        &self,
+        revision_id: &MemoryRevisionId,
+        repository: &RepositoryRef,
+        snapshot_id: Option<&SnapshotId>,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT link_set_json FROM memory_repository_link_sets \
+                 WHERE memory_revision_id = ?1 AND repository_namespace = ?2 \
+                   AND repository_id = ?3 AND snapshot_id IS ?4 \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![
+                    revision_id.as_str(),
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                    snapshot_id.map(SnapshotId::as_str),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    fn latest_repository_link_set(
+        &self,
+        revision_id: &MemoryRevisionId,
+        repository: &RepositoryRef,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT link_set_json FROM memory_repository_link_sets \
+                 WHERE memory_revision_id = ?1 AND repository_namespace = ?2 \
+                   AND repository_id = ?3 ORDER BY sequence DESC LIMIT 1",
+                params![
+                    revision_id.as_str(),
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    fn repository_links(
+        &self,
+        link_set_id: &MemoryRepositoryLinkSetId,
+    ) -> Result<Vec<MemoryRelationship>, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT relationship_json FROM memory_repository_links \
+             WHERE link_set_id = ?1 ORDER BY relationship_id",
+        )?;
+        let rows = statement.query_map([link_set_id.as_str()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+}
+
+fn insert_repository_link_commit(
+    transaction: &Transaction<'_>,
+    revision: &MemoryRevision,
+    commit: &MemoryRepositoryLinkCommit,
+) -> Result<(), MemoryStoreError> {
+    if commit.link_set.project != revision.project
+        || commit.link_set.memory_revision_id != revision.id
+        || commit.relationships.iter().any(|relationship| {
+            relationship.project != revision.project
+                || relationship.memory_revision_id != revision.id
+        })
+    {
+        return Err(MemoryStoreError::IdentityMismatch);
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT link_set_json FROM memory_repository_link_sets WHERE id = ?1",
+            [commit.link_set.id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing: MemoryRepositoryLinkSet = serde_json::from_str(&existing)?;
+        if existing != commit.link_set {
+            return Err(MemoryStoreError::IdentityMismatch);
+        }
+        let mut statement = transaction.prepare(
+            "SELECT relationship_json FROM memory_repository_links \
+             WHERE link_set_id = ?1 ORDER BY relationship_id",
+        )?;
+        let rows =
+            statement.query_map([commit.link_set.id.as_str()], |row| row.get::<_, String>(0))?;
+        let existing_relationships = rows
+            .map(|row| Ok(serde_json::from_str::<MemoryRelationship>(&row?)?))
+            .collect::<Result<Vec<_>, MemoryStoreError>>()?;
+        if existing_relationships.len() != commit.relationships.len()
+            || existing_relationships
+                .iter()
+                .zip(&commit.relationships)
+                .any(|(left, right)| {
+                    repository_link_semantics(left) != repository_link_semantics(right)
+                })
+        {
+            return Err(MemoryStoreError::IdentityMismatch);
+        }
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO memory_repository_link_sets( \
+            id, memory_revision_id, repository_namespace, repository_id, snapshot_id, \
+            link_set_json, created_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            commit.link_set.id.as_str(),
+            revision.id.as_str(),
+            commit.link_set.repository.namespace.as_str(),
+            commit.link_set.repository.repository_id.as_str(),
+            commit
+                .link_set
+                .repository_snapshot_id
+                .as_ref()
+                .map(SnapshotId::as_str),
+            serde_json::to_string(&commit.link_set)?,
+            timestamp(),
+        ],
+    )?;
+    for relationship in &commit.relationships {
+        transaction.execute(
+            "INSERT INTO memory_repository_links( \
+                link_set_id, relationship_id, resolution, relationship_json \
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                commit.link_set.id.as_str(),
+                relationship.id.as_str(),
+                resolution_state(relationship.provenance.resolution),
+                serde_json::to_string(relationship)?,
+            ],
+        )?;
+    }
+    for (sequence, diagnostic) in commit.diagnostics.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO memory_repository_link_diagnostics( \
+                link_set_id, sequence, code, diagnostic_json \
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                commit.link_set.id.as_str(),
+                sequence as i64,
+                diagnostic.code.as_str(),
+                serde_json::to_string(diagnostic)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn repository_link_semantics(relationship: &MemoryRelationship) -> Vec<u8> {
+    serde_json::to_vec(&(
+        &relationship.project,
+        &relationship.memory_revision_id,
+        &relationship.id,
+        relationship.kind,
+        &relationship.source,
+        &relationship.target,
+        relationship.provenance.source_category,
+        &relationship.provenance.source_locator,
+        &relationship.provenance.source_fingerprint,
+        &relationship.provenance.extractor,
+        &relationship.provenance.evidence,
+        relationship.provenance.resolution,
+        relationship.provenance.confidence,
+    ))
+    .expect("repository link semantics are serializable")
+}
+
 fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryStoreError> {
     let application_id: u32 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
@@ -400,8 +597,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryStoreError
     if version == MEMORY_SIDECAR_SCHEMA_VERSION {
         return Ok(());
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
+    if version == 0 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
         r#"
         CREATE TABLE memory_builds (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -488,8 +686,58 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryStoreError
             ON memory_diagnostics(revision_id, sequence);
         "#,
     )?;
-    transaction.pragma_update(None, "application_id", MEMORY_APPLICATION_ID)?;
-    transaction.pragma_update(None, "user_version", MEMORY_SIDECAR_SCHEMA_VERSION)?;
+        transaction.pragma_update(None, "application_id", MEMORY_APPLICATION_ID)?;
+        transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+    }
+    migrate_repository_link_schema(connection)?;
+    Ok(())
+}
+
+fn migrate_repository_link_schema(connection: &mut Connection) -> Result<(), MemoryStoreError> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= 2 {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE memory_repository_link_sets (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            memory_revision_id TEXT NOT NULL REFERENCES memory_revisions(id) ON DELETE CASCADE,
+            repository_namespace TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            snapshot_id TEXT,
+            link_set_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE memory_repository_links (
+            link_set_id TEXT NOT NULL REFERENCES memory_repository_link_sets(id) ON DELETE CASCADE,
+            relationship_id TEXT NOT NULL,
+            resolution TEXT NOT NULL CHECK (resolution IN ('resolved', 'unresolved', 'stale')),
+            relationship_json TEXT NOT NULL,
+            PRIMARY KEY(link_set_id, relationship_id)
+        ) STRICT;
+
+        CREATE TABLE memory_repository_link_diagnostics (
+            link_set_id TEXT NOT NULL REFERENCES memory_repository_link_sets(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            diagnostic_json TEXT NOT NULL,
+            PRIMARY KEY(link_set_id, sequence)
+        ) STRICT;
+
+        CREATE INDEX memory_repository_link_sets_revision_idx
+            ON memory_repository_link_sets(
+                memory_revision_id, repository_namespace, repository_id, sequence
+            );
+        CREATE INDEX memory_repository_links_resolution_idx
+            ON memory_repository_links(link_set_id, resolution, relationship_id);
+        "#,
+    )?;
+    transaction.pragma_update(None, "user_version", 2)?;
     transaction.commit()?;
     Ok(())
 }
@@ -664,6 +912,53 @@ fn source_category(category: &super::domain::MemorySourceCategory) -> &'static s
     }
 }
 
+fn resolution_state(state: MemoryResolutionState) -> &'static str {
+    match state {
+        MemoryResolutionState::Resolved => "resolved",
+        MemoryResolutionState::Unresolved => "unresolved",
+        MemoryResolutionState::Stale => "stale",
+    }
+}
+
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_one_sidecars_migrate_to_repository_link_sets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(MEMORY_SIDECAR_FILE_NAME);
+        drop(MemorySidecar::open(path.clone()).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE memory_repository_link_diagnostics; \
+                 DROP TABLE memory_repository_links; \
+                 DROP TABLE memory_repository_link_sets; \
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let sidecar = MemorySidecar::open(path).unwrap();
+        let version: u32 = sidecar
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MEMORY_SIDECAR_SCHEMA_VERSION);
+        let tables: i64 = sidecar
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'memory_repository_link_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
+    }
 }

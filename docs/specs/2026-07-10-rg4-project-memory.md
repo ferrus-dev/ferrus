@@ -157,13 +157,18 @@ needed for citations without importing raw artifact bodies.
 Implemented by registered-project discovery plus sanitized archive and read-only `ferrus.db` adapters. Runtime
 payloads are reduced to task, run, milestone, status, and check-event identities before extraction.
 
-- [ ] #4.3 Build evidence-backed links between memory and repository context
+- [x] #4.3 Build evidence-backed links between memory and repository context
 
 ID: rg4.3
 Depends on: rg4.1, rg4.2
 
 Resolve explicit paths, semantic keys, task/milestone origins, archive records, and authorized changed-path
 evidence against repository snapshots while preserving stale and unresolved links honestly.
+
+Implemented as independently revisioned repository link sets in `project-memory.db`. The local resolver accepts
+tracked/archive paths, explicit `` `path:...` `` and `` `symbol:...` `` references, and changed paths derived from
+authorized baseline/submitted graph snapshot identities. Exact matches target immutable snapshots; missing prior
+matches remain stale, while never-resolved or ambiguous references remain unresolved with bounded diagnostics.
 
 - [ ] #4.4 Implement bounded federated search and context assembly
 

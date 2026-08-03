@@ -85,6 +85,12 @@ bounded_string!(
     false
 );
 bounded_string!(
+    MemoryRepositoryLinkSetId,
+    "memory repository link set id",
+    MAX_ID_BYTES,
+    false
+);
+bounded_string!(
     MemoryExtractorId,
     "memory extractor id",
     MAX_ID_BYTES,
@@ -262,6 +268,10 @@ pub enum MemoryEntityData {
         task_id: MemoryRecordId,
         milestone_id: Option<MemoryRecordId>,
         status: MemoryStatusToken,
+        #[serde(default)]
+        baseline_snapshot_id: Option<SnapshotId>,
+        #[serde(default)]
+        repository_snapshot_id: Option<SnapshotId>,
     },
     RunReference {
         run_id: MemoryRecordId,
@@ -269,6 +279,10 @@ pub enum MemoryEntityData {
         status: MemoryStatusToken,
         #[serde(default)]
         check_ids: Vec<MemoryRecordId>,
+        #[serde(default)]
+        baseline_snapshot_id: Option<SnapshotId>,
+        #[serde(default)]
+        repository_snapshot_id: Option<SnapshotId>,
     },
     ArchiveReference {
         archive_id: MemoryRecordId,
@@ -404,6 +418,25 @@ pub struct MemoryRelationship {
     pub source: MemoryEntityId,
     pub target: MemoryRelationshipTarget,
     pub provenance: MemoryProvenance,
+}
+
+/// One immutable resolution of a memory revision against a repository
+/// snapshot. Link sets advance independently from semantic memory revisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRepositoryLinkSet {
+    pub id: MemoryRepositoryLinkSetId,
+    pub project: ProjectRef,
+    pub memory_revision_id: MemoryRevisionId,
+    pub repository: RepositoryRef,
+    pub repository_snapshot_id: Option<SnapshotId>,
+    pub resolver: MemoryExtractorIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRepositoryLinkCommit {
+    pub link_set: MemoryRepositoryLinkSet,
+    pub relationships: Vec<MemoryRelationship>,
+    pub diagnostics: Vec<super::diagnostics::MemoryDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +643,7 @@ pub struct MemoryCommit {
     pub relationships: Vec<MemoryRelationship>,
     pub cache_writes: Vec<CachedMemoryFragment>,
     pub diagnostics: Vec<super::diagnostics::MemoryDiagnostic>,
+    pub repository_links: Vec<MemoryRepositoryLinkCommit>,
     pub metrics: MemoryBuildMetrics,
 }
 

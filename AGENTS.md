@@ -114,6 +114,12 @@ Never import raw task, submission, review, patch, log, question, answer, consult
 integration-error bodies through the default adapters. Memory indexing must not mutate
 `ferrus.db`, specifications, archives, or repository graph publications.
 
+Keep repository cross-links in immutable link sets addressed by both memory revision and
+repository snapshot; do not make repository state an implicit input to `memory_revision_id`.
+Resolve only tracked/archive paths, explicit `path:` or `symbol:` references, and authorized
+task snapshot origins. Retain prior exact targets as stale after refactors, keep never-matched
+or ambiguous references unresolved, and never promote similarity-only links to authoritative.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not

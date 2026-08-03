@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::repository_graph::domain::{RepoPath, SourcePosition, SourceSpan};
+use crate::repository_graph::domain::{RepoPath, SnapshotId, SourcePosition, SourceSpan};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ArchiveSourceDocument {
@@ -27,6 +27,8 @@ pub(crate) struct RuntimeTaskDocument {
     pub id: String,
     pub milestone_id: Option<String>,
     pub status: String,
+    pub baseline_snapshot_id: Option<SnapshotId>,
+    pub repository_snapshot_id: Option<SnapshotId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,8 @@ pub(crate) struct RuntimeRunDocument {
     pub task_id: String,
     pub status: String,
     pub check_ids: Vec<String>,
+    pub baseline_snapshot_id: Option<SnapshotId>,
+    pub repository_snapshot_id: Option<SnapshotId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

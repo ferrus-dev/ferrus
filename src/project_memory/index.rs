@@ -15,13 +15,14 @@ use super::{
         CachedMemoryFragment, MemoryBuild, MemoryBuildId, MemoryBuildMetrics, MemoryBuildState,
         MemoryCommit, MemoryEntity, MemoryEntityId, MemoryFragment, MemoryFragmentCacheKey,
         MemoryPublicationOutcome, MemoryPublicationVersion, MemoryPublishRequest,
-        MemoryRelationship, MemoryRelationshipId, MemoryRevision, MemorySourceCategory,
-        MemoryViewName, PublishedMemoryRevision,
+        MemoryRelationship, MemoryRelationshipId, MemoryRepositoryLinkSet, MemoryResolutionState,
+        MemoryRevision, MemorySourceCategory, MemoryViewName, PublishedMemoryRevision,
     },
     extractors::built_in_extractors,
+    links::LocalRepositoryLinkResolver,
     ports::{
-        MemoryBuildFailure, MemoryExtractionContext, MemoryExtractionInput, MemorySource,
-        MemoryStore,
+        MemoryBuildFailure, MemoryExtractionContext, MemoryExtractionInput, MemoryLinkStore,
+        MemorySource, MemoryStore,
     },
     source::LocalMemorySource,
     sqlite::{MemorySidecar, MemoryStoreError},
@@ -42,6 +43,7 @@ pub struct MemoryIndexOutcome {
     pub build_id: MemoryBuildId,
     pub revision: MemoryRevision,
     pub publication: MemoryPublicationOutcome,
+    pub repository_link_set: MemoryRepositoryLinkSet,
     pub metrics: MemoryBuildMetrics,
 }
 
@@ -53,6 +55,8 @@ pub enum MemoryIndexError {
     Store(#[from] MemoryStoreError),
     #[error("project-memory identity validation failed")]
     Identity(#[from] super::domain::AuthorizedSourceManifestError),
+    #[error("project-memory repository link resolution failed")]
+    Links(#[source] anyhow::Error),
     #[error("project-memory facts contain conflicting deterministic identities")]
     FactCollision,
 }
@@ -239,16 +243,56 @@ impl<'a> MemoryIndexer<'a> {
         self.source
             .revalidate(manifest)
             .map_err(MemoryIndexError::Source)?;
+        let entities = entities.into_values().collect::<Vec<_>>();
+        let relationships = relationships.into_values().collect::<Vec<_>>();
+        let resolver = LocalRepositoryLinkResolver::open(self.source.data_dir(), &revision.project)
+            .map_err(MemoryIndexError::Links)?;
+        let current_link_set_id = resolver
+            .link_set_id(&revision, &entities)
+            .map_err(MemoryIndexError::Links)?;
+        let previous_link_set = match self.store.repository_link_set(&current_link_set_id)? {
+            Some(link_set) => Some(link_set),
+            None => self
+                .store
+                .latest_repository_link_set(&revision.id, resolver.repository())?,
+        };
+        let previous_links = previous_link_set
+            .as_ref()
+            .map(|set| self.store.repository_links(&set.id))
+            .transpose()?;
+        let repository_links = resolver
+            .resolve(
+                &revision,
+                &entities,
+                previous_link_set.as_ref().zip(previous_links.as_deref()),
+            )
+            .map_err(MemoryIndexError::Links)?;
         metrics.entities = entities.len() as u64;
-        metrics.relationships = relationships.len() as u64;
+        metrics.relationships =
+            relationships.len() as u64 + repository_links.relationships.len() as u64;
+        metrics.stale_links = repository_links
+            .relationships
+            .iter()
+            .filter(|relationship| {
+                relationship.provenance.resolution == MemoryResolutionState::Stale
+            })
+            .count() as u64;
+        diagnostics.extend(
+            repository_links
+                .diagnostics
+                .iter()
+                .take(MAX_DIAGNOSTICS.saturating_sub(diagnostics.len()))
+                .cloned(),
+        );
         metrics.diagnostics = diagnostics.len() as u64;
         metrics.duration_ms = started.elapsed().as_millis() as u64;
         Ok(MemoryCommit {
             revision,
-            entities: entities.into_values().collect(),
-            relationships: relationships.into_values().collect(),
+            entities,
+            relationships,
             cache_writes,
             diagnostics,
+            repository_links: vec![repository_links],
             metrics,
         })
     }
@@ -259,6 +303,12 @@ impl<'a> MemoryIndexer<'a> {
         expected: Option<MemoryPublicationVersion>,
     ) -> Result<MemoryIndexOutcome, MemoryIndexError> {
         let candidate_revision = commit.revision.clone();
+        let repository_link_set = commit
+            .repository_links
+            .first()
+            .expect("local memory builds always resolve one repository link set")
+            .link_set
+            .clone();
         let build_id = candidate_revision.completed_by.clone();
         let metrics = commit.metrics.clone();
         if let Err(error) = self.store.complete_build(&commit) {
@@ -300,6 +350,7 @@ impl<'a> MemoryIndexer<'a> {
             build_id,
             revision,
             publication,
+            repository_link_set,
             metrics,
         })
     }
@@ -398,12 +449,19 @@ mod tests {
 
     use crate::{
         project_memory::{
-            domain::{MemoryEntityData, ProjectId, ProjectNamespace, ProjectRef},
+            domain::{
+                MemoryEntityData, MemoryRelationshipTarget, MemoryResolutionState, ProjectId,
+                ProjectNamespace, ProjectRef,
+            },
             policy::MemoryPolicy,
+            ports::MemoryLinkStore,
             source::LocalMemorySource,
             sqlite::MemorySidecar,
         },
-        repository_graph::domain::RepoPath,
+        repository_graph::{
+            domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId},
+            sqlite::{OpenSidecarResult, SIDECAR_FILE_NAME, open_for_build_at},
+        },
     };
 
     use super::*;
@@ -412,6 +470,120 @@ mod tests {
         ProjectRef {
             namespace: ProjectNamespace::new("local:test").unwrap(),
             project_id: ProjectId::new("project-1").unwrap(),
+        }
+    }
+
+    fn graph_repository() -> RepositoryRef {
+        RepositoryRef {
+            namespace: RepositoryNamespace::new("local:project-1").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
+        }
+    }
+
+    fn insert_graph_snapshot(
+        data: &TempDir,
+        snapshot_id: &str,
+        identity: &str,
+        files: &[&str],
+        symbols: &[(&str, &str)],
+        publish: bool,
+    ) {
+        let path = data.path().join(SIDECAR_FILE_NAME);
+        let mut sidecar = match open_for_build_at(&path).unwrap() {
+            OpenSidecarResult::Ready(sidecar) => sidecar,
+            OpenSidecarResult::RequiresRebuild(_) => panic!("test graph sidecar requires rebuild"),
+        };
+        let repository = graph_repository();
+        let build_id = format!("build-{snapshot_id}");
+        sidecar
+            .connection_mut()
+            .execute(
+                "INSERT INTO index_builds( \
+                    id, repository_namespace, repository_id, source_revision_id, \
+                    prospective_snapshot_id, state, started_at, finished_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'published', ?6, ?6)",
+                params![
+                    build_id,
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                    format!("source-{snapshot_id}"),
+                    snapshot_id,
+                    "2026-08-03T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        sidecar
+            .connection_mut()
+            .execute(
+                "INSERT INTO snapshots( \
+                    id, repository_namespace, repository_id, source_revision_id, \
+                    source_manifest_algorithm, source_manifest_digest, graph_model_version, \
+                    analysis_config_algorithm, analysis_config_digest, extractor_set_algorithm, \
+                    extractor_set_digest, completed_by_build_id, created_at \
+                 ) VALUES (?1, ?2, ?3, ?4, 'sha256', ?5, 1, 'sha256', ?5, 'sha256', ?5, ?6, ?7)",
+                params![
+                    snapshot_id,
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                    format!("source-{snapshot_id}"),
+                    identity,
+                    build_id,
+                    "2026-08-03T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        for (index, file) in files.iter().enumerate() {
+            sidecar
+                .connection_mut()
+                .execute(
+                    "INSERT INTO files( \
+                        snapshot_id, path, content_algorithm, content_digest, byte_length \
+                     ) VALUES (?1, ?2, 'sha256', ?3, 1)",
+                    params![snapshot_id, file, format!("{identity}{index:02x}")],
+                )
+                .unwrap();
+        }
+        for (index, (semantic_key, path)) in symbols.iter().enumerate() {
+            sidecar
+                .connection_mut()
+                .execute(
+                    "INSERT INTO nodes( \
+                        snapshot_id, id, kind, semantic_key, extractor_id, extractor_version, \
+                        extractor_contract_version, resolution_state, confidence, evidence_path, \
+                        evidence_content_algorithm, evidence_content_digest, properties_json \
+                     ) VALUES (?1, ?2, 'function', ?3, 'test', '1', 1, 'resolved', 'exact', \
+                        ?4, 'sha256', ?5, '{}')",
+                    params![
+                        snapshot_id,
+                        format!("node-{snapshot_id}-{index}"),
+                        semantic_key,
+                        path,
+                        format!("{identity}{index:02x}"),
+                    ],
+                )
+                .unwrap();
+        }
+        if publish {
+            sidecar
+                .connection_mut()
+                .execute(
+                    "INSERT INTO published_views( \
+                        repository_namespace, repository_id, view_name, snapshot_id, build_id, \
+                        generation, published_at \
+                     ) VALUES (?1, ?2, 'canonical', ?3, ?4, 1, ?5) \
+                     ON CONFLICT(repository_namespace, repository_id, view_name) DO UPDATE SET \
+                        snapshot_id = excluded.snapshot_id, build_id = excluded.build_id, \
+                        generation = published_views.generation + 1, \
+                        published_at = excluded.published_at",
+                    params![
+                        repository.namespace.as_str(),
+                        repository.repository_id.as_str(),
+                        snapshot_id,
+                        build_id,
+                        "2026-08-03T00:00:00Z",
+                    ],
+                )
+                .unwrap();
         }
     }
 
@@ -587,6 +759,219 @@ mod tests {
     }
 
     #[test]
+    fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init(root.path());
+        write_spec(
+            root.path(),
+            Some(
+                "Touched `path:src/old.rs`, `path:src/missing.rs`, and \
+                 `symbol:rust:function:src/old.rs:run`; ambiguous evidence is \
+                 `symbol:rust:function:src/old.rs:ambiguous`.",
+            ),
+        );
+        insert_graph_snapshot(
+            &data,
+            "snapshot-old",
+            "11",
+            &["docs/specs/example.md", "src/old.rs"],
+            &[
+                ("rust:function:src/old.rs:run", "src/old.rs"),
+                ("rust:function:src/old.rs:ambiguous", "src/old.rs"),
+                ("rust:function:src/old.rs:ambiguous", "src/old.rs"),
+            ],
+            true,
+        );
+        let source = source(&root, &data);
+        let mut store = MemorySidecar::open_at(data.path()).unwrap();
+        let first = MemoryIndexer::new(&source, &mut store)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        let first_set = store
+            .latest_repository_link_set(&first.revision.id, &graph_repository())
+            .unwrap()
+            .unwrap();
+        let first_links = store.repository_links(&first_set.id).unwrap();
+        assert!(first_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Resolved
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryPath { path, snapshot_id: Some(id), .. }
+                        if path.as_str() == "src/old.rs" && id.as_str() == "snapshot-old"
+                )
+        }));
+        assert!(first_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Unresolved
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositorySymbol {
+                        semantic_key,
+                        snapshot_id: Some(id),
+                        ..
+                    } if semantic_key.as_str() == "rust:function:src/old.rs:ambiguous"
+                        && id.as_str() == "snapshot-old"
+                )
+        }));
+        assert!(first_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Resolved
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryNode { snapshot_id, .. }
+                        if snapshot_id.as_str() == "snapshot-old"
+                )
+        }));
+        assert!(first_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Unresolved
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryPath { path, snapshot_id: None, .. }
+                        if path.as_str() == "src/missing.rs"
+                )
+        }));
+
+        insert_graph_snapshot(
+            &data,
+            "snapshot-new",
+            "22",
+            &["docs/specs/example.md", "src/new.rs"],
+            &[("rust:function:src/new.rs:run", "src/new.rs")],
+            true,
+        );
+        let second = MemoryIndexer::new(&source, &mut store)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        assert_eq!(second.revision.id, first.revision.id);
+        assert!(second.metrics.stale_links > 0);
+        let second_set = store
+            .latest_repository_link_set(&second.revision.id, &graph_repository())
+            .unwrap()
+            .unwrap();
+        assert_ne!(second_set.id, first_set.id);
+        assert_eq!(
+            store
+                .repository_link_set_for_snapshot(
+                    &second.revision.id,
+                    &graph_repository(),
+                    Some(&SnapshotId::new("snapshot-old").unwrap()),
+                )
+                .unwrap()
+                .unwrap()
+                .id,
+            first_set.id
+        );
+        let second_links = store.repository_links(&second_set.id).unwrap();
+        assert!(second_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Stale
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryPath { path, snapshot_id: Some(id), .. }
+                        if path.as_str() == "src/old.rs" && id.as_str() == "snapshot-old"
+                )
+        }));
+        assert!(second_links.iter().any(|relationship| {
+            relationship.provenance.resolution == MemoryResolutionState::Stale
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryNode { snapshot_id, .. }
+                        if snapshot_id.as_str() == "snapshot-old"
+                )
+        }));
+    }
+
+    #[test]
+    fn task_changed_paths_link_task_and_milestone_to_current_snapshot() {
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init(root.path());
+        write_spec(root.path(), None);
+        insert_graph_snapshot(
+            &data,
+            "snapshot-baseline",
+            "31",
+            &["docs/specs/example.md", "src/lib.rs"],
+            &[],
+            false,
+        );
+        insert_graph_snapshot(
+            &data,
+            "snapshot-task",
+            "32",
+            &["docs/specs/example.md", "src/lib.rs"],
+            &[],
+            false,
+        );
+        insert_graph_snapshot(
+            &data,
+            "snapshot-current",
+            "33",
+            &["docs/specs/example.md", "src/lib.rs"],
+            &[],
+            true,
+        );
+        let connection = Connection::open(data.path().join("ferrus.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks( \
+                    id TEXT, milestone_id TEXT, status TEXT, spec_path TEXT, \
+                    baseline_snapshot_id TEXT, repository_view_snapshot_id TEXT \
+                 ); \
+                 CREATE TABLE runs( \
+                    id TEXT, task_id TEXT, status TEXT, baseline_snapshot_id TEXT, \
+                    repository_view_snapshot_id TEXT \
+                 ); \
+                 CREATE TABLE events(id INTEGER, run_id TEXT, type TEXT, payload_json TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks VALUES ( \
+                    't-1', 'one', 'complete', 'docs/specs/example.md', \
+                    'snapshot-baseline', 'snapshot-task' \
+                 )",
+                [],
+            )
+            .unwrap();
+        let source = source(&root, &data);
+        let mut store = MemorySidecar::open_at(data.path()).unwrap();
+        let outcome = MemoryIndexer::new(&source, &mut store)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        let entities = store.entities_for_revision(&outcome.revision.id).unwrap();
+        let task = entities
+            .iter()
+            .find(|entity| matches!(entity.data, MemoryEntityData::TaskReference { .. }))
+            .unwrap();
+        let milestone = entities
+            .iter()
+            .find(|entity| matches!(entity.data, MemoryEntityData::Milestone { .. }))
+            .unwrap();
+        let link_set = store
+            .latest_repository_link_set(&outcome.revision.id, &graph_repository())
+            .unwrap()
+            .unwrap();
+        let links = store.repository_links(&link_set.id).unwrap();
+        for source in [&task.id, &milestone.id] {
+            assert!(links.iter().any(|relationship| {
+                &relationship.source == source
+                    && relationship.provenance.resolution == MemoryResolutionState::Resolved
+                    && matches!(
+                        &relationship.target,
+                        MemoryRelationshipTarget::RepositoryPath {
+                            path,
+                            snapshot_id: Some(snapshot),
+                            ..
+                        } if path.as_str() == "src/lib.rs"
+                            && snapshot.as_str() == "snapshot-current"
+                    )
+            }));
+        }
+    }
+
+    #[test]
     fn archive_and_runtime_adapters_create_only_provenance_entities() {
         let root = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
@@ -620,19 +1005,26 @@ archived_run_dir = "runs/t-1"
         let connection = Connection::open(data.path().join("ferrus.db")).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE tasks(id TEXT, milestone_id TEXT, status TEXT, spec_path TEXT); \
-                 CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT); \
+                "CREATE TABLE tasks(id TEXT, milestone_id TEXT, status TEXT, spec_path TEXT, \
+                    baseline_snapshot_id TEXT, repository_view_snapshot_id TEXT); \
+                 CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT, baseline_snapshot_id TEXT, \
+                    repository_view_snapshot_id TEXT); \
                  CREATE TABLE events(id INTEGER, run_id TEXT, type TEXT, payload_json TEXT);",
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO tasks VALUES ('t-1', 'one', 'complete', 'docs/specs/example.md')",
+                "INSERT INTO tasks VALUES (\
+                    't-1', 'one', 'complete', 'docs/specs/example.md', NULL, NULL\
+                 )",
                 [],
             )
             .unwrap();
         connection
-            .execute("INSERT INTO runs VALUES ('run-1', 't-1', 'completed')", [])
+            .execute(
+                "INSERT INTO runs VALUES ('run-1', 't-1', 'completed', NULL, NULL)",
+                [],
+            )
             .unwrap();
         connection
             .execute(
@@ -648,6 +1040,10 @@ archived_run_dir = "runs/t-1"
             .index(MemoryIndexOptions::default())
             .unwrap();
         let entities = store.entities_for_revision(&outcome.revision.id).unwrap();
+        let archive_entity = entities
+            .iter()
+            .find(|entity| matches!(entity.data, MemoryEntityData::ArchiveReference { .. }))
+            .unwrap();
         assert!(
             entities
                 .iter()
@@ -678,5 +1074,17 @@ archived_run_dir = "runs/t-1"
         ] {
             assert!(!serialized.contains(forbidden));
         }
+        let links = store
+            .repository_links(&outcome.repository_link_set.id)
+            .unwrap();
+        assert!(links.iter().any(|relationship| {
+            relationship.source == archive_entity.id
+                && relationship.provenance.resolution == MemoryResolutionState::Unresolved
+                && matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::RepositoryPath { path, snapshot_id: None, .. }
+                        if path.as_str() == "docs/specs/example.md"
+                )
+        }));
     }
 }
