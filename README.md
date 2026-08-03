@@ -198,9 +198,10 @@ Starts the agent coordination server on stdio. Agents load this as an MCP server
 | `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `ask_human`, `wait_for_answer`, `status`, `reset`, `heartbeat` |
 | *(omitted)* | All tools |
 
-All three server modes also expose the optional read-only repository retrieval tools
-`repository_graph_status`, `repository_search`, and `repository_context`. They do not require a task lease and never
-build an index or mutate task/run state.
+All three server modes also expose optional read-only retrieval tools. The repository-only tools are
+`repository_graph_status`, `repository_search`, and `repository_context`. Project memory and explicit federation use
+`project_memory_status`, `project_context_search`, and `project_context`. They do not require a task lease, build an
+index, author memory, or mutate task/run state.
 
 The unfiltered server additionally exposes compatibility tools such as `create_task` and `answer`. The `status` tool includes scoped SQLite task context when called by a running agent with a resolved runtime identity.
 
@@ -241,6 +242,10 @@ ferrus graph show --symbol <semantic-key> [--json]
 ferrus graph show --path src/project.rs [--json]
 ferrus graph context (--node <node-id> | --symbol <semantic-key> | --path <path>) [--depth 2] [--max-results 50] [--json]
 ferrus graph neighbors <node-id> --direction both --depth 2 --limit 50 [--kind contains] [--json]
+ferrus graph memory index [--full] [--json]
+ferrus graph memory status [--json]
+ferrus graph search decision --domain memory [--kind decision] [--json]
+ferrus graph context --domain all --milestone rg3.6 [--depth 2] [--json]
 ```
 
 `index` reuses unchanged per-file fragments by default; `--full` bypasses that cache. Completed snapshots are
@@ -251,6 +256,14 @@ Every query reports the snapshot ID, freshness against the current source manife
 repository-relative evidence spans, provenance, and any truncation. CLI limits are requests: configured
 `[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
 `ferrus.db`; it stores structural facts and content identities, not source bodies.
+
+Project memory is a separate machine-local `project-memory.db` built from tracked specification structure,
+approved `## Outcome` sections, sanitized archive manifests, and bounded runtime identities/counts. Raw tasks,
+submissions, reviews, patches, logs, questions, answers, consultations, and integration-error bodies are excluded
+by default. Memory revisions and repository snapshots advance independently. `--domain repository` remains the CLI
+default; `memory` and `all` report both selected identities and freshness separately. Spec archival remains the only
+workflow that authors approved outcomes, and it triggers a best-effort incremental memory refresh only after the
+archive transaction succeeds.
 
 Managed Executor worktrees use a task-owned graph view pinned to the dispatch baseline. `/check` and the final
 submit gate refresh its changed-file overlay best-effort: unchanged fragments are reused, changed and added files
@@ -285,6 +298,9 @@ Supervisor and Executor agents can inspect the same published graph through `rep
 paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
 Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically
 injected into task or review prompts, and a missing relationship means only that the current index does not know it.
+For approved historical context, agents can check `project_memory_status` and then call `project_context_search` or
+`project_context` with an explicit `repository`, `memory`, or `all` domain. Combined context crosses domains only
+through evidence-backed links for the exact selected revisions.
 
 The normative retrieval behavior is documented in
 [`docs/repository-graph-retrieval.md`](docs/repository-graph-retrieval.md). Local Criterion methodology and dogfood

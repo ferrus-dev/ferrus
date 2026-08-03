@@ -46,6 +46,7 @@ pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
 
 async fn run(spec_path: String, outcome: String) -> Result<String> {
     let result = project::archive_completed_spec(&spec_path, &outcome).await?;
+    crate::project_memory_runtime::refresh_after_archive_best_effort().await;
     Ok(format!(
         "Spec archived. Archive: {}. Tasks archived: {}. Runs archived: {}.",
         result.archive_dir, result.archived_tasks, result.archived_runs

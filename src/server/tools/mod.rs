@@ -9,6 +9,10 @@ pub mod create_spec;
 pub mod create_task;
 pub mod enqueue_task;
 pub mod heartbeat;
+pub mod project_context;
+pub mod project_context_search;
+mod project_context_telemetry;
+pub mod project_memory_status;
 pub mod reject;
 pub mod repository_context;
 pub mod repository_graph_status;
@@ -133,6 +137,11 @@ mod tests {
             ("create_spec", create_spec::INPUT_SCHEMA),
             ("create_task", create_task::INPUT_SCHEMA),
             ("enqueue_task", enqueue_task::INPUT_SCHEMA),
+            ("project_context", project_context::INPUT_SCHEMA),
+            (
+                "project_context_search",
+                project_context_search::INPUT_SCHEMA,
+            ),
             ("reject", reject::INPUT_SCHEMA),
             ("repository_context", repository_context::INPUT_SCHEMA),
             ("repository_search", repository_search::INPUT_SCHEMA),
@@ -195,6 +204,7 @@ mod tests {
         }))
         .await
         .unwrap();
+        let memory_status = project_memory_status::run_without_agent().await.unwrap();
 
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&status).unwrap()["data"]["availability"],
@@ -208,8 +218,13 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&context).unwrap()["code"],
             "not_built"
         );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&memory_status).unwrap()["data"]["availability"],
+            "not_built"
+        );
         assert_eq!(tokio::fs::read(&runtime_db).await.unwrap(), sentinel);
         assert!(!data_dir.join("repo-graph.db").exists());
+        assert!(!data_dir.join("project-memory.db").exists());
         assert!(!std::path::Path::new(".ferrus/tasks").exists());
 
         teardown(previous);

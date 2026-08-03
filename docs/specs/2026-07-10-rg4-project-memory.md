@@ -184,7 +184,7 @@ identities, interrupt SQLite work at the duration deadline, and verify optional 
 Combined context crosses domains only through the exact repository link set for the selected memory revision and
 repository snapshot, preserves the link records as evidence, and reports freshness for both domains independently.
 
-- [ ] #4.5 Expose memory lifecycle and federation through CLI and read-only MCP
+- [x] #4.5 Expose memory lifecycle and federation through CLI and read-only MCP
 
 ID: rg4.5
 Depends on: rg4.4
@@ -192,6 +192,10 @@ Depends on: rg4.4
 Add the specified memory lifecycle CLI, domain-scoped search/context options, `project_memory_status`,
 `project_context_search`, and `project_context` tools, archive/outcome invalidation hooks, guidance, and
 privacy-safe metrics without creating another memory-authoring workflow.
+
+Implemented with explicit local memory index/status commands, backward-compatible CLI domain
+routing, three role-visible read-only MCP tools, verified memory snippets, privacy-safe retrieval
+metrics, and a post-commit best-effort archive refresh that cannot change archive lifecycle state.
 
 - [ ] #4.6 Validate privacy defaults, freshness, lifecycle, and retrieval usefulness
 

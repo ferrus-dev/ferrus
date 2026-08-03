@@ -63,8 +63,10 @@ ferrus events list
 ferrus migrate
 ferrus graph index [--full] [--json]
 ferrus graph status [--json]
-ferrus graph search <query> [--kind <kind>] [--path <path>] [--limit <n>] [--json]
-ferrus graph context (--node <id> | --symbol <key> | --path <path>) [--depth <n>] [--json]
+ferrus graph memory index [--full] [--json]
+ferrus graph memory status [--json]
+ferrus graph search <query> [--domain repository|memory|all] [--kind <kind>] [--path <path>] [--limit <n>] [--json]
+ferrus graph context (--node <id> | --symbol <key> | --path <path> | --memory-entity <id> | --milestone <id> | --task <id> | --run <id>) [--domain repository|memory|all] [--depth <n>] [--json]
 ```
 
 ## Source Layout
@@ -78,6 +80,7 @@ src/
   project_memory/             # project-memory contracts and local ingestion backend
   repository_graph/           # backend-neutral graph contracts and local backend
   repository_graph_runtime.rs # project-local graph CLI/MCP adapter
+  project_memory_runtime.rs   # project-local memory/federation CLI/MCP adapter
   templates.rs                # embedded Markdown templates
   specs.rs                    # spec discovery and milestone resolution
   agent_id.rs                 # stable agent IDs and MCP server names
@@ -126,6 +129,14 @@ require no task lease and must not mutate tasks, runs, events, or either databas
 inject graph output into task or review prompts. Structural responses omit source bodies;
 requested snippets must pass the snapshot-aware, hash-verified content boundary. Treat a
 missing relationship as unknown, not absent.
+
+**Project context tools**: `project_memory_status`, `project_context_search`, and
+`project_context` are read-only and role-visible. Federated requests must supply an explicit
+`repository`, `memory`, or `all` domain. They must not build either sidecar, author outcomes,
+change source policy, or mutate orchestration state. Report repository snapshot and memory
+revision freshness independently; cross domains only through evidence-backed links for those
+exact revisions. Spec archive is the only approved Outcome authoring workflow. Refresh memory
+best-effort after archive commit, and never turn refresh failure into archive failure.
 
 **Task graph overlays**: managed Executor worktrees query a task-owned publication composed
 from the pinned baseline and the last successful changed-file overlay refresh. `/check` and

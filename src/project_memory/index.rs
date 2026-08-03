@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::Serialize;
 use thiserror::Error;
 
 use super::{
@@ -38,7 +39,7 @@ pub struct MemoryIndexOptions {
     pub full: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryIndexOutcome {
     pub build_id: MemoryBuildId,
     pub revision: MemoryRevision,
@@ -75,13 +76,41 @@ pub async fn index_current_project(
         .map_err(MemoryIndexError::Source)?;
     let data_dir = source.data_dir().to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let mut store = MemorySidecar::open_at(&data_dir)?;
+        let mut store = match MemorySidecar::open_at(&data_dir) {
+            Ok(store) => store,
+            Err(MemoryStoreError::RequiresRebuild) if options.full => {
+                remove_memory_sidecar_file_set(&data_dir)?;
+                MemorySidecar::open_at(&data_dir)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         MemoryIndexer::new(&source, &mut store)
             .expect("static memory view name is valid")
             .index(options)
     })
     .await
     .map_err(|error| MemoryIndexError::Source(anyhow::Error::from(error)))?
+}
+
+fn remove_memory_sidecar_file_set(data_dir: &std::path::Path) -> Result<(), MemoryStoreError> {
+    let path = data_dir.join(super::sqlite::MEMORY_SIDECAR_FILE_NAME);
+    let suffixed = |suffix: &str| {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        std::path::PathBuf::from(value)
+    };
+    for candidate in [path.clone(), suffixed("-wal"), suffixed("-shm")] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(MemoryStoreError::Database(
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<'a> MemoryIndexer<'a> {

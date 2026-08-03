@@ -24,7 +24,8 @@ use super::{
     },
     extractors::{built_in_extractor_set_digest, canonical_digest},
     policy::MemoryPolicy,
-    ports::{MemorySource, MemorySourceContent},
+    ports::{MemoryContent, MemorySource, MemorySourceContent},
+    query::{MemoryContentRequest, MemoryContentResponse, MemoryQueryError},
 };
 
 const MAX_SPEC_BYTES: u64 = 4 * 1024 * 1024;
@@ -237,6 +238,64 @@ impl MemorySource for LocalMemorySource {
             anyhow::bail!("project-memory sources changed during indexing");
         }
         Ok(())
+    }
+}
+
+impl MemoryContent for LocalMemorySource {
+    fn content(
+        &self,
+        request: MemoryContentRequest,
+    ) -> Result<MemoryContentResponse, MemoryQueryError> {
+        if request.project != self.project {
+            return Err(MemoryQueryError::SourceNotAuthorized);
+        }
+        let current_revision = self
+            .manifest
+            .revision_id()
+            .map_err(|_| MemoryQueryError::ContentChanged)?;
+        if request.revision_id != current_revision {
+            return Err(MemoryQueryError::ContentChanged);
+        }
+        let material = self
+            .materials
+            .iter()
+            .find(|material| {
+                material.descriptor.category == request.source_category
+                    && material.descriptor.locator == request.locator
+                    && material.descriptor.fingerprint == request.expected_fingerprint
+            })
+            .ok_or(MemoryQueryError::ContentChanged)?;
+        let content = self
+            .read_verified(&material.descriptor)
+            .map_err(|_| MemoryQueryError::ContentChanged)?;
+        let (start, end) = match request.evidence.as_ref() {
+            Some(super::domain::MemoryEvidenceLocator::Span(span)) => (
+                usize::try_from(span.start.byte_offset)
+                    .map_err(|_| MemoryQueryError::ContentChanged)?,
+                usize::try_from(span.end.byte_offset)
+                    .map_err(|_| MemoryQueryError::ContentChanged)?,
+            ),
+            _ => (0, content.bytes.len()),
+        };
+        let bytes = content
+            .bytes
+            .get(start..end)
+            .ok_or(MemoryQueryError::ContentChanged)?;
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            MemoryQueryError::Backend(
+                super::diagnostics::MemoryDiagnosticCode::new("content.nonutf8")
+                    .expect("static diagnostic code is valid"),
+            )
+        })?;
+        let mut length = text.len().min(request.max_bytes.get() as usize);
+        while length > 0 && !text.is_char_boundary(length) {
+            length -= 1;
+        }
+        Ok(MemoryContentResponse {
+            verified_fingerprint: material.descriptor.fingerprint.clone(),
+            bytes: text.as_bytes()[..length].to_vec(),
+            truncated: length < text.len(),
+        })
     }
 }
 
@@ -647,6 +706,9 @@ fn material_key(material: &SourceMaterial) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use crate::project_memory::domain::MemoryEvidenceLocator;
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -798,5 +860,76 @@ mod tests {
             assert!(!value.contains(forbidden));
         }
         assert!(value.contains("event:1"));
+    }
+
+    #[test]
+    fn verified_memory_content_clamps_utf8_and_rejects_changed_fingerprints() {
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init_git(root.path());
+        add_tracked(
+            root.path(),
+            "docs/specs/example.md",
+            "# Example\n\n## Outcome\n\ncaf\u{00e9}\n",
+        );
+        let source = LocalMemorySource::discover_at(
+            root.path().to_path_buf(),
+            data.path().to_path_buf(),
+            project_ref(),
+            RepoPath::new("docs/specs").unwrap(),
+            MemoryPolicy::default(),
+        )
+        .unwrap();
+        let descriptor = source
+            .manifest
+            .sources
+            .iter()
+            .find(|source| source.category == MemorySourceCategory::ApprovedOutcome)
+            .unwrap();
+        let content = fs::read(root.path().join("docs/specs/example.md")).unwrap();
+        let start = content
+            .windows("caf\u{00e9}".len())
+            .position(|window| window == "caf\u{00e9}".as_bytes())
+            .unwrap() as u64;
+        let response = source
+            .content(MemoryContentRequest {
+                project: project_ref(),
+                revision_id: source.manifest.revision_id().unwrap(),
+                source_category: descriptor.category,
+                locator: descriptor.locator.clone(),
+                expected_fingerprint: descriptor.fingerprint.clone(),
+                evidence: Some(MemoryEvidenceLocator::Span(
+                    crate::repository_graph::domain::SourceSpan {
+                        start: crate::repository_graph::domain::SourcePosition {
+                            byte_offset: start,
+                            line: None,
+                            column: None,
+                        },
+                        end: crate::repository_graph::domain::SourcePosition {
+                            byte_offset: start + 5,
+                            line: None,
+                            column: None,
+                        },
+                    },
+                )),
+                max_bytes: NonZeroU64::new(4).unwrap(),
+            })
+            .unwrap();
+        assert!(std::str::from_utf8(&response.bytes).is_ok());
+        assert_eq!(response.bytes, b"caf");
+        assert!(response.truncated);
+
+        let error = source
+            .content(MemoryContentRequest {
+                project: project_ref(),
+                revision_id: source.manifest.revision_id().unwrap(),
+                source_category: descriptor.category,
+                locator: descriptor.locator.clone(),
+                expected_fingerprint: Digest::new("sha256", "00").unwrap(),
+                evidence: None,
+                max_bytes: NonZeroU64::new(4).unwrap(),
+            })
+            .unwrap_err();
+        assert_eq!(error, MemoryQueryError::ContentChanged);
     }
 }

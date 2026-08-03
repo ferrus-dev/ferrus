@@ -165,7 +165,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_description(tools::wait_for_consult::DESCRIPTION);
     }
 
-    if repository_retrieval_tools_visible(all_roles, supervisor_role, executor_role) {
+    if retrieval_tools_visible(all_roles, supervisor_role, executor_role) {
         app.map_tool(
             "repository_graph_status",
             tools::repository_graph_status::handler,
@@ -181,6 +181,22 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_input_schema(|_| {
                 ToolSchema::from_json_str(tools::repository_context::INPUT_SCHEMA)
             });
+        app.map_tool(
+            "project_memory_status",
+            tools::project_memory_status::handler,
+        )
+        .with_description(tools::project_memory_status::DESCRIPTION);
+        app.map_tool(
+            "project_context_search",
+            tools::project_context_search::handler,
+        )
+        .with_description(tools::project_context_search::DESCRIPTION)
+        .with_input_schema(|_| {
+            ToolSchema::from_json_str(tools::project_context_search::INPUT_SCHEMA)
+        });
+        app.map_tool("project_context", tools::project_context::handler)
+            .with_description(tools::project_context::DESCRIPTION)
+            .with_input_schema(|_| ToolSchema::from_json_str(tools::project_context::INPUT_SCHEMA));
     }
 
     // Resources
@@ -267,11 +283,7 @@ fn supervisor_review_tools_visible(archive_scoped_supervisor: bool) -> bool {
     !archive_scoped_supervisor
 }
 
-fn repository_retrieval_tools_visible(
-    all_roles: bool,
-    supervisor_role: bool,
-    executor_role: bool,
-) -> bool {
+fn retrieval_tools_visible(all_roles: bool, supervisor_role: bool, executor_role: bool) -> bool {
     all_roles || supervisor_role || executor_role
 }
 
@@ -307,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_supervisor_mapping_includes_repository_reads_without_heartbeat() {
+    fn interactive_supervisor_mapping_includes_read_only_context_without_heartbeat() {
         let all_roles = false;
         let executor_role = false;
         let archive_scoped_supervisor = false;
@@ -327,14 +339,14 @@ mod tests {
         assert!(!(all_roles || executor_role || task_scoped_supervisor));
         let definition_tools = 2usize;
         let review_and_consult_tools = 6usize;
-        let repository_read_tools = 3usize;
+        let read_only_context_tools = 6usize;
         let shared_human_tools = 2usize;
         assert_eq!(
             definition_tools
                 + review_and_consult_tools
-                + repository_read_tools
+                + read_only_context_tools
                 + shared_human_tools,
-            13
+            16
         );
     }
 
@@ -394,10 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn repository_reads_are_visible_to_every_server_role() {
-        assert!(repository_retrieval_tools_visible(true, false, false));
-        assert!(repository_retrieval_tools_visible(false, true, false));
-        assert!(repository_retrieval_tools_visible(false, false, true));
-        assert!(!repository_retrieval_tools_visible(false, false, false));
+    fn read_only_context_tools_are_visible_to_every_server_role() {
+        assert!(retrieval_tools_visible(true, false, false));
+        assert!(retrieval_tools_visible(false, true, false));
+        assert!(retrieval_tools_visible(false, false, true));
+        assert!(!retrieval_tools_visible(false, false, false));
     }
 }
