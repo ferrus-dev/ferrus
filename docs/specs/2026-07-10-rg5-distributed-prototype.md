@@ -169,7 +169,7 @@ SQLite prototype adapter in `src/distributed/coordinator_sqlite.rs`. Concurrent 
 claims and transitions require renewable generation leases, retry and reclaim respect bounded attempts,
 cancellation revokes publication authority, and inspection exposes typed metadata without free-form diagnostics.
 
-- [ ] #5.3 Implement stateless graph and memory extraction workers and fact batches
+- [x] #5.3 Implement stateless graph and memory extraction workers and fact batches
 
 ID: rg5.3
 Depends on: rg5.1, rg5.2
@@ -177,6 +177,13 @@ Depends on: rg5.1, rg5.2
 Run existing graph and memory extractors in isolated resource-bounded workers, consume the matching immutable
 manifest kind, emit idempotent versioned fact batches, persist retry progress, and prohibit repository code
 execution and unrestricted egress.
+
+Implemented by the secure-only sandbox and stateless extraction adapter in `src/distributed/worker.rs`, the
+unpublished `FactBatchStore` port, and the encrypted durable SQLite prototype in
+`src/distributed/fact_store_sqlite.rs`. Workers revalidate live lease authority, read only scoped immutable
+objects, reuse the shipped graph and memory extractors, enforce hard input/parser/fact/diagnostic/time/output
+budgets, and deterministically reuse fact batches across retries. The deployment adapter remains responsible for
+applying the declared OS or container CPU, memory, filesystem, credential, and allowlisted-egress controls.
 
 - [ ] #5.4 Implement remote graph and memory storage with independent publication
 

@@ -189,6 +189,45 @@ identical batch is a no-op; changing its payload without changing its identity i
 Partial batches may be durable for retry. Ordinary queries cannot observe them. Storage
 promotes only a validated complete job into an immutable queryable snapshot or revision.
 
+### Stateless worker and unpublished fact-store prototype
+
+RG5.3 implements `StatelessIndexWorker` over the vendor-neutral coordinator, tenant object
+store, and fact-batch store ports. It accepts only a currently running job whose worker ID and
+lease generation still match the durable coordinator. Authority is checked before source reads
+and before every fact-batch write, so accepted cancellation, lease loss, or job expiry stops the
+attempt. Worker failures cross the boundary only as bounded `worker.*` codes.
+
+The worker reads the manifest body through its tenant-scoped immutable object reference and
+validates the body against the job input. Repository jobs reconstruct the shipped immutable
+`SourceManifest`, run the existing generic, Cargo, Rust syntax, and conservative cross-file
+extractors, and never invoke repository commands. Memory jobs reconstruct only the authorized
+Phase 4 source manifest and run the existing deterministic memory extractors over the sanitized
+objects uploaded by RG5.1. Retry timestamps are pinned to the durable job creation time so a
+repeated memory attempt produces identical provenance and batch identities.
+
+`WorkerLimits` independently caps manifest objects and bytes, per-object bytes, per-source and
+total facts, diagnostics, parser and resolver time, total attempt time, batch facts and bytes,
+and total output bytes. The worker is sequential even when the containing sandbox permits more
+process concurrency. Output is sorted, deterministically chunked, and written as one sequence
+with exactly one final marker. A retry recomputes the same immutable batches and reuses the
+existing durable rows.
+
+`FactBatchStore` exposes only unpublished worker progress and a separate ingestion read intended
+for RG5.4. It is not a repository or memory query port. `SqliteFactBatchStore` is the durable
+prototype adapter: it scopes every row by tenant, project, job kind, job, shard, and sequence;
+encrypts the complete batch with AES-256-GCM; authenticates the scope as associated data;
+enforces project and batch quotas; rejects sequence/final-marker conflicts and ciphertext
+tampering; and converges repeated writes on the same batch. Partial rows survive worker loss but
+remain outside every ordinary query path.
+
+The Rust worker intentionally has no repository filesystem, process-command, or network API.
+`WorkerSandbox` has secure-only variants for repository execution, egress, and filesystem
+access, plus nonzero memory, CPU-time, and concurrency limits. A deployment adapter must apply
+those controls with an OS process, container, or stronger sandbox before entering the worker;
+the library contract is not itself a multi-tenant kernel isolation boundary. The prototype
+tests exercise this contract in process, while production deployment still requires externally
+enforced CPU, memory, filesystem, credential, and allowlisted-egress isolation.
+
 ## Publication and query consistency
 
 Graph and memory have independent compare-and-set publication pointers and generations.

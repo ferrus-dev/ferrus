@@ -6,11 +6,14 @@
 
 pub mod coordinator;
 pub mod coordinator_sqlite;
+pub mod fact_store;
+pub mod fact_store_sqlite;
 pub mod identity;
 pub mod object_store;
 pub mod protocol;
 pub mod security;
 pub mod source;
+pub mod worker;
 
 #[cfg(test)]
 mod contracts;
@@ -25,3 +28,5 @@ pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u32 = 1;
 pub const DISTRIBUTED_POLICY_VERSION: u32 = 1;
 /// Version of privacy-filtered repository and memory source manifests.
 pub const DISTRIBUTED_SOURCE_MANIFEST_VERSION: u32 = 1;
+/// Version of stateless worker execution requests and sandbox declarations.
+pub const DISTRIBUTED_WORKER_PROTOCOL_VERSION: u32 = 1;

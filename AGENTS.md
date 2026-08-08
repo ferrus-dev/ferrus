@@ -139,6 +139,16 @@ Resolve only tracked/archive paths, explicit `path:` or `symbol:` references, an
 task snapshot origins. Retain prior exact targets as stale after refactors, keep never-matched
 or ambiguous references unresolved, and never promote similarity-only links to authoritative.
 
+**Distributed workers**: remote extraction consumes only validated tenant-scoped immutable
+manifest and object references. Keep the worker stateless and free of repository filesystem,
+process execution, and unrestricted network APIs. Reuse shipped deterministic graph and memory
+extractors under server-side input, parser, duration, fact, diagnostic, batch, and output caps.
+Check the durable worker ID and lease generation before source reads and every fact-batch write.
+Persist partial output only through the encrypted unpublished fact-batch port; repeated attempts
+must produce the same sequence and batch identities, and ordinary queries must never see partial
+batches. OS or container adapters must enforce the secure-only sandbox declaration, including
+CPU, memory, ephemeral filesystem, short-lived credentials, and allowlisted egress.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not

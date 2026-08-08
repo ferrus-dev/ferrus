@@ -8,6 +8,8 @@ fn distributed_contracts_are_vendor_and_storage_neutral() {
         include_str!("security.rs"),
         include_str!("source.rs"),
         include_str!("coordinator.rs"),
+        include_str!("fact_store.rs"),
+        include_str!("worker.rs"),
     );
     for forbidden in [
         "rusqlite::",
@@ -23,6 +25,24 @@ fn distributed_contracts_are_vendor_and_storage_neutral() {
         assert!(
             !contracts.contains(forbidden),
             "distributed contract leaked backend detail: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn stateless_worker_has_no_repository_execution_or_network_api() {
+    let worker = include_str!("worker.rs");
+    for forbidden in [
+        "std::process::Command",
+        "tokio::process",
+        "TcpStream",
+        "UdpSocket",
+        "ureq::",
+        "reqwest::",
+    ] {
+        assert!(
+            !worker.contains(forbidden),
+            "stateless worker gained a forbidden capability: {forbidden}"
         );
     }
 }
