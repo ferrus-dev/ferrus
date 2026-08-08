@@ -1,0 +1,959 @@
+//! Versioned control, fact, publication, and query envelopes.
+
+use std::num::{NonZeroU32, NonZeroU64};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+
+use crate::{
+    project_memory::{
+        diagnostics::MemoryDiagnostic,
+        domain::{
+            MemoryBuildId, MemoryEntity, MemoryRelationship, MemoryRevisionId, MemoryViewName,
+        },
+    },
+    repository_graph::domain::{
+        BuildId, Digest, GraphDiagnostic, GraphEdge, GraphNode, PublishedViewName, SnapshotId,
+    },
+};
+
+use super::{
+    DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_FACT_PROTOCOL_VERSION,
+    DISTRIBUTED_QUERY_PROTOCOL_VERSION,
+    identity::{
+        FactBatchId, FactShardId, FederatedViewRef, IndexJobId, MemoryManifestRef,
+        RemoteGraphSnapshotRef, RemoteMemoryRevisionRef, RemoteProjectRef, RemoteRepositoryRef,
+        RepositoryManifestRef, RequestId, WorkerId,
+    },
+};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DistributedProtocolError {
+    #[error("unsupported distributed protocol version")]
+    UnsupportedVersion,
+    #[error("index job kind does not match its immutable input")]
+    JobInputMismatch,
+    #[error("index job idempotency key does not match its semantic inputs")]
+    IdempotencyMismatch,
+    #[error("index job state transition is invalid")]
+    InvalidJobTransition,
+    #[error("fact batch kind, target, or fact identity is inconsistent")]
+    FactBatchMismatch,
+    #[error("fact batch content digest or deterministic identity is invalid")]
+    FactBatchIdentityMismatch,
+    #[error("publication request scope, job kind, or expected version is inconsistent")]
+    PublicationMismatch,
+    #[error("query target does not belong to the request project")]
+    QueryScopeMismatch,
+    #[error("distributed contract serialization failed")]
+    Serialization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexJobKind {
+    RepositoryGraph,
+    ProjectMemory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum IndexInputRef {
+    Repository(RepositoryManifestRef),
+    Memory(MemoryManifestRef),
+}
+
+impl IndexInputRef {
+    pub fn project(&self) -> &RemoteProjectRef {
+        match self {
+            Self::Repository(manifest) => &manifest.repository.project,
+            Self::Memory(manifest) => &manifest.project,
+        }
+    }
+
+    pub fn kind(&self) -> IndexJobKind {
+        match self {
+            Self::Repository(_) => IndexJobKind::RepositoryGraph,
+            Self::Memory(_) => IndexJobKind::ProjectMemory,
+        }
+    }
+
+    fn manifest_digest(&self) -> &Digest {
+        match self {
+            Self::Repository(manifest) => &manifest.manifest_digest,
+            Self::Memory(manifest) => &manifest.manifest_digest,
+        }
+    }
+
+    fn policy_digest(&self) -> &Digest {
+        match self {
+            Self::Repository(manifest) => &manifest.source_policy_digest,
+            Self::Memory(manifest) => &manifest.memory_policy_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexSemantics {
+    pub semantic_config_digest: Digest,
+    pub model_version: NonZeroU32,
+    pub extractor_set_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexJobSpec {
+    pub protocol_version: u32,
+    pub kind: IndexJobKind,
+    pub input: IndexInputRef,
+    pub semantics: IndexSemantics,
+    pub idempotency_key: Digest,
+}
+
+#[derive(Serialize)]
+struct IdempotencyMaterial<'a> {
+    protocol_version: u32,
+    project: &'a RemoteProjectRef,
+    kind: IndexJobKind,
+    manifest_digest: &'a Digest,
+    policy_digest: &'a Digest,
+    semantics: &'a IndexSemantics,
+}
+
+impl IndexJobSpec {
+    pub fn new(
+        kind: IndexJobKind,
+        input: IndexInputRef,
+        semantics: IndexSemantics,
+    ) -> Result<Self, DistributedProtocolError> {
+        if kind != input.kind() {
+            return Err(DistributedProtocolError::JobInputMismatch);
+        }
+        let idempotency_key = idempotency_key(kind, &input, &semantics)?;
+        Ok(Self {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            kind,
+            input,
+            semantics,
+            idempotency_key,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)?;
+        if self.kind != self.input.kind() {
+            return Err(DistributedProtocolError::JobInputMismatch);
+        }
+        if self.idempotency_key != idempotency_key(self.kind, &self.input, &self.semantics)? {
+            return Err(DistributedProtocolError::IdempotencyMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn project(&self) -> &RemoteProjectRef {
+        self.input.project()
+    }
+}
+
+fn idempotency_key(
+    kind: IndexJobKind,
+    input: &IndexInputRef,
+    semantics: &IndexSemantics,
+) -> Result<Digest, DistributedProtocolError> {
+    hash(
+        b"ferrus.distributed.index-job.v1\0",
+        &IdempotencyMaterial {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            project: input.project(),
+            kind,
+            manifest_digest: input.manifest_digest(),
+            policy_digest: input.policy_digest(),
+            semantics,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexJobState {
+    Queued,
+    Leased,
+    Running,
+    Publishing,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl IndexJobState {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Queued, Self::Leased | Self::Cancelled | Self::Failed)
+                | (
+                    Self::Leased,
+                    Self::Running | Self::Queued | Self::Cancelled | Self::Failed
+                )
+                | (
+                    Self::Running,
+                    Self::Publishing | Self::Queued | Self::Cancelled | Self::Failed
+                )
+                | (
+                    Self::Publishing,
+                    Self::Complete | Self::Cancelled | Self::Failed
+                )
+        )
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexJobRef {
+    pub project: RemoteProjectRef,
+    pub job_id: IndexJobId,
+    pub kind: IndexJobKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLease {
+    pub worker_id: WorkerId,
+    pub generation: NonZeroU64,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexJobRecord {
+    pub job: IndexJobRef,
+    pub spec: IndexJobSpec,
+    pub state: IndexJobState,
+    pub attempt: NonZeroU32,
+    pub max_attempts: NonZeroU32,
+    pub lease: Option<JobLease>,
+    pub cancellation_requested: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl IndexJobRecord {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        self.spec.validate()?;
+        if self.job.project != *self.spec.project()
+            || self.job.kind != self.spec.kind
+            || self.attempt > self.max_attempts
+            || (matches!(
+                self.state,
+                IndexJobState::Leased | IndexJobState::Running | IndexJobState::Publishing
+            ) != self.lease.is_some())
+            || (self.cancellation_requested && self.state == IndexJobState::Complete)
+        {
+            return Err(DistributedProtocolError::JobInputMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitIndexJobRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub project: RemoteProjectRef,
+    pub job: IndexJobSpec,
+}
+
+impl SubmitIndexJobRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)?;
+        self.job.validate()?;
+        if self.project != *self.job.project() {
+            return Err(DistributedProtocolError::JobInputMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectIndexJobRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub job: IndexJobRef,
+}
+
+impl InspectIndexJobRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelIndexJobRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub job: IndexJobRef,
+    pub expected_state: Option<IndexJobState>,
+}
+
+impl CancelIndexJobRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatJobRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub job: IndexJobRef,
+    pub worker_id: WorkerId,
+    pub lease_generation: NonZeroU64,
+}
+
+impl HeartbeatJobRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FactTarget {
+    RepositoryGraph {
+        snapshot: RemoteGraphSnapshotRef,
+        build_id: BuildId,
+    },
+    ProjectMemory {
+        revision: RemoteMemoryRevisionRef,
+        build_id: MemoryBuildId,
+    },
+}
+
+impl FactTarget {
+    pub fn project(&self) -> &RemoteProjectRef {
+        match self {
+            Self::RepositoryGraph { snapshot, .. } => &snapshot.repository.project,
+            Self::ProjectMemory { revision, .. } => &revision.project,
+        }
+    }
+
+    pub fn kind(&self) -> IndexJobKind {
+        match self {
+            Self::RepositoryGraph { .. } => IndexJobKind::RepositoryGraph,
+            Self::ProjectMemory { .. } => IndexJobKind::ProjectMemory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FactBatchPayload {
+    RepositoryGraph {
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
+        diagnostics: Vec<GraphDiagnostic>,
+    },
+    ProjectMemory {
+        entities: Vec<MemoryEntity>,
+        relationships: Vec<MemoryRelationship>,
+        diagnostics: Vec<MemoryDiagnostic>,
+    },
+}
+
+impl FactBatchPayload {
+    fn kind(&self) -> IndexJobKind {
+        match self {
+            Self::RepositoryGraph { .. } => IndexJobKind::RepositoryGraph,
+            Self::ProjectMemory { .. } => IndexJobKind::ProjectMemory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactBatchHeader {
+    pub protocol_version: u32,
+    pub job: IndexJobRef,
+    pub target: FactTarget,
+    pub batch_id: FactBatchId,
+    pub shard_id: FactShardId,
+    pub sequence: u32,
+    pub payload_digest: Digest,
+    pub extractor_set_digest: Digest,
+    pub final_batch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactBatch {
+    pub header: FactBatchHeader,
+    pub payload: FactBatchPayload,
+}
+
+#[derive(Serialize)]
+struct FactBatchIdentityMaterial<'a> {
+    job: &'a IndexJobRef,
+    target: &'a FactTarget,
+    shard_id: &'a FactShardId,
+    sequence: u32,
+    payload_digest: &'a Digest,
+    extractor_set_digest: &'a Digest,
+}
+
+impl FactBatch {
+    pub fn new(
+        job: IndexJobRef,
+        target: FactTarget,
+        shard_id: FactShardId,
+        sequence: u32,
+        extractor_set_digest: Digest,
+        final_batch: bool,
+        payload: FactBatchPayload,
+    ) -> Result<Self, DistributedProtocolError> {
+        let payload_digest = hash(b"ferrus.distributed.fact-payload.v1\0", &payload)?;
+        let batch_id = fact_batch_id(
+            &job,
+            &target,
+            &shard_id,
+            sequence,
+            &payload_digest,
+            &extractor_set_digest,
+        )?;
+        let batch = Self {
+            header: FactBatchHeader {
+                protocol_version: DISTRIBUTED_FACT_PROTOCOL_VERSION,
+                job,
+                target,
+                batch_id,
+                shard_id,
+                sequence,
+                payload_digest,
+                extractor_set_digest,
+                final_batch,
+            },
+            payload,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        if self.header.protocol_version != DISTRIBUTED_FACT_PROTOCOL_VERSION {
+            return Err(DistributedProtocolError::UnsupportedVersion);
+        }
+        if self.header.job.kind != self.header.target.kind()
+            || self.header.job.kind != self.payload.kind()
+            || self.header.job.project != *self.header.target.project()
+        {
+            return Err(DistributedProtocolError::FactBatchMismatch);
+        }
+        validate_fact_targets(&self.header.target, &self.payload)?;
+        let payload_digest = hash(b"ferrus.distributed.fact-payload.v1\0", &self.payload)?;
+        let batch_id = fact_batch_id(
+            &self.header.job,
+            &self.header.target,
+            &self.header.shard_id,
+            self.header.sequence,
+            &payload_digest,
+            &self.header.extractor_set_digest,
+        )?;
+        if payload_digest != self.header.payload_digest || batch_id != self.header.batch_id {
+            return Err(DistributedProtocolError::FactBatchIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn validate_fact_targets(
+    target: &FactTarget,
+    payload: &FactBatchPayload,
+) -> Result<(), DistributedProtocolError> {
+    let valid = match (target, payload) {
+        (
+            FactTarget::RepositoryGraph { snapshot, build_id },
+            FactBatchPayload::RepositoryGraph {
+                nodes,
+                edges,
+                diagnostics,
+            },
+        ) => {
+            nodes
+                .iter()
+                .all(|node| node.snapshot_id == snapshot.snapshot_id)
+                && edges
+                    .iter()
+                    .all(|edge| edge.snapshot_id == snapshot.snapshot_id)
+                && diagnostics.iter().all(|diagnostic| {
+                    diagnostic.build_id == *build_id
+                        && diagnostic
+                            .snapshot_id
+                            .as_ref()
+                            .is_none_or(|id| id == &snapshot.snapshot_id)
+                })
+        }
+        (
+            FactTarget::ProjectMemory { revision, build_id },
+            FactBatchPayload::ProjectMemory {
+                entities,
+                relationships,
+                diagnostics,
+            },
+        ) => {
+            entities
+                .iter()
+                .all(|entity| entity.memory_revision_id == revision.revision_id)
+                && relationships
+                    .iter()
+                    .all(|relationship| relationship.memory_revision_id == revision.revision_id)
+                && diagnostics.iter().all(|diagnostic| {
+                    diagnostic.build_id == *build_id
+                        && diagnostic.revision_id == revision.revision_id
+                })
+        }
+        _ => false,
+    };
+    valid
+        .then_some(())
+        .ok_or(DistributedProtocolError::FactBatchMismatch)
+}
+
+fn fact_batch_id(
+    job: &IndexJobRef,
+    target: &FactTarget,
+    shard_id: &FactShardId,
+    sequence: u32,
+    payload_digest: &Digest,
+    extractor_set_digest: &Digest,
+) -> Result<FactBatchId, DistributedProtocolError> {
+    let digest = hash(
+        b"ferrus.distributed.fact-batch.v1\0",
+        &FactBatchIdentityMaterial {
+            job,
+            target,
+            shard_id,
+            sequence,
+            payload_digest,
+            extractor_set_digest,
+        },
+    )?;
+    FactBatchId::new(digest.value()).map_err(|_| DistributedProtocolError::Serialization)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphPublicationVersion {
+    pub snapshot_id: SnapshotId,
+    pub generation: NonZeroU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishGraphRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub job: IndexJobRef,
+    pub repository: RemoteRepositoryRef,
+    pub view_name: PublishedViewName,
+    pub snapshot_id: SnapshotId,
+    pub expected: Option<GraphPublicationVersion>,
+}
+
+impl PublishGraphRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)?;
+        if self.job.kind != IndexJobKind::RepositoryGraph
+            || self.job.project != self.repository.project
+        {
+            return Err(DistributedProtocolError::PublicationMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPublicationVersion {
+    pub revision_id: MemoryRevisionId,
+    pub generation: NonZeroU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishMemoryRequest {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub job: IndexJobRef,
+    pub project: RemoteProjectRef,
+    pub view_name: MemoryViewName,
+    pub revision_id: MemoryRevisionId,
+    pub expected: Option<MemoryPublicationVersion>,
+}
+
+impl PublishMemoryRequest {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        validate_control_version(self.protocol_version)?;
+        if self.job.kind != IndexJobKind::ProjectMemory || self.job.project != self.project {
+            return Err(DistributedProtocolError::PublicationMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum RemoteQueryTarget {
+    Repository(RemoteGraphSnapshotRef),
+    Memory(RemoteMemoryRevisionRef),
+    Federated(FederatedViewRef),
+}
+
+impl RemoteQueryTarget {
+    pub fn project(&self) -> &RemoteProjectRef {
+        match self {
+            Self::Repository(snapshot) => &snapshot.repository.project,
+            Self::Memory(revision) => &revision.project,
+            Self::Federated(view) => view.project(),
+        }
+    }
+}
+
+/// Remote query envelope. `body` is one existing bounded graph, memory, or
+/// federation request DTO, selected by the adapter for `target`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteQueryRequest<T> {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub project: RemoteProjectRef,
+    pub target: RemoteQueryTarget,
+    pub body: T,
+}
+
+impl<T> RemoteQueryRequest<T> {
+    pub fn validate(&self) -> Result<(), DistributedProtocolError> {
+        if self.protocol_version != DISTRIBUTED_QUERY_PROTOCOL_VERSION {
+            return Err(DistributedProtocolError::UnsupportedVersion);
+        }
+        if self.project != *self.target.project() {
+            return Err(DistributedProtocolError::QueryScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteQueryResponse<T> {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub project: RemoteProjectRef,
+    pub resolved_target: RemoteQueryTarget,
+    pub body: T,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteErrorCode {
+    Unauthorized,
+    NotFound,
+    UnsupportedVersion,
+    InvalidRequest,
+    Conflict,
+    Cancelled,
+    AttemptLimit,
+    BudgetExceeded,
+    TemporarilyUnavailable,
+    Internal,
+}
+
+/// Privacy-safe wire error. It has no free-form message or backend detail field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteError {
+    pub protocol_version: u32,
+    pub request_id: RequestId,
+    pub code: RemoteErrorCode,
+    pub retryable: bool,
+}
+
+fn validate_control_version(version: u32) -> Result<(), DistributedProtocolError> {
+    (version == DISTRIBUTED_CONTROL_PROTOCOL_VERSION)
+        .then_some(())
+        .ok_or(DistributedProtocolError::UnsupportedVersion)
+}
+
+fn hash<T: Serialize>(domain: &[u8], value: &T) -> Result<Digest, DistributedProtocolError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| DistributedProtocolError::Serialization)?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(encoded);
+    let value = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Digest::new("sha256", value).map_err(|_| DistributedProtocolError::Serialization)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributed::identity::{
+        MemoryManifestId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId, TenantId,
+    };
+
+    fn digest(value: &str) -> Digest {
+        Digest::new("sha256", value).unwrap()
+    }
+
+    fn project(tenant: &str) -> RemoteProjectRef {
+        RemoteProjectRef {
+            tenant_id: TenantId::new(tenant).unwrap(),
+            project_id: RemoteProjectId::new("project").unwrap(),
+        }
+    }
+
+    fn repository_input(tenant: &str) -> IndexInputRef {
+        IndexInputRef::Repository(RepositoryManifestRef {
+            repository: repository(tenant),
+            manifest_id: RepositoryManifestId::new("manifest").unwrap(),
+            manifest_digest: digest("11"),
+            source_policy_digest: digest("22"),
+        })
+    }
+
+    fn repository(tenant: &str) -> RemoteRepositoryRef {
+        RemoteRepositoryRef {
+            project: project(tenant),
+            repository_id: RemoteRepositoryId::new("repo").unwrap(),
+        }
+    }
+
+    fn graph_job(tenant: &str) -> IndexJobRef {
+        IndexJobRef {
+            project: project(tenant),
+            job_id: IndexJobId::new("job").unwrap(),
+            kind: IndexJobKind::RepositoryGraph,
+        }
+    }
+
+    fn graph_target(tenant: &str) -> FactTarget {
+        FactTarget::RepositoryGraph {
+            snapshot: RemoteGraphSnapshotRef {
+                repository: repository(tenant),
+                snapshot_id: SnapshotId::new("snapshot").unwrap(),
+            },
+            build_id: BuildId::new("build").unwrap(),
+        }
+    }
+
+    fn memory_input(tenant: &str) -> IndexInputRef {
+        IndexInputRef::Memory(MemoryManifestRef {
+            project: project(tenant),
+            manifest_id: MemoryManifestId::new("manifest").unwrap(),
+            manifest_digest: digest("11"),
+            memory_policy_digest: digest("22"),
+        })
+    }
+
+    fn semantics() -> IndexSemantics {
+        IndexSemantics {
+            semantic_config_digest: digest("33"),
+            model_version: NonZeroU32::new(1).unwrap(),
+            extractor_set_digest: digest("44"),
+        }
+    }
+
+    #[test]
+    fn idempotency_is_deterministic_kind_specific_and_tenant_scoped() {
+        let first = IndexJobSpec::new(
+            IndexJobKind::RepositoryGraph,
+            repository_input("tenant-a"),
+            semantics(),
+        )
+        .unwrap();
+        let repeated = IndexJobSpec::new(
+            IndexJobKind::RepositoryGraph,
+            repository_input("tenant-a"),
+            semantics(),
+        )
+        .unwrap();
+        let foreign = IndexJobSpec::new(
+            IndexJobKind::RepositoryGraph,
+            repository_input("tenant-b"),
+            semantics(),
+        )
+        .unwrap();
+        let memory = IndexJobSpec::new(
+            IndexJobKind::ProjectMemory,
+            memory_input("tenant-a"),
+            semantics(),
+        )
+        .unwrap();
+        assert_eq!(first.idempotency_key, repeated.idempotency_key);
+        assert_ne!(first.idempotency_key, foreign.idempotency_key);
+        assert_ne!(first.idempotency_key, memory.idempotency_key);
+        assert!(first.validate().is_ok());
+    }
+
+    #[test]
+    fn mismatched_job_kinds_and_modified_keys_fail_closed() {
+        assert_eq!(
+            IndexJobSpec::new(
+                IndexJobKind::ProjectMemory,
+                repository_input("tenant-a"),
+                semantics(),
+            ),
+            Err(DistributedProtocolError::JobInputMismatch)
+        );
+        let mut spec = IndexJobSpec::new(
+            IndexJobKind::RepositoryGraph,
+            repository_input("tenant-a"),
+            semantics(),
+        )
+        .unwrap();
+        spec.idempotency_key = digest("00");
+        assert_eq!(
+            spec.validate(),
+            Err(DistributedProtocolError::IdempotencyMismatch)
+        );
+    }
+
+    #[test]
+    fn job_state_machine_is_reclaimable_but_terminal_states_are_final() {
+        assert!(IndexJobState::Queued.can_transition_to(IndexJobState::Leased));
+        assert!(IndexJobState::Running.can_transition_to(IndexJobState::Queued));
+        assert!(IndexJobState::Publishing.can_transition_to(IndexJobState::Complete));
+        assert!(IndexJobState::Publishing.can_transition_to(IndexJobState::Cancelled));
+        assert!(!IndexJobState::Complete.can_transition_to(IndexJobState::Queued));
+        assert!(IndexJobState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn fact_batches_are_idempotent_and_detect_tampering() {
+        let payload = FactBatchPayload::RepositoryGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let first = FactBatch::new(
+            graph_job("tenant-a"),
+            graph_target("tenant-a"),
+            FactShardId::new("shard").unwrap(),
+            0,
+            digest("44"),
+            true,
+            payload.clone(),
+        )
+        .unwrap();
+        let repeated = FactBatch::new(
+            graph_job("tenant-a"),
+            graph_target("tenant-a"),
+            FactShardId::new("shard").unwrap(),
+            0,
+            digest("44"),
+            true,
+            payload,
+        )
+        .unwrap();
+        assert_eq!(first.header.batch_id, repeated.header.batch_id);
+        let mut tampered = first;
+        tampered.header.payload_digest = digest("00");
+        assert_eq!(
+            tampered.validate(),
+            Err(DistributedProtocolError::FactBatchIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn graph_and_memory_publication_contracts_cannot_cross_domains() {
+        let valid = PublishGraphRequest {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            request_id: RequestId::new("publish").unwrap(),
+            job: graph_job("tenant-a"),
+            repository: repository("tenant-a"),
+            view_name: PublishedViewName::new("canonical").unwrap(),
+            snapshot_id: SnapshotId::new("snapshot").unwrap(),
+            expected: None,
+        };
+        assert!(valid.validate().is_ok());
+        let mut foreign = valid.clone();
+        foreign.repository = repository("tenant-b");
+        assert_eq!(
+            foreign.validate(),
+            Err(DistributedProtocolError::PublicationMismatch)
+        );
+
+        let memory = PublishMemoryRequest {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            request_id: RequestId::new("publish-memory").unwrap(),
+            job: graph_job("tenant-a"),
+            project: project("tenant-a"),
+            view_name: MemoryViewName::new("canonical").unwrap(),
+            revision_id: MemoryRevisionId::new("revision").unwrap(),
+            expected: None,
+        };
+        assert_eq!(
+            memory.validate(),
+            Err(DistributedProtocolError::PublicationMismatch)
+        );
+    }
+
+    #[test]
+    fn query_envelopes_reject_scope_and_version_mismatches() {
+        let repository = RemoteRepositoryRef {
+            project: project("tenant-a"),
+            repository_id: RemoteRepositoryId::new("repo").unwrap(),
+        };
+        let mut request = RemoteQueryRequest {
+            protocol_version: DISTRIBUTED_QUERY_PROTOCOL_VERSION,
+            request_id: RequestId::new("request").unwrap(),
+            project: project("tenant-b"),
+            target: RemoteQueryTarget::Repository(RemoteGraphSnapshotRef {
+                repository,
+                snapshot_id: SnapshotId::new("snapshot").unwrap(),
+            }),
+            body: (),
+        };
+        assert_eq!(
+            request.validate(),
+            Err(DistributedProtocolError::QueryScopeMismatch)
+        );
+        request.project = project("tenant-a");
+        request.protocol_version += 1;
+        assert_eq!(
+            request.validate(),
+            Err(DistributedProtocolError::UnsupportedVersion)
+        );
+    }
+}

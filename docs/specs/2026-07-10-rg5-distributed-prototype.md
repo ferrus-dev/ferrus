@@ -131,13 +131,17 @@ deletable.
 
 ## Milestones
 
-- [ ] #5.0 Define distributed identities, protocols, consistency, tenancy, and threat model
+- [x] #5.0 Define distributed identities, protocols, consistency, tenancy, and threat model
 
 ID: rg5.0
 Depends on: none
 
 Specify versioned control/query/fact contracts, tenant and repository identity, idempotency, job state machine,
 publication consistency, authorization matrix, data classification, retention, deletion, and worker threat model.
+
+Implemented by the vendor-neutral contracts under `src/distributed/` and the normative consistency, tenancy,
+data-lifecycle, and threat-model decisions in `docs/distributed-indexing-architecture.md`. This milestone adds no
+remote backend, network dependency, cloud SDK, or change to the local SQLite execution path.
 
 - [ ] #5.1 Implement privacy-filtered repository and memory packaging and source storage
 

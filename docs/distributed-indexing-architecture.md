@@ -1,0 +1,251 @@
+# Distributed Context Data Plane Contracts
+
+This document is the normative RG5.0 contract for the optional distributed repository graph
+and project memory prototype. It defines identities, protocols, consistency, tenant isolation,
+data lifecycle, and the worker threat model. It does not select a cloud vendor or implement a
+remote backend.
+
+## Local-first boundary
+
+Local Ferrus remains the default. Repository graph and project memory continue to use their
+local adapters when remote indexing is absent or disabled. Loading Ferrus configuration,
+starting HQ, running tasks, and querying local sidecars must not initialize a network client,
+cloud SDK, queue, or remote credential provider.
+
+The `distributed` module contains vendor-neutral wire and policy contracts only. Existing
+repository graph and project memory domain DTOs remain independent of it. Future remote
+adapters may translate between the two layers, but local stores and runtimes must not depend
+on distributed types.
+
+Remote indexing is opt-in. Missing endpoint, tenant, project, repository, or authorized
+credential is an error. A local or remote failure must never trigger an implicit upload,
+backend switch, or mutation of Ferrus orchestration state.
+
+## Identity hierarchy
+
+Cloud identity is deliberately distinct from machine-local Ferrus identity:
+
+```text
+tenant
+  -> project
+       -> repository
+            -> repository manifest
+            -> graph snapshot
+       -> memory manifest
+       -> memory revision
+       -> index job
+```
+
+Every remote object, request, job, fact batch, publication, cache entry, and audit event is
+authorized through explicit tenant and project scope. Repository-scoped values include the
+repository as well. A digest identifies content; it does not grant access and never erases
+scope. Identical content in two tenants remains two separately authorized, retained, and
+deletable objects. Cross-tenant deduplication is forbidden.
+
+`RemoteProjectRef`, `RemoteRepositoryRef`, `RemoteGraphSnapshotRef`, and
+`RemoteMemoryRevisionRef` wrap the shipped semantic snapshot and revision identities with
+cloud scope. `FederatedViewRef` pairs one immutable graph snapshot with one immutable memory
+revision from the same tenant and project. It is a query selection value, not a third mutable
+publication pointer.
+
+Remote IDs are canonical bounded lowercase ASCII tokens. All content identities use the
+existing validated digest contract. Unknown fields, invalid IDs, unsupported versions, and
+scope mismatches fail closed at deserialization or validation boundaries.
+
+## Protocol versions
+
+Control, fact, query, and policy contracts have independent versions. A service must reject
+an unsupported version explicitly. It must not reinterpret an older payload under newer
+extractor, model, policy, or publication semantics.
+
+The protocol groups are:
+
+| Group | Purpose |
+| --- | --- |
+| Control | Submit, inspect, lease, heartbeat, cancel, publish, and delete |
+| Fact | Idempotent worker output for one immutable job target |
+| Query | Snapshot-, revision-, or federated-view-pinned bounded retrieval |
+| Policy | Authorization, protection, retention, deletion, and worker isolation |
+
+Wire errors contain a bounded code and retryable flag. They have no source, query, path,
+credential, backend message, stack trace, or free-form detail channel.
+
+## Immutable input and idempotency
+
+Repository graph and project memory are separate job kinds with separate manifest contracts.
+Repository jobs accept only a repository manifest. Memory jobs accept only a memory manifest.
+A mismatched kind and input is invalid.
+
+The logical index-job idempotency key includes:
+
+- protocol version;
+- tenant and project, plus repository through the repository manifest;
+- graph or memory job kind;
+- immutable manifest digest;
+- source or memory policy digest;
+- effective semantic configuration digest;
+- model version;
+- extractor-set digest.
+
+Request IDs trace attempts but do not affect logical build identity. Repeated submission of
+the same semantic inputs must return or resume the same logical job and converge on the same
+immutable result. A change to scope, kind, policy, semantics, model, extractors, or manifest
+creates a different key.
+
+## Job consistency
+
+Index jobs use at-least-once execution. Exactly-once worker execution is not assumed.
+
+```text
+queued -> leased -> running -> publishing -> complete
+   |         |         |             |
+   +---------+---------+-------------+-> failed
+   +---------+---------+-------------+-> cancelled
+             |         |
+             +---------+-> queued after expiry or retry
+```
+
+Terminal states are `complete`, `failed`, and `cancelled`. A claim creates a lease generation.
+Only its worker may heartbeat or advance the job while the lease is valid. Active leases are
+renewed through publication. Expiry makes non-terminal work reclaimable. Attempts, lease
+duration, total duration, retries, and resource use are server bounded.
+
+Cancellation and publication are serialized by the coordinator. Once cancellation is
+accepted, no worker fact or publication transaction may make the job visible. A stale worker
+or lease generation cannot publish. A duplicate queue delivery may repeat computation, but
+it cannot create duplicate visible facts or publications.
+
+## Fact batches
+
+Workers emit immutable versioned batches for exactly one graph snapshot/build or memory
+revision/build. Each header carries job, target, shard, sequence, extractor-set digest,
+payload digest, and final-batch marker. The deterministic batch ID covers those values.
+
+Graph payload nodes, edges, and diagnostics must name the target graph snapshot and build.
+Memory entities, relationships, and diagnostics must name the target memory revision and
+build. Cross-kind, cross-project, and mixed-target batches are rejected. Replaying an
+identical batch is a no-op; changing its payload without changing its identity is invalid.
+
+Partial batches may be durable for retry. Ordinary queries cannot observe them. Storage
+promotes only a validated complete job into an immutable queryable snapshot or revision.
+
+## Publication and query consistency
+
+Graph and memory have independent compare-and-set publication pointers and generations.
+Publishing graph state cannot advance memory, and publishing memory cannot advance graph.
+The publication transaction verifies job kind, scope, completion, cancellation state, lease
+generation, expected pointer, and complete fact set before changing one pointer. A slower old
+job loses to a newer publication instead of replacing it.
+
+Repository-only queries pin one graph snapshot. Memory-only queries pin one memory revision.
+Federated queries pin one validated `FederatedViewRef`. If a request asks for `latest`, the
+service resolves each requested pointer exactly once at request start, uses the immutable
+resolved values for the entire operation, and returns them in the response. Task and run
+contexts always carry explicit immutable identities and never follow `latest` after dispatch.
+
+Server-side result, byte, depth, duration, cursor, snippet, and diagnostic limits clamp all
+client budgets. Remote adapters preserve existing local freshness, provenance, truncation,
+and missing-relationship semantics. A missing relationship remains unknown, not absent.
+
+## Authorization matrix
+
+Authentication resolves a server-owned `AuthorizationContext`. A request body cannot choose
+its credential class or permissions. The service authorizes the operation and scope before
+looking up an object, job, project, snapshot, cache entry, or search record. Unauthorized and
+foreign-scope probes return the same bounded denial without disclosing existence.
+
+| Credential class | Allowed capability set |
+| --- | --- |
+| Query agent | Graph query, memory query, verified content |
+| Snapshot uploader | Source upload only |
+| Index worker | Claim job, read scoped source objects, write fact batches |
+| Coordinator | Inspect/cancel jobs and publish graph or memory |
+| Project operator | Upload, submit, inspect/cancel, query, verified content |
+| Tenant administrator | Explicit full administrative matrix, including project/repository deletion and administrative diagnostics |
+
+Credentials are scoped to tenant, project, or repository. Narrow scopes cannot be widened by
+an object ID or digest. Query-agent credentials cannot upload, submit, inspect administrative
+diagnostics, publish, change policy, or delete data. Worker credentials cannot query arbitrary
+tenant data or publish a pointer.
+
+## Data classification and protection
+
+| Data class | Sensitivity | Required handling |
+| --- | --- | --- |
+| Repository source | Confidential | Policy filter before upload, tenant-scoped object, encrypted transport and storage |
+| Curated memory source | Confidential | Phase 4 allowlist before upload, separate manifest and object scope |
+| Derived facts | Confidential | Tenant/project rows and indexes, invisible before publication |
+| Query input and verified snippets | Confidential | Bounded, authorized, excluded from default telemetry |
+| Reusable credentials | Sensitive | Secret store only, never DTOs, logs, facts, or audits |
+| Operational and audit metadata | Operational | Bounded IDs, codes, counters, and timestamps only |
+
+Authenticated encryption in transit is mandatory. Remote storage must encrypt data at rest.
+If the prototype backend cannot meet at-rest encryption, it must fail closed by default and
+declare the limitation explicitly in deployment configuration and documentation. Tenant
+scope applies to primary rows, object keys, queues, search indexes, caches, logs, metrics,
+traces, and errors, not only to API routes.
+
+## Retention and deletion
+
+Retention is defined independently for uploaded source, unpublished facts, published graph
+snapshots, published memory revisions, query caches, and audit records. Each class has an
+explicit maximum age or is retained until deletion. Published pins required by active work
+must be protected from age-based collection.
+
+Project or repository deletion is an authenticated, idempotent job keyed by its exact scope
+and requested coverage. It removes every covered source and derived class, including
+secondary indexes and caches, without deleting another tenant's identical content. Progress
+and failures use bounded audit metadata. A retry resumes the same logical deletion.
+Completion means all live stores in the declared coverage are removed.
+
+Backup expiry, immutable audit retention, legal holds, and provider deletion guarantees are
+deployment policy. If they prevent immediate physical deletion, the service must document
+the remaining class and deadline rather than reporting stronger deletion than it provides.
+
+## Worker threat model
+
+Repository and memory content are untrusted input. A malicious repository may contain parser
+bombs, oversized files, adversarial encodings, symlinks, crafted manifests, misleading paths,
+or content intended to trigger a package hook or network call.
+
+Workers therefore:
+
+- consume only authenticated versioned manifests and tenant-scoped read-only objects;
+- use an ephemeral workspace and retain no durable progress locally;
+- never execute repository code, compilers, build scripts, proc macros, package hooks, or tests;
+- allow egress only to allowlisted control and object-storage endpoints;
+- enforce snapshot, file, memory, parser-time, job-time, concurrency, fact, and diagnostic caps;
+- emit facts only through the validated batch contract;
+- receive no query-agent, publication, deletion, or tenant-administration authority;
+- erase workspaces and short-lived credentials after an attempt.
+
+The first prototype should prefer OS or container isolation with CPU, memory, filesystem, and
+network controls. Ordinary in-process limits are not sufficient protection for a hostile
+multi-tenant source corpus.
+
+## Threats and required mitigations
+
+| Threat | Required mitigation |
+| --- | --- |
+| Tenant object enumeration | Authorization before lookup; uniform bounded denial |
+| Cross-tenant digest collision or reuse | Scope all references and storage keys; no cross-tenant deduplication |
+| Duplicate queue delivery | Semantic job key and deterministic idempotent fact batches |
+| Worker loss or stale worker | Renewable generation lease, bounded attempts, reclaim, publication guard |
+| Cancellation race | Coordinator transaction prevents facts or publication after accepted cancellation |
+| Old build replaces new | Independent generation-based CAS pointer per domain |
+| Partial result disclosure | Unpublished namespace; query only immutable published targets |
+| Parser or resource exhaustion | Worker sandbox and hard input, time, memory, output, and concurrency caps |
+| Repository code execution | No build/package hooks; repository execution denied |
+| SSRF or data exfiltration | Allowlisted egress and no unrestricted network |
+| Credential theft through telemetry | Short-lived scoped credentials; no reusable credential fields or logs |
+| Source, memory, path, or query leakage | Typed errors and audits; no free-form payload or local absolute paths |
+| Deletion misses secondary data | Coverage by retention class, idempotent traversal, auditable completion |
+| Protocol semantic drift | Independent explicit versions and fail-closed compatibility checks |
+
+## Prototype limits
+
+RG5.0 defines contracts, not a production service. It does not choose the queue, object store,
+relational store, search index, graph database, cloud vendor, deployment model, SLO, region,
+or billing model. Remote task overlays, dirty worktrees, arbitrary filesystem streaming, and
+cross-repository federation remain out of scope. Later RG5 milestones must implement these
+contracts behind optional adapters and prove them with shared local/remote behavior tests.

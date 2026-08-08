@@ -77,6 +77,7 @@ src/
   cli/                        # clap entry and command implementations
   config/mod.rs               # ferrus.toml deserialization and updates
   config/claude.rs            # Claude MCP isolation config helpers
+  distributed/                # vendor-neutral remote identity, protocol, and security contracts
   project_memory/             # project-memory contracts and local ingestion backend
   repository_graph/           # backend-neutral graph contracts and local backend
   repository_graph_runtime.rs # project-local graph CLI/MCP adapter
@@ -102,6 +103,13 @@ src/
 **Runtime state**: SQLite is the runtime source of truth. MCP tools resolve the caller's
 `RuntimeTaskContext` from `ferrus.db`, update task and run rows transactionally, and write only
 scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`.
+
+**Distributed data-plane boundary**: `src/distributed/` defines optional vendor-neutral remote
+identity, protocol, consistency, authorization, retention, deletion, and worker-isolation
+contracts. Local graph, memory, HQ, task, and run paths must not depend on these types or initialize
+network or cloud clients. Every remote adapter operation is opt-in, explicitly tenant/project
+scoped, authorized before lookup, version checked, and snapshot or revision pinned. Graph and
+memory jobs and compare-and-set publication pointers remain independent.
 
 **Repository graph boundary**: the optional repository graph is derived machine-local state
 in `repo-graph.db`, separate from orchestration state in `ferrus.db`. Keep backend-neutral
