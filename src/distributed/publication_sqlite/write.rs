@@ -1,0 +1,767 @@
+use super::*;
+
+pub(super) fn prepare_graph(
+    request: &PublishGraphRequest,
+    batches: &[FactBatch],
+    now: DateTime<Utc>,
+    max_facts: NonZeroU64,
+) -> Result<PreparedGraph, RemoteStoreError> {
+    validate_batch_stream(&request.job, batches)?;
+    let mut nodes = BTreeMap::<NodeId, GraphNode>::new();
+    let mut edges = BTreeMap::<EdgeId, GraphEdge>::new();
+    let mut diagnostics = BTreeMap::<String, GraphDiagnostic>::new();
+    let mut target = None;
+    let mut extractor_set_digest = None;
+    for batch in batches {
+        let FactTarget::RepositoryGraph { snapshot, build_id } = &batch.header.target else {
+            return Err(RemoteStoreError::InvalidInput);
+        };
+        if snapshot.repository != request.repository || snapshot.snapshot_id != request.snapshot_id
+        {
+            return Err(RemoteStoreError::InvalidInput);
+        }
+        match &target {
+            None => target = Some((snapshot.clone(), build_id.clone())),
+            Some((existing_snapshot, existing_build))
+                if existing_snapshot == snapshot && existing_build == build_id => {}
+            Some(_) => return Err(RemoteStoreError::InvalidInput),
+        }
+        match &extractor_set_digest {
+            None => extractor_set_digest = Some(batch.header.extractor_set_digest.clone()),
+            Some(existing) if existing == &batch.header.extractor_set_digest => {}
+            Some(_) => return Err(RemoteStoreError::InvalidInput),
+        }
+        let FactBatchPayload::RepositoryGraph {
+            nodes: batch_nodes,
+            edges: batch_edges,
+            diagnostics: batch_diagnostics,
+        } = &batch.payload
+        else {
+            return Err(RemoteStoreError::InvalidInput);
+        };
+        merge_facts(&mut nodes, batch_nodes, |node| &node.id)?;
+        merge_facts(&mut edges, batch_edges, |edge| &edge.id)?;
+        for diagnostic in batch_diagnostics {
+            let encoded =
+                serde_json::to_vec(diagnostic).map_err(|_| RemoteStoreError::Serialization)?;
+            let id = sha256_value(b"ferrus.remote.graph-diagnostic.v1\0", &encoded);
+            if diagnostics
+                .insert(id, diagnostic.clone())
+                .is_some_and(|existing| existing != *diagnostic)
+            {
+                return Err(RemoteStoreError::FactConflict);
+            }
+        }
+    }
+    for edge in edges.values() {
+        if !nodes.contains_key(&edge.source)
+            || matches!(&edge.target, EdgeTarget::Node(target) if !nodes.contains_key(target))
+        {
+            return Err(RemoteStoreError::FactConflict);
+        }
+    }
+    let count = checked_fact_count(nodes.len(), edges.len(), diagnostics.len())?;
+    if count > max_facts.get() {
+        return Err(RemoteStoreError::QuotaExceeded);
+    }
+    let (snapshot, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
+    let extractor_set_digest = extractor_set_digest.ok_or(RemoteStoreError::InvalidInput)?;
+    let fact_set_digest = canonical_digest(&(
+        nodes.values().collect::<Vec<_>>(),
+        edges.values().collect::<Vec<_>>(),
+        diagnostics.values().collect::<Vec<_>>(),
+    ))?;
+    let mut facts = Vec::with_capacity(count as usize);
+    append_facts(
+        &mut facts,
+        "node",
+        nodes.into_iter().map(|(id, value)| (id.to_string(), value)),
+    )?;
+    append_facts(
+        &mut facts,
+        "edge",
+        edges.into_iter().map(|(id, value)| (id.to_string(), value)),
+    )?;
+    append_facts(&mut facts, "diagnostic", diagnostics)?;
+    Ok(PreparedGraph {
+        record: RemoteGraphSnapshotRecord {
+            snapshot,
+            job: request.job.clone(),
+            build_id,
+            extractor_set_digest,
+            fact_set_digest,
+            counts: RemoteFactCounts {
+                primary: facts.iter().filter(|fact| fact.kind == "node").count() as u64,
+                relationships: facts.iter().filter(|fact| fact.kind == "edge").count() as u64,
+                diagnostics: facts
+                    .iter()
+                    .filter(|fact| fact.kind == "diagnostic")
+                    .count() as u64,
+            },
+            completed_at: now,
+        },
+        facts,
+    })
+}
+
+pub(super) fn prepare_memory(
+    request: &PublishMemoryRequest,
+    batches: &[FactBatch],
+    now: DateTime<Utc>,
+    max_facts: NonZeroU64,
+) -> Result<PreparedMemory, RemoteStoreError> {
+    validate_batch_stream(&request.job, batches)?;
+    let mut entities = BTreeMap::<MemoryEntityId, MemoryEntity>::new();
+    let mut relationships = BTreeMap::<MemoryRelationshipId, MemoryRelationship>::new();
+    let mut diagnostics = BTreeMap::<String, MemoryDiagnostic>::new();
+    let mut target = None;
+    let mut extractor_set_digest = None;
+    for batch in batches {
+        let FactTarget::ProjectMemory { revision, build_id } = &batch.header.target else {
+            return Err(RemoteStoreError::InvalidInput);
+        };
+        if revision.project != request.project || revision.revision_id != request.revision_id {
+            return Err(RemoteStoreError::InvalidInput);
+        }
+        match &target {
+            None => target = Some((revision.clone(), build_id.clone())),
+            Some((existing_revision, existing_build))
+                if existing_revision == revision && existing_build == build_id => {}
+            Some(_) => return Err(RemoteStoreError::InvalidInput),
+        }
+        match &extractor_set_digest {
+            None => extractor_set_digest = Some(batch.header.extractor_set_digest.clone()),
+            Some(existing) if existing == &batch.header.extractor_set_digest => {}
+            Some(_) => return Err(RemoteStoreError::InvalidInput),
+        }
+        let FactBatchPayload::ProjectMemory {
+            entities: batch_entities,
+            relationships: batch_relationships,
+            diagnostics: batch_diagnostics,
+        } = &batch.payload
+        else {
+            return Err(RemoteStoreError::InvalidInput);
+        };
+        merge_facts(&mut entities, batch_entities, |entity| &entity.id)?;
+        merge_facts(&mut relationships, batch_relationships, |relationship| {
+            &relationship.id
+        })?;
+        for diagnostic in batch_diagnostics {
+            let encoded =
+                serde_json::to_vec(diagnostic).map_err(|_| RemoteStoreError::Serialization)?;
+            let id = sha256_value(b"ferrus.remote.memory-diagnostic.v1\0", &encoded);
+            if diagnostics
+                .insert(id, diagnostic.clone())
+                .is_some_and(|existing| existing != *diagnostic)
+            {
+                return Err(RemoteStoreError::FactConflict);
+            }
+        }
+    }
+    for relationship in relationships.values() {
+        if !entities.contains_key(&relationship.source)
+            || matches!(
+                &relationship.target,
+                MemoryRelationshipTarget::MemoryEntity { entity_id }
+                    if !entities.contains_key(entity_id)
+            )
+        {
+            return Err(RemoteStoreError::FactConflict);
+        }
+    }
+    let count = checked_fact_count(entities.len(), relationships.len(), diagnostics.len())?;
+    if count > max_facts.get() {
+        return Err(RemoteStoreError::QuotaExceeded);
+    }
+    let (revision, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
+    let extractor_set_digest = extractor_set_digest.ok_or(RemoteStoreError::InvalidInput)?;
+    let fact_set_digest = canonical_digest(&(
+        entities.values().collect::<Vec<_>>(),
+        relationships.values().collect::<Vec<_>>(),
+        diagnostics.values().collect::<Vec<_>>(),
+    ))?;
+    let mut facts = Vec::with_capacity(count as usize);
+    append_facts(
+        &mut facts,
+        "entity",
+        entities
+            .into_iter()
+            .map(|(id, value)| (id.to_string(), value)),
+    )?;
+    append_facts(
+        &mut facts,
+        "relationship",
+        relationships
+            .into_iter()
+            .map(|(id, value)| (id.to_string(), value)),
+    )?;
+    append_facts(&mut facts, "diagnostic", diagnostics)?;
+    Ok(PreparedMemory {
+        record: RemoteMemoryRevisionRecord {
+            revision,
+            job: request.job.clone(),
+            build_id,
+            extractor_set_digest,
+            fact_set_digest,
+            counts: RemoteFactCounts {
+                primary: facts.iter().filter(|fact| fact.kind == "entity").count() as u64,
+                relationships: facts
+                    .iter()
+                    .filter(|fact| fact.kind == "relationship")
+                    .count() as u64,
+                diagnostics: facts
+                    .iter()
+                    .filter(|fact| fact.kind == "diagnostic")
+                    .count() as u64,
+            },
+            completed_at: now,
+        },
+        facts,
+    })
+}
+
+pub(super) fn validate_batch_stream(
+    job: &IndexJobRef,
+    batches: &[FactBatch],
+) -> Result<(), RemoteStoreError> {
+    if batches.is_empty() {
+        return Err(RemoteStoreError::InvalidInput);
+    }
+    let shard = &batches[0].header.shard_id;
+    for (index, batch) in batches.iter().enumerate() {
+        batch
+            .validate()
+            .map_err(|_| RemoteStoreError::InvalidInput)?;
+        if batch.header.job != *job
+            || batch.header.shard_id != *shard
+            || usize::try_from(batch.header.sequence).ok() != Some(index)
+            || batch.header.final_batch != (index + 1 == batches.len())
+        {
+            return Err(RemoteStoreError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn merge_facts<K, V, F>(
+    destination: &mut BTreeMap<K, V>,
+    incoming: &[V],
+    key: F,
+) -> Result<(), RemoteStoreError>
+where
+    K: Ord + Clone,
+    V: Clone + PartialEq,
+    F: Fn(&V) -> &K,
+{
+    for value in incoming {
+        let id = key(value).clone();
+        if destination
+            .insert(id, value.clone())
+            .is_some_and(|existing| existing != *value)
+        {
+            return Err(RemoteStoreError::FactConflict);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn append_facts<T: Serialize>(
+    output: &mut Vec<PlainFact>,
+    kind: &'static str,
+    facts: impl IntoIterator<Item = (String, T)>,
+) -> Result<(), RemoteStoreError> {
+    for (id, fact) in facts {
+        output.push(PlainFact {
+            kind,
+            id,
+            encoded: serde_json::to_vec(&fact).map_err(|_| RemoteStoreError::Serialization)?,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn checked_fact_count(
+    primary: usize,
+    relationships: usize,
+    diagnostics: usize,
+) -> Result<u64, RemoteStoreError> {
+    [primary, relationships, diagnostics]
+        .into_iter()
+        .try_fold(0u64, |total, value| {
+            total.checked_add(u64::try_from(value).ok()?)
+        })
+        .ok_or(RemoteStoreError::QuotaExceeded)
+}
+
+pub(super) fn canonical_digest(value: &impl Serialize) -> Result<Digest, RemoteStoreError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| RemoteStoreError::Serialization)?;
+    Ok(Digest::new(
+        "sha256",
+        sha256_value(b"ferrus.remote.fact-set.v1\0", &encoded),
+    )
+    .expect("sha256 output is canonical"))
+}
+
+pub(super) fn sha256_value(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(super) fn encrypt_facts(
+    key: &LessSafeKey,
+    job: &IndexJobRef,
+    domain: &str,
+    target_id: &str,
+    facts: Vec<PlainFact>,
+    max_fact_bytes: NonZeroU64,
+) -> Result<Vec<EncryptedFact>, RemoteStoreError> {
+    facts
+        .into_iter()
+        .map(|fact| {
+            let byte_len =
+                u64::try_from(fact.encoded.len()).map_err(|_| RemoteStoreError::QuotaExceeded)?;
+            if byte_len > max_fact_bytes.get() {
+                return Err(RemoteStoreError::QuotaExceeded);
+            }
+            let mut nonce_bytes = [0u8; NONCE_BYTES];
+            SystemRandom::new()
+                .fill(&mut nonce_bytes)
+                .map_err(|_| RemoteStoreError::Encryption)?;
+            let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+            let mut ciphertext = fact.encoded;
+            key.seal_in_place_append_tag(
+                nonce,
+                Aad::from(fact_aad(job, domain, target_id, fact.kind, &fact.id)),
+                &mut ciphertext,
+            )
+            .map_err(|_| RemoteStoreError::Encryption)?;
+            Ok(EncryptedFact {
+                kind: fact.kind,
+                id: fact.id,
+                byte_len,
+                nonce: nonce_bytes,
+                ciphertext,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn fact_aad(
+    job: &IndexJobRef,
+    domain: &str,
+    target_id: &str,
+    fact_kind: &str,
+    fact_id: &str,
+) -> Vec<u8> {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        job.project.tenant_id,
+        job.project.project_id,
+        job.job_id,
+        domain,
+        target_id,
+        fact_kind,
+        fact_id
+    )
+    .into_bytes()
+}
+
+pub(super) struct JobAuthority {
+    pub(super) spec: IndexJobSpec,
+}
+
+pub(super) fn require_publication_authority(
+    transaction: &Transaction<'_>,
+    job: &IndexJobRef,
+    worker_id: &WorkerId,
+    lease_generation: NonZeroU64,
+    now: DateTime<Utc>,
+) -> Result<JobAuthority, RemoteStoreError> {
+    let record = transaction
+        .query_row(
+            "SELECT kind, spec_json, state, cancellation_requested, lease_worker_id,
+                    lease_generation, lease_until_ms, deadline_at_ms
+             FROM distributed_index_jobs
+             WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3",
+            params![
+                job.project.tenant_id.as_str(),
+                job.project.project_id.as_str(),
+                job.job_id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(RemoteStoreError::AuthorityLost)?;
+    let kind = parse_job_kind(&record.0)?;
+    let spec: IndexJobSpec =
+        serde_json::from_slice(&record.1).map_err(|_| RemoteStoreError::IntegrityFailure)?;
+    spec.validate()
+        .map_err(|_| RemoteStoreError::IntegrityFailure)?;
+    let live = kind == job.kind
+        && spec.project() == &job.project
+        && record.2 == "publishing"
+        && !record.3
+        && record.4.as_deref() == Some(worker_id.as_str())
+        && u64::try_from(record.5).ok() == Some(lease_generation.get())
+        && record
+            .6
+            .is_some_and(|expires| expires > now.timestamp_millis())
+        && record.7 > now.timestamp_millis();
+    if !live {
+        return Err(RemoteStoreError::AuthorityLost);
+    }
+    Ok(JobAuthority { spec })
+}
+
+pub(super) trait PublicationLease {
+    fn job(&self) -> &IndexJobRef;
+    fn worker_id(&self) -> &WorkerId;
+    fn lease_generation(&self) -> NonZeroU64;
+}
+
+impl PublicationLease for PublishGraphRequest {
+    fn job(&self) -> &IndexJobRef {
+        &self.job
+    }
+    fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    fn lease_generation(&self) -> NonZeroU64 {
+        self.lease_generation
+    }
+}
+
+impl PublicationLease for PublishMemoryRequest {
+    fn job(&self) -> &IndexJobRef {
+        &self.job
+    }
+    fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    fn lease_generation(&self) -> NonZeroU64 {
+        self.lease_generation
+    }
+}
+
+pub(super) fn complete_job(
+    transaction: &Transaction<'_>,
+    request: &impl PublicationLease,
+    now: DateTime<Utc>,
+) -> Result<(), RemoteStoreError> {
+    let changed = transaction.execute(
+        "UPDATE distributed_index_jobs
+         SET state = 'complete', lease_worker_id = NULL, lease_until_ms = NULL,
+             failure_code = NULL, updated_at_ms = ?1
+         WHERE tenant_id = ?2 AND project_id = ?3 AND job_id = ?4
+           AND state = 'publishing' AND cancellation_requested = 0
+           AND lease_worker_id = ?5 AND lease_generation = ?6
+           AND lease_until_ms > ?1 AND deadline_at_ms > ?1",
+        params![
+            now.timestamp_millis(),
+            request.job().project.tenant_id.as_str(),
+            request.job().project.project_id.as_str(),
+            request.job().job_id.as_str(),
+            request.worker_id().as_str(),
+            i64::try_from(request.lease_generation().get())
+                .map_err(|_| RemoteStoreError::InvalidInput)?
+        ],
+    )?;
+    if changed != 1 {
+        return Err(RemoteStoreError::AuthorityLost);
+    }
+    Ok(())
+}
+
+pub(super) fn insert_graph_snapshot(
+    transaction: &Transaction<'_>,
+    record: &RemoteGraphSnapshotRecord,
+    facts: &[EncryptedFact],
+    limits: RemoteStoreLimits,
+) -> Result<bool, RemoteStoreError> {
+    insert_revision(
+        transaction,
+        &record.snapshot.repository.project,
+        "repository_graph",
+        record.snapshot.repository.repository_id.as_str(),
+        record.snapshot.snapshot_id.as_str(),
+        &record.job,
+        record.build_id.as_str(),
+        &record.extractor_set_digest,
+        &record.fact_set_digest,
+        record.counts,
+        record.completed_at,
+        facts,
+        limits,
+    )
+}
+
+pub(super) fn insert_memory_revision(
+    transaction: &Transaction<'_>,
+    record: &RemoteMemoryRevisionRecord,
+    facts: &[EncryptedFact],
+    limits: RemoteStoreLimits,
+) -> Result<bool, RemoteStoreError> {
+    insert_revision(
+        transaction,
+        &record.revision.project,
+        "project_memory",
+        "",
+        record.revision.revision_id.as_str(),
+        &record.job,
+        record.build_id.as_str(),
+        &record.extractor_set_digest,
+        &record.fact_set_digest,
+        record.counts,
+        record.completed_at,
+        facts,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_revision(
+    transaction: &Transaction<'_>,
+    project: &RemoteProjectRef,
+    domain: &str,
+    repository_id: &str,
+    target_id: &str,
+    job: &IndexJobRef,
+    build_id: &str,
+    extractor_set_digest: &Digest,
+    fact_set_digest: &Digest,
+    counts: RemoteFactCounts,
+    completed_at: DateTime<Utc>,
+    facts: &[EncryptedFact],
+    limits: RemoteStoreLimits,
+) -> Result<bool, RemoteStoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT fact_digest_algorithm, fact_digest_value, extractor_digest_algorithm,
+                    extractor_digest_value, primary_count, relationship_count, diagnostic_count
+             FROM remote_immutable_revisions
+             WHERE tenant_id = ?1 AND project_id = ?2 AND domain = ?3
+               AND repository_id = ?4 AND target_id = ?5",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                domain,
+                repository_id,
+                target_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let same = existing.0 == fact_set_digest.algorithm()
+            && existing.1 == fact_set_digest.value()
+            && existing.2 == extractor_set_digest.algorithm()
+            && existing.3 == extractor_set_digest.value()
+            && u64::try_from(existing.4).ok() == Some(counts.primary)
+            && u64::try_from(existing.5).ok() == Some(counts.relationships)
+            && u64::try_from(existing.6).ok() == Some(counts.diagnostics);
+        return same
+            .then_some(true)
+            .ok_or(RemoteStoreError::ImmutableConflict);
+    }
+
+    enforce_project_quota(transaction, project, facts, limits)?;
+    transaction.execute(
+        "INSERT INTO remote_immutable_revisions (
+             tenant_id, project_id, domain, repository_id, target_id, job_id, job_kind,
+             build_id, extractor_digest_algorithm, extractor_digest_value,
+             fact_digest_algorithm, fact_digest_value, primary_count, relationship_count,
+             diagnostic_count, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            project.tenant_id.as_str(),
+            project.project_id.as_str(),
+            domain,
+            repository_id,
+            target_id,
+            job.job_id.as_str(),
+            job_kind(job.kind),
+            build_id,
+            extractor_set_digest.algorithm(),
+            extractor_set_digest.value(),
+            fact_set_digest.algorithm(),
+            fact_set_digest.value(),
+            i64_from_u64(counts.primary)?,
+            i64_from_u64(counts.relationships)?,
+            i64_from_u64(counts.diagnostics)?,
+            completed_at.timestamp_millis()
+        ],
+    )?;
+    for fact in facts {
+        transaction.execute(
+            "INSERT INTO remote_encrypted_facts (
+                 tenant_id, project_id, domain, repository_id, target_id, fact_kind,
+                 fact_id, byte_len, nonce, ciphertext
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                domain,
+                repository_id,
+                target_id,
+                fact.kind,
+                fact.id,
+                i64_from_u64(fact.byte_len)?,
+                fact.nonce.as_slice(),
+                fact.ciphertext
+            ],
+        )?;
+    }
+    Ok(false)
+}
+
+pub(super) fn enforce_project_quota(
+    transaction: &Transaction<'_>,
+    project: &RemoteProjectRef,
+    facts: &[EncryptedFact],
+    limits: RemoteStoreLimits,
+) -> Result<(), RemoteStoreError> {
+    let (snapshots, stored_facts, stored_bytes): (i64, i64, i64) = transaction.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM remote_immutable_revisions
+              WHERE tenant_id = ?1 AND project_id = ?2),
+             (SELECT COUNT(*) FROM remote_encrypted_facts
+              WHERE tenant_id = ?1 AND project_id = ?2),
+             (SELECT COALESCE(SUM(length(ciphertext)), 0) FROM remote_encrypted_facts
+              WHERE tenant_id = ?1 AND project_id = ?2)",
+        params![project.tenant_id.as_str(), project.project_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let incoming_facts = u64::try_from(facts.len()).map_err(|_| RemoteStoreError::QuotaExceeded)?;
+    let incoming_bytes = facts
+        .iter()
+        .try_fold(0u64, |total, fact| {
+            total.checked_add(u64::try_from(fact.ciphertext.len()).ok()?)
+        })
+        .ok_or(RemoteStoreError::QuotaExceeded)?;
+    if u64::try_from(snapshots)
+        .ok()
+        .is_none_or(|value| value >= limits.max_snapshots_per_project.get())
+        || u64::try_from(stored_facts).ok().is_none_or(|value| {
+            value.saturating_add(incoming_facts) > limits.max_facts_per_project.get()
+        })
+        || u64::try_from(stored_bytes).ok().is_none_or(|value| {
+            value.saturating_add(incoming_bytes) > limits.max_bytes_per_project.get()
+        })
+    {
+        return Err(RemoteStoreError::QuotaExceeded);
+    }
+    Ok(())
+}
+
+pub(super) fn graph_expected_matches(
+    expected: Option<&GraphPublicationVersion>,
+    actual: Option<&PublishedRemoteGraphView>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.snapshot_id == actual.snapshot_id && expected.generation == actual.generation
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn memory_expected_matches(
+    expected: Option<&MemoryPublicationVersion>,
+    actual: Option<&PublishedRemoteMemoryView>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.revision_id == actual.revision_id && expected.generation == actual.generation
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn next_generation(actual: Option<NonZeroU64>) -> Result<NonZeroU64, RemoteStoreError> {
+    let generation = actual
+        .map(NonZeroU64::get)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(RemoteStoreError::IntegrityFailure)?;
+    NonZeroU64::new(generation).ok_or(RemoteStoreError::IntegrityFailure)
+}
+
+pub(super) fn upsert_graph_view(
+    transaction: &Transaction<'_>,
+    view: &PublishedRemoteGraphView,
+) -> Result<(), RemoteStoreError> {
+    transaction.execute(
+        "INSERT INTO remote_graph_views (
+             tenant_id, project_id, domain, repository_id, view_name, snapshot_id, job_id,
+             generation
+         ) VALUES (?1, ?2, 'repository_graph', ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (tenant_id, project_id, repository_id, view_name) DO UPDATE SET
+             snapshot_id = excluded.snapshot_id,
+             job_id = excluded.job_id,
+             generation = excluded.generation",
+        params![
+            view.repository.project.tenant_id.as_str(),
+            view.repository.project.project_id.as_str(),
+            view.repository.repository_id.as_str(),
+            view.view_name.as_str(),
+            view.snapshot_id.as_str(),
+            view.job.job_id.as_str(),
+            i64_from_u64(view.generation.get())?
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn upsert_memory_view(
+    transaction: &Transaction<'_>,
+    view: &PublishedRemoteMemoryView,
+) -> Result<(), RemoteStoreError> {
+    transaction.execute(
+        "INSERT INTO remote_memory_views (
+             tenant_id, project_id, domain, repository_id, view_name, revision_id, job_id,
+             generation
+         ) VALUES (?1, ?2, 'project_memory', '', ?3, ?4, ?5, ?6)
+         ON CONFLICT (tenant_id, project_id, view_name) DO UPDATE SET
+             revision_id = excluded.revision_id,
+             job_id = excluded.job_id,
+             generation = excluded.generation",
+        params![
+            view.project.tenant_id.as_str(),
+            view.project.project_id.as_str(),
+            view.view_name.as_str(),
+            view.revision_id.as_str(),
+            view.job.job_id.as_str(),
+            i64_from_u64(view.generation.get())?
+        ],
+    )?;
+    Ok(())
+}
