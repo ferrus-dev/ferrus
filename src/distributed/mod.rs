@@ -11,6 +11,8 @@ pub mod fact_store_sqlite;
 pub mod identity;
 pub mod object_store;
 pub mod protocol;
+pub mod publication;
+pub mod publication_sqlite;
 pub mod security;
 pub mod source;
 pub mod worker;
@@ -30,3 +32,5 @@ pub const DISTRIBUTED_POLICY_VERSION: u32 = 1;
 pub const DISTRIBUTED_SOURCE_MANIFEST_VERSION: u32 = 1;
 /// Version of stateless worker execution requests and sandbox declarations.
 pub const DISTRIBUTED_WORKER_PROTOCOL_VERSION: u32 = 1;
+/// Version of immutable remote fact storage and publication pointers.
+pub const DISTRIBUTED_STORAGE_PROTOCOL_VERSION: u32 = 1;

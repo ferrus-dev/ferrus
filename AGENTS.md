@@ -149,6 +149,16 @@ must produce the same sequence and batch identities, and ordinary queries must n
 batches. OS or container adapters must enforce the secure-only sandbox declaration, including
 CPU, memory, ephemeral filesystem, short-lived credentials, and allowlisted egress.
 
+**Distributed publication**: keep immutable remote graph/memory records and publication ports
+vendor-neutral. The SQLite prototype shares the exact coordinator control-plane database so one
+transaction can revalidate job kind and scope, cancellation, worker lease generation, complete
+fact coverage, immutable insertion, pointer CAS, and job completion. Store graph and memory facts
+under separate tenant/project namespaces with authenticated encryption and hard quotas. Compare
+the expected pointer before a same-target no-op, never let a stale publisher replace the winner,
+and update only one domain pointer per publication. Compose federated refs from the two immutable
+targets without adding a third mutable pointer. Unpublished batches and unreferenced immutable
+losers are not ordinary query results.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not

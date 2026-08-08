@@ -236,6 +236,35 @@ The publication transaction verifies job kind, scope, completion, cancellation s
 generation, expected pointer, and complete fact set before changing one pointer. A slower old
 job loses to a newer publication instead of replacing it.
 
+### Immutable storage and publication prototype
+
+RG5.4 implements `RemotePublicationStore` as a vendor-neutral storage and publication port.
+`SqliteRemotePublicationStore` is the durable relational prototype. It uses the same explicitly
+supplied control-plane database as `SqliteIndexJobCoordinator`, while the unpublished worker
+batch store remains separate. This lets one immediate transaction revalidate the exact worker
+and lease generation, reject cancellation or expiry, insert or reuse the complete immutable
+fact set, compare the expected pointer, update only the requested domain, and complete the job.
+If any step fails, neither facts nor a pointer become visible.
+
+Immutable graph snapshots and memory revisions occupy separate tenant/project namespaces.
+Repository rows add repository scope. Fact bodies are encrypted with AES-256-GCM and authenticate
+the tenant, project, job, domain, target, fact kind, and fact ID as associated data. Metadata is
+bounded to identities, digests, counts, and timestamps. Per-project snapshot, fact, and encrypted
+byte quotas plus per-snapshot and per-fact limits fail closed before publication. Conflicting
+facts, missing internal relationship endpoints, incompatible schemas, and ciphertext or count
+tampering return typed errors without exposing source-derived text.
+
+The graph and memory CAS checks run before the same-target no-op branch. A stale publisher may
+leave an immutable unreferenced target for later retention, but it completes without changing the
+winner's pointer. Graph and memory generations advance independently. The prototype composes a
+`FederatedViewRef` by reading both current pointers together; it does not persist a third mutable
+federated pointer.
+
+This adapter is a storage and consistency proof, not the RG5.5 query service. It supports internal
+scoped snapshot reads for the next adapter layer, but exposes no network endpoint, search index,
+credential handling, or unpinned query API. The current worker emits one deterministic shard, so
+the ingestion prototype requires one contiguous sequence with exactly one final marker.
+
 Repository-only queries pin one graph snapshot. Memory-only queries pin one memory revision.
 Federated queries pin one validated `FederatedViewRef`. If a request asks for `latest`, the
 service resolves each requested pointer exactly once at request start, uses the immutable

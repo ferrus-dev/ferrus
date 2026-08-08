@@ -185,13 +185,21 @@ objects, reuse the shipped graph and memory extractors, enforce hard input/parse
 budgets, and deterministically reuse fact batches across retries. The deployment adapter remains responsible for
 applying the declared OS or container CPU, memory, filesystem, credential, and allowlisted-egress controls.
 
-- [ ] #5.4 Implement remote graph and memory storage with independent publication
+- [x] #5.4 Implement remote graph and memory storage with independent publication
 
 ID: rg5.4
 Depends on: rg5.3
 
 Ingest graph and memory fact batches into tenant-scoped remote storage, keep partial builds invisible, publish graph
 snapshots and memory revisions through independent compare-and-set pointers, and compose explicit federated refs.
+
+Implemented by the vendor-neutral `RemotePublicationStore` port in
+`src/distributed/publication.rs` and the durable SQLite prototype in
+`src/distributed/publication_sqlite.rs`. The prototype validates a complete fact stream and exact live publication
+lease, stores tenant-scoped immutable graph and memory facts with authenticated encryption, and atomically combines
+immutable ingestion, one domain-specific CAS pointer update, and durable job completion. Graph and memory pointers
+advance independently, stale publishers retain at most an unreferenced immutable result, and federated selection
+returns an explicit pair without introducing another mutable pointer.
 
 - [ ] #5.5 Expose authenticated control and snapshot-pinned query APIs
 

@@ -21,7 +21,7 @@ use super::{
     },
 };
 
-const COORDINATOR_SCHEMA_VERSION: u32 = 1;
+pub(crate) const COORDINATOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorLimits {

@@ -310,9 +310,10 @@ results live in [`docs/repository-graph-benchmarks.md`](docs/repository-graph-be
 Project-memory privacy, lifecycle, freshness, and operations are documented in
 [`docs/project-memory.md`](docs/project-memory.md); its reproducible federated retrieval gate is in
 [`docs/project-memory-evaluations.md`](docs/project-memory-evaluations.md).
-The vendor-neutral contracts and threat model for the future opt-in distributed prototype are in
-[`docs/distributed-indexing-architecture.md`](docs/distributed-indexing-architecture.md); they do not enable a
-remote backend or change the local SQLite workflow.
+The vendor-neutral contracts, threat model, and in-process SQLite prototypes for optional distributed packaging,
+jobs, workers, and immutable publication are in
+[`docs/distributed-indexing-architecture.md`](docs/distributed-indexing-architecture.md). They do not expose a
+remote service, initialize a cloud client, or change the local SQLite workflow.
 
 ### `ferrus projects list`
 
