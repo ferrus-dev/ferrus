@@ -6,7 +6,7 @@
 //! share a physical sidecar, but that choice must not leak into these APIs.
 
 pub mod diagnostics;
-mod documents;
+pub(crate) mod documents;
 pub mod domain;
 pub mod extractors;
 pub mod federation;

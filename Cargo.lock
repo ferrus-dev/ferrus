@@ -483,6 +483,7 @@ dependencies = [
  "futures-util",
  "libc",
  "neva",
+ "ring",
  "rusqlite",
  "semver",
  "serde",

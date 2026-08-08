@@ -6,6 +6,8 @@ fn distributed_contracts_are_vendor_and_storage_neutral() {
         include_str!("identity.rs"),
         include_str!("protocol.rs"),
         include_str!("security.rs"),
+        include_str!("source.rs"),
+        include_str!("coordinator.rs"),
     );
     for forbidden in [
         "rusqlite::",

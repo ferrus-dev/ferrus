@@ -111,6 +111,14 @@ network or cloud clients. Every remote adapter operation is opt-in, explicitly t
 scoped, authorized before lookup, version checked, and snapshot or revision pinned. Graph and
 memory jobs and compare-and-set publication pointers remain independent.
 
+Remote packaging runs only after local repository and memory policy enforcement. Store source and
+manifest objects under explicit tenant/project scope with authenticated encryption, quotas, digest
+verification, and no cross-tenant reuse. The Phase 5 prototype accepts clean canonical repository
+snapshots only; task overlays and dirty worktrees remain local. Distributed coordinator persistence
+must use its own versioned database, never orchestration or local graph/memory sidecars. Job effects
+are at-least-once and therefore require semantic idempotency keys, renewable generation leases,
+bounded attempts, typed failure codes, cancellation guards, and transactional reclaim.
+
 **Repository graph boundary**: the optional repository graph is derived machine-local state
 in `repo-graph.db`, separate from orchestration state in `ferrus.db`. Keep backend-neutral
 identities, requests, responses, and ports under `src/repository_graph/`. Keep project-local

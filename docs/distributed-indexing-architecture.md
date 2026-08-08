@@ -92,6 +92,39 @@ the same semantic inputs must return or resume the same logical job and converge
 immutable result. A change to scope, kind, policy, semantics, model, extractors, or manifest
 creates a different key.
 
+### Privacy-filtered packaging and source objects
+
+RG5.1 implements packaging after the shipped local source boundaries. Repository packaging
+accepts only a clean canonical repository manifest. The local include, ignore, sensitive-path,
+binary, generated/vendor, size, file-kind, and symlink policies run before any object-store
+write. Dirty Git workspaces and untracked overlays fail closed. The remote manifest contains
+only included repository-relative paths, content identities, lengths, file modes, inferred file
+roles, tenant-scoped object references, policy identity, and bounded diagnostic-code counts.
+Excluded paths are never serialized into the remote manifest.
+
+Project-memory packaging accepts only the four Phase 4 categories: specification structure,
+approved Outcome, sanitized archive manifest, and sanitized runtime provenance. Specification
+files are projected before upload. Non-authorized bytes become spaces while newlines and byte
+offsets remain stable, so existing deterministic extractors and evidence spans still work
+without uploading task bodies or unrelated specification text. Archive and runtime JSON must
+match their closed sanitized schemas and canonical encoding. Every raw artifact category fails
+closed even if a caller constructs a more permissive local policy.
+
+Source objects and the manifest body are uploaded separately. The manifest reference names the
+tenant-scoped immutable manifest object, digest, source policy, and cloud scope. Packaging
+revalidates the mutable local source after all verified reads and returns no manifest if it
+changed. Repeated packaging of identical authorized input returns the same manifest body and
+reuses existing objects.
+
+The prototype `EncryptedFilesystemObjectStore` demonstrates the storage contract without a
+cloud SDK. It derives immutable object locations under tenant and project directories, verifies
+SHA-256 before writes and after reads, encrypts each object with AES-256-GCM, authenticates its
+tenant/project/object/digest scope as associated data, and serializes quota updates in a
+separate SQLite metadata database. The encryption key is supplied by the caller and is never
+stored with the objects. Construction fails unless the calling adapter declares authenticated
+transport. Tests verify that plaintext is absent at rest and ciphertext tampering is rejected.
+Production adapters must establish transport security rather than trusting a declaration.
+
 ## Job consistency
 
 Index jobs use at-least-once execution. Exactly-once worker execution is not assumed.
@@ -114,6 +147,33 @@ Cancellation and publication are serialized by the coordinator. Once cancellatio
 accepted, no worker fact or publication transaction may make the job visible. A stale worker
 or lease generation cannot publish. A duplicate queue delivery may repeat computation, but
 it cannot create duplicate visible facts or publications.
+
+### Durable coordinator prototype
+
+RG5.2 implements `IndexJobCoordinator` as a vendor-neutral port and
+`SqliteIndexJobCoordinator` as a durable prototype adapter. Its database is explicitly supplied
+by the remote adapter and is never `ferrus.db`, `repo-graph.db`, or `project-memory.db`. Opening
+the coordinator applies only its own versioned schema.
+
+Submission validates the complete versioned job and tenant-scoped manifest reference. The job
+ID is deterministic from the semantic idempotency key. A unique scoped key plus an immediate
+transaction makes concurrent duplicate submission converge on one durable record, including
+after process restart.
+
+Claims are serialized by tenant, project, and job kind. They create monotonically increasing
+lease generations and bounded expirations. Start, heartbeat, failure, publication entry, and
+completion require the exact live worker and generation. Lease expiry is clamped to the durable
+total-job deadline, and no transition or heartbeat can extend work beyond it. A retryable worker
+failure requeues a leased or running job while attempts remain; the next claim increments the
+attempt and clears the prior bounded failure code. Publishing failures are terminal because
+remote publication may need reconciliation rather than blind extraction retry.
+
+Maintenance reclaims expired leases transactionally. It requeues work below the attempt limit,
+records a typed terminal attempt-limit failure at the cap, and honors cancellation. Cancellation
+atomically clears the lease and moves every non-terminal state to `cancelled`, so a stale worker
+cannot enter publication afterward. Job inspection returns only manifests, identities, state,
+lease metadata, counters, timestamps, and a bounded failure code. It has no source body or
+free-form backend-error field.
 
 ## Fact batches
 

@@ -143,7 +143,7 @@ Implemented by the vendor-neutral contracts under `src/distributed/` and the nor
 data-lifecycle, and threat-model decisions in `docs/distributed-indexing-architecture.md`. This milestone adds no
 remote backend, network dependency, cloud SDK, or change to the local SQLite execution path.
 
-- [ ] #5.1 Implement privacy-filtered repository and memory packaging and source storage
+- [x] #5.1 Implement privacy-filtered repository and memory packaging and source storage
 
 ID: rg5.1
 Depends on: rg5.0
@@ -151,13 +151,23 @@ Depends on: rg5.0
 Package repository and authorized memory sources as separate manifests after local policy enforcement, upload them
 to tenant-scoped immutable object storage, and verify manifests, encryption, quotas, and idempotent reuse.
 
-- [ ] #5.2 Implement durable idempotent index-job coordination
+Implemented by `src/distributed/source.rs` and `src/distributed/object_store.rs`. Repository packaging accepts only
+locally filtered canonical manifests, project-memory packaging uploads only sanitized Phase 4 categories, and both
+store their immutable manifest body and content objects under tenant/project scope. The durable prototype adapter
+uses authenticated encryption at rest, digest verification, atomic object writes, quotas, and idempotent reuse.
+
+- [x] #5.2 Implement durable idempotent index-job coordination
 
 ID: rg5.2
 Depends on: rg5.0
 
 Add build submission, idempotency, durable states, leases, heartbeats, bounded attempts, retry, cancellation,
 reclaim, and privacy-safe job inspection through a vendor-neutral coordinator interface.
+
+Implemented by the `IndexJobCoordinator` port in `src/distributed/coordinator.rs` and its separately versioned
+SQLite prototype adapter in `src/distributed/coordinator_sqlite.rs`. Concurrent duplicate submissions converge,
+claims and transitions require renewable generation leases, retry and reclaim respect bounded attempts,
+cancellation revokes publication authority, and inspection exposes typed metadata without free-form diagnostics.
 
 - [ ] #5.3 Implement stateless graph and memory extraction workers and fact batches
 

@@ -4,9 +4,13 @@
 //! They reuse the repository-graph and project-memory semantic DTOs without
 //! making local Ferrus depend on a network, queue, object store, or cloud SDK.
 
+pub mod coordinator;
+pub mod coordinator_sqlite;
 pub mod identity;
+pub mod object_store;
 pub mod protocol;
 pub mod security;
+pub mod source;
 
 #[cfg(test)]
 mod contracts;
@@ -19,3 +23,5 @@ pub const DISTRIBUTED_FACT_PROTOCOL_VERSION: u32 = 1;
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u32 = 1;
 /// Version of the distributed authorization and retention policy contracts.
 pub const DISTRIBUTED_POLICY_VERSION: u32 = 1;
+/// Version of privacy-filtered repository and memory source manifests.
+pub const DISTRIBUTED_SOURCE_MANIFEST_VERSION: u32 = 1;

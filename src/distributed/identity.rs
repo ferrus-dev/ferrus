@@ -18,6 +18,8 @@ pub enum RemoteIdentityError {
     Invalid { kind: &'static str },
     #[error("federated graph and memory references must belong to the same tenant and project")]
     FederatedScopeMismatch,
+    #[error("manifest object scope or identity does not match its manifest reference")]
+    ManifestObjectMismatch,
 }
 
 fn validate_remote_id(value: String, kind: &'static str) -> Result<String, RemoteIdentityError> {
@@ -75,6 +77,7 @@ remote_id!(RemoteRepositoryId, "remote repository id");
 remote_id!(RepositoryManifestId, "repository manifest id");
 remote_id!(MemoryManifestId, "memory manifest id");
 remote_id!(IndexJobId, "index job id");
+remote_id!(IndexJobFailureCode, "index job failure code");
 remote_id!(FactBatchId, "fact batch id");
 remote_id!(FactShardId, "fact shard id");
 remote_id!(WorkerId, "worker id");
@@ -130,6 +133,19 @@ pub struct RepositoryManifestRef {
     pub manifest_id: RepositoryManifestId,
     pub manifest_digest: Digest,
     pub source_policy_digest: Digest,
+    pub manifest_object: TenantObjectRef,
+}
+
+impl RepositoryManifestRef {
+    pub fn validate(&self) -> Result<(), RemoteIdentityError> {
+        if self.manifest_object.project != self.repository.project
+            || self.manifest_object.content_identity != self.manifest_digest
+            || self.manifest_object.object_id.as_str() != self.manifest_digest.value()
+        {
+            return Err(RemoteIdentityError::ManifestObjectMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +155,19 @@ pub struct MemoryManifestRef {
     pub manifest_id: MemoryManifestId,
     pub manifest_digest: Digest,
     pub memory_policy_digest: Digest,
+    pub manifest_object: TenantObjectRef,
+}
+
+impl MemoryManifestRef {
+    pub fn validate(&self) -> Result<(), RemoteIdentityError> {
+        if self.manifest_object.project != self.project
+            || self.manifest_object.content_identity != self.manifest_digest
+            || self.manifest_object.object_id.as_str() != self.manifest_digest.value()
+        {
+            return Err(RemoteIdentityError::ManifestObjectMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Immutable pair used only for federated query selection.

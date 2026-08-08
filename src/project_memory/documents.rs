@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::repository_graph::domain::{RepoPath, SnapshotId, SourcePosition, SourceSpan};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArchiveSourceDocument {
     pub archive_id: String,
     pub spec_path: RepoPath,
@@ -16,6 +17,7 @@ pub(crate) struct ArchiveSourceDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeSourceDocument {
     pub tasks: Vec<RuntimeTaskDocument>,
     pub runs: Vec<RuntimeRunDocument>,
@@ -23,6 +25,7 @@ pub(crate) struct RuntimeSourceDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeTaskDocument {
     pub id: String,
     pub milestone_id: Option<String>,
@@ -32,6 +35,7 @@ pub(crate) struct RuntimeTaskDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeRunDocument {
     pub id: String,
     pub task_id: String,
@@ -42,6 +46,7 @@ pub(crate) struct RuntimeRunDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCheckDocument {
     pub id: String,
     pub task_id: String,
@@ -143,6 +148,79 @@ pub(crate) fn parse_spec_memory(content: &str) -> ParsedSpecMemory {
         title_span,
         outcome,
     }
+}
+
+/// Produces a parser-compatible projection containing only the authorized
+/// specification category. Redacted bytes become spaces while line endings
+/// and byte offsets remain stable for evidence spans.
+pub(crate) fn sanitized_spec_source(
+    category: crate::project_memory::domain::MemorySourceCategory,
+    content: &str,
+) -> Option<Vec<u8>> {
+    use crate::project_memory::domain::MemorySourceCategory;
+
+    let lines = lines(content);
+    let mut sanitized = content
+        .bytes()
+        .map(|byte| {
+            if matches!(byte, b'\n' | b'\r') {
+                byte
+            } else {
+                b' '
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut preserve = |line: &Line<'_>| {
+        sanitized[line.start..line.end].copy_from_slice(&content.as_bytes()[line.start..line.end]);
+    };
+    match category {
+        MemorySourceCategory::SpecificationStructure => {
+            if let Some(title) = lines
+                .iter()
+                .find(|line| line.text.trim_start().starts_with("# "))
+            {
+                preserve(title);
+            }
+            for (index, line) in lines.iter().enumerate() {
+                if milestone_header(line.text).is_none() {
+                    continue;
+                }
+                preserve(line);
+                let end = lines
+                    .iter()
+                    .skip(index + 1)
+                    .position(|candidate| milestone_header(candidate.text).is_some())
+                    .map_or(lines.len(), |offset| index + 1 + offset);
+                if let Some(id_line) = lines[index + 1..end]
+                    .iter()
+                    .find(|candidate| child_field(candidate.text, "ID").is_some())
+                {
+                    preserve(id_line);
+                }
+            }
+        }
+        MemorySourceCategory::ApprovedOutcome => {
+            let start = lines
+                .iter()
+                .position(|line| line.text.trim_end() == "## Outcome")?;
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, line)| {
+                    line.text.trim_start().starts_with("## ").then_some(index)
+                })
+                .unwrap_or(lines.len());
+            for line in &lines[start..end] {
+                preserve(line);
+            }
+            if let Some(boundary) = lines.get(end) {
+                sanitized[boundary.start..boundary.start + 3].copy_from_slice(b"## ");
+            }
+        }
+        _ => return None,
+    }
+    Some(sanitized)
 }
 
 fn parse_outcome(lines: &[Line<'_>], start: usize, content: &str) -> Option<SpecOutcomeDocument> {
@@ -305,5 +383,34 @@ mod tests {
         assert_eq!(outcome.sections.len(), 2);
         assert_eq!(outcome.sections[0].kind, OutcomeSectionKind::Decision);
         assert_eq!(outcome.sections[1].kind, OutcomeSectionKind::FollowUp);
+    }
+
+    #[test]
+    fn sanitized_spec_sources_preserve_authorized_facts_and_redact_other_text() {
+        let content = "# Example\n\nSecret task body.\n\n- [x] #1.0 Done\n\nID: one\nDepends on: secret\n\n## Outcome\n\nDelivered.\n\n### Decisions\n\nUse SQLite.\n\n## Private\n\nDo not upload.\n";
+        let parsed = parse_spec_memory(content);
+        let structure = sanitized_spec_source(
+            crate::project_memory::domain::MemorySourceCategory::SpecificationStructure,
+            content,
+        )
+        .unwrap();
+        let structure = String::from_utf8(structure).unwrap();
+        let sanitized_structure = parse_spec_memory(&structure);
+        assert_eq!(sanitized_structure.structure, parsed.structure);
+        assert_eq!(sanitized_structure.title_span, parsed.title_span);
+        assert!(!structure.contains("Secret task body"));
+        assert!(!structure.contains("Depends on: secret"));
+        assert!(!structure.contains("Delivered"));
+
+        let outcome = sanitized_spec_source(
+            crate::project_memory::domain::MemorySourceCategory::ApprovedOutcome,
+            content,
+        )
+        .unwrap();
+        let outcome = String::from_utf8(outcome).unwrap();
+        assert_eq!(parse_spec_memory(&outcome).outcome, parsed.outcome);
+        assert!(!outcome.contains("Secret task body"));
+        assert!(!outcome.contains("Do not upload"));
+        assert!(outcome.contains("Use SQLite"));
     }
 }

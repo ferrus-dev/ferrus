@@ -23,9 +23,9 @@ use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_FACT_PROTOCOL_VERSION,
     DISTRIBUTED_QUERY_PROTOCOL_VERSION,
     identity::{
-        FactBatchId, FactShardId, FederatedViewRef, IndexJobId, MemoryManifestRef,
-        RemoteGraphSnapshotRef, RemoteMemoryRevisionRef, RemoteProjectRef, RemoteRepositoryRef,
-        RepositoryManifestRef, RequestId, WorkerId,
+        FactBatchId, FactShardId, FederatedViewRef, IndexJobFailureCode, IndexJobId,
+        MemoryManifestRef, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef, RemoteProjectRef,
+        RemoteRepositoryRef, RepositoryManifestRef, RequestId, WorkerId,
     },
 };
 
@@ -98,6 +98,14 @@ impl IndexInputRef {
             Self::Memory(manifest) => &manifest.memory_policy_digest,
         }
     }
+
+    fn validate(&self) -> Result<(), DistributedProtocolError> {
+        let result = match self {
+            Self::Repository(manifest) => manifest.validate(),
+            Self::Memory(manifest) => manifest.validate(),
+        };
+        result.map_err(|_| DistributedProtocolError::JobInputMismatch)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,7 +142,7 @@ impl IndexJobSpec {
         input: IndexInputRef,
         semantics: IndexSemantics,
     ) -> Result<Self, DistributedProtocolError> {
-        if kind != input.kind() {
+        if kind != input.kind() || input.validate().is_err() {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
         let idempotency_key = idempotency_key(kind, &input, &semantics)?;
@@ -149,6 +157,7 @@ impl IndexJobSpec {
 
     pub fn validate(&self) -> Result<(), DistributedProtocolError> {
         validate_control_version(self.protocol_version)?;
+        self.input.validate()?;
         if self.kind != self.input.kind() {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
@@ -244,8 +253,10 @@ pub struct IndexJobRecord {
     pub max_attempts: NonZeroU32,
     pub lease: Option<JobLease>,
     pub cancellation_requested: bool,
+    pub failure_code: Option<IndexJobFailureCode>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub deadline_at: DateTime<Utc>,
 }
 
 impl IndexJobRecord {
@@ -259,6 +270,12 @@ impl IndexJobRecord {
                 IndexJobState::Leased | IndexJobState::Running | IndexJobState::Publishing
             ) != self.lease.is_some())
             || (self.cancellation_requested && self.state == IndexJobState::Complete)
+            || (self.state == IndexJobState::Failed && self.failure_code.is_none())
+            || (matches!(
+                self.state,
+                IndexJobState::Complete | IndexJobState::Cancelled
+            ) && self.failure_code.is_some())
+            || self.deadline_at < self.created_at
         {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
@@ -729,7 +746,8 @@ fn hash<T: Serialize>(domain: &[u8], value: &T) -> Result<Digest, DistributedPro
 mod tests {
     use super::*;
     use crate::distributed::identity::{
-        MemoryManifestId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId, TenantId,
+        MemoryManifestId, ObjectId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId,
+        TenantId, TenantObjectRef,
     };
 
     fn digest(value: &str) -> Digest {
@@ -749,6 +767,11 @@ mod tests {
             manifest_id: RepositoryManifestId::new("manifest").unwrap(),
             manifest_digest: digest("11"),
             source_policy_digest: digest("22"),
+            manifest_object: TenantObjectRef {
+                project: project(tenant),
+                object_id: ObjectId::new("11").unwrap(),
+                content_identity: digest("11"),
+            },
         })
     }
 
@@ -783,6 +806,11 @@ mod tests {
             manifest_id: MemoryManifestId::new("manifest").unwrap(),
             manifest_digest: digest("11"),
             memory_policy_digest: digest("22"),
+            manifest_object: TenantObjectRef {
+                project: project(tenant),
+                object_id: ObjectId::new("11").unwrap(),
+                content_identity: digest("11"),
+            },
         })
     }
 
