@@ -6,6 +6,22 @@ Thanks for contributing to `ferrus`.
 so the main goal for contributions is not just to add features, but to keep the core runtime
 predictable, debuggable, and easy to extend.
 
+## Contributor License Agreement
+
+All contributors must accept the Ferrus Individual Contributor
+License Agreement before their pull request can be merged.
+
+The agreement applies to both `ferrus-dev/ferrus` and
+`ferrus-dev/ferrus-platform`. You only need to accept each version
+of the agreement once.
+
+The CLA Assistant will provide a signing link in your first pull
+request.
+
+If your employer or another legal entity owns or controls your
+contribution, do not sign the Individual CLA. Contact the maintainer
+regarding a Corporate Contributor License Agreement.
+
 ## Before you start
 
 - Read [README.md](README.md) for the current project model and CLI behavior.
