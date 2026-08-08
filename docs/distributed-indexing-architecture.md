@@ -260,10 +260,52 @@ winner's pointer. Graph and memory generations advance independently. The protot
 `FederatedViewRef` by reading both current pointers together; it does not persist a third mutable
 federated pointer.
 
-This adapter is a storage and consistency proof, not the RG5.5 query service. It supports internal
-scoped snapshot reads for the next adapter layer, but exposes no network endpoint, search index,
-credential handling, or unpinned query API. The current worker emits one deterministic shard, so
-the ingestion prototype requires one contiguous sequence with exactly one final marker.
+This adapter is the storage and consistency layer below the RG5.5 query service. It supports
+scoped snapshot reads with an interruptible SQLite deadline. The current worker emits one
+deterministic shard, so the ingestion prototype requires one contiguous sequence with exactly one
+final marker.
+
+### Authenticated control and pinned query prototype
+
+RG5.5 defines transport-neutral `RemoteControlApi` and `RemoteSnapshotQueryApi` contracts.
+`SqliteRemoteControlApi` and `SqliteRemoteQueryApi` are in-process service adapters over the
+coordinator, publication store, and encrypted object store. They do not open a listener or accept
+credentials from request data. A deployment transport must authenticate the caller first and
+construct the server-owned `AuthorizationContext`; that type exposes no deserialization boundary.
+
+Control operations cover submit, inspect, and cancel. Query-agent credentials have no control or
+publication permissions. Query operations cover status, graph and memory search, bounded graph
+neighborhoods, federated context expansion, and opt-in verified repository or sanitized memory
+snippets. Authorization for the requested domain and scope runs before protocol validation,
+pointer resolution, job inspection, snapshot lookup, or content lookup. Snippet access requires a
+separate verified-content permission before the service looks up its source manifest.
+
+Every query carries explicit protocol and contract versions plus client budgets. Independent
+server limits clamp result count, serialized bytes, expansion depth, duration, diagnostics, and
+snippet bytes. SQLite progress handlers interrupt fact scans at the effective deadline; manual
+checks cover decryption, ranking, traversal, pagination, and snippet assembly. Source objects also
+have a hard per-object upload quota, which bounds the indivisible synchronous object read in this
+prototype. A single item larger than the remaining result or response budget returns a terminal
+budget error rather than an empty page with the same cursor.
+
+Requests may name an immutable target or an explicit graph, memory, or federated view selector.
+The service resolves a selector exactly once before reading facts and returns the immutable target
+in `resolved_target`. Cursor fingerprints bind that target, the complete effective operation, and
+effective depth. Clients must paginate using the returned target; changed parameters or an old
+target produce `stale_cursor` instead of applying an offset to a different result set.
+
+Verified repository snippets are available only when the completed graph job points to a manifest
+whose descriptor matches the requested evidence path and content digest. Verified memory snippets
+are available only for source categories whose policy permits retained sanitized content, and the
+category, locator, and fingerprint must match the completed memory job's manifest. The encrypted
+object store rechecks object identity and authenticated scope before returning bytes. Raw task,
+submission, review, patch, log, question, answer, or integration-error bodies therefore do not
+become queryable through this surface.
+
+The SQLite implementation intentionally uses bounded deterministic scans rather than introducing
+a provider-specific search engine. A production transport, credential issuer, rate limiter, and
+indexed search adapter remain deployment concerns. With no explicit remote adapter construction,
+Ferrus opens no remote connection and the existing local graph and memory workflows are unchanged.
 
 Repository-only queries pin one graph snapshot. Memory-only queries pin one memory revision.
 Federated queries pin one validated `FederatedViewRef`. If a request asks for `latest`, the

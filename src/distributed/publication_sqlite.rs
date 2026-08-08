@@ -1,6 +1,11 @@
 //! Durable tenant-scoped remote fact storage and atomic publication prototype.
 
-use std::{collections::BTreeMap, num::NonZeroU64, path::Path};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroU64,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use ring::{
@@ -48,6 +53,33 @@ use super::{
 
 const STORAGE_SCHEMA_VERSION: u32 = 1;
 const NONCE_BYTES: usize = 12;
+const SQLITE_PROGRESS_OPS: i32 = 100;
+
+struct ReadDeadline<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> ReadDeadline<'connection> {
+    fn install(
+        connection: &'connection Connection,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Self, RemoteStoreError> {
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || started.elapsed() >= duration),
+            )
+            .map_err(RemoteStoreError::Database)?;
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for ReadDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteStoreLimits {
@@ -72,6 +104,8 @@ pub enum RemoteStoreError {
     FactConflict,
     #[error("remote storage quota exceeded")]
     QuotaExceeded,
+    #[error("remote storage read exceeded its duration budget")]
+    ReadBudgetExceeded,
     #[error("remote fact ciphertext failed authentication or validation")]
     IntegrityFailure,
     #[error("remote storage schema is incompatible")]
@@ -148,6 +182,118 @@ impl SqliteRemotePublicationStore {
             key,
             limits,
         })
+    }
+
+    pub fn graph_snapshot_bounded(
+        &self,
+        snapshot: &RemoteGraphSnapshotRef,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result = self.load_graph_snapshot(snapshot, Some((started, duration)));
+        drop(deadline);
+        result
+    }
+
+    pub fn memory_revision_bounded(
+        &self,
+        revision: &RemoteMemoryRevisionRef,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<StoredRemoteMemoryRevision>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result = self.load_memory_revision(revision, Some((started, duration)));
+        drop(deadline);
+        result
+    }
+
+    fn load_graph_snapshot(
+        &self,
+        snapshot: &RemoteGraphSnapshotRef,
+        deadline: Option<(Instant, Duration)>,
+    ) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
+        ensure_read_budget(deadline)?;
+        let Some(record) = load_graph_record(&self.connection, snapshot)? else {
+            return Ok(None);
+        };
+        let facts = load_facts(
+            &self.connection,
+            &self.key,
+            &record.job,
+            "repository_graph",
+            record.snapshot.snapshot_id.as_str(),
+            record.snapshot.repository.repository_id.as_str(),
+            deadline,
+        )?;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (kind, encoded) in facts {
+            ensure_read_budget(deadline)?;
+            match kind.as_str() {
+                "node" => nodes.push(decode(&encoded)?),
+                "edge" => edges.push(decode(&encoded)?),
+                "diagnostic" => diagnostics.push(decode(&encoded)?),
+                _ => return Err(RemoteStoreError::IntegrityFailure),
+            }
+        }
+        if u64::try_from(nodes.len()).ok() != Some(record.counts.primary)
+            || u64::try_from(edges.len()).ok() != Some(record.counts.relationships)
+            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
+        {
+            return Err(RemoteStoreError::IntegrityFailure);
+        }
+        Ok(Some(StoredRemoteGraphSnapshot {
+            record,
+            nodes,
+            edges,
+            diagnostics,
+        }))
+    }
+
+    fn load_memory_revision(
+        &self,
+        revision: &RemoteMemoryRevisionRef,
+        deadline: Option<(Instant, Duration)>,
+    ) -> Result<Option<StoredRemoteMemoryRevision>, RemoteStoreError> {
+        ensure_read_budget(deadline)?;
+        let Some(record) = load_memory_record(&self.connection, revision)? else {
+            return Ok(None);
+        };
+        let facts = load_facts(
+            &self.connection,
+            &self.key,
+            &record.job,
+            "project_memory",
+            record.revision.revision_id.as_str(),
+            "",
+            deadline,
+        )?;
+        let mut entities = Vec::new();
+        let mut relationships = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (kind, encoded) in facts {
+            ensure_read_budget(deadline)?;
+            match kind.as_str() {
+                "entity" => entities.push(decode(&encoded)?),
+                "relationship" => relationships.push(decode(&encoded)?),
+                "diagnostic" => diagnostics.push(decode(&encoded)?),
+                _ => return Err(RemoteStoreError::IntegrityFailure),
+            }
+        }
+        if u64::try_from(entities.len()).ok() != Some(record.counts.primary)
+            || u64::try_from(relationships.len()).ok() != Some(record.counts.relationships)
+            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
+        {
+            return Err(RemoteStoreError::IntegrityFailure);
+        }
+        Ok(Some(StoredRemoteMemoryRevision {
+            record,
+            entities,
+            relationships,
+            diagnostics,
+        }))
     }
 
     fn publish_graph_prepared(
@@ -320,80 +466,14 @@ impl RemotePublicationStore for SqliteRemotePublicationStore {
         &self,
         snapshot: &RemoteGraphSnapshotRef,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, Self::Error> {
-        let Some(record) = load_graph_record(&self.connection, snapshot)? else {
-            return Ok(None);
-        };
-        let facts = load_facts(
-            &self.connection,
-            &self.key,
-            &record.job,
-            "repository_graph",
-            record.snapshot.snapshot_id.as_str(),
-            record.snapshot.repository.repository_id.as_str(),
-        )?;
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let mut diagnostics = Vec::new();
-        for (kind, encoded) in facts {
-            match kind.as_str() {
-                "node" => nodes.push(decode(&encoded)?),
-                "edge" => edges.push(decode(&encoded)?),
-                "diagnostic" => diagnostics.push(decode(&encoded)?),
-                _ => return Err(RemoteStoreError::IntegrityFailure),
-            }
-        }
-        if u64::try_from(nodes.len()).ok() != Some(record.counts.primary)
-            || u64::try_from(edges.len()).ok() != Some(record.counts.relationships)
-            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
-        {
-            return Err(RemoteStoreError::IntegrityFailure);
-        }
-        Ok(Some(StoredRemoteGraphSnapshot {
-            record,
-            nodes,
-            edges,
-            diagnostics,
-        }))
+        self.load_graph_snapshot(snapshot, None)
     }
 
     fn memory_revision(
         &self,
         revision: &RemoteMemoryRevisionRef,
     ) -> Result<Option<StoredRemoteMemoryRevision>, Self::Error> {
-        let Some(record) = load_memory_record(&self.connection, revision)? else {
-            return Ok(None);
-        };
-        let facts = load_facts(
-            &self.connection,
-            &self.key,
-            &record.job,
-            "project_memory",
-            record.revision.revision_id.as_str(),
-            "",
-        )?;
-        let mut entities = Vec::new();
-        let mut relationships = Vec::new();
-        let mut diagnostics = Vec::new();
-        for (kind, encoded) in facts {
-            match kind.as_str() {
-                "entity" => entities.push(decode(&encoded)?),
-                "relationship" => relationships.push(decode(&encoded)?),
-                "diagnostic" => diagnostics.push(decode(&encoded)?),
-                _ => return Err(RemoteStoreError::IntegrityFailure),
-            }
-        }
-        if u64::try_from(entities.len()).ok() != Some(record.counts.primary)
-            || u64::try_from(relationships.len()).ok() != Some(record.counts.relationships)
-            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
-        {
-            return Err(RemoteStoreError::IntegrityFailure);
-        }
-        Ok(Some(StoredRemoteMemoryRevision {
-            record,
-            entities,
-            relationships,
-            diagnostics,
-        }))
+        self.load_memory_revision(revision, None)
     }
 
     fn graph_view(
@@ -1443,6 +1523,7 @@ fn load_facts(
     domain: &str,
     target_id: &str,
     repository_id: &str,
+    deadline: Option<(Instant, Duration)>,
 ) -> Result<Vec<(String, Vec<u8>)>, RemoteStoreError> {
     let mut statement = connection.prepare(
         "SELECT fact_kind, fact_id, byte_len, nonce, ciphertext
@@ -1469,8 +1550,16 @@ fn load_facts(
             ))
         },
     )?;
-    rows.map(|row| {
-        let (kind, id, byte_len, nonce, mut ciphertext) = row?;
+    let mut facts = Vec::new();
+    for row in rows {
+        ensure_read_budget(deadline)?;
+        let (kind, id, byte_len, nonce, mut ciphertext) = match row {
+            Ok(row) => row,
+            Err(_) if read_budget_exceeded(deadline) => {
+                return Err(RemoteStoreError::ReadBudgetExceeded);
+            }
+            Err(error) => return Err(RemoteStoreError::Database(error)),
+        };
         let nonce = Nonce::try_assume_unique_for_key(&nonce)
             .map_err(|_| RemoteStoreError::IntegrityFailure)?;
         let plaintext = key
@@ -1483,9 +1572,21 @@ fn load_facts(
         if u64::try_from(plaintext.len()).ok() != u64::try_from(byte_len).ok() {
             return Err(RemoteStoreError::IntegrityFailure);
         }
-        Ok((kind, plaintext.to_vec()))
-    })
-    .collect()
+        facts.push((kind, plaintext.to_vec()));
+    }
+    Ok(facts)
+}
+
+fn read_budget_exceeded(deadline: Option<(Instant, Duration)>) -> bool {
+    deadline.is_some_and(|(started, duration)| started.elapsed() >= duration)
+}
+
+fn ensure_read_budget(deadline: Option<(Instant, Duration)>) -> Result<(), RemoteStoreError> {
+    if read_budget_exceeded(deadline) {
+        Err(RemoteStoreError::ReadBudgetExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(encoded: &[u8]) -> Result<T, RemoteStoreError> {
@@ -2184,6 +2285,34 @@ mod tests {
                 snapshot_id: request.snapshot_id,
             }),
             Err(RemoteStoreError::IntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn bounded_snapshot_reads_stop_after_the_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let mut coordinator = coordinator(&path);
+        let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1c");
+        let request = graph_request(&job, "snapshot-deadline", None);
+        let mut store = store(&path);
+        store
+            .publish_graph(
+                &request,
+                &[graph_batch(&job.job, "snapshot-deadline", "private")],
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.graph_snapshot_bounded(
+                &RemoteGraphSnapshotRef {
+                    repository: request.repository,
+                    snapshot_id: request.snapshot_id,
+                },
+                Instant::now(),
+                Duration::ZERO,
+            ),
+            Err(RemoteStoreError::ReadBudgetExceeded)
         ));
     }
 

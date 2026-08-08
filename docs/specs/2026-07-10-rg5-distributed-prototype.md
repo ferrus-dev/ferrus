@@ -201,13 +201,25 @@ immutable ingestion, one domain-specific CAS pointer update, and durable job com
 advance independently, stale publishers retain at most an unreferenced immutable result, and federated selection
 returns an explicit pair without introducing another mutable pointer.
 
-- [ ] #5.5 Expose authenticated control and snapshot-pinned query APIs
+- [x] #5.5 Expose authenticated control and snapshot-pinned query APIs
 
 ID: rg5.5
 Depends on: rg5.0, rg5.4
 
 Provide least-privilege build control and bounded graph/memory query services, query-only agent credentials,
 authorization-before-disclosure, explicit protocol versions, and local behavior that remains opt-in and offline.
+
+Implemented by the vendor-neutral control and query contracts in `src/distributed/api.rs` and the in-process
+SQLite service adapter in `src/distributed/api_sqlite.rs`. The server-owned authorization context is not part of
+the request body, every operation is authorized before validation or storage lookup, and query-agent credentials
+cannot submit, inspect, cancel, or publish builds. Query budgets are clamped independently by the service, SQLite
+reads are deadline-interruptible, pagination cursors bind the immutable target and effective query shape, and
+oversized first results fail terminally instead of reissuing a non-advancing cursor. A `latest` selector is resolved
+once to an immutable graph snapshot, memory revision, or explicit federated pair and that target is returned in the
+response. Opt-in snippets are read only through the completed build's immutable source manifest and are verified
+against the manifest descriptor and encrypted object digest before disclosure. The prototype remains
+transport-neutral: a future HTTP or RPC adapter must authenticate the caller and construct `AuthorizationContext`;
+RG5.5 does not start a listener, initialize a cloud client, or change the local Ferrus path.
 
 - [ ] #5.6 Validate recovery, deletion, observability, tenant isolation, and adapter parity
 

@@ -84,6 +84,7 @@ remote_id!(WorkerId, "worker id");
 remote_id!(PrincipalId, "principal id");
 remote_id!(CredentialId, "credential id");
 remote_id!(RequestId, "request id");
+remote_id!(RemotePageCursor, "remote page cursor");
 remote_id!(DeletionId, "deletion id");
 remote_id!(AuditEventId, "audit event id");
 remote_id!(ObjectId, "tenant object id");

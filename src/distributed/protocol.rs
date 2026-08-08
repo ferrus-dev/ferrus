@@ -656,6 +656,19 @@ pub enum RemoteQueryTarget {
     Repository(RemoteGraphSnapshotRef),
     Memory(RemoteMemoryRevisionRef),
     Federated(FederatedViewRef),
+    RepositoryView {
+        repository: RemoteRepositoryRef,
+        view_name: PublishedViewName,
+    },
+    MemoryView {
+        project: RemoteProjectRef,
+        view_name: MemoryViewName,
+    },
+    FederatedView {
+        repository: RemoteRepositoryRef,
+        graph_view: PublishedViewName,
+        memory_view: MemoryViewName,
+    },
 }
 
 impl RemoteQueryTarget {
@@ -664,6 +677,10 @@ impl RemoteQueryTarget {
             Self::Repository(snapshot) => &snapshot.repository.project,
             Self::Memory(revision) => &revision.project,
             Self::Federated(view) => view.project(),
+            Self::RepositoryView { repository, .. } | Self::FederatedView { repository, .. } => {
+                &repository.project
+            }
+            Self::MemoryView { project, .. } => project,
         }
     }
 }
@@ -713,6 +730,7 @@ pub enum RemoteErrorCode {
     Cancelled,
     AttemptLimit,
     BudgetExceeded,
+    StaleCursor,
     TemporarilyUnavailable,
     Internal,
 }

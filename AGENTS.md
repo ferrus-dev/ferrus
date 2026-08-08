@@ -159,6 +159,17 @@ and update only one domain pointer per publication. Compose federated refs from 
 targets without adding a third mutable pointer. Unpublished batches and unreferenced immutable
 losers are not ordinary query results.
 
+**Distributed APIs**: keep build control and snapshot query contracts transport-neutral. A network
+adapter must authenticate first and construct the server-owned `AuthorizationContext`; request
+bodies must never select their own credential class or permissions. Authorize scope and operation
+before protocol validation or any job, pointer, snapshot, revision, manifest, or object lookup.
+Query-agent credentials are read-only. Resolve mutable view selectors once, return the immutable
+target, and bind pagination cursors to that target plus the effective query shape and depth. Clamp
+all client budgets with independent service limits, interrupt storage scans at the effective
+deadline, and return a terminal error when one result cannot fit. Source snippets require separate
+verified-content authority and must match the completed job's immutable manifest descriptor before
+the encrypted object store is read. Do not initialize a remote transport from local Ferrus paths.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not

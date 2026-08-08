@@ -4,6 +4,8 @@
 //! They reuse the repository-graph and project-memory semantic DTOs without
 //! making local Ferrus depend on a network, queue, object store, or cloud SDK.
 
+pub mod api;
+pub mod api_sqlite;
 pub mod coordinator;
 pub mod coordinator_sqlite;
 pub mod fact_store;
