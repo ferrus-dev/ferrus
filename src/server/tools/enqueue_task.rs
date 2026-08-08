@@ -36,15 +36,15 @@ pub const INPUT_SCHEMA: &str = r#"{
     "required": ["input"]
 }"#;
 
-pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
-    let input = parse_input(input).map_err(tool_err)?;
+pub async fn handler(input: Json<EnqueueTaskInput>) -> Result<String, Error> {
+    let input = validate_input(input.into_inner()).map_err(tool_err)?;
     run(input.description, input.spec_path, input.milestone_id)
         .await
         .map_err(tool_err)
 }
 
 #[derive(Debug, Deserialize)]
-struct EnqueueTaskInput {
+pub struct EnqueueTaskInput {
     description: String,
     spec_path: Option<String>,
     milestone_id: Option<String>,
@@ -110,12 +110,7 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn parse_input(input: serde_json::Value) -> Result<EnqueueTaskInput> {
-    let input: EnqueueTaskInput = serde_json::from_value(input).map_err(|err| {
-        anyhow::anyhow!(
-            "Cannot enqueue task: expected input object with description, optional spec_path, and optional milestone_id ({err})."
-        )
-    })?;
+fn validate_input(input: EnqueueTaskInput) -> Result<EnqueueTaskInput> {
     if input.description.trim().is_empty() {
         anyhow::bail!("Cannot enqueue task: description is required.");
     }
@@ -174,12 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_reads_wrapped_request_object() {
-        let input = parse_input(serde_json::json!({
-            "description": "Build task",
-            "spec_path": "docs/specs/spec.md",
-            "milestone_id": "m1.0",
-        }))
+    fn validates_extracted_request_object() {
+        let input = validate_input(EnqueueTaskInput {
+            description: "Build task".to_string(),
+            spec_path: Some("docs/specs/spec.md".to_string()),
+            milestone_id: Some("m1.0".to_string()),
+        })
         .unwrap();
 
         assert_eq!(input.description, "Build task");
@@ -202,8 +197,8 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
-        let input = parse_input(input).unwrap();
+        let (input,): (Json<EnqueueTaskInput>,) = params.try_into().unwrap();
+        let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.description, "Build task");
         assert_eq!(input.spec_path.as_deref(), Some("docs/specs/spec.md"));
@@ -211,10 +206,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_rejects_bare_string() {
-        let err = parse_input(serde_json::json!("m1.0")).unwrap_err();
+    fn neva_json_extractor_rejects_bare_string() {
+        let params = CallToolRequestParams {
+            name: "enqueue_task".to_string(),
+            args: Some(HashMap::from([(
+                "input".to_string(),
+                serde_json::json!("m1.0"),
+            )])),
+            meta: None,
+        };
+        let result: std::result::Result<(Json<EnqueueTaskInput>,), Error> = params.try_into();
+        let err = result.unwrap_err();
 
-        assert!(err.to_string().contains("expected input object"));
+        assert!(err.to_string().contains("invalid type: string"));
     }
 
     #[tokio::test]

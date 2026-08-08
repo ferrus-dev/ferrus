@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use neva::prelude::*;
 use serde::Deserialize;
 
@@ -65,7 +65,7 @@ pub const INPUT_SCHEMA: &str = r#"{
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Input {
+pub struct ProjectContextInput {
     domain: ContextDomain,
     seeds: Vec<SeedInput>,
     #[serde(default)]
@@ -105,15 +105,15 @@ enum SeedInput {
 
 pub async fn handler(
     ctx: neva::di::Dc<crate::server::ServerContext>,
-    input: serde_json::Value,
+    input: Json<ProjectContextInput>,
 ) -> Result<String, Error> {
-    run(ctx.agent_id(), input).await.map_err(tool_err)
+    run(ctx.agent_id(), input.into_inner())
+        .await
+        .map_err(tool_err)
 }
 
-async fn run(agent_id: &str, input: serde_json::Value) -> Result<String> {
+async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
     let started = Instant::now();
-    let input: Input = serde_json::from_value(input)
-        .context("project_context expects an input object matching its schema")?;
     if input.seeds.is_empty() || input.seeds.len() > 32 {
         anyhow::bail!("project_context requires 1..=32 seeds");
     }

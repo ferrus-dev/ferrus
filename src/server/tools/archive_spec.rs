@@ -34,13 +34,13 @@ pub const INPUT_SCHEMA: &str = r#"{
 }"#;
 
 #[derive(Debug, Deserialize)]
-struct ArchiveSpecInput {
+pub struct ArchiveSpecInput {
     spec_path: String,
     outcome: String,
 }
 
-pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
-    let input = parse_input(input).map_err(tool_err)?;
+pub async fn handler(input: Json<ArchiveSpecInput>) -> Result<String, Error> {
+    let input = validate_input(input.into_inner()).map_err(tool_err)?;
     run(input.spec_path, input.outcome).await.map_err(tool_err)
 }
 
@@ -66,12 +66,7 @@ async fn complete_after_archive(
     )
 }
 
-fn parse_input(input: serde_json::Value) -> Result<ArchiveSpecInput> {
-    let input: ArchiveSpecInput = serde_json::from_value(input).map_err(|err| {
-        anyhow::anyhow!(
-            "Cannot archive spec: expected input object with spec_path and outcome ({err})."
-        )
-    })?;
+fn validate_input(input: ArchiveSpecInput) -> Result<ArchiveSpecInput> {
     if input.spec_path.trim().is_empty() {
         anyhow::bail!("Cannot archive spec: spec_path is required.");
     }
@@ -88,11 +83,11 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn parses_archive_spec_input() {
-        let input = parse_input(serde_json::json!({
-            "spec_path": "docs/specs/example.md",
-            "outcome": "## Outcome\n\nDone."
-        }))
+    fn validates_archive_spec_input() {
+        let input = validate_input(ArchiveSpecInput {
+            spec_path: "docs/specs/example.md".to_string(),
+            outcome: "## Outcome\n\nDone.".to_string(),
+        })
         .unwrap();
         assert_eq!(input.spec_path, "docs/specs/example.md");
         assert!(input.outcome.contains("Done."));
@@ -112,8 +107,8 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
-        let input = parse_input(input).unwrap();
+        let (input,): (Json<ArchiveSpecInput>,) = params.try_into().unwrap();
+        let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.spec_path, "docs/specs/example.md");
         assert!(input.outcome.contains("Done."));

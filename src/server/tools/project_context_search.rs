@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use neva::prelude::*;
 use serde::Deserialize;
 
@@ -49,7 +49,7 @@ pub const INPUT_SCHEMA: &str = r#"{
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Input {
+pub struct ProjectContextSearchInput {
     domain: ContextDomain,
     query: String,
     #[serde(default)]
@@ -69,15 +69,15 @@ struct Input {
 
 pub async fn handler(
     ctx: neva::di::Dc<crate::server::ServerContext>,
-    input: serde_json::Value,
+    input: Json<ProjectContextSearchInput>,
 ) -> Result<String, Error> {
-    run(ctx.agent_id(), input).await.map_err(tool_err)
+    run(ctx.agent_id(), input.into_inner())
+        .await
+        .map_err(tool_err)
 }
 
-async fn run(agent_id: &str, input: serde_json::Value) -> Result<String> {
+async fn run(agent_id: &str, input: ProjectContextSearchInput) -> Result<String> {
     let started = Instant::now();
-    let input: Input = serde_json::from_value(input)
-        .context("project_context_search expects an input object matching its schema")?;
     let context = LocalProjectContext::load_for_agent(agent_id, false).await?;
     let budget = context.requested_budget(
         input.max_results,
