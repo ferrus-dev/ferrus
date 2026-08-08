@@ -658,6 +658,87 @@ mod tests {
         .unwrap()
     }
 
+    fn normalize_index_timestamps(
+        entities: &mut [MemoryEntity],
+        relationships: &mut [MemoryRelationship],
+    ) {
+        let epoch = chrono::DateTime::<Utc>::from(std::time::UNIX_EPOCH);
+        for entity in entities {
+            entity.provenance.timestamps.source_observed_at = epoch;
+            entity.provenance.timestamps.indexed_at = epoch;
+        }
+        for relationship in relationships {
+            relationship.provenance.timestamps.source_observed_at = epoch;
+            relationship.provenance.timestamps.indexed_at = epoch;
+        }
+    }
+
+    #[test]
+    fn equivalent_authorized_inputs_produce_equivalent_records() {
+        let root = TempDir::new().unwrap();
+        let first_data = TempDir::new().unwrap();
+        let second_data = TempDir::new().unwrap();
+        init(root.path());
+        write_spec(root.path(), Some("Delivered deterministically."));
+        let first_source = source(&root, &first_data);
+        let second_source = source(&root, &second_data);
+        let mut first_store = MemorySidecar::open_at(first_data.path()).unwrap();
+        let mut second_store = MemorySidecar::open_at(second_data.path()).unwrap();
+        let first = MemoryIndexer::new(&first_source, &mut first_store)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        let second = MemoryIndexer::new(&second_source, &mut second_store)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        assert_eq!(first.revision.id, second.revision.id);
+
+        let mut first_entities = first_store
+            .entities_for_revision(&first.revision.id)
+            .unwrap();
+        let mut second_entities = second_store
+            .entities_for_revision(&second.revision.id)
+            .unwrap();
+        let mut first_relationships = first_store
+            .relationships_for_revision(&first.revision.id)
+            .unwrap();
+        let mut second_relationships = second_store
+            .relationships_for_revision(&second.revision.id)
+            .unwrap();
+        normalize_index_timestamps(&mut first_entities, &mut first_relationships);
+        normalize_index_timestamps(&mut second_entities, &mut second_relationships);
+        assert_eq!(first_entities, second_entities);
+        assert_eq!(first_relationships, second_relationships);
+    }
+
+    #[test]
+    fn full_rebuild_removes_an_incompatible_sidecar_file_set() {
+        let data = TempDir::new().unwrap();
+        let path = data
+            .path()
+            .join(super::super::sqlite::MEMORY_SIDECAR_FILE_NAME);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA application_id = 1; PRAGMA user_version = 999;")
+            .unwrap();
+        drop(connection);
+        fs::write(path.with_extension("db-wal"), "stale wal").unwrap();
+        fs::write(path.with_extension("db-shm"), "stale shm").unwrap();
+        assert!(matches!(
+            MemorySidecar::open_at(data.path()),
+            Err(MemoryStoreError::RequiresRebuild)
+        ));
+
+        remove_memory_sidecar_file_set(data.path()).unwrap();
+        let rebuilt = MemorySidecar::open_at(data.path()).unwrap();
+        let version: u32 = rebuilt
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::super::sqlite::MEMORY_SIDECAR_SCHEMA_VERSION);
+    }
+
     #[test]
     fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
         let root = TempDir::new().unwrap();
@@ -729,6 +810,25 @@ mod tests {
                 .iter()
                 .any(|entity| matches!(entity.data, MemoryEntityData::Outcome { .. }))
         );
+        let entity_ids = entities
+            .iter()
+            .map(|entity| entity.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            store
+                .relationships_for_revision(&removed.revision.id)
+                .unwrap()
+                .iter()
+                .all(|relationship| {
+                    entity_ids.contains(&relationship.source)
+                        && match &relationship.target {
+                            MemoryRelationshipTarget::MemoryEntity { entity_id } => {
+                                entity_ids.contains(entity_id)
+                            }
+                            _ => true,
+                        }
+                })
+        );
         assert_eq!(removed.metrics.reused_sources, 1);
 
         assert!(
@@ -747,6 +847,18 @@ mod tests {
         assert!(
             store
                 .entities_for_revision(&deleted.revision.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .relationships_for_revision(&deleted.revision.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .repository_links(&deleted.repository_link_set.id)
                 .unwrap()
                 .is_empty()
         );
@@ -1014,6 +1126,27 @@ mod tests {
             "raw submission body secret",
         )
         .unwrap();
+        for (path, body) in [
+            ("runs/t-1/REVIEW.md", "raw review body secret"),
+            ("runs/t-1/PATCH.diff", "raw patch body secret"),
+            ("runs/t-1/QUESTION.md", "raw question body secret"),
+            ("runs/t-1/ANSWER.md", "raw answer body secret"),
+            (
+                "runs/t-1/CONSULT_REQUEST.md",
+                "raw consultation request secret",
+            ),
+            (
+                "runs/t-1/CONSULT_RESPONSE.md",
+                "raw consultation response secret",
+            ),
+            (
+                "runs/t-1/INTEGRATION_ERROR.md",
+                "raw integration error secret",
+            ),
+            ("runs/t-1/check.log", "raw check log secret"),
+        ] {
+            fs::write(archive.join(path), body).unwrap();
+        }
         fs::write(
             archive.join("manifest.toml"),
             r#"spec_path = "docs/specs/example.md"
@@ -1098,10 +1231,25 @@ archived_run_dir = "runs/t-1"
         for forbidden in [
             "raw task body secret",
             "raw submission body secret",
+            "raw review body secret",
+            "raw patch body secret",
+            "raw check log secret",
+            "raw question body secret",
+            "raw answer body secret",
+            "raw consultation request secret",
+            "raw consultation response secret",
+            "raw integration error secret",
             "/private/task.md",
             "must not persist",
         ] {
             assert!(!serialized.contains(forbidden));
+            assert!(
+                !fs::read(store.path())
+                    .unwrap()
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden.as_bytes()),
+                "forbidden source body was persisted: {forbidden}"
+            );
         }
         let links = store
             .repository_links(&outcome.repository_link_set.id)

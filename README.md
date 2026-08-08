@@ -307,6 +307,9 @@ The normative retrieval behavior is documented in
 results live in [`docs/repository-graph-benchmarks.md`](docs/repository-graph-benchmarks.md); the reproducible
 26-case navigation evaluation and current automation decision are in
 [`docs/repository-graph-evaluations.md`](docs/repository-graph-evaluations.md).
+Project-memory privacy, lifecycle, freshness, and operations are documented in
+[`docs/project-memory.md`](docs/project-memory.md); its reproducible federated retrieval gate is in
+[`docs/project-memory-evaluations.md`](docs/project-memory-evaluations.md).
 
 ### `ferrus projects list`
 

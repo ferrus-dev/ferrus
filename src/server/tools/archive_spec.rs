@@ -46,11 +46,24 @@ pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
 
 async fn run(spec_path: String, outcome: String) -> Result<String> {
     let result = project::archive_completed_spec(&spec_path, &outcome).await?;
-    crate::project_memory_runtime::refresh_after_archive_best_effort().await;
-    Ok(format!(
+    Ok(complete_after_archive(
+        result,
+        crate::project_memory_runtime::refresh_after_archive_best_effort(),
+    )
+    .await)
+}
+
+async fn complete_after_archive(
+    result: project::SpecArchiveResult,
+    refresh: impl std::future::Future<
+        Output = crate::project_memory_runtime::ArchiveMemoryRefreshOutcome,
+    >,
+) -> String {
+    let _ = refresh.await;
+    format!(
         "Spec archived. Archive: {}. Tasks archived: {}. Runs archived: {}.",
         result.archive_dir, result.archived_tasks, result.archived_runs
-    ))
+    )
 }
 
 fn parse_input(input: serde_json::Value) -> Result<ArchiveSpecInput> {
@@ -104,5 +117,22 @@ mod tests {
 
         assert_eq!(input.spec_path, "docs/specs/example.md");
         assert!(input.outcome.contains("Done."));
+    }
+
+    #[tokio::test]
+    async fn completed_archive_is_not_failed_by_memory_refresh_failure() {
+        let message = complete_after_archive(
+            project::SpecArchiveResult {
+                archive_dir: "archive/specs/example".to_string(),
+                archived_tasks: 2,
+                archived_runs: 3,
+            },
+            async { crate::project_memory_runtime::ArchiveMemoryRefreshOutcome::Failed },
+        )
+        .await;
+        assert_eq!(
+            message,
+            "Spec archived. Archive: archive/specs/example. Tasks archived: 2. Runs archived: 3."
+        );
     }
 }

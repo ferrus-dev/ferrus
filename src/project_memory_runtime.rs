@@ -43,34 +43,46 @@ use crate::{
 
 pub(crate) const PROJECT_MEMORY_VIEW: &str = "project";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveMemoryRefreshOutcome {
+    Refreshed,
+    Failed,
+}
+
 /// Refreshes derived memory after the archive transaction has committed.
 /// Failure is deliberately isolated from the successful archive lifecycle.
-pub(crate) async fn refresh_after_archive_best_effort() {
+pub(crate) async fn refresh_after_archive_best_effort() -> ArchiveMemoryRefreshOutcome {
     let started = std::time::Instant::now();
     match crate::project_memory::index::index_current_project(
         crate::project_memory::index::MemoryIndexOptions::default(),
     )
     .await
     {
-        Ok(outcome) => tracing::info!(
-            target: "ferrus::project_memory::index",
-            revision_id = outcome.revision.id.as_str(),
-            build_id = outcome.build_id.as_str(),
-            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            discovered_sources = outcome.metrics.discovered_sources,
-            reused_sources = outcome.metrics.reused_sources,
-            extracted_sources = outcome.metrics.extracted_sources,
-            entities = outcome.metrics.entities,
-            relationships = outcome.metrics.relationships,
-            diagnostics = outcome.metrics.diagnostics,
-            trigger = "spec_archive",
-            "project memory refreshed after spec archive"
-        ),
-        Err(error) => tracing::warn!(
-            error_category = memory_index_error_category(&error),
-            trigger = "spec_archive",
-            "project memory refresh failed after successful spec archive; archive state is unchanged"
-        ),
+        Ok(outcome) => {
+            tracing::info!(
+                target: "ferrus::project_memory::index",
+                revision_id = outcome.revision.id.as_str(),
+                build_id = outcome.build_id.as_str(),
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                discovered_sources = outcome.metrics.discovered_sources,
+                reused_sources = outcome.metrics.reused_sources,
+                extracted_sources = outcome.metrics.extracted_sources,
+                entities = outcome.metrics.entities,
+                relationships = outcome.metrics.relationships,
+                diagnostics = outcome.metrics.diagnostics,
+                trigger = "spec_archive",
+                "project memory refreshed after spec archive"
+            );
+            ArchiveMemoryRefreshOutcome::Refreshed
+        }
+        Err(error) => {
+            tracing::warn!(
+                error_category = memory_index_error_category(&error),
+                trigger = "spec_archive",
+                "project memory refresh failed after successful spec archive; archive state is unchanged"
+            );
+            ArchiveMemoryRefreshOutcome::Failed
+        }
     }
 }
 
@@ -435,6 +447,7 @@ fn unavailable_status(
             build_id: None,
             memory_model_version: None,
             statistics: None,
+            retention: None,
             recommended_action: Some(action),
             source_policy: MemorySourceCategory::ALL
                 .into_iter()

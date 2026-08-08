@@ -581,6 +581,16 @@ async fn memory(command: MemoryCommand) -> Result<()> {
                         statistics.stale_links
                     );
                 }
+                if let Some(retention) = response.data.retention {
+                    println!(
+                        "Retention: {} revisions ({} historical), {} builds ({} terminal unpublished), {} repository link sets",
+                        retention.revisions,
+                        retention.historical_revisions,
+                        retention.builds,
+                        retention.terminal_unpublished_builds,
+                        retention.repository_link_sets
+                    );
+                }
                 if response.data.recommended_action.is_some() {
                     println!(
                         "Next: ferrus graph memory index{}",

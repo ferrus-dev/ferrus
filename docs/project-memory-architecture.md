@@ -147,6 +147,11 @@ again while assembling responses. Memory cursors bind the operation, exact reque
 memory revision. Optional snippets are requested only through `MemoryContent` with the stored locator and expected
 fingerprint.
 
+Status also exposes retention diagnostics without silently collecting immutable history. It reports
+total and non-published revisions, total and terminal unpublished builds, and repository link-set
+counts for the selected project. A full rebuild remains the explicit local cleanup path while
+automatic memory-retention policy is intentionally deferred.
+
 `FederatedContextService` keeps repository and memory queries separate and routes every request according to its
 tagged `repository`, `memory`, or `all` target. Combined search uses deterministic score, domain, and identity
 ordering before applying the common result and byte budget. Combined context resolves the selected repository and

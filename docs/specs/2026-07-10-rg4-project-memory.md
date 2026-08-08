@@ -197,13 +197,17 @@ Implemented with explicit local memory index/status commands, backward-compatibl
 routing, three role-visible read-only MCP tools, verified memory snippets, privacy-safe retrieval
 metrics, and a post-commit best-effort archive refresh that cannot change archive lifecycle state.
 
-- [ ] #4.6 Validate privacy defaults, freshness, lifecycle, and retrieval usefulness
+- [x] #4.6 Validate privacy defaults, freshness, lifecycle, and retrieval usefulness
 
 ID: rg4.6
 Depends on: rg4.5
 
 Add deterministic fixtures, deletion and stale-link tests, archive lifecycle coverage, sensitive-source tests,
 federated retrieval evals, retention diagnostics, and user documentation.
+
+Completed with cross-build determinism and incompatible-sidecar tests, expanded sensitive-artifact
+exclusion coverage, stale archive freshness and best-effort lifecycle checks, read-only retention
+statistics, an offline federated usefulness corpus, and user-facing operations and evaluation guides.
 
 ## Acceptance Criteria
 

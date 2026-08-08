@@ -160,6 +160,15 @@ pub struct MemoryStatistics {
     pub stale_links: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetentionStatistics {
+    pub revisions: u64,
+    pub historical_revisions: u64,
+    pub builds: u64,
+    pub terminal_unpublished_builds: u64,
+    pub repository_link_sets: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStatusRequest {
@@ -173,6 +182,8 @@ pub struct MemoryStatusData {
     pub build_id: Option<MemoryBuildId>,
     pub memory_model_version: Option<u32>,
     pub statistics: Option<MemoryStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<MemoryRetentionStatistics>,
     pub recommended_action: Option<MemoryRetrievalAction>,
     pub source_policy: Vec<MemorySourcePolicyStatus>,
 }

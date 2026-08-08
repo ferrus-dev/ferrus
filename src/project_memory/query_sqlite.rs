@@ -490,8 +490,14 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
                     super::query::MemoryRevisionSelector::Published(_)
                 ) =>
             {
-                drop(deadline);
                 let latest = self.latest_build(&request.scope.project)?;
+                let retention = self.retention_statistics(&request.scope.project)?;
+                drop(deadline);
+                if started.elapsed() >= budget.duration() {
+                    return Err(MemoryQueryError::BudgetExceeded(
+                        MemoryTruncationReason::Duration,
+                    ));
+                }
                 return Ok(MemoryStatusResponse {
                     wire_version: MEMORY_QUERY_WIRE_VERSION,
                     project: request.scope.project.clone(),
@@ -504,6 +510,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
                         build_id: latest.map(|build| build.id),
                         memory_model_version: None,
                         statistics: None,
+                        retention: Some(retention),
                         recommended_action: Some(MemoryRetrievalAction::Build),
                         source_policy: source_policy_status(),
                     },
@@ -513,6 +520,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         };
         let latest = self.latest_build(&scope.revision.project)?;
         let statistics = self.statistics(&scope.revision.id)?;
+        let retention = self.retention_statistics(&scope.revision.project)?;
         let diagnostics = self.diagnostics(&scope.revision.id, budget.max_diagnostics)?;
         drop(deadline);
         if started.elapsed() >= budget.duration() {
@@ -532,6 +540,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
                 build_id: latest.map(|build| build.id),
                 memory_model_version: Some(scope.revision.memory_model_version),
                 statistics: Some(statistics),
+                retention: Some(retention),
                 recommended_action: freshness_action(&scope.freshness),
                 source_policy: source_policy_status(),
             },
@@ -818,6 +827,46 @@ impl SqliteMemoryQuery<'_> {
                         entities: unsigned(row.get(1)?)?,
                         relationships: unsigned(row.get(2)?)?,
                         stale_links: unsigned(row.get(3)?)?,
+                    })
+                },
+            )
+            .map_err(sqlite_error)
+    }
+
+    fn retention_statistics(
+        &self,
+        project: &ProjectRef,
+    ) -> Result<super::query::MemoryRetentionStatistics, MemoryQueryError> {
+        self.sidecar
+            .connection()
+            .query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM memory_revisions revisions \
+                     WHERE revisions.project_namespace = ?1 AND revisions.project_id = ?2), \
+                    (SELECT COUNT(*) FROM memory_revisions revisions \
+                     WHERE revisions.project_namespace = ?1 AND revisions.project_id = ?2 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM memory_published_views views \
+                         WHERE views.project_namespace = revisions.project_namespace \
+                           AND views.project_id = revisions.project_id \
+                           AND views.revision_id = revisions.id \
+                       )), \
+                    (SELECT COUNT(*) FROM memory_builds builds \
+                     WHERE builds.project_namespace = ?1 AND builds.project_id = ?2), \
+                    (SELECT COUNT(*) FROM memory_builds builds \
+                     WHERE builds.project_namespace = ?1 AND builds.project_id = ?2 \
+                       AND builds.state IN ('complete', 'failed', 'superseded')), \
+                    (SELECT COUNT(*) FROM memory_repository_link_sets sets \
+                     JOIN memory_revisions revisions ON revisions.id = sets.memory_revision_id \
+                     WHERE revisions.project_namespace = ?1 AND revisions.project_id = ?2)",
+                [project.namespace.as_str(), project.project_id.as_str()],
+                |row| {
+                    Ok(super::query::MemoryRetentionStatistics {
+                        revisions: unsigned(row.get(0)?)?,
+                        historical_revisions: unsigned(row.get(1)?)?,
+                        builds: unsigned(row.get(2)?)?,
+                        terminal_unpublished_builds: unsigned(row.get(3)?)?,
+                        repository_link_sets: unsigned(row.get(4)?)?,
                     })
                 },
             )
@@ -1287,7 +1336,8 @@ mod tests {
         domain::{MemoryRecordId, MemoryViewName, ProjectId, ProjectNamespace, ProjectRef},
         index::{MemoryIndexOptions, MemoryIndexer},
         policy::MemoryPolicy,
-        query::{MemoryPageRequest, MemoryQueryScope},
+        ports::MemorySource,
+        query::{MemoryFreshnessComparison, MemoryPageRequest, MemoryQueryScope},
         source::LocalMemorySource,
         sqlite::{MEMORY_SIDECAR_FILE_NAME, OpenMemoryQuerySidecarResult, open_for_query_at},
     };
@@ -1407,6 +1457,99 @@ mod tests {
         assert_eq!(effective.max_depth, limits.max_depth);
         assert_eq!(effective.max_duration_ms, limits.max_duration_ms);
         assert_eq!(effective.max_diagnostics, limits.max_diagnostics);
+    }
+
+    #[test]
+    fn status_reports_source_policy_retention_and_stale_archive_freshness() {
+        let (root, data, project, first_revision) = indexed_fixture();
+        fs::write(
+            root.path().join("docs/specs/query.md"),
+            "# Query memory\n\n- [x] #4.4 Federation\n\nID: rg-test\nDepends on: none\n\n## Outcome\n\nDelivered a changed archive outcome.\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(root.path())
+                .args(["add", "--", "docs/specs/query.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let changed_source = LocalMemorySource::discover_at(
+            root.path().to_path_buf(),
+            data.path().to_path_buf(),
+            project.clone(),
+            RepoPath::new("docs/specs").unwrap(),
+            MemoryPolicy::default(),
+        )
+        .unwrap();
+        let comparison =
+            MemoryFreshnessComparison::from_manifest(&changed_source.manifest().unwrap());
+        let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+            open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+        else {
+            panic!("memory query sidecar should be ready");
+        };
+        let limits = QueryLimitsConfig::default();
+        let mut scope = published_scope(project.clone(), &limits);
+        scope.freshness_comparison = Some(comparison);
+        let status = SqliteMemoryQuery::new(&sidecar, limits.clone())
+            .status(MemoryStatusRequest { scope })
+            .unwrap();
+        assert_eq!(status.revision_id, Some(first_revision.clone()));
+        assert_eq!(status.freshness.freshness, MemoryFreshness::Stale);
+        assert_eq!(
+            status.data.recommended_action,
+            Some(MemoryRetrievalAction::Refresh)
+        );
+        assert_eq!(
+            status.data.source_policy.len(),
+            MemorySourceCategory::ALL.len()
+        );
+        assert_eq!(
+            status
+                .data
+                .source_policy
+                .iter()
+                .filter(|source| source.policy.enabled)
+                .count(),
+            4
+        );
+        assert!(status.data.source_policy.iter().all(|source| {
+            source.policy.enabled
+                || source.policy.sensitivity
+                    == super::super::policy::MemorySourceSensitivity::Sensitive
+        }));
+        let retention = status.data.retention.unwrap();
+        assert_eq!(retention.revisions, 1);
+        assert_eq!(retention.historical_revisions, 0);
+        assert_eq!(retention.builds, 1);
+        assert_eq!(retention.terminal_unpublished_builds, 0);
+
+        drop(sidecar);
+        let mut writable = MemorySidecar::open_at(data.path()).unwrap();
+        let changed = MemoryIndexer::new(&changed_source, &mut writable)
+            .unwrap()
+            .index(MemoryIndexOptions::default())
+            .unwrap();
+        assert_ne!(changed.revision.id, first_revision);
+        drop(writable);
+        let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+            open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+        else {
+            panic!("memory query sidecar should be ready");
+        };
+        let status = SqliteMemoryQuery::new(&sidecar, limits)
+            .status(MemoryStatusRequest {
+                scope: published_scope(project, &QueryLimitsConfig::default()),
+            })
+            .unwrap();
+        let retention = status.data.retention.unwrap();
+        assert_eq!(retention.revisions, 2);
+        assert_eq!(retention.historical_revisions, 1);
+        assert_eq!(retention.builds, 2);
+        assert_eq!(retention.terminal_unpublished_builds, 1);
+        assert!(retention.repository_link_sets >= 2);
     }
 
     #[test]

@@ -161,6 +161,18 @@ impl MemorySidecar {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    pub fn relationships_for_revision(
+        &self,
+        revision_id: &MemoryRevisionId,
+    ) -> Result<Vec<MemoryRelationship>, MemoryStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT relationship_json FROM memory_relationships \
+             WHERE revision_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([revision_id.as_str()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
     pub fn diagnostics_for_revision(
         &self,
         revision_id: &MemoryRevisionId,
