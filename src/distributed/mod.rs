@@ -11,6 +11,8 @@ pub mod coordinator_sqlite;
 pub mod fact_store;
 pub mod fact_store_sqlite;
 pub mod identity;
+pub mod maintenance;
+pub mod maintenance_sqlite;
 pub mod object_store;
 pub mod protocol;
 pub mod publication;
@@ -21,11 +23,15 @@ pub mod worker;
 
 #[cfg(test)]
 mod contracts;
+#[cfg(test)]
+mod maintenance_sqlite_tests;
 
 /// Version of distributed control-plane request and response envelopes.
 pub const DISTRIBUTED_CONTROL_PROTOCOL_VERSION: u32 = 1;
 /// Version of immutable worker fact-batch envelopes.
 pub const DISTRIBUTED_FACT_PROTOCOL_VERSION: u32 = 1;
+/// Version of authenticated deletion, recovery, and audit envelopes.
+pub const DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION: u32 = 1;
 /// Version of snapshot-pinned remote query envelopes.
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u32 = 1;
 /// Version of the distributed authorization and retention policy contracts.

@@ -311,7 +311,8 @@ Project-memory privacy, lifecycle, freshness, and operations are documented in
 [`docs/project-memory.md`](docs/project-memory.md); its reproducible federated retrieval gate is in
 [`docs/project-memory-evaluations.md`](docs/project-memory-evaluations.md).
 The vendor-neutral contracts, threat model, and in-process SQLite prototypes for optional distributed packaging,
-jobs, workers, immutable publication, authenticated build control, and snapshot-pinned bounded queries are in
+jobs, workers, immutable publication, authenticated build control, snapshot-pinned bounded queries, resumable
+project deletion, and privacy-safe audits are in
 [`docs/distributed-indexing-architecture.md`](docs/distributed-indexing-architecture.md). The API layer is
 transport-neutral: Ferrus does not start a remote listener, initialize a cloud client, or change the local SQLite
 workflow unless a future deployment explicitly constructs a remote adapter.

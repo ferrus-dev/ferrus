@@ -12,6 +12,7 @@ fn distributed_contracts_are_vendor_and_storage_neutral() {
         include_str!("worker.rs"),
         include_str!("publication.rs"),
         include_str!("api.rs"),
+        include_str!("maintenance.rs"),
     );
     for forbidden in [
         "rusqlite::",

@@ -47,6 +47,8 @@ pub enum DistributedProtocolError {
     PublicationMismatch,
     #[error("query target does not belong to the request project")]
     QueryScopeMismatch,
+    #[error("deletion scope, coverage, or idempotency identity is inconsistent")]
+    DeletionMismatch,
     #[error("distributed contract serialization failed")]
     Serialization,
 }

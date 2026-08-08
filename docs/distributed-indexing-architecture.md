@@ -368,6 +368,23 @@ secondary indexes and caches, without deleting another tenant's identical conten
 and failures use bounded audit metadata. A retry resumes the same logical deletion.
 Completion means all live stores in the declared coverage are removed.
 
+RG5.6 implements this contract with `RemoteMaintenanceApi` and
+`SqliteRemoteMaintenance`. Authorization runs before request validation or durable lookup.
+The adapter records progress after each independent store, so a source-object deletion
+followed by a fact-store outage resumes without losing the completed step or its counters.
+Repeated requests with the same target and coverage return the original deletion identity
+and completion record. Full project deletion removes source objects, unpublished batches,
+published graph and memory facts and pointers, coordinator jobs, the currently absent query
+cache class, and prior project audits. It then writes one new bounded completion audit as the
+proof of the deletion operation.
+
+Repository deletion removes repository graph publications, matching jobs and unpublished
+batches, repository audit records, and cache entries when present. Uploaded objects remain
+project-scoped and may be shared by memory or another repository. Until the remote manifest
+store persists a complete repository ownership and reference-count index, a repository request
+claiming `uploaded_source` coverage fails before a deletion record is created. Full project
+deletion is the supported way to remove uploaded bytes in this prototype.
+
 Backup expiry, immutable audit retention, legal holds, and provider deletion guarantees are
 deployment policy. If they prevent immediate physical deletion, the service must document
 the remaining class and deadline rather than reporting stronger deletion than it provides.
@@ -412,10 +429,28 @@ multi-tenant source corpus.
 | Deletion misses secondary data | Coverage by retention class, idempotent traversal, auditable completion |
 | Protocol semantic drift | Independent explicit versions and fail-closed compatibility checks |
 
+## Deterministic failure and recovery matrix
+
+| Scenario | Prototype outcome |
+| --- | --- |
+| Duplicate queue delivery or submission | Semantic idempotency key returns the same job; deterministic fact batches are reused |
+| Worker loss after partial output | Lease expiry increments generation; another worker resumes from durable unpublished batches |
+| Active worker lease contention | Non-expired generation lease cannot be stolen; stale workers lose every state transition and publication check |
+| Cancellation during extraction or publication | Accepted cancellation revokes the lease and publication authority; no partial target becomes queryable |
+| Object-store timeout or partition | Packaging or verified-content read returns a typed retryable unavailable result; no source or backend text is returned |
+| Graph-store timeout | SQLite progress handlers interrupt the read and return the bounded budget error; publication pointers remain unchanged |
+| Fact-store interruption during deletion | Deletion becomes `failed` with durable completed-step counters; retry resumes the same logical deletion |
+| Concurrent old and new publication | Domain-specific compare-and-set selects one winner; the older target cannot replace the current pointer |
+| Foreign-tenant probe | Authorization denies before lookup with the same bounded error regardless of resource existence |
+| Remote adapter outage or absence | Local graph, memory, task, run, and `ferrus.db` paths are not opened or mutated by distributed code |
+
 ## Prototype limits
 
-RG5.0 defines contracts, not a production service. It does not choose the queue, object store,
-relational store, search index, graph database, cloud vendor, deployment model, SLO, region,
-or billing model. Remote task overlays, dirty worktrees, arbitrary filesystem streaming, and
-cross-repository federation remain out of scope. Later RG5 milestones must implement these
-contracts behind optional adapters and prove them with shared local/remote behavior tests.
+RG5 is an in-process SQLite and encrypted-filesystem proof, not a production remote service.
+It does not choose a network transport, queue, cloud object store, database vendor, search
+engine, graph database, credential issuer, deployment model, SLO, region, backup policy, or
+billing model. The deterministic failure tests exercise equivalent local failure boundaries,
+not an actual packet network. Remote task overlays, dirty worktrees, arbitrary filesystem
+streaming, repository-scoped source-object deletion, and cross-repository federation remain
+out of scope. A production adapter must preserve the same contracts and run the shared query
+behavior and tenant-isolation suites against its real failure injection environment.

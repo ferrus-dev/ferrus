@@ -170,6 +170,16 @@ deadline, and return a terminal error when one result cannot fit. Source snippet
 verified-content authority and must match the completed job's immutable manifest descriptor before
 the encrypted object store is read. Do not initialize a remote transport from local Ferrus paths.
 
+**Distributed maintenance**: authorize deletion before validation or lookup, key retries by exact
+target and retention coverage, and persist bounded progress between independent stores. Full project
+deletion must remove uploaded objects, unpublished batches, published graph and memory data and
+pointers, jobs, caches, and prior audits without affecting an identical object in another tenant.
+Write a new completion audit only after the covered purge; audit records may contain only canonical
+IDs, enum codes, counters, and timestamps. Repository deletion must preserve project memory and
+shared project-scoped source objects. Fail repository `uploaded_source` coverage closed until a
+complete ownership/refcount index makes it safe. Keep every step idempotent so failed cross-store
+deletion can resume without inventing stronger atomicity than the adapter provides.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not

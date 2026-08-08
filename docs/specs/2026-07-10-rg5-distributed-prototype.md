@@ -221,13 +221,27 @@ against the manifest descriptor and encrypted object digest before disclosure. T
 transport-neutral: a future HTTP or RPC adapter must authenticate the caller and construct `AuthorizationContext`;
 RG5.5 does not start a listener, initialize a cloud client, or change the local Ferrus path.
 
-- [ ] #5.6 Validate recovery, deletion, observability, tenant isolation, and adapter parity
+- [x] #5.6 Validate recovery, deletion, observability, tenant isolation, and adapter parity
 
 ID: rg5.6
 Depends on: rg5.2, rg5.4, rg5.5
 
 Exercise duplication, worker loss, lease expiry, cancellation, timeouts, publication races, network partitions,
 tenant attacks, retention/deletion, privacy-safe telemetry, and the shared local/remote contract suite.
+
+Implemented by the versioned maintenance contracts in `src/distributed/maintenance.rs`, the resumable SQLite
+deletion and audit adapter in `src/distributed/maintenance_sqlite.rs`, and the cross-store and cross-adapter tests in
+`src/distributed/maintenance_sqlite_tests.rs` and `src/distributed/api_sqlite.rs`. Full project deletion removes
+tenant-scoped source objects, unpublished batches, graph snapshots, memory revisions, publication pointers, jobs,
+caches when present, and prior audit records without touching identical content in another tenant. Progress is
+durable between stores, retries converge on the same deletion identity, and completion or failure emits only
+bounded IDs, enum codes, counters, and timestamps. Repository deletion removes repository-owned graph, job, and
+batch state while preserving project memory and shared project-scoped objects; repository source-object deletion
+fails closed until a complete ownership/refcount index exists. The shared query behavior contract exercises local
+and remote SQLite graph and memory adapters for deterministic versioned results, immutable target pinning, and
+provenance. Focused failure coverage now includes duplicate delivery, lease loss/reclaim, cancellation, parser and
+query deadlines, publication races, content-store outage, interrupted cross-store deletion, and foreign-tenant
+probes, while compile-time boundaries keep distributed failure paths out of local Ferrus runtime state.
 
 ## Acceptance Criteria
 

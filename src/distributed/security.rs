@@ -522,6 +522,7 @@ pub enum AuditCounter {
     Snapshots,
     Revisions,
     CacheEntries,
+    AuditRecords,
     DurationMs,
 }
 
