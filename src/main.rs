@@ -17,8 +17,8 @@ mod state;
 mod templates;
 mod update_check;
 
-use ferrus::{project_memory, repository_graph};
 use clap::Parser;
+use ferrus::{project_memory, repository_graph};
 
 #[cfg(test)]
 mod test_support {
