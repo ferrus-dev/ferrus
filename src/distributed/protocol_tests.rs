@@ -242,3 +242,36 @@ fn query_envelopes_reject_scope_and_version_mismatches() {
         Err(DistributedProtocolError::UnsupportedVersion)
     );
 }
+
+#[test]
+fn query_envelopes_reject_cross_project_federated_targets() {
+    let memory_project = project("tenant-a");
+    let foreign_repository = RemoteRepositoryRef {
+        project: RemoteProjectRef {
+            tenant_id: memory_project.tenant_id.clone(),
+            project_id: RemoteProjectId::new("foreign-project").unwrap(),
+        },
+        repository_id: RemoteRepositoryId::new("repo").unwrap(),
+    };
+    let request = RemoteQueryRequest {
+        protocol_version: DISTRIBUTED_QUERY_PROTOCOL_VERSION,
+        request_id: RequestId::new("federated-request").unwrap(),
+        project: memory_project.clone(),
+        target: RemoteQueryTarget::Federated(FederatedViewRef {
+            graph: RemoteGraphSnapshotRef {
+                repository: foreign_repository,
+                snapshot_id: SnapshotId::new("snapshot").unwrap(),
+            },
+            memory: RemoteMemoryRevisionRef {
+                project: memory_project,
+                revision_id: MemoryRevisionId::new("revision").unwrap(),
+            },
+        }),
+        body: (),
+    };
+
+    assert_eq!(
+        request.validate(),
+        Err(DistributedProtocolError::QueryScopeMismatch)
+    );
+}

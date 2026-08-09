@@ -469,10 +469,17 @@ impl StatelessIndexWorker {
             max_diagnostics: self.limits.max_diagnostics.get(),
         };
         let mut merger = GraphMerger::default();
+        let mut extracted_facts = 0u64;
         if active.generic_enabled {
-            merger.merge(GenericExtractor::new().repository_fragment(&context, &manifest))?;
+            let fragment = GenericExtractor::new().repository_fragment(&context, &manifest);
+            reserve_extracted_facts(
+                &mut extracted_facts,
+                graph_fragment_fact_count(&fragment)?,
+                self.limits.max_total_facts.get(),
+            )?;
+            merger.merge(fragment)?;
         }
-        merger.merge(GraphFragment {
+        let source_diagnostics = GraphFragment {
             diagnostics: manifest
                 .diagnostics
                 .iter()
@@ -486,7 +493,13 @@ impl StatelessIndexWorker {
                 })
                 .collect(),
             ..GraphFragment::default()
-        })?;
+        };
+        reserve_extracted_facts(
+            &mut extracted_facts,
+            graph_fragment_fact_count(&source_diagnostics)?,
+            self.limits.max_total_facts.get(),
+        )?;
+        merger.merge(source_diagnostics)?;
 
         let generic = GenericExtractor::new();
         let cargo = CargoExtractor::new();
@@ -524,10 +537,18 @@ impl StatelessIndexWorker {
                 if source_facts > self.limits.max_facts_per_source.get() {
                     return Err(WorkerError::OutputLimitExceeded);
                 }
+                reserve_extracted_facts(
+                    &mut extracted_facts,
+                    graph_fragment_fact_count(&fragment)?,
+                    self.limits.max_total_facts.get(),
+                )?;
                 merger.merge(fragment)?;
             }
         }
         let unresolved = merger.finish(&context);
+        if graph_fragment_fact_count(&unresolved)? > self.limits.max_total_facts.get() {
+            return Err(WorkerError::OutputLimitExceeded);
+        }
         let graph = if active.resolver_enabled {
             ConservativeResolver::new()
                 .resolve(CrossFileResolutionInput {
@@ -544,6 +565,9 @@ impl StatelessIndexWorker {
         } else {
             unresolved
         };
+        if graph_fragment_fact_count(&graph)? > self.limits.max_total_facts.get() {
+            return Err(WorkerError::OutputLimitExceeded);
+        }
         self.check_deadline(started)?;
         Ok((
             FactTarget::RepositoryGraph {
@@ -625,6 +649,7 @@ impl StatelessIndexWorker {
         let mut entities = BTreeMap::<MemoryEntityId, MemoryEntity>::new();
         let mut relationships = BTreeMap::<MemoryRelationshipId, MemoryRelationship>::new();
         let mut diagnostics = Vec::new();
+        let mut extracted_facts = 0u64;
         for (remote_source, source) in remote.body.sources.iter().zip(&manifest.sources) {
             self.check_deadline(started)?;
             self.authorize(request, coordinator)?;
@@ -649,18 +674,26 @@ impl StatelessIndexWorker {
                 content: &content,
             }) {
                 Ok(fragment) => {
-                    if fragment.entities.len() as u64 > self.limits.max_facts_per_source.get()
-                        || fragment.relationships.len() as u64
-                            > self.limits.max_facts_per_source.get()
-                    {
+                    let source_facts = memory_fragment_fact_count(&fragment)?;
+                    if source_facts > self.limits.max_facts_per_source.get() {
                         return Err(WorkerError::OutputLimitExceeded);
                     }
+                    reserve_extracted_facts(
+                        &mut extracted_facts,
+                        source_facts,
+                        self.limits.max_total_facts.get(),
+                    )?;
                     merge_memory_fragment(&mut entities, &mut relationships, fragment)?;
                 }
                 Err(failure) => {
                     if diagnostics.len() as u64 >= self.limits.max_diagnostics.get() {
                         return Err(WorkerError::OutputLimitExceeded);
                     }
+                    reserve_extracted_facts(
+                        &mut extracted_facts,
+                        1,
+                        self.limits.max_total_facts.get(),
+                    )?;
                     diagnostics.push(MemoryDiagnostic {
                         build_id: build_id.clone(),
                         revision_id: revision.id.clone(),
@@ -727,6 +760,30 @@ fn graph_fragment_fact_count(fragment: &GraphFragment) -> Result<u64, WorkerErro
         .and_then(|count| count.checked_add(fragment.diagnostics.len()))
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(WorkerError::OutputLimitExceeded)
+}
+
+fn memory_fragment_fact_count(fragment: &MemoryFragment) -> Result<u64, WorkerError> {
+    fragment
+        .entities
+        .len()
+        .checked_add(fragment.relationships.len())
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or(WorkerError::OutputLimitExceeded)
+}
+
+fn reserve_extracted_facts(
+    total: &mut u64,
+    additional: u64,
+    limit: u64,
+) -> Result<(), WorkerError> {
+    let next = total
+        .checked_add(additional)
+        .ok_or(WorkerError::OutputLimitExceeded)?;
+    if next > limit {
+        return Err(WorkerError::OutputLimitExceeded);
+    }
+    *total = next;
+    Ok(())
 }
 
 fn require_fact_protection<F: FactBatchStore>(facts: &F) -> Result<(), WorkerError> {

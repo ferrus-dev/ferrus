@@ -31,6 +31,7 @@ use crate::{
         sqlite::{MEMORY_SIDECAR_FILE_NAME, OpenMemoryQuerySidecarResult, open_for_query_at},
     },
     repository_graph::{
+        config::QueryLimitsConfig,
         domain::QueryBudget,
         ports::GraphQuery,
         query_sqlite::SqliteGraphQuery,
@@ -87,7 +88,8 @@ pub(crate) async fn refresh_after_archive_best_effort() -> ArchiveMemoryRefreshO
 }
 
 pub(crate) struct LocalProjectContext {
-    pub(crate) graph: LocalGraphContext,
+    graph: Option<LocalGraphContext>,
+    query_limits: QueryLimitsConfig,
     pub(crate) project: ProjectRef,
     data_dir: PathBuf,
     exact_memory_source: Option<LocalMemorySource>,
@@ -107,8 +109,9 @@ impl LocalProjectContext {
     pub(crate) async fn load_for_agent(
         agent_id: &str,
         include_memory_content: bool,
+        require_graph: bool,
     ) -> AnyResult<Self> {
-        Self::load(false, Some(agent_id), include_memory_content, false).await
+        Self::load(require_graph, Some(agent_id), include_memory_content, false).await
     }
 
     async fn load(
@@ -117,10 +120,19 @@ impl LocalProjectContext {
         include_memory_content: bool,
         compare_local_freshness: bool,
     ) -> AnyResult<Self> {
-        let graph = match agent_id {
-            Some(agent_id) => LocalGraphContext::load_for_agent(require_graph, agent_id).await?,
-            None => LocalGraphContext::load(require_graph).await?,
+        let graph = if require_graph {
+            Some(match agent_id {
+                Some(agent_id) => LocalGraphContext::load_for_agent(true, agent_id).await?,
+                None => LocalGraphContext::load(true).await?,
+            })
+        } else {
+            None
         };
+        let query_limits = graph
+            .as_ref()
+            .map_or_else(QueryLimitsConfig::default, |graph| {
+                graph.config.query_limits.clone()
+            });
         let project_id = project::current_project_id().await?;
         let data_dir = project::current_project_data_dir().await?;
         let project = ProjectRef {
@@ -134,6 +146,7 @@ impl LocalProjectContext {
         };
         Ok(Self {
             graph,
+            query_limits,
             project,
             data_dir,
             exact_memory_source,
@@ -142,7 +155,7 @@ impl LocalProjectContext {
     }
 
     pub(crate) fn default_budget(&self) -> AnyResult<MemoryQueryBudget> {
-        default_memory_budget(&self.graph.config.query_limits).map_err(Into::into)
+        default_memory_budget(&self.query_limits).map_err(Into::into)
     }
 
     pub(crate) fn requested_budget(
@@ -182,8 +195,9 @@ impl LocalProjectContext {
         domain: ContextDomain,
         budget: MemoryQueryBudget,
     ) -> AnyResult<FederatedScope> {
+        let graph = self.graph.as_ref();
         if matches!(domain, ContextDomain::Repository | ContextDomain::All)
-            && !self.graph.config.enabled
+            && graph.is_none_or(|graph| !graph.config.enabled)
         {
             anyhow::bail!(
                 "repository graph is disabled; enable it before repository or combined retrieval"
@@ -193,7 +207,8 @@ impl LocalProjectContext {
             MemoryViewName::new(PROJECT_MEMORY_VIEW).expect("static memory view is valid"),
         );
         let repository_scope = || -> AnyResult<RepositoryContextTarget> {
-            let scope = self.graph.scope(repository_budget(&budget))?;
+            let graph = graph.context("repository graph context was not loaded")?;
+            let scope = graph.scope(repository_budget(&budget))?;
             Ok(RepositoryContextTarget {
                 repository: scope.repository,
                 snapshot: scope.snapshot,
@@ -258,7 +273,15 @@ impl LocalProjectContext {
         &self,
         request: FederatedSearchRequest,
     ) -> Result<FederatedSearchResponse, MemoryQueryError> {
-        let graph_sidecar = self.open_graph_query().map_err(runtime_error)?;
+        let includes_repository = matches!(
+            request.scope.target,
+            FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
+        );
+        let graph_sidecar = if includes_repository {
+            self.open_graph_query().map_err(runtime_error)?
+        } else {
+            None
+        };
         let memory_sidecar = self.open_memory_query().map_err(runtime_error)?;
         if matches!(
             request.scope.target,
@@ -276,7 +299,7 @@ impl LocalProjectContext {
         }
         let graph_query = OptionalGraphQuery::new(
             graph_sidecar.as_deref(),
-            self.graph.config.query_limits.clone(),
+            self.query_limits.clone(),
             self.graph_freshness_comparison(),
         );
         let memory_query = memory_sidecar
@@ -290,12 +313,15 @@ impl LocalProjectContext {
             &graph_query,
             &backend,
             &backend,
-            self.graph.config.query_limits.clone(),
+            self.query_limits.clone(),
             self.memory_freshness_comparison().map_err(runtime_error)?,
         );
         let mut response = service.search(request)?;
         if let Some(repository) = response.repository.as_mut() {
-            repository.task_view = self.graph.task_view_envelope();
+            repository.task_view = self
+                .graph
+                .as_ref()
+                .and_then(LocalGraphContext::task_view_envelope);
         }
         Ok(response)
     }
@@ -304,7 +330,15 @@ impl LocalProjectContext {
         &self,
         request: FederatedContextRequest,
     ) -> Result<FederatedContextResponse, MemoryQueryError> {
-        let graph_sidecar = self.open_graph_query().map_err(runtime_error)?;
+        let includes_repository = matches!(
+            request.scope.target,
+            FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
+        );
+        let graph_sidecar = if includes_repository {
+            self.open_graph_query().map_err(runtime_error)?
+        } else {
+            None
+        };
         let memory_sidecar = self.open_memory_query().map_err(runtime_error)?;
         if matches!(
             request.scope.target,
@@ -322,7 +356,7 @@ impl LocalProjectContext {
         }
         let graph_query = OptionalGraphQuery::new(
             graph_sidecar.as_deref(),
-            self.graph.config.query_limits.clone(),
+            self.query_limits.clone(),
             self.graph_freshness_comparison(),
         );
         let memory_query = memory_sidecar
@@ -336,12 +370,15 @@ impl LocalProjectContext {
             &graph_query,
             &backend,
             &backend,
-            self.graph.config.query_limits.clone(),
+            self.query_limits.clone(),
             self.memory_freshness_comparison().map_err(runtime_error)?,
         );
         let mut response = service.context(request)?;
         if let Some(repository) = response.repository.as_mut() {
-            repository.task_view = self.graph.task_view_envelope();
+            repository.task_view = self
+                .graph
+                .as_ref()
+                .and_then(LocalGraphContext::task_view_envelope);
         }
         Ok(response)
     }
@@ -350,7 +387,7 @@ impl LocalProjectContext {
         &'a self,
         sidecar: &'a crate::project_memory::sqlite::MemorySidecar,
     ) -> SqliteMemoryQuery<'a> {
-        let query = SqliteMemoryQuery::new(sidecar, self.graph.config.query_limits.clone());
+        let query = SqliteMemoryQuery::new(sidecar, self.query_limits.clone());
         match self.exact_memory_source.as_ref() {
             Some(source) => query.with_content(source),
             None => query,
@@ -375,7 +412,9 @@ impl LocalProjectContext {
         &self,
     ) -> Option<crate::repository_graph::query_sqlite::FreshnessComparison> {
         if self.compare_local_freshness {
-            self.graph.freshness_comparison().ok().flatten()
+            self.graph
+                .as_ref()
+                .and_then(|graph| graph.freshness_comparison().ok().flatten())
         } else {
             None
         }
@@ -639,6 +678,15 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .latest_repository_link_set(revision, repository)
     }
+    fn latest_compatible_repository_link_set(
+        &self,
+        revision: &crate::project_memory::domain::MemoryRevision,
+        repository: &crate::repository_graph::domain::RepositoryRef,
+    ) -> Result<Option<crate::project_memory::domain::MemoryRepositoryLinkSet>, Self::Error> {
+        self.sidecar
+            .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
+            .latest_compatible_repository_link_set(revision, repository)
+    }
     fn repository_links(
         &self,
         id: &crate::project_memory::domain::MemoryRepositoryLinkSetId,
@@ -667,3 +715,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .bounded_repository_links(id, max_relationships, max_diagnostics, max_duration_ms)
     }
 }
+
+#[cfg(test)]
+#[path = "project_memory_runtime_tests.rs"]
+mod tests;

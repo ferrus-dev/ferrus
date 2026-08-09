@@ -78,7 +78,12 @@ pub async fn handler(
 
 async fn run(agent_id: &str, input: ProjectContextSearchInput) -> Result<String> {
     let started = Instant::now();
-    let context = LocalProjectContext::load_for_agent(agent_id, false).await?;
+    let context = LocalProjectContext::load_for_agent(
+        agent_id,
+        false,
+        matches!(input.domain, ContextDomain::Repository | ContextDomain::All),
+    )
+    .await?;
     let budget = context.requested_budget(
         input.max_results,
         input.max_bytes,

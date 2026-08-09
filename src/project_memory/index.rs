@@ -281,9 +281,15 @@ impl<'a> MemoryIndexer<'a> {
             .map_err(MemoryIndexError::Links)?;
         let previous_link_set = match self.store.repository_link_set(&current_link_set_id)? {
             Some(link_set) => Some(link_set),
-            None => self
+            None => match self
                 .store
-                .latest_repository_link_set(&revision.id, resolver.repository())?,
+                .latest_repository_link_set(&revision.id, resolver.repository())?
+            {
+                Some(link_set) => Some(link_set),
+                None => self
+                    .store
+                    .latest_compatible_repository_link_set(&revision, resolver.repository())?,
+            },
         };
         let previous_links = previous_link_set
             .as_ref()

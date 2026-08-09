@@ -1041,6 +1041,26 @@ fn search_candidate_generation_observes_an_expired_deadline() {
 }
 
 #[test]
+fn graph_context_seed_resolution_observes_an_expired_deadline() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+
+    let roots = graph_seed_ids(
+        &graph,
+        &[RemoteContextSeed::GraphSymbol(
+            SemanticKey::new("rust:function:src/lib.rs:important").unwrap(),
+        )],
+        Instant::now(),
+        Duration::ZERO,
+    );
+
+    assert!(roots.is_empty());
+}
+
+#[test]
 fn exact_response_budget_returns_a_smaller_page_instead_of_a_terminal_error() {
     let fixture = fixture();
     let store =

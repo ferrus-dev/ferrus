@@ -117,7 +117,12 @@ async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
     if input.seeds.is_empty() || input.seeds.len() > 32 {
         anyhow::bail!("project_context requires 1..=32 seeds");
     }
-    let context = LocalProjectContext::load_for_agent(agent_id, input.include_snippets).await?;
+    let context = LocalProjectContext::load_for_agent(
+        agent_id,
+        input.include_snippets,
+        matches!(input.domain, ContextDomain::Repository | ContextDomain::All),
+    )
+    .await?;
     let budget = context.requested_budget(
         input.max_results,
         input.max_bytes,

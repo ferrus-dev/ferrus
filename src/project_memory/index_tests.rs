@@ -451,9 +451,9 @@ fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
         ],
         true,
     );
-    let source = source(&root, &data);
+    let initial_source = source(&root, &data);
     let mut store = MemorySidecar::open_at(data.path()).unwrap();
-    let first = MemoryIndexer::new(&source, &mut store)
+    let first = MemoryIndexer::new(&initial_source, &mut store)
         .unwrap()
         .index(MemoryIndexOptions::default())
         .unwrap();
@@ -507,11 +507,25 @@ fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
         &[("rust:function:src/new.rs:run", "src/new.rs")],
         true,
     );
-    let second = MemoryIndexer::new(&source, &mut store)
+    let spec_path = root.path().join("docs/specs/example.md");
+    let updated = fs::read_to_string(&spec_path)
+        .unwrap()
+        .replace("Use SQLite.", "Use SQLite carefully.");
+    fs::write(&spec_path, updated).unwrap();
+    assert!(
+        Command::new("git")
+            .current_dir(root.path())
+            .args(["add", "--", "docs/specs/example.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let updated_source = source(&root, &data);
+    let second = MemoryIndexer::new(&updated_source, &mut store)
         .unwrap()
         .index(MemoryIndexOptions::default())
         .unwrap();
-    assert_eq!(second.revision.id, first.revision.id);
+    assert_ne!(second.revision.id, first.revision.id);
     assert!(second.metrics.stale_links > 0);
     let second_set = store
         .latest_repository_link_set(&second.revision.id, &graph_repository())
@@ -521,7 +535,7 @@ fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
     assert_eq!(
         store
             .repository_link_set_for_snapshot(
-                &second.revision.id,
+                &first.revision.id,
                 &graph_repository(),
                 Some(&SnapshotId::new("snapshot-old").unwrap()),
             )

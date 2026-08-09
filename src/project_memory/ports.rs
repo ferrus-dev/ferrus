@@ -154,6 +154,11 @@ pub trait MemoryLinkStore {
         revision_id: &MemoryRevisionId,
         repository: &crate::repository_graph::domain::RepositoryRef,
     ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+    fn latest_compatible_repository_link_set(
+        &self,
+        revision: &MemoryRevision,
+        repository: &crate::repository_graph::domain::RepositoryRef,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
     fn repository_links(
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,

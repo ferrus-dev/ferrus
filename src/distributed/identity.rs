@@ -184,10 +184,16 @@ impl FederatedViewRef {
         graph: RemoteGraphSnapshotRef,
         memory: RemoteMemoryRevisionRef,
     ) -> Result<Self, RemoteIdentityError> {
-        if graph.repository.project != memory.project {
+        let value = Self { graph, memory };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), RemoteIdentityError> {
+        if self.graph.repository.project != self.memory.project {
             return Err(RemoteIdentityError::FederatedScopeMismatch);
         }
-        Ok(Self { graph, memory })
+        Ok(())
     }
 
     pub fn project(&self) -> &RemoteProjectRef {

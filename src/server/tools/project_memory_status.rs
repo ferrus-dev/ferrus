@@ -15,7 +15,7 @@ pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<
 
 async fn run(agent_id: &str) -> Result<String> {
     let started = Instant::now();
-    let context = LocalProjectContext::load_for_agent(agent_id, false).await?;
+    let context = LocalProjectContext::load_for_agent(agent_id, false, false).await?;
     let response = context.memory_status(context.default_budget()?)?;
     let serialized = serde_json::to_string(&response)?;
     project_context_telemetry::memory_status(started, &response, serialized.len());

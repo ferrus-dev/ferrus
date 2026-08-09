@@ -546,6 +546,42 @@ impl MemoryLinkStore for MemorySidecar {
             .transpose()
     }
 
+    fn latest_compatible_repository_link_set(
+        &self,
+        revision: &MemoryRevision,
+        repository: &RepositoryRef,
+    ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT sets.link_set_json FROM memory_repository_link_sets sets \
+                 JOIN memory_revisions revisions ON revisions.id = sets.memory_revision_id \
+                 WHERE sets.memory_revision_id <> ?1 \
+                   AND revisions.project_namespace = ?2 AND revisions.project_id = ?3 \
+                   AND revisions.policy_algorithm = ?4 AND revisions.policy_digest = ?5 \
+                   AND revisions.memory_model_version = ?6 \
+                   AND revisions.extractor_set_algorithm = ?7 \
+                   AND revisions.extractor_set_digest = ?8 \
+                   AND sets.repository_namespace = ?9 AND sets.repository_id = ?10 \
+                 ORDER BY sets.sequence DESC LIMIT 1",
+                params![
+                    revision.id.as_str(),
+                    revision.project.namespace.as_str(),
+                    revision.project.project_id.as_str(),
+                    revision.policy_digest.algorithm(),
+                    revision.policy_digest.value(),
+                    revision.memory_model_version,
+                    revision.extractor_set_digest.algorithm(),
+                    revision.extractor_set_digest.value(),
+                    repository.namespace.as_str(),
+                    repository.repository_id.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
     fn repository_links(
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,

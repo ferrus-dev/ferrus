@@ -412,6 +412,42 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
         },
     );
     let request = execution_request(running);
+    let mut per_source_facts = fact_store(&storage_dir.path().join("memory-per-source-facts.db"));
+    let mut per_source_limited = worker_limits();
+    per_source_limited.max_facts_per_source = NonZeroU64::new(2).unwrap();
+    assert_eq!(
+        StatelessIndexWorker::new(per_source_limited).execute(
+            &request,
+            &jobs,
+            &objects,
+            &mut per_source_facts,
+        ),
+        Err(WorkerError::OutputLimitExceeded)
+    );
+    assert!(
+        per_source_facts
+            .load_for_ingestion(&request.job.job)
+            .unwrap()
+            .is_empty()
+    );
+    let mut total_facts = fact_store(&storage_dir.path().join("memory-total-facts.db"));
+    let mut total_limited = worker_limits();
+    total_limited.max_total_facts = NonZeroU64::new(2).unwrap();
+    assert_eq!(
+        StatelessIndexWorker::new(total_limited).execute(
+            &request,
+            &jobs,
+            &objects,
+            &mut total_facts,
+        ),
+        Err(WorkerError::OutputLimitExceeded)
+    );
+    assert!(
+        total_facts
+            .load_for_ingestion(&request.job.job)
+            .unwrap()
+            .is_empty()
+    );
     let mut facts = fact_store(&storage_dir.path().join("facts.db"));
     let outcome = StatelessIndexWorker::new(worker_limits())
         .execute(&request, &jobs, &objects, &mut facts)

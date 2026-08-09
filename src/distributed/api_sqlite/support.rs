@@ -420,20 +420,35 @@ pub(super) fn context_units(
     let mut units = Vec::new();
     let mut explored = 0;
     if let Some(graph) = &loaded.graph {
-        let roots = graph_seed_ids(graph, seeds);
+        let roots = graph_seed_ids(graph, seeds, started, duration);
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        let mut nodes = Vec::with_capacity(graph.nodes.len());
+        for node in &graph.nodes {
+            if started.elapsed() >= duration {
+                return (Vec::new(), 0);
+            }
+            nodes.push(node.clone());
+        }
+        let mut edges = Vec::new();
+        for edge in &graph.edges {
+            if started.elapsed() >= duration {
+                return (Vec::new(), 0);
+            }
+            let included = match &edge.target {
+                EdgeTarget::Node(_) => true,
+                EdgeTarget::External(_) => include_external,
+                EdgeTarget::Unresolved(_) => include_unresolved,
+            };
+            if included {
+                edges.push(edge.clone());
+            }
+        }
         let filtered = StoredRemoteGraphSnapshot {
             record: graph.record.clone(),
-            nodes: graph.nodes.clone(),
-            edges: graph
-                .edges
-                .iter()
-                .filter(|edge| match &edge.target {
-                    EdgeTarget::Node(_) => true,
-                    EdgeTarget::External(_) => include_external,
-                    EdgeTarget::Unresolved(_) => include_unresolved,
-                })
-                .cloned()
-                .collect(),
+            nodes,
+            edges,
             diagnostics: Vec::new(),
         };
         let (graph_units, depth) = graph_neighborhood(
@@ -487,17 +502,25 @@ fn federated_context_units(
     started: Instant,
     duration: Duration,
 ) -> (Vec<ContextUnit>, u32) {
-    let graph_nodes = graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect::<BTreeMap<_, _>>();
-    let memory_entities = memory
-        .entities
-        .iter()
-        .map(|entity| (entity.id.clone(), entity))
-        .collect::<BTreeMap<_, _>>();
-    let mut selected = graph_seed_ids(graph, seeds)
+    let graph_roots = graph_seed_ids(graph, seeds, started, duration);
+    if started.elapsed() >= duration {
+        return (Vec::new(), 0);
+    }
+    let mut graph_nodes = BTreeMap::new();
+    for node in &graph.nodes {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        graph_nodes.insert(node.id.clone(), node);
+    }
+    let mut memory_entities = BTreeMap::new();
+    for entity in &memory.entities {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        memory_entities.insert(entity.id.clone(), entity);
+    }
+    let mut selected = graph_roots
         .into_iter()
         .filter(|id| graph_nodes.contains_key(id))
         .map(FederatedNode::Graph)
@@ -682,35 +705,42 @@ fn federated_relationship_targets(
 pub(super) fn graph_seed_ids(
     graph: &StoredRemoteGraphSnapshot,
     seeds: &[RemoteContextSeed],
+    started: Instant,
+    duration: Duration,
 ) -> Vec<NodeId> {
     let mut roots = BTreeSet::new();
     for seed in seeds {
+        if started.elapsed() >= duration {
+            break;
+        }
         match seed {
             RemoteContextSeed::GraphNode(id) => {
                 roots.insert(id.clone());
             }
             RemoteContextSeed::GraphSymbol(key) => {
-                roots.extend(
-                    graph
-                        .nodes
-                        .iter()
-                        .filter(|node| node.semantic_key.as_ref() == Some(key))
-                        .map(|node| node.id.clone()),
-                );
+                for node in &graph.nodes {
+                    if started.elapsed() >= duration {
+                        break;
+                    }
+                    if node.semantic_key.as_ref() == Some(key) {
+                        roots.insert(node.id.clone());
+                    }
+                }
             }
             RemoteContextSeed::GraphPath(path) => {
-                roots.extend(
-                    graph
-                        .nodes
-                        .iter()
-                        .filter(|node| {
-                            node.provenance
-                                .evidence
-                                .as_ref()
-                                .is_some_and(|evidence| &evidence.path == path)
-                        })
-                        .map(|node| node.id.clone()),
-                );
+                for node in &graph.nodes {
+                    if started.elapsed() >= duration {
+                        break;
+                    }
+                    if node
+                        .provenance
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|evidence| &evidence.path == path)
+                    {
+                        roots.insert(node.id.clone());
+                    }
+                }
             }
             RemoteContextSeed::MemoryEntity(_) => {}
         }

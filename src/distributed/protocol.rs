@@ -704,6 +704,10 @@ impl<T> RemoteQueryRequest<T> {
         if self.protocol_version != DISTRIBUTED_QUERY_PROTOCOL_VERSION {
             return Err(DistributedProtocolError::UnsupportedVersion);
         }
+        if let RemoteQueryTarget::Federated(view) = &self.target {
+            view.validate()
+                .map_err(|_| DistributedProtocolError::QueryScopeMismatch)?;
+        }
         if self.project != *self.target.project() {
             return Err(DistributedProtocolError::QueryScopeMismatch);
         }
