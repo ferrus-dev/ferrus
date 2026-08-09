@@ -144,7 +144,7 @@ impl SqliteRemoteQueryApi {
             RemoteQueryTarget::Repository(snapshot) => LoadedTarget {
                 graph: Some(
                     self.publication
-                        .graph_snapshot_bounded(snapshot, started, duration)
+                        .published_graph_snapshot_bounded(snapshot, started, duration)
                         .map_err(|error| query_store_error(request_id, error))?
                         .ok_or_else(|| query_not_found(request_id))?,
                 ),
@@ -154,7 +154,7 @@ impl SqliteRemoteQueryApi {
                 graph: None,
                 memory: Some(
                     self.publication
-                        .memory_revision_bounded(revision, started, duration)
+                        .published_memory_revision_bounded(revision, started, duration)
                         .map_err(|error| query_store_error(request_id, error))?
                         .ok_or_else(|| query_not_found(request_id))?,
                 ),
@@ -162,13 +162,13 @@ impl SqliteRemoteQueryApi {
             RemoteQueryTarget::Federated(view) => LoadedTarget {
                 graph: Some(
                     self.publication
-                        .graph_snapshot_bounded(&view.graph, started, duration)
+                        .published_graph_snapshot_bounded(&view.graph, started, duration)
                         .map_err(|error| query_store_error(request_id, error))?
                         .ok_or_else(|| query_not_found(request_id))?,
                 ),
                 memory: Some(
                     self.publication
-                        .memory_revision_bounded(&view.memory, started, duration)
+                        .published_memory_revision_bounded(&view.memory, started, duration)
                         .map_err(|error| query_store_error(request_id, error))?
                         .ok_or_else(|| query_not_found(request_id))?,
                 ),

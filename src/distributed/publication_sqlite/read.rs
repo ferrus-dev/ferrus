@@ -148,6 +148,31 @@ pub(super) fn load_memory_record(
     .transpose()
 }
 
+pub(super) fn target_was_published(
+    connection: &Connection,
+    project: &RemoteProjectRef,
+    domain: &str,
+    repository_id: &str,
+    target_id: &str,
+) -> Result<bool, RemoteStoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM remote_published_targets
+             WHERE tenant_id = ?1 AND project_id = ?2 AND domain = ?3
+               AND repository_id = ?4 AND target_id = ?5",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                domain,
+                repository_id,
+                target_id
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 struct RevisionRow {
     job_id: IndexJobId,
     build_id: String,
@@ -416,6 +441,19 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
              PRIMARY KEY (
                  tenant_id, project_id, domain, repository_id, target_id, fact_kind, fact_id
              ),
+             FOREIGN KEY (tenant_id, project_id, domain, repository_id, target_id)
+                 REFERENCES remote_immutable_revisions (
+                     tenant_id, project_id, domain, repository_id, target_id
+                 ) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS remote_published_targets (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             domain TEXT NOT NULL CHECK (domain IN ('repository_graph', 'project_memory')),
+             repository_id TEXT NOT NULL,
+             target_id TEXT NOT NULL,
+             first_published_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id, domain, repository_id, target_id),
              FOREIGN KEY (tenant_id, project_id, domain, repository_id, target_id)
                  REFERENCES remote_immutable_revisions (
                      tenant_id, project_id, domain, repository_id, target_id

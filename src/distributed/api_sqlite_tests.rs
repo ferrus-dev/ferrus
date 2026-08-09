@@ -832,6 +832,41 @@ fn authorization_denies_foreign_queries_without_disclosing_target_existence() {
 }
 
 #[test]
+fn explicit_queries_reject_immutable_targets_without_publication_visibility() {
+    let fixture = fixture();
+    rusqlite::Connection::open(&fixture.control_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM remote_published_targets
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            rusqlite::params![
+                fixture.project.tenant_id.as_str(),
+                fixture.project.project_id.as_str()
+            ],
+        )
+        .unwrap();
+    let authorization = auth(
+        CredentialClass::QueryAgent,
+        AuthorizationScope::Project(fixture.project.clone()),
+    );
+
+    for target in [
+        RemoteQueryTarget::Repository(fixture.graph.clone()),
+        RemoteQueryTarget::Memory(fixture.memory.clone()),
+    ] {
+        let request = query_request(&fixture, target, RemoteQueryOperation::Status, 10, None);
+        assert_eq!(
+            fixture
+                .query
+                .query(&authorization, &request)
+                .unwrap_err()
+                .code,
+            RemoteErrorCode::NotFound
+        );
+    }
+}
+
+#[test]
 fn stale_cursor_and_tiny_response_budget_fail_without_reissuing_pages() {
     let fixture = fixture();
     let authorization = auth(

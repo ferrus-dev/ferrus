@@ -51,7 +51,7 @@ use super::{
     },
 };
 
-const STORAGE_SCHEMA_VERSION: u32 = 1;
+pub(super) const STORAGE_SCHEMA_VERSION: u32 = 2;
 const NONCE_BYTES: usize = 12;
 const SQLITE_PROGRESS_OPS: i32 = 100;
 
@@ -184,26 +184,26 @@ impl SqliteRemotePublicationStore {
         })
     }
 
-    pub fn graph_snapshot_bounded(
+    pub fn published_graph_snapshot_bounded(
         &self,
         snapshot: &RemoteGraphSnapshotRef,
         started: Instant,
         duration: Duration,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
-        let result = self.load_graph_snapshot(snapshot, Some((started, duration)));
+        let result = self.load_graph_snapshot(snapshot, Some((started, duration)), true);
         drop(deadline);
         result
     }
 
-    pub fn memory_revision_bounded(
+    pub fn published_memory_revision_bounded(
         &self,
         revision: &RemoteMemoryRevisionRef,
         started: Instant,
         duration: Duration,
     ) -> Result<Option<StoredRemoteMemoryRevision>, RemoteStoreError> {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
-        let result = self.load_memory_revision(revision, Some((started, duration)));
+        let result = self.load_memory_revision(revision, Some((started, duration)), true);
         drop(deadline);
         result
     }
@@ -212,8 +212,20 @@ impl SqliteRemotePublicationStore {
         &self,
         snapshot: &RemoteGraphSnapshotRef,
         deadline: Option<(Instant, Duration)>,
+        published_only: bool,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
         ensure_read_budget(deadline)?;
+        if published_only
+            && !target_was_published(
+                &self.connection,
+                &snapshot.repository.project,
+                "repository_graph",
+                snapshot.repository.repository_id.as_str(),
+                snapshot.snapshot_id.as_str(),
+            )?
+        {
+            return Ok(None);
+        }
         let Some(record) = load_graph_record(&self.connection, snapshot)? else {
             return Ok(None);
         };
@@ -256,8 +268,20 @@ impl SqliteRemotePublicationStore {
         &self,
         revision: &RemoteMemoryRevisionRef,
         deadline: Option<(Instant, Duration)>,
+        published_only: bool,
     ) -> Result<Option<StoredRemoteMemoryRevision>, RemoteStoreError> {
         ensure_read_budget(deadline)?;
+        if published_only
+            && !target_was_published(
+                &self.connection,
+                &revision.project,
+                "project_memory",
+                "",
+                revision.revision_id.as_str(),
+            )?
+        {
+            return Ok(None);
+        }
         let Some(record) = load_memory_record(&self.connection, revision)? else {
             return Ok(None);
         };
@@ -359,6 +383,16 @@ impl SqliteRemotePublicationStore {
                 reused_snapshot,
             }
         };
+        if matches!(&outcome, GraphPublicationOutcome::Published { .. }) {
+            mark_published_target(
+                &transaction,
+                &request.repository.project,
+                "repository_graph",
+                request.repository.repository_id.as_str(),
+                request.snapshot_id.as_str(),
+                now,
+            )?;
+        }
         complete_job(&transaction, request, now)?;
         transaction.commit()?;
         Ok(outcome)
@@ -427,6 +461,16 @@ impl SqliteRemotePublicationStore {
                 reused_revision,
             }
         };
+        if matches!(&outcome, MemoryPublicationOutcome::Published { .. }) {
+            mark_published_target(
+                &transaction,
+                &request.project,
+                "project_memory",
+                "",
+                request.revision_id.as_str(),
+                now,
+            )?;
+        }
         complete_job(&transaction, request, now)?;
         transaction.commit()?;
         Ok(outcome)
@@ -466,14 +510,14 @@ impl RemotePublicationStore for SqliteRemotePublicationStore {
         &self,
         snapshot: &RemoteGraphSnapshotRef,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, Self::Error> {
-        self.load_graph_snapshot(snapshot, None)
+        self.load_graph_snapshot(snapshot, None, false)
     }
 
     fn memory_revision(
         &self,
         revision: &RemoteMemoryRevisionRef,
     ) -> Result<Option<StoredRemoteMemoryRevision>, Self::Error> {
-        self.load_memory_revision(revision, None)
+        self.load_memory_revision(revision, None, false)
     }
 
     fn graph_view(

@@ -715,6 +715,31 @@ pub(super) fn next_generation(actual: Option<NonZeroU64>) -> Result<NonZeroU64, 
     NonZeroU64::new(generation).ok_or(RemoteStoreError::IntegrityFailure)
 }
 
+pub(super) fn mark_published_target(
+    transaction: &Transaction<'_>,
+    project: &RemoteProjectRef,
+    domain: &str,
+    repository_id: &str,
+    target_id: &str,
+    published_at: DateTime<Utc>,
+) -> Result<(), RemoteStoreError> {
+    transaction.execute(
+        "INSERT INTO remote_published_targets (
+             tenant_id, project_id, domain, repository_id, target_id, first_published_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (tenant_id, project_id, domain, repository_id, target_id) DO NOTHING",
+        params![
+            project.tenant_id.as_str(),
+            project.project_id.as_str(),
+            domain,
+            repository_id,
+            target_id,
+            published_at.timestamp_millis()
+        ],
+    )?;
+    Ok(())
+}
+
 pub(super) fn upsert_graph_view(
     transaction: &Transaction<'_>,
     view: &PublishedRemoteGraphView,

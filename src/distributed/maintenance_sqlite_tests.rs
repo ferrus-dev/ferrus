@@ -16,9 +16,9 @@ use super::{
     fact_store::FactBatchStore,
     fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
     identity::{
-        CredentialId, DeletionId, FactShardId, PrincipalId, RemoteGraphSnapshotRef,
-        RemoteProjectId, RemoteProjectRef, RemoteRepositoryId, RemoteRepositoryRef,
-        RepositoryManifestId, RequestId, TenantId, TenantObjectRef,
+        CredentialId, DeletionId, FactShardId, MemoryManifestId, PrincipalId,
+        RemoteGraphSnapshotRef, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
+        RemoteRepositoryRef, RepositoryManifestId, RequestId, TenantId, TenantObjectRef,
     },
     maintenance::{InspectRemoteDeletionRequest, RemoteDeleteRequest, RemoteMaintenanceApi},
     maintenance_sqlite::SqliteRemoteMaintenance,
@@ -48,6 +48,8 @@ struct Fixture {
     project_a: RemoteProjectRef,
     project_b: RemoteProjectRef,
     repository_a: RemoteRepositoryRef,
+    graph_job_a: IndexJobRef,
+    memory_job_a: IndexJobRef,
     object_a: TenantObjectRef,
     object_b: TenantObjectRef,
     maintenance: SqliteRemoteMaintenance,
@@ -152,6 +154,44 @@ fn submit_job(
         .job
 }
 
+fn submit_memory_job(
+    control_path: &Path,
+    project: &RemoteProjectRef,
+    object: &TenantObjectRef,
+    suffix: &str,
+) -> IndexJobRef {
+    let input = IndexInputRef::Memory(super::identity::MemoryManifestRef {
+        project: project.clone(),
+        manifest_id: MemoryManifestId::new(format!("memory-manifest-{suffix}")).unwrap(),
+        manifest_digest: object.content_identity.clone(),
+        memory_policy_digest: digest("22"),
+        manifest_object: object.clone(),
+    });
+    let job = IndexJobSpec::new(
+        IndexJobKind::ProjectMemory,
+        input,
+        IndexSemantics {
+            semantic_config_digest: digest("33"),
+            model_version: NonZeroU32::new(1).unwrap(),
+            extractor_set_digest: digest("44"),
+        },
+    )
+    .unwrap();
+    SqliteIndexJobCoordinator::open(control_path, coordinator_limits())
+        .unwrap()
+        .submit(
+            &SubmitIndexJobRequest {
+                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+                request_id: RequestId::new(format!("submit-memory-{suffix}")).unwrap(),
+                project: project.clone(),
+                job,
+            },
+            Utc::now(),
+        )
+        .unwrap()
+        .job
+}
+
 fn batch(job: &IndexJobRef, suffix: &str) -> FactBatch {
     FactBatch::new(
         job.clone(),
@@ -175,13 +215,13 @@ fn batch(job: &IndexJobRef, suffix: &str) -> FactBatch {
     .unwrap()
 }
 
-fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
+fn seed_publications(control_path: &Path, jobs: &[(&IndexJobRef, &IndexJobRef)]) {
     let connection = Connection::open(control_path).unwrap();
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .unwrap();
-    for job in jobs {
-        let suffix = job.project.tenant_id.as_str();
+    for (graph_job, memory_job) in jobs {
+        let suffix = graph_job.project.tenant_id.as_str();
         let snapshot = format!("snapshot-{suffix}");
         let revision = format!("memory-{suffix}");
         connection
@@ -195,10 +235,10 @@ fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
                            'repository_graph', 'build', 'sha256', '44', 'sha256', '55',
                            1, 0, 0, ?5)",
                 params![
-                    job.project.tenant_id.as_str(),
-                    job.project.project_id.as_str(),
+                    graph_job.project.tenant_id.as_str(),
+                    graph_job.project.project_id.as_str(),
                     snapshot,
-                    job.job_id.as_str(),
+                    graph_job.job_id.as_str(),
                     Utc::now().timestamp_millis()
                 ],
             )
@@ -210,10 +250,24 @@ fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
                     snapshot_id, job_id, generation
                  ) VALUES (?1, ?2, 'repository_graph', 'repository', 'canonical', ?3, ?4, 1)",
                 params![
-                    job.project.tenant_id.as_str(),
-                    job.project.project_id.as_str(),
+                    graph_job.project.tenant_id.as_str(),
+                    graph_job.project.project_id.as_str(),
                     snapshot,
-                    job.job_id.as_str()
+                    graph_job.job_id.as_str()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remote_published_targets (
+                    tenant_id, project_id, domain, repository_id, target_id,
+                    first_published_at_ms
+                 ) VALUES (?1, ?2, 'repository_graph', 'repository', ?3, ?4)",
+                params![
+                    graph_job.project.tenant_id.as_str(),
+                    graph_job.project.project_id.as_str(),
+                    snapshot,
+                    Utc::now().timestamp_millis()
                 ],
             )
             .unwrap();
@@ -225,8 +279,8 @@ fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
                  ) VALUES (?1, ?2, 'repository_graph', 'repository', ?3,
                            'node', 'node', 1, ?4, ?5)",
                 params![
-                    job.project.tenant_id.as_str(),
-                    job.project.project_id.as_str(),
+                    graph_job.project.tenant_id.as_str(),
+                    graph_job.project.project_id.as_str(),
                     snapshot,
                     vec![0u8; 12],
                     vec![0u8; 16]
@@ -244,10 +298,10 @@ fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
                            'project_memory', 'memory-build', 'sha256', '44', 'sha256', '55',
                            1, 0, 0, ?5)",
                 params![
-                    job.project.tenant_id.as_str(),
-                    job.project.project_id.as_str(),
+                    memory_job.project.tenant_id.as_str(),
+                    memory_job.project.project_id.as_str(),
                     revision,
-                    job.job_id.as_str(),
+                    memory_job.job_id.as_str(),
                     Utc::now().timestamp_millis()
                 ],
             )
@@ -259,10 +313,24 @@ fn seed_publications(control_path: &Path, jobs: &[&IndexJobRef]) {
                     revision_id, job_id, generation
                  ) VALUES (?1, ?2, 'project_memory', '', 'project', ?3, ?4, 1)",
                 params![
-                    job.project.tenant_id.as_str(),
-                    job.project.project_id.as_str(),
+                    memory_job.project.tenant_id.as_str(),
+                    memory_job.project.project_id.as_str(),
                     revision,
-                    job.job_id.as_str()
+                    memory_job.job_id.as_str()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remote_published_targets (
+                    tenant_id, project_id, domain, repository_id, target_id,
+                    first_published_at_ms
+                 ) VALUES (?1, ?2, 'project_memory', '', ?3, ?4)",
+                params![
+                    memory_job.project.tenant_id.as_str(),
+                    memory_job.project.project_id.as_str(),
+                    revision,
+                    Utc::now().timestamp_millis()
                 ],
             )
             .unwrap();
@@ -292,16 +360,21 @@ fn fixture() -> Fixture {
             .object;
         (object_a, object_b)
     };
-    let job_a = submit_job(&control_path, &project_a, &repository_a, &object_a, "a");
-    let job_b = submit_job(&control_path, &project_b, &repository_b, &object_b, "b");
+    let graph_job_a = submit_job(&control_path, &project_a, &repository_a, &object_a, "a");
+    let graph_job_b = submit_job(&control_path, &project_b, &repository_b, &object_b, "b");
+    let memory_job_a = submit_memory_job(&control_path, &project_a, &object_a, "a");
+    let memory_job_b = submit_memory_job(&control_path, &project_b, &object_b, "b");
     drop(
         SqliteRemotePublicationStore::open(&control_path, KEY, publication_limits(), true).unwrap(),
     );
-    seed_publications(&control_path, &[&job_a, &job_b]);
+    seed_publications(
+        &control_path,
+        &[(&graph_job_a, &memory_job_a), (&graph_job_b, &memory_job_b)],
+    );
     {
         let mut facts = SqliteFactBatchStore::open(&fact_path, KEY, fact_quota(), true).unwrap();
-        facts.put(&batch(&job_a, "a")).unwrap();
-        facts.put(&batch(&job_b, "b")).unwrap();
+        facts.put(&batch(&graph_job_a, "a")).unwrap();
+        facts.put(&batch(&graph_job_b, "b")).unwrap();
     }
     let maintenance =
         SqliteRemoteMaintenance::open(&control_path, &fact_path, &object_root).unwrap();
@@ -313,6 +386,8 @@ fn fixture() -> Fixture {
         project_a,
         project_b,
         repository_a,
+        graph_job_a,
+        memory_job_a,
         object_a,
         object_b,
         maintenance,
@@ -368,7 +443,7 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
         (AuditCounter::FactBatches, 1),
         (AuditCounter::Snapshots, 1),
         (AuditCounter::Revisions, 1),
-        (AuditCounter::Jobs, 1),
+        (AuditCounter::Jobs, 2),
     ] {
         assert_eq!(result.counters.get(&counter), Some(&expected));
     }
@@ -377,6 +452,7 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
     for table in [
         "distributed_index_jobs",
         "remote_immutable_revisions",
+        "remote_published_targets",
         "remote_graph_views",
         "remote_memory_views",
     ] {
@@ -484,7 +560,7 @@ fn authorization_precedes_validation_and_foreign_lookup() {
             "distributed_index_jobs",
             &fixture.project_b
         ),
-        1
+        2
     );
 }
 
@@ -529,6 +605,137 @@ fn failed_cross_store_deletion_resumes_without_losing_progress() {
             &fixture.control_path,
             "distributed_index_jobs",
             &fixture.project_b
+        ),
+        2
+    );
+}
+
+fn job_count_for_kind(path: &Path, project: &RemoteProjectRef, kind: &str) -> u64 {
+    let count = Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM distributed_index_jobs
+             WHERE tenant_id = ?1 AND project_id = ?2 AND kind = ?3",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                kind
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    u64::try_from(count).unwrap()
+}
+
+fn partial_project_request(
+    project: &RemoteProjectRef,
+    deletion: &str,
+    coverage: RetentionClass,
+) -> RemoteDeleteRequest {
+    RemoteDeleteRequest {
+        protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
+        request_id: RequestId::new(format!("request-{deletion}")).unwrap(),
+        deletion: DeleteDataRequest::new(
+            DeletionId::new(deletion).unwrap(),
+            DeletionTarget::Project(project.clone()),
+            BTreeSet::from([coverage]),
+            Utc::now(),
+        )
+        .unwrap(),
+    }
+}
+
+#[test]
+fn graph_only_project_deletion_preserves_memory_job_linkage() {
+    let mut fixture = fixture();
+    let request = partial_project_request(
+        &fixture.project_a,
+        "delete-only-graph",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    let result = fixture
+        .maintenance
+        .delete(&administrator(&fixture.project_a), &request, Utc::now())
+        .unwrap();
+
+    assert_eq!(result.counters.get(&AuditCounter::Snapshots), Some(&1));
+    assert_eq!(result.counters.get(&AuditCounter::Jobs), Some(&1));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        0
+    );
+    assert_eq!(
+        job_count_for_kind(&fixture.control_path, &fixture.project_a, "project_memory"),
+        1
+    );
+    assert!(
+        SqliteIndexJobCoordinator::open(&fixture.control_path, coordinator_limits())
+            .unwrap()
+            .inspect(&super::protocol::InspectIndexJobRequest {
+                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+                request_id: RequestId::new("inspect-retained-memory-job").unwrap(),
+                job: fixture.memory_job_a.clone(),
+            })
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        table_count(
+            &fixture.control_path,
+            "remote_immutable_revisions",
+            &fixture.project_a
+        ),
+        1
+    );
+}
+
+#[test]
+fn memory_only_project_deletion_preserves_graph_job_linkage() {
+    let mut fixture = fixture();
+    let request = partial_project_request(
+        &fixture.project_a,
+        "delete-only-memory",
+        RetentionClass::PublishedMemoryRevision,
+    );
+    let result = fixture
+        .maintenance
+        .delete(&administrator(&fixture.project_a), &request, Utc::now())
+        .unwrap();
+
+    assert_eq!(result.counters.get(&AuditCounter::Revisions), Some(&1));
+    assert_eq!(result.counters.get(&AuditCounter::Jobs), Some(&1));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        1
+    );
+    assert_eq!(
+        job_count_for_kind(&fixture.control_path, &fixture.project_a, "project_memory"),
+        0
+    );
+    assert!(
+        SqliteIndexJobCoordinator::open(&fixture.control_path, coordinator_limits())
+            .unwrap()
+            .inspect(&super::protocol::InspectIndexJobRequest {
+                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+                request_id: RequestId::new("inspect-retained-graph-job").unwrap(),
+                job: fixture.graph_job_a.clone(),
+            })
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        table_count(
+            &fixture.control_path,
+            "remote_immutable_revisions",
+            &fixture.project_a
         ),
         1
     );

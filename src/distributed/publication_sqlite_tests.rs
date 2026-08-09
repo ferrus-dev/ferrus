@@ -394,10 +394,23 @@ fn stale_graph_cas_cannot_replace_the_current_pointer() {
         store
             .graph_snapshot(&RemoteGraphSnapshotRef {
                 repository: old_request.repository.clone(),
-                snapshot_id: old_request.snapshot_id,
+                snapshot_id: old_request.snapshot_id.clone(),
             })
             .unwrap()
             .is_some()
+    );
+    assert!(
+        store
+            .published_graph_snapshot_bounded(
+                &RemoteGraphSnapshotRef {
+                    repository: old_request.repository.clone(),
+                    snapshot_id: old_request.snapshot_id,
+                },
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .is_none()
     );
     assert_eq!(
         store
@@ -406,6 +419,53 @@ fn stale_graph_cas_cannot_replace_the_current_pointer() {
             .unwrap()
             .snapshot_id,
         first_request.snapshot_id
+    );
+}
+
+#[test]
+fn stale_memory_cas_target_is_retained_but_not_query_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let first_job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "14a");
+    let first_request = memory_request(&first_job, "revision-first", None);
+    let mut store = store(&path);
+    store
+        .publish_memory(
+            &first_request,
+            &[memory_batch(&first_job.job, "revision-first")],
+            Utc::now(),
+        )
+        .unwrap();
+
+    let old_job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "14b");
+    let old_request = memory_request(&old_job, "revision-old", None);
+    let outcome = store
+        .publish_memory(
+            &old_request,
+            &[memory_batch(&old_job.job, "revision-old")],
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        MemoryPublicationOutcome::Superseded { current: Some(ref view) }
+            if view.revision_id == first_request.revision_id
+    ));
+    let old_revision = RemoteMemoryRevisionRef {
+        project: old_request.project,
+        revision_id: old_request.revision_id,
+    };
+    assert!(store.memory_revision(&old_revision).unwrap().is_some());
+    assert!(
+        store
+            .published_memory_revision_bounded(
+                &old_revision,
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -505,6 +565,61 @@ fn same_snapshot_is_reused_only_after_expected_pointer_matches() {
 }
 
 #[test]
+fn previously_published_snapshot_remains_query_visible_after_view_advances() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let first_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "19a");
+    let first_request = graph_request(&first_job, "snapshot-history-first", None);
+    let mut store = store(&path);
+    let first_outcome = store
+        .publish_graph(
+            &first_request,
+            &[graph_batch(
+                &first_job.job,
+                "snapshot-history-first",
+                "first",
+            )],
+            Utc::now(),
+        )
+        .unwrap();
+    let GraphPublicationOutcome::Published { view, .. } = first_outcome else {
+        panic!("initial publication must win");
+    };
+
+    let next_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "19b");
+    let next_request = graph_request(
+        &next_job,
+        "snapshot-history-next",
+        Some(GraphPublicationVersion {
+            snapshot_id: view.snapshot_id,
+            generation: view.generation,
+        }),
+    );
+    store
+        .publish_graph(
+            &next_request,
+            &[graph_batch(&next_job.job, "snapshot-history-next", "next")],
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .published_graph_snapshot_bounded(
+                &RemoteGraphSnapshotRef {
+                    repository: first_request.repository,
+                    snapshot_id: first_request.snapshot_id,
+                },
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn encrypted_fact_tampering_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
@@ -551,7 +666,7 @@ fn bounded_snapshot_reads_stop_after_the_deadline() {
         )
         .unwrap();
     assert!(matches!(
-        store.graph_snapshot_bounded(
+        store.published_graph_snapshot_bounded(
             &RemoteGraphSnapshotRef {
                 repository: request.repository,
                 snapshot_id: request.snapshot_id,

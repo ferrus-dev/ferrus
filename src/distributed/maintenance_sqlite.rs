@@ -24,6 +24,7 @@ use super::{
     protocol::{
         DistributedProtocolError, IndexInputRef, IndexJobSpec, RemoteError, RemoteErrorCode,
     },
+    publication_sqlite::STORAGE_SCHEMA_VERSION,
     security::{
         AuditCounter, AuditOutcome, AuditRecord, AuditedResource, AuthorizationContext,
         AuthorizationScope, DeleteDataRequest, DeletionState, DeletionTarget, RemotePermission,
@@ -101,7 +102,11 @@ impl SqliteRemoteMaintenance {
         };
         let connection = service.control_connection()?;
         ensure_schema(&connection, "distributed_coordinator_metadata", 1)?;
-        ensure_schema(&connection, "remote_storage_metadata", 1)?;
+        ensure_schema(
+            &connection,
+            "remote_storage_metadata",
+            STORAGE_SCHEMA_VERSION,
+        )?;
         initialize_schema(&connection)?;
         let facts = open_existing(&service.fact_path)?;
         ensure_schema(&facts, "fact_store_metadata", 1)?;
@@ -690,21 +695,27 @@ fn delete_control_data(
             u64::try_from(deleted).map_err(|_| MaintenanceStoreError::IntegrityFailure)?,
         );
     }
-    if deletion.coverage.iter().any(|class| {
-        matches!(
-            class,
-            RetentionClass::UploadedSource
-                | RetentionClass::UnpublishedFact
-                | RetentionClass::PublishedGraphSnapshot
-                | RetentionClass::PublishedMemoryRevision
-        )
-    }) {
+    let delete_graph_jobs = deletion
+        .coverage
+        .contains(&RetentionClass::PublishedGraphSnapshot);
+    let delete_memory_jobs = deletion
+        .coverage
+        .contains(&RetentionClass::PublishedMemoryRevision)
+        && matches!(deletion.target, DeletionTarget::Project(_));
+    if delete_graph_jobs || delete_memory_jobs {
         let deleted = match &deletion.target {
             DeletionTarget::Project(_) => transaction
                 .execute(
                     "DELETE FROM distributed_index_jobs
-                     WHERE tenant_id = ?1 AND project_id = ?2",
-                    params![project.tenant_id.as_str(), project.project_id.as_str()],
+                     WHERE tenant_id = ?1 AND project_id = ?2
+                       AND ((kind = 'repository_graph' AND ?3)
+                         OR (kind = 'project_memory' AND ?4))",
+                    params![
+                        project.tenant_id.as_str(),
+                        project.project_id.as_str(),
+                        delete_graph_jobs,
+                        delete_memory_jobs
+                    ],
                 )
                 .map_err(|_| MaintenanceStoreError::Unavailable)?,
             DeletionTarget::Repository(_) => {
