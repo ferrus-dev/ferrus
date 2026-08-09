@@ -130,7 +130,7 @@ struct ContextAssembly {
     candidates: Vec<ContextCandidate>,
     relationships: Vec<MemoryRelationship>,
     explored_depth: u32,
-    duration_exceeded: bool,
+    truncation: Option<MemoryTruncationReason>,
 }
 
 /// Local query implementation. It never creates, migrates, or mutates a sidecar.
@@ -380,11 +380,12 @@ impl<'a> SqliteMemoryQuery<'a> {
             }
         }
         let mut selected_relationships = BTreeMap::new();
+        let mut selected_relationship_bytes = 0_u64;
         let mut explored_depth = 0_u32;
-        let mut duration_exceeded = false;
-        while let Some((entity_id, depth)) = queue.pop_front() {
+        let mut truncation = None;
+        'traversal: while let Some((entity_id, depth)) = queue.pop_front() {
             if started.elapsed() >= scope.budget.duration() {
-                duration_exceeded = true;
+                truncation = Some(MemoryTruncationReason::Duration);
                 break;
             }
             explored_depth = explored_depth.max(depth);
@@ -392,11 +393,29 @@ impl<'a> SqliteMemoryQuery<'a> {
                 continue;
             }
             for (neighbor, relationship) in adjacency.get(&entity_id).into_iter().flatten() {
-                selected_relationships
-                    .entry(relationship.id.clone())
-                    .or_insert_with(|| relationship.clone());
+                if started.elapsed() >= scope.budget.duration() {
+                    truncation = Some(MemoryTruncationReason::Duration);
+                    break 'traversal;
+                }
+                if !selected_relationships.contains_key(&relationship.id) {
+                    if selected_relationships.len() >= scope.budget.max_results as usize {
+                        truncation = Some(MemoryTruncationReason::Results);
+                        break 'traversal;
+                    }
+                    let relationship_bytes = serialized_len(relationship)?;
+                    if selected_relationship_bytes.saturating_add(relationship_bytes)
+                        > scope.budget.max_bytes
+                    {
+                        truncation = Some(MemoryTruncationReason::Bytes);
+                        break 'traversal;
+                    }
+                    selected_relationship_bytes =
+                        selected_relationship_bytes.saturating_add(relationship_bytes);
+                    selected_relationships.insert(relationship.id.clone(), relationship.clone());
+                }
                 if selected.len() >= MAX_CONTEXT_CANDIDATES {
-                    continue;
+                    truncation = Some(MemoryTruncationReason::Results);
+                    break 'traversal;
                 }
                 if !selected.contains_key(neighbor) {
                     selected.insert(
@@ -430,7 +449,7 @@ impl<'a> SqliteMemoryQuery<'a> {
             candidates,
             relationships: selected_relationships.into_values().collect(),
             explored_depth,
-            duration_exceeded,
+            truncation,
         })
     }
 
@@ -675,7 +694,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
                     candidates: vec![],
                     relationships: vec![],
                     explored_depth: 0,
-                    duration_exceeded: true,
+                    truncation: Some(MemoryTruncationReason::Duration),
                 }
             }
             Err(error) => return Err(error),
@@ -690,9 +709,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         let mut items = Vec::new();
         let mut returned_bytes = 0_u64;
         let mut snippet_bytes = 0_u64;
-        let mut reason = assembly
-            .duration_exceeded
-            .then_some(MemoryTruncationReason::Duration);
+        let mut reason = assembly.truncation;
         if request.policy.include_snippets && self.content.is_none() && reason.is_none() {
             reason = Some(MemoryTruncationReason::Capability);
         }

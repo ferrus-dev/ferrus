@@ -360,6 +360,74 @@ fn combined_context_crosses_only_the_exact_resolved_link_set() {
 }
 
 #[test]
+fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
+    let fixture = fixture();
+    let graph = SqliteGraphQuery::new(
+        &fixture.graph_sidecar,
+        fixture.config.query_limits.clone(),
+        Some(fixture.graph_freshness.clone()),
+    );
+    let memory =
+        SqliteMemoryQuery::new(&fixture.memory_sidecar, fixture.config.query_limits.clone());
+    let memory_search = memory
+        .search(MemorySearchRequest {
+            scope: MemoryQueryScope::current(
+                fixture.project.clone(),
+                MemoryRevisionSelector::Published(MemoryViewName::new("project").unwrap()),
+                budget(&fixture.config),
+            ),
+            text: MemoryQueryText::new("src/lib.rs").unwrap(),
+            entity_kinds: vec![],
+            source_categories: vec![],
+            page: MemoryPageRequest::default(),
+        })
+        .unwrap();
+    let memory_entity = memory_search.hits[0].entity.id.clone();
+    let service = service(&fixture, &graph, &memory);
+    let request = |query_budget| FederatedContextRequest {
+        scope: FederatedScope::current(
+            fixture.project.clone(),
+            target(&fixture, ContextDomain::All),
+            query_budget,
+        ),
+        seeds: vec![FederatedContextSeed::MemoryEntity(memory_entity.clone())],
+        repository_policy: ContextPolicy {
+            direction: EdgeDirection::Both,
+            edge_kinds: vec![],
+            include_unresolved: false,
+            include_external: false,
+        },
+        memory_policy: MemoryContextPolicy {
+            relationship_kinds: vec![],
+            include_unresolved: false,
+            include_stale: false,
+            include_snippets: false,
+        },
+        cursor: None,
+    };
+    let complete = service.context(request(budget(&fixture.config))).unwrap();
+    assert!(!complete.cross_domain_links.is_empty());
+    let primary_bytes = complete
+        .items
+        .iter()
+        .map(serialized_len)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .sum::<u64>();
+    let mut constrained_budget = budget(&fixture.config);
+    constrained_budget.max_bytes = std::num::NonZeroU64::new(primary_bytes).unwrap();
+
+    let truncated = service.context(request(constrained_budget)).unwrap();
+    assert_eq!(truncated.items, complete.items);
+    assert_eq!(
+        truncated.page.truncation.as_ref().map(|value| value.reason),
+        Some(MemoryTruncationReason::Bytes)
+    );
+    assert!(truncated.page.next_cursor.is_none());
+}
+
+#[test]
 fn combined_search_cursor_is_deterministic_and_does_not_repeat_results() {
     let fixture = fixture();
     let graph = SqliteGraphQuery::new(

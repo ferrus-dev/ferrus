@@ -790,7 +790,7 @@ where
             returned_bytes = returned_bytes.saturating_add(bytes);
             returned.push(item);
         }
-        let mut has_more = offset + returned.len() < total || candidates.peek().is_some();
+        let has_more = offset + returned.len() < total || candidates.peek().is_some();
         let explored_depth = repository_response
             .as_ref()
             .and_then(|response| response.page.truncation.as_ref())
@@ -854,14 +854,13 @@ where
         )?;
         if supplemental_truncated {
             reason = Some(MemoryTruncationReason::Bytes);
-            has_more = true;
         }
         let page = federated_page(
             reason,
             returned.len(),
             budget.max_bytes.saturating_sub(remaining_bytes),
             explored_depth,
-            has_more,
+            has_more && !supplemental_truncated,
             "context",
             &fingerprint,
             &revision_key,

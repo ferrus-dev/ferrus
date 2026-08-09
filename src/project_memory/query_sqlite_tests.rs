@@ -268,6 +268,40 @@ fn search_and_context_are_revision_bound_and_deterministic() {
 }
 
 #[test]
+fn context_bounds_relationship_expansion_by_the_effective_result_limit() {
+    let (_root, data, project, _) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let mut scope = published_scope(project, &limits);
+    scope.budget.max_results = std::num::NonZeroU32::new(1).unwrap();
+    let response = SqliteMemoryQuery::new(&sidecar, limits)
+        .context(MemoryContextRequest {
+            scope,
+            seeds: vec![MemoryContextSeed::Milestone(
+                MemoryRecordId::new("rg-test").unwrap(),
+            )],
+            policy: super::super::query::MemoryContextPolicy {
+                relationship_kinds: vec![],
+                include_unresolved: false,
+                include_stale: false,
+                include_snippets: false,
+            },
+            page: MemoryPageRequest::default(),
+        })
+        .unwrap();
+
+    assert_eq!(response.relationships.len(), 1);
+    assert_eq!(
+        response.page.truncation.map(|value| value.reason),
+        Some(MemoryTruncationReason::Results)
+    );
+}
+
+#[test]
 fn context_snippets_use_the_verified_content_boundary_and_effective_cap() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =
