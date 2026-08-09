@@ -125,7 +125,18 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    async fn setup() -> (TempDir, std::path::PathBuf) {
+    struct TestWorkspace {
+        _dir: TempDir,
+        previous: std::path::PathBuf,
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    async fn setup() -> TestWorkspace {
         let dir = TempDir::new().unwrap();
         let previous = std::env::current_dir().unwrap();
         let data_dir = dir.path().join(".ferrus/projects/test-project");
@@ -139,11 +150,10 @@ mod tests {
         let local_ref = toml::to_string_pretty(&local_ref).unwrap();
         std::fs::write(dir.path().join(".ferrus/project.toml"), local_ref).unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        (dir, previous)
-    }
-
-    fn teardown(previous: std::path::PathBuf) {
-        std::env::set_current_dir(previous).unwrap();
+        TestWorkspace {
+            _dir: dir,
+            previous,
+        }
     }
 
     #[test]
@@ -224,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_task_writes_pending_artifact_without_state_json() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         let response = run(
             "Build queued task".to_string(),
@@ -249,14 +259,12 @@ mod tests {
         assert_eq!(tasks[0].status, "pending");
         assert_eq!(tasks[0].spec_path.as_deref(), Some("docs/specs/spec.md"));
         assert_eq!(tasks[0].milestone_id.as_deref(), Some("m1.0"));
-
-        teardown(previous);
     }
 
     #[tokio::test]
     async fn enqueue_task_rejects_duplicate_non_terminal_origin() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         run(
             "First task".to_string(),
@@ -274,14 +282,12 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("already has task t-001"));
-
-        teardown(previous);
     }
 
     #[tokio::test]
     async fn concurrent_enqueue_allows_only_one_task_per_origin() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         let first = run(
             "First task".to_string(),
@@ -297,11 +303,12 @@ mod tests {
 
         assert_ne!(first.is_ok(), second.is_ok());
         let error = first.err().or_else(|| second.err()).unwrap();
-        assert!(error.to_string().contains("already has task"));
+        assert!(
+            error.to_string().contains("already has task"),
+            "unexpected concurrent enqueue error: {error:#}"
+        );
         let tasks = project::list_tasks().await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
-
-        teardown(previous);
     }
 }

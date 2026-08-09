@@ -33,7 +33,10 @@ use crate::{
             MemorySourceLocator, MemoryStatusToken, MemoryText, ProjectId, ProjectNamespace,
             ProjectRef,
         },
-        policy::{MEMORY_POLICY_SCHEMA_VERSION, MemoryContentAccess, MemorySourceSensitivity},
+        policy::{
+            MEMORY_POLICY_SCHEMA_VERSION, MemoryContentAccess, MemoryPolicy,
+            MemorySourceSensitivity,
+        },
     },
     repository_graph::{
         domain::{
@@ -235,6 +238,7 @@ fn repository_manifest(
 
 fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySourceManifest {
     let content = b"approved memory outcome";
+    let policy_digest = MemoryPolicy::default().digest();
     let content_identity = sha256(content);
     let source_object = objects
         .put_verified(&project(), &content_identity, content)
@@ -243,7 +247,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
     let body = MemorySourceManifestBody {
         protocol_version: DISTRIBUTED_SOURCE_MANIFEST_VERSION,
         project: project(),
-        memory_policy_digest: digest("21"),
+        memory_policy_digest: policy_digest.clone(),
         project_identity: local_project(),
         source_set_digest: digest("22"),
         extractor_set_digest: digest("44"),
@@ -276,7 +280,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
             project: project(),
             manifest_id: MemoryManifestId::new(manifest_digest.value()).unwrap(),
             manifest_digest,
-            memory_policy_digest: digest("21"),
+            memory_policy_digest: policy_digest,
             manifest_object,
         },
         body,

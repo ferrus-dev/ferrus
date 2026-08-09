@@ -334,10 +334,10 @@ pub async fn create_pending_task_artifact(
 
     if let Err(err) = result {
         if let Err(cleanup_err) = discard_task_artifact_reservation(&artifact).await {
-            return Err(err.context(format!(
-                "Also failed to discard task reservation {}: {cleanup_err}",
+            return Err(anyhow::anyhow!(
+                "{err}; also failed to discard task reservation {}: {cleanup_err}",
                 artifact.id
-            )));
+            ));
         }
         return Err(err);
     }

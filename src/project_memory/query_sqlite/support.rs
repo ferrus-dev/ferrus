@@ -160,6 +160,7 @@ pub(super) fn entity_text(entity: &MemoryEntity) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn memory_hit_order(
     left: &MemorySearchHit,
     right: &MemorySearchHit,

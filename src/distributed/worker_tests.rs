@@ -63,6 +63,26 @@ fn local_project() -> ProjectRef {
     }
 }
 
+fn git(root: &std::path::Path, args: &[&str]) {
+    assert!(
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn commit_repository(root: &std::path::Path) {
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tests@example.com"]);
+    git(root, &["config", "user.name", "Ferrus Tests"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["add", "--all"]);
+    git(root, &["commit", "-m", "initial"]);
+}
+
 fn packaging_limits() -> PackagingLimits {
     PackagingLimits {
         max_objects: NonZeroU64::new(100).unwrap(),
@@ -219,6 +239,7 @@ fn repository_worker_is_deterministic_and_reuses_durable_batches() {
         b"pub struct Api;\nimpl Api { pub fn run(&self) {} }\n",
     )
     .unwrap();
+    commit_repository(repository_dir.path());
     let config = RepositoryGraphConfig::default();
     let identities = builtin_extractor_identities();
     let context =

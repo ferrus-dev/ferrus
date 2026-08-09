@@ -19,7 +19,7 @@ use crate::{
         ports::MemorySource,
     },
     repository_graph::{
-        domain::{DiagnosticCode, Digest, RepoPath, SourceRevision},
+        domain::{DiagnosticCode, Digest, RepoPath, SourceKind, SourceRevision},
         ports::{RepositorySource, SourceFileDescriptor, SourceFileMode},
     },
 };
@@ -91,6 +91,7 @@ impl RepositorySourceManifest {
     ) -> Result<(), PackagingError<SourceError, StoreError>> {
         if self.body.protocol_version != DISTRIBUTED_SOURCE_MANIFEST_VERSION
             || self.body.policy_schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION
+            || self.body.source_revision.source_kind != SourceKind::CommittedTree
             || self.body.repository != self.reference.repository
             || self.body.source_policy_digest != self.reference.source_policy_digest
             || !self
@@ -162,14 +163,23 @@ impl MemorySourceManifest {
     pub fn validate<SourceError, StoreError>(
         &self,
     ) -> Result<(), PackagingError<SourceError, StoreError>> {
+        let approved_policy = MemoryPolicy::default();
         if self.body.protocol_version != DISTRIBUTED_SOURCE_MANIFEST_VERSION
             || self.body.policy_schema_version
                 != crate::project_memory::policy::MEMORY_POLICY_SCHEMA_VERSION
             || self.body.project != self.reference.project
             || self.body.memory_policy_digest != self.reference.memory_policy_digest
+            || self.body.memory_policy_digest != approved_policy.digest()
             || self.body.sources.iter().any(|source| {
                 source.object.project != self.reference.project
                     || !is_remote_memory_category(source.category)
+                    || !approved_policy
+                        .category(source.category)
+                        .is_some_and(|policy| {
+                            policy.enabled
+                                && source.sensitivity == policy.sensitivity
+                                && source.content_access == policy.content_access
+                        })
             })
             || self.body.summary.included_objects != self.body.sources.len() as u64
             || self.body.summary.total_bytes
@@ -245,7 +255,10 @@ where
     if policy.schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION {
         return Err(PackagingError::InvalidManifest);
     }
-    if local.revision.dirty || local.revision.includes_untracked {
+    if local.revision.source_kind != SourceKind::CommittedTree
+        || local.revision.dirty
+        || local.revision.includes_untracked
+    {
         return Err(PackagingError::NonCanonicalRepositorySource);
     }
     if (local.files.len() as u64).saturating_add(1) > limits.max_objects.get() {
@@ -337,7 +350,7 @@ where
 {
     require_protection(store.protection())?;
     let local = source.manifest().map_err(PackagingError::Source)?;
-    if policy.schema_version != crate::project_memory::policy::MEMORY_POLICY_SCHEMA_VERSION {
+    if policy != &MemoryPolicy::default() {
         return Err(PackagingError::InvalidManifest);
     }
     local
@@ -574,7 +587,9 @@ mod tests {
     use super::*;
     use crate::{
         distributed::{
-            identity::{RemoteProjectId, RemoteRepositoryId, TenantId},
+            identity::{
+                ObjectId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId, TenantId,
+            },
             object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
         },
         project_memory::{
@@ -642,6 +657,26 @@ mod tests {
         .unwrap()
     }
 
+    fn git(root: &std::path::Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn commit_repository(root: &std::path::Path) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "tests@example.com"]);
+        git(root, &["config", "user.name", "Ferrus Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["add", "--all"]);
+        git(root, &["commit", "-m", "initial"]);
+    }
+
     #[test]
     fn repository_packaging_uploads_only_locally_filtered_verified_files() {
         let repository_dir = tempfile::tempdir().unwrap();
@@ -653,6 +688,7 @@ mod tests {
         .unwrap();
         std::fs::write(repository_dir.path().join(".env"), b"TOKEN=secret\n").unwrap();
         std::fs::write(repository_dir.path().join("binary.bin"), b"binary\0secret").unwrap();
+        commit_repository(repository_dir.path());
         let config = RepositoryGraphConfig::default();
         let context =
             SourceDiscoveryContext::from_config(local_repository(), &config, &[]).unwrap();
@@ -698,6 +734,51 @@ mod tests {
                 .keys()
                 .any(|code| code.as_str() == "sensitive_path_excluded")
         );
+
+        let mut forged = packaged;
+        forged.body.source_revision.source_kind = SourceKind::NonGitManifest;
+        let manifest_digest = hash_manifest::<
+            anyhow::Error,
+            crate::distributed::object_store::ObjectStoreError,
+        >(&forged.body)
+        .unwrap();
+        forged.reference.manifest_id = RepositoryManifestId::new(manifest_digest.value()).unwrap();
+        forged.reference.manifest_digest = manifest_digest.clone();
+        forged.reference.manifest_object.object_id =
+            ObjectId::new(manifest_digest.value()).unwrap();
+        forged.reference.manifest_object.content_identity = manifest_digest;
+        assert!(matches!(
+            forged.validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(),
+            Err(PackagingError::InvalidManifest)
+        ));
+    }
+
+    #[test]
+    fn repository_packaging_rejects_non_git_manifests() {
+        let repository_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repository_dir.path().join("lib.rs"), b"pub fn run() {}\n").unwrap();
+        let config = RepositoryGraphConfig::default();
+        let context =
+            SourceDiscoveryContext::from_config(local_repository(), &config, &[]).unwrap();
+        let source = LocalRepositorySource::discover(repository_dir.path(), context).unwrap();
+        let object_dir = tempfile::tempdir().unwrap();
+        let mut object_store = store(object_dir.path());
+
+        let result = package_repository_source(
+            &source,
+            remote_repository("tenant-a"),
+            RepositoryPackagingPolicy {
+                schema_version: 1,
+                source_policy_digest: config.source_policy_digest().unwrap(),
+            },
+            limits(),
+            &mut object_store,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PackagingError::NonCanonicalRepositorySource)
+        ));
     }
 
     struct FakeMemorySource {
@@ -790,6 +871,24 @@ mod tests {
         assert!(!stored.contains("Private task body"));
         assert!(!stored.contains("Approved result"));
         assert!(!stored.contains("Never upload"));
+
+        let mut forged = first;
+        forged.body.sources[0].sensitivity = MemorySourceSensitivity::Sensitive;
+        forged.body.sources[0].content_access = MemoryContentAccess::RawBody;
+        let manifest_digest = hash_manifest::<
+            anyhow::Error,
+            crate::distributed::object_store::ObjectStoreError,
+        >(&forged.body)
+        .unwrap();
+        forged.reference.manifest_id = MemoryManifestId::new(manifest_digest.value()).unwrap();
+        forged.reference.manifest_digest = manifest_digest.clone();
+        forged.reference.manifest_object.object_id =
+            ObjectId::new(manifest_digest.value()).unwrap();
+        forged.reference.manifest_object.content_identity = manifest_digest;
+        assert!(matches!(
+            forged.validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(),
+            Err(PackagingError::InvalidManifest)
+        ));
     }
 
     #[test]

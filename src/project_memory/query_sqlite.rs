@@ -133,6 +133,76 @@ struct ContextAssembly {
     truncation: Option<MemoryTruncationReason>,
 }
 
+#[derive(Debug, Clone)]
+struct MemoryHitOrderKey {
+    score: f64,
+    kind: MemoryEntityKind,
+    id: MemoryEntityId,
+}
+
+impl MemoryHitOrderKey {
+    fn new(hit: &MemorySearchHit) -> Self {
+        Self {
+            score: hit.score,
+            kind: hit.entity.data.kind(),
+            id: hit.entity.id.clone(),
+        }
+    }
+}
+
+impl PartialEq for MemoryHitOrderKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MemoryHitOrderKey {}
+
+impl PartialOrd for MemoryHitOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MemoryHitOrderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+fn rank_memory_search_hits(
+    entities: Vec<MemoryEntity>,
+    request: &MemorySearchRequest,
+    mut deadline_reached: impl FnMut() -> bool,
+) -> (Vec<MemorySearchHit>, bool) {
+    let mut hits = BTreeMap::new();
+    for entity in entities {
+        if deadline_reached() {
+            return (hits.into_values().collect(), true);
+        }
+        if (!request.entity_kinds.is_empty() && !request.entity_kinds.contains(&entity.data.kind()))
+            || (!request.source_categories.is_empty()
+                && !request
+                    .source_categories
+                    .contains(&entity.provenance.source_category))
+        {
+            continue;
+        }
+        let Some(hit) = memory_search_hit(entity, request.text.as_str()) else {
+            continue;
+        };
+        if deadline_reached() {
+            return (hits.into_values().collect(), true);
+        }
+        hits.insert(MemoryHitOrderKey::new(&hit), hit);
+    }
+    (hits.into_values().collect(), false)
+}
+
 /// Local query implementation. It never creates, migrates, or mutates a sidecar.
 pub struct SqliteMemoryQuery<'a> {
     sidecar: &'a MemorySidecar,
@@ -585,7 +655,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         )?;
         let deadline =
             QueryDeadline::install(self.sidecar.connection(), started, scope.budget.duration())?;
-        let (entities, query_timed_out) = match self.entities(&scope.revision.id) {
+        let (entities, mut query_timed_out) = match self.entities(&scope.revision.id) {
             Ok(entities) => (entities, false),
             Err(MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)) => {
                 (vec![], true)
@@ -593,20 +663,10 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             Err(error) => return Err(error),
         };
         drop(deadline);
-        let mut hits = entities
-            .into_iter()
-            .filter(|entity| {
-                (request.entity_kinds.is_empty()
-                    || request.entity_kinds.contains(&entity.data.kind()))
-                    && (request.source_categories.is_empty()
-                        || request
-                            .source_categories
-                            .contains(&entity.provenance.source_category))
-            })
-            .filter_map(|entity| memory_search_hit(entity, request.text.as_str()))
-            .collect::<Vec<_>>();
-        hits.sort_by(memory_hit_order);
-        hits.dedup_by(|left, right| left.entity.id == right.entity.id);
+        let (hits, ranking_timed_out) = rank_memory_search_hits(entities, &request, || {
+            started.elapsed() >= scope.budget.duration()
+        });
+        query_timed_out |= ranking_timed_out;
         let offset = usize::try_from(offset).map_err(|_| MemoryQueryError::StaleCursor)?;
         if offset > hits.len() {
             return Err(MemoryQueryError::StaleCursor);

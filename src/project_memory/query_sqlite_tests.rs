@@ -268,6 +268,36 @@ fn search_and_context_are_revision_bound_and_deterministic() {
 }
 
 #[test]
+fn search_candidate_ranking_stops_when_the_deadline_expires() {
+    let (_root, data, project, revision_id) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let request = MemorySearchRequest {
+        scope: published_scope(project, &limits),
+        text: super::super::domain::MemoryQueryText::new("sqlite").unwrap(),
+        entity_kinds: vec![],
+        source_categories: vec![],
+        page: MemoryPageRequest::default(),
+    };
+    let entities = query.entities(&revision_id).unwrap();
+    let mut deadline_checks = 0;
+
+    let (hits, timed_out) = rank_memory_search_hits(entities, &request, || {
+        deadline_checks += 1;
+        deadline_checks > 1
+    });
+
+    assert!(timed_out);
+    assert_eq!(deadline_checks, 2);
+    assert!(hits.len() <= 1);
+}
+
+#[test]
 fn context_bounds_relationship_expansion_by_the_effective_result_limit() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =
