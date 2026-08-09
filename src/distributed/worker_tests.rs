@@ -249,6 +249,24 @@ fn repository_worker_is_deterministic_and_reuses_durable_batches() {
         },
     );
     let request = execution_request(running);
+    let mut per_source_facts = fact_store(&storage_dir.path().join("per-source-facts.db"));
+    let mut per_source_limited = worker_limits();
+    per_source_limited.max_facts_per_source = NonZeroU64::new(10).unwrap();
+    assert_eq!(
+        StatelessIndexWorker::new(per_source_limited).execute(
+            &request,
+            &jobs,
+            &objects,
+            &mut per_source_facts,
+        ),
+        Err(WorkerError::OutputLimitExceeded)
+    );
+    assert!(
+        per_source_facts
+            .load_for_ingestion(&request.job.job)
+            .unwrap()
+            .is_empty()
+    );
     let mut limited_facts = fact_store(&storage_dir.path().join("limited-facts.db"));
     let mut limited = worker_limits();
     limited.max_total_facts = NonZeroU64::new(1).unwrap();

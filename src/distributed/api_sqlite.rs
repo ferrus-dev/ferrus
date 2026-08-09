@@ -217,8 +217,16 @@ impl SqliteRemoteQueryApi {
                 graph_paths,
                 memory_kinds,
             } => {
-                let candidates =
-                    search_candidates(&loaded, text, graph_kinds, graph_paths, memory_kinds);
+                let candidates = search_candidates(
+                    &loaded,
+                    text,
+                    graph_kinds,
+                    graph_paths,
+                    memory_kinds,
+                    started,
+                    duration,
+                )
+                .map_err(|_| query_budget(&request.request_id))?;
                 let (items, page) = paginate(
                     candidates,
                     request.body.page.cursor.as_ref(),
@@ -337,8 +345,14 @@ impl SqliteRemoteQueryApi {
             diagnostics,
             data,
         };
-        let encoded = encoded_len(&result).map_err(|_| query_internal(&request.request_id))?;
-        if encoded > budget.max_bytes.get() || started.elapsed() >= duration {
+        let result = fit_result_to_budget(
+            result,
+            budget.max_bytes.get(),
+            request.body.page.cursor.as_ref(),
+            &fingerprint,
+            &request.request_id,
+        )?;
+        if started.elapsed() >= duration {
             return Err(query_budget(&request.request_id));
         }
         Ok(result)

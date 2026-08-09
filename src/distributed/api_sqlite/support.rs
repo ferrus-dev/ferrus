@@ -170,11 +170,16 @@ pub(super) fn search_candidates(
     graph_kinds: &[String],
     graph_paths: &[crate::repository_graph::domain::RepoPath],
     memory_kinds: &[crate::project_memory::domain::MemoryEntityKind],
-) -> Vec<RemoteSearchItem> {
+    started: Instant,
+    duration: Duration,
+) -> Result<Vec<RemoteSearchItem>, ()> {
     let needle = text.to_lowercase();
-    let mut scored = Vec::<(u32, String, RemoteSearchItem)>::new();
+    let mut scored = BTreeMap::<(std::cmp::Reverse<u32>, String, u8), RemoteSearchItem>::new();
     if let Some(graph) = &loaded.graph {
         for node in &graph.nodes {
+            if started.elapsed() >= duration {
+                return Err(());
+            }
             if !graph_kinds.is_empty() && !graph_kinds.iter().any(|kind| kind == &node.kind) {
                 continue;
             }
@@ -197,38 +202,44 @@ pub(super) fn search_candidates(
                 continue;
             }
             if let Some((rank, match_kind)) = graph_match(node, &needle) {
-                scored.push((
-                    rank,
-                    node.id.to_string(),
+                scored.insert(
+                    (std::cmp::Reverse(rank), node.id.to_string(), 0),
                     RemoteSearchItem::Repository {
                         node: node.clone(),
                         match_kind,
                         score: f64::from(rank),
                     },
-                ));
+                );
+            }
+            if started.elapsed() >= duration {
+                return Err(());
             }
         }
     }
     if let Some(memory) = &loaded.memory {
         for entity in &memory.entities {
+            if started.elapsed() >= duration {
+                return Err(());
+            }
             if !memory_kinds.is_empty() && !memory_kinds.contains(&entity.data.kind()) {
                 continue;
             }
             if let Some((rank, match_kind)) = memory_match(entity, &needle) {
-                scored.push((
-                    rank,
-                    entity.id.to_string(),
+                scored.insert(
+                    (std::cmp::Reverse(rank), entity.id.to_string(), 1),
                     RemoteSearchItem::Memory {
                         entity: entity.clone(),
                         match_kind,
                         score: f64::from(rank),
                     },
-                ));
+                );
+            }
+            if started.elapsed() >= duration {
+                return Err(());
             }
         }
     }
-    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    scored.into_iter().map(|(_, _, item)| item).collect()
+    Ok(scored.into_values().collect())
 }
 
 pub(super) fn graph_match(node: &GraphNode, needle: &str) -> Option<(u32, RemoteSearchMatchKind)> {
@@ -391,6 +402,21 @@ pub(super) fn context_units(
     started: Instant,
     duration: Duration,
 ) -> (Vec<ContextUnit>, u32) {
+    if let (Some(graph), Some(memory)) = (&loaded.graph, &loaded.memory) {
+        return federated_context_units(
+            graph,
+            memory,
+            seeds,
+            direction,
+            graph_edge_kinds,
+            memory_relationship_kinds,
+            include_unresolved,
+            include_external,
+            max_depth,
+            started,
+            duration,
+        );
+    }
     let mut units = Vec::new();
     let mut explored = 0;
     if let Some(graph) = &loaded.graph {
@@ -439,6 +465,218 @@ pub(super) fn context_units(
         units.extend(memory_units);
     }
     (units, explored)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FederatedNode {
+    Graph(NodeId),
+    Memory(crate::project_memory::domain::MemoryEntityId),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_context_units(
+    graph: &StoredRemoteGraphSnapshot,
+    memory: &StoredRemoteMemoryRevision,
+    seeds: &[RemoteContextSeed],
+    direction: EdgeDirection,
+    graph_edge_kinds: &[String],
+    memory_relationship_kinds: &[crate::project_memory::domain::MemoryRelationshipKind],
+    include_unresolved: bool,
+    include_external: bool,
+    max_depth: u32,
+    started: Instant,
+    duration: Duration,
+) -> (Vec<ContextUnit>, u32) {
+    let graph_nodes = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let memory_entities = memory
+        .entities
+        .iter()
+        .map(|entity| (entity.id.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = graph_seed_ids(graph, seeds)
+        .into_iter()
+        .filter(|id| graph_nodes.contains_key(id))
+        .map(FederatedNode::Graph)
+        .chain(seeds.iter().filter_map(|seed| match seed {
+            RemoteContextSeed::MemoryEntity(id) if memory_entities.contains_key(id) => {
+                Some(FederatedNode::Memory(id.clone()))
+            }
+            _ => None,
+        }))
+        .collect::<BTreeSet<_>>();
+    let mut frontier = selected.clone();
+    let mut selected_graph_edges = BTreeSet::new();
+    let mut selected_memory_relationships = BTreeSet::new();
+    let mut explored = 0;
+
+    while !frontier.is_empty() && explored < max_depth && started.elapsed() < duration {
+        let mut next = BTreeSet::new();
+        for edge in &graph.edges {
+            if started.elapsed() >= duration {
+                break;
+            }
+            if !graph_edge_kinds.is_empty()
+                && !graph_edge_kinds.iter().any(|kind| kind == &edge.kind)
+            {
+                continue;
+            }
+            let target = match &edge.target {
+                EdgeTarget::Node(target) => Some(target),
+                EdgeTarget::External(_) if include_external => None,
+                EdgeTarget::Unresolved(_) if include_unresolved => None,
+                EdgeTarget::External(_) | EdgeTarget::Unresolved(_) => continue,
+            };
+            let outgoing = frontier.contains(&FederatedNode::Graph(edge.source.clone()))
+                && matches!(direction, EdgeDirection::Outgoing | EdgeDirection::Both);
+            let incoming = target
+                .is_some_and(|target| frontier.contains(&FederatedNode::Graph(target.clone())))
+                && matches!(direction, EdgeDirection::Incoming | EdgeDirection::Both);
+            if outgoing || incoming {
+                selected_graph_edges.insert(edge.id.clone());
+                if outgoing && let Some(target) = target {
+                    next.insert(FederatedNode::Graph(target.clone()));
+                }
+                if incoming {
+                    next.insert(FederatedNode::Graph(edge.source.clone()));
+                }
+            }
+        }
+
+        for relationship in &memory.relationships {
+            if started.elapsed() >= duration {
+                break;
+            }
+            if !memory_relationship_kinds.is_empty()
+                && !memory_relationship_kinds.contains(&relationship.kind)
+            {
+                continue;
+            }
+            let targets = federated_relationship_targets(graph, relationship);
+            let outgoing = frontier.contains(&FederatedNode::Memory(relationship.source.clone()))
+                && matches!(direction, EdgeDirection::Outgoing | EdgeDirection::Both);
+            let incoming = targets.iter().any(|target| frontier.contains(target))
+                && matches!(direction, EdgeDirection::Incoming | EdgeDirection::Both);
+            if outgoing || incoming {
+                selected_memory_relationships.insert(relationship.id.clone());
+                if outgoing {
+                    next.extend(targets);
+                }
+                if incoming {
+                    next.insert(FederatedNode::Memory(relationship.source.clone()));
+                }
+            }
+        }
+
+        next.retain(|node| !selected.contains(node));
+        next.retain(|node| match node {
+            FederatedNode::Graph(id) => graph_nodes.contains_key(id),
+            FederatedNode::Memory(id) => memory_entities.contains_key(id),
+        });
+        selected.extend(next.iter().cloned());
+        frontier = next;
+        explored += 1;
+    }
+
+    let mut units = selected
+        .iter()
+        .filter_map(|node| match node {
+            FederatedNode::Graph(id) => graph_nodes
+                .get(id)
+                .map(|node| ContextUnit::GraphNode((*node).clone())),
+            FederatedNode::Memory(_) => None,
+        })
+        .collect::<Vec<_>>();
+    units.extend(
+        graph
+            .edges
+            .iter()
+            .filter(|edge| selected_graph_edges.contains(&edge.id))
+            .cloned()
+            .map(ContextUnit::GraphEdge),
+    );
+    units.extend(selected.iter().filter_map(|node| {
+        match node {
+            FederatedNode::Memory(id) => memory_entities
+                .get(id)
+                .map(|entity| ContextUnit::MemoryEntity((*entity).clone())),
+            FederatedNode::Graph(_) => None,
+        }
+    }));
+    units.extend(
+        memory
+            .relationships
+            .iter()
+            .filter(|relationship| selected_memory_relationships.contains(&relationship.id))
+            .cloned()
+            .map(ContextUnit::MemoryRelationship),
+    );
+    (units, explored)
+}
+
+fn federated_relationship_targets(
+    graph: &StoredRemoteGraphSnapshot,
+    relationship: &MemoryRelationship,
+) -> BTreeSet<FederatedNode> {
+    match &relationship.target {
+        MemoryRelationshipTarget::MemoryEntity { entity_id } => {
+            BTreeSet::from([FederatedNode::Memory(entity_id.clone())])
+        }
+        MemoryRelationshipTarget::RepositoryNode {
+            snapshot_id,
+            node_id,
+            ..
+        } if relationship.provenance.resolution
+            == crate::project_memory::domain::MemoryResolutionState::Resolved
+            && snapshot_id == &graph.record.snapshot.snapshot_id =>
+        {
+            BTreeSet::from([FederatedNode::Graph(node_id.clone())])
+        }
+        MemoryRelationshipTarget::RepositoryPath {
+            path,
+            snapshot_id: Some(snapshot_id),
+            ..
+        } if relationship.provenance.resolution
+            == crate::project_memory::domain::MemoryResolutionState::Resolved
+            && snapshot_id == &graph.record.snapshot.snapshot_id =>
+        {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.provenance
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|evidence| &evidence.path == path)
+                })
+                .map(|node| FederatedNode::Graph(node.id.clone()))
+                .collect()
+        }
+        MemoryRelationshipTarget::RepositorySymbol {
+            semantic_key,
+            snapshot_id: Some(snapshot_id),
+            ..
+        } if relationship.provenance.resolution
+            == crate::project_memory::domain::MemoryResolutionState::Resolved
+            && snapshot_id == &graph.record.snapshot.snapshot_id =>
+        {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.semantic_key.as_ref() == Some(semantic_key))
+                .map(|node| FederatedNode::Graph(node.id.clone()))
+                .collect()
+        }
+        MemoryRelationshipTarget::RepositoryNode { .. }
+        | MemoryRelationshipTarget::RepositoryPath { .. }
+        | MemoryRelationshipTarget::RepositorySymbol { .. }
+        | MemoryRelationshipTarget::Task { .. }
+        | MemoryRelationshipTarget::Run { .. }
+        | MemoryRelationshipTarget::Milestone { .. } => BTreeSet::new(),
+    }
 }
 
 pub(super) fn graph_seed_ids(
@@ -628,6 +866,95 @@ pub(super) fn paginate<T: Clone + Serialize>(
             explored_depth,
         },
     ))
+}
+
+pub(super) fn fit_result_to_budget(
+    mut result: RemoteQueryResult,
+    max_bytes: u64,
+    cursor: Option<&RemotePageCursor>,
+    fingerprint: &str,
+    request_id: &RequestId,
+) -> Result<RemoteQueryResult, RemoteError> {
+    let offset = cursor_offset(cursor, fingerprint).map_err(|_| query_stale_cursor(request_id))?;
+    loop {
+        result.page.returned_bytes = encoded_len(&(&result.diagnostics, &result.data))
+            .map_err(|_| query_internal(request_id))?;
+        if encoded_len(&result).map_err(|_| query_internal(request_id))? <= max_bytes {
+            return Ok(result);
+        }
+        if result.diagnostics.pop().is_some() {
+            result.page.truncation = Some(RemoteTruncationReason::Bytes);
+            continue;
+        }
+        if query_result_count(&result.data) <= 1 || !pop_last_query_result(&mut result.data) {
+            return Err(query_budget(request_id));
+        }
+        prune_context_snippets(&mut result.data);
+        result.page.returned_results = result.page.returned_results.saturating_sub(1);
+        let next = offset.saturating_add(result.page.returned_results as usize);
+        result.page.next_cursor = Some(
+            RemotePageCursor::new(format!("{fingerprint}.{next}"))
+                .map_err(|_| query_internal(request_id))?,
+        );
+        result.page.truncation = Some(RemoteTruncationReason::Bytes);
+    }
+}
+
+fn query_result_count(data: &RemoteQueryData) -> usize {
+    match data {
+        RemoteQueryData::Status(_) => 0,
+        RemoteQueryData::Search(data) => data.items.len(),
+        RemoteQueryData::Neighborhood(data) => data.nodes.len().saturating_add(data.edges.len()),
+        RemoteQueryData::Context(data) => data
+            .graph_nodes
+            .len()
+            .saturating_add(data.graph_edges.len())
+            .saturating_add(data.memory_entities.len())
+            .saturating_add(data.memory_relationships.len()),
+    }
+}
+
+fn pop_last_query_result(data: &mut RemoteQueryData) -> bool {
+    match data {
+        RemoteQueryData::Status(_) => false,
+        RemoteQueryData::Search(data) => data.items.pop().is_some(),
+        RemoteQueryData::Neighborhood(data) => data
+            .edges
+            .pop()
+            .map(|_| true)
+            .unwrap_or_else(|| data.nodes.pop().is_some()),
+        RemoteQueryData::Context(data) => data
+            .memory_relationships
+            .pop()
+            .map(|_| true)
+            .or_else(|| data.memory_entities.pop().map(|_| true))
+            .or_else(|| data.graph_edges.pop().map(|_| true))
+            .unwrap_or_else(|| data.graph_nodes.pop().is_some()),
+    }
+}
+
+fn prune_context_snippets(data: &mut RemoteQueryData) {
+    let RemoteQueryData::Context(context) = data else {
+        return;
+    };
+    context.snippets.retain(|snippet| match snippet {
+        RemoteVerifiedSnippet::Repository {
+            path,
+            span,
+            verified_content_identity,
+            ..
+        } => context.graph_nodes.iter().any(|node| {
+            node.provenance.evidence.as_ref().is_some_and(|evidence| {
+                &evidence.path == path
+                    && &evidence.span == span
+                    && &evidence.content_identity == verified_content_identity
+            })
+        }),
+        RemoteVerifiedSnippet::Memory { entity_id, .. } => context
+            .memory_entities
+            .iter()
+            .any(|entity| &entity.id == entity_id),
+    });
 }
 
 pub(super) fn query_fingerprint(

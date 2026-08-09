@@ -493,6 +493,7 @@ impl StatelessIndexWorker {
         let rust = RustSyntaxExtractor::new();
         let extractors: [&dyn DynExtractor; 3] = [&generic, &cargo, &rust];
         for (remote_file, file) in remote.body.files.iter().zip(&manifest.files) {
+            let mut source_facts = 0u64;
             self.check_deadline(started)?;
             self.authorize(request, coordinator)?;
             if remote_file.byte_len > self.limits.max_object_bytes.get() {
@@ -517,12 +518,10 @@ impl StatelessIndexWorker {
                         content: &content,
                     })
                     .map_err(|_| WorkerError::ExtractionFailed)?;
-                if payload_fact_count(&FactBatchPayload::RepositoryGraph {
-                    nodes: fragment.nodes.clone(),
-                    edges: fragment.edges.clone(),
-                    diagnostics: fragment.diagnostics.clone(),
-                }) > self.limits.max_facts_per_source.get()
-                {
+                source_facts = source_facts
+                    .checked_add(graph_fragment_fact_count(&fragment)?)
+                    .ok_or(WorkerError::OutputLimitExceeded)?;
+                if source_facts > self.limits.max_facts_per_source.get() {
                     return Err(WorkerError::OutputLimitExceeded);
                 }
                 merger.merge(fragment)?;
@@ -718,6 +717,16 @@ impl StatelessIndexWorker {
         }
         Ok(())
     }
+}
+
+fn graph_fragment_fact_count(fragment: &GraphFragment) -> Result<u64, WorkerError> {
+    fragment
+        .nodes
+        .len()
+        .checked_add(fragment.edges.len())
+        .and_then(|count| count.checked_add(fragment.diagnostics.len()))
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or(WorkerError::OutputLimitExceeded)
 }
 
 fn require_fact_protection<F: FactBatchStore>(facts: &F) -> Result<(), WorkerError> {

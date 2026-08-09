@@ -883,6 +883,222 @@ fn memory_context_traversal_honors_relationship_direction() {
 }
 
 #[test]
+fn federated_context_traverses_resolved_repository_links_in_both_directions() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+    let memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+    let source = memory.entities[0].clone();
+    let targets = vec![
+        MemoryRelationshipTarget::RepositoryNode {
+            repository: local_repository(),
+            snapshot_id: fixture.graph.snapshot_id.clone(),
+            node_id: fixture.graph_node.clone(),
+        },
+        MemoryRelationshipTarget::RepositoryPath {
+            repository: local_repository(),
+            path: RepoPath::new("src/lib.rs").unwrap(),
+            snapshot_id: Some(fixture.graph.snapshot_id.clone()),
+        },
+        MemoryRelationshipTarget::RepositorySymbol {
+            repository: local_repository(),
+            semantic_key: SemanticKey::new("important-type").unwrap(),
+            snapshot_id: Some(fixture.graph.snapshot_id.clone()),
+        },
+    ];
+
+    for (index, target) in targets.into_iter().enumerate() {
+        let mut linked_memory = memory.clone();
+        linked_memory.relationships = vec![MemoryRelationship {
+            project: source.project.clone(),
+            memory_revision_id: source.memory_revision_id.clone(),
+            id: MemoryRelationshipId::new(format!("memory-repository-link-{index}")).unwrap(),
+            kind: MemoryRelationshipKind::Touches,
+            source: source.id.clone(),
+            target,
+            provenance: source.provenance.clone(),
+        }];
+        let loaded = LoadedTarget {
+            graph: Some(graph.clone()),
+            memory: Some(linked_memory),
+        };
+        let traverse = |seed, direction| {
+            context_units(
+                &loaded,
+                &[seed],
+                direction,
+                &[],
+                &[],
+                false,
+                false,
+                1,
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .0
+        };
+        let outgoing = traverse(
+            RemoteContextSeed::MemoryEntity(source.id.clone()),
+            EdgeDirection::Outgoing,
+        );
+        assert!(outgoing.iter().any(
+            |unit| matches!(unit, ContextUnit::GraphNode(node) if node.id == fixture.graph_node)
+        ));
+        assert!(
+            outgoing
+                .iter()
+                .any(|unit| matches!(unit, ContextUnit::MemoryRelationship(_)))
+        );
+
+        let incoming = traverse(
+            RemoteContextSeed::GraphNode(fixture.graph_node.clone()),
+            EdgeDirection::Incoming,
+        );
+        assert!(incoming.iter().any(
+            |unit| matches!(unit, ContextUnit::MemoryEntity(entity) if entity.id == source.id)
+        ));
+        assert!(
+            incoming
+                .iter()
+                .any(|unit| matches!(unit, ContextUnit::MemoryRelationship(_)))
+        );
+    }
+}
+
+#[test]
+fn federated_context_rejects_repository_links_for_another_snapshot() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+    let mut memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+    let source = memory.entities[0].clone();
+    memory.relationships = vec![MemoryRelationship {
+        project: source.project.clone(),
+        memory_revision_id: source.memory_revision_id.clone(),
+        id: MemoryRelationshipId::new("stale-repository-link").unwrap(),
+        kind: MemoryRelationshipKind::Touches,
+        source: source.id.clone(),
+        target: MemoryRelationshipTarget::RepositoryNode {
+            repository: local_repository(),
+            snapshot_id: SnapshotId::new("another-snapshot").unwrap(),
+            node_id: fixture.graph_node.clone(),
+        },
+        provenance: source.provenance,
+    }];
+    let loaded = LoadedTarget {
+        graph: Some(graph),
+        memory: Some(memory),
+    };
+    let (units, _) = context_units(
+        &loaded,
+        &[RemoteContextSeed::MemoryEntity(source.id)],
+        EdgeDirection::Outgoing,
+        &[],
+        &[],
+        false,
+        false,
+        1,
+        Instant::now(),
+        Duration::from_secs(1),
+    );
+    assert!(
+        !units
+            .iter()
+            .any(|unit| matches!(unit, ContextUnit::GraphNode(_)))
+    );
+}
+
+#[test]
+fn search_candidate_generation_observes_an_expired_deadline() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let loaded = LoadedTarget {
+        graph: Some(store.graph_snapshot(&fixture.graph).unwrap().unwrap()),
+        memory: Some(store.memory_revision(&fixture.memory).unwrap().unwrap()),
+    };
+    assert!(
+        search_candidates(
+            &loaded,
+            "important",
+            &[],
+            &[],
+            &[],
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn exact_response_budget_returns_a_smaller_page_instead_of_a_terminal_error() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let loaded = LoadedTarget {
+        graph: Some(store.graph_snapshot(&fixture.graph).unwrap().unwrap()),
+        memory: Some(store.memory_revision(&fixture.memory).unwrap().unwrap()),
+    };
+    let fingerprint = "response-budget";
+    let candidates = search_candidates(
+        &loaded,
+        "important",
+        &[],
+        &[],
+        &[],
+        Instant::now(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(candidates.len() > 1);
+    let (items, mut page) = paginate(
+        candidates,
+        None,
+        fingerprint,
+        query_budget(10),
+        Instant::now(),
+        0,
+        &RequestId::new("response-budget").unwrap(),
+    )
+    .unwrap();
+    let data = RemoteQueryData::Search(RemoteSearchData { items });
+    page.returned_bytes = encoded_len(&(&Vec::<RemoteQueryDiagnostic>::new(), &data)).unwrap();
+    let result = RemoteQueryResult {
+        page,
+        diagnostics: Vec::new(),
+        data,
+    };
+    let mut one = result.clone();
+    let RemoteQueryData::Search(data) = &mut one.data else {
+        unreachable!();
+    };
+    data.items.truncate(1);
+    one.page.returned_results = 1;
+    one.page.next_cursor = Some(RemotePageCursor::new(format!("{fingerprint}.1")).unwrap());
+    one.page.truncation = Some(RemoteTruncationReason::Bytes);
+    one.page.returned_bytes =
+        encoded_len(&(&one.diagnostics, &one.data)).expect("one result serializes");
+    let one_result_budget = encoded_len(&one).unwrap();
+
+    let fitted = fit_result_to_budget(
+        result,
+        one_result_budget,
+        None,
+        fingerprint,
+        &RequestId::new("response-budget").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fitted, one);
+}
+
+#[test]
 fn authorization_denies_foreign_queries_without_disclosing_target_existence() {
     let fixture = fixture();
     let authorization = auth(
