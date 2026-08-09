@@ -23,7 +23,7 @@ use super::{
         MemorySourceLocator, MemoryStatusToken, ProjectId, ProjectNamespace, ProjectRef,
     },
     extractors::{built_in_extractor_set_digest, canonical_digest},
-    policy::MemoryPolicy,
+    policy::{MemoryContentAccess, MemoryPolicy},
     ports::{MemoryContent, MemorySource, MemorySourceContent},
     query::{MemoryContentRequest, MemoryContentResponse, MemoryQueryError},
 };
@@ -255,6 +255,28 @@ impl MemoryContent for LocalMemorySource {
             .map_err(|_| MemoryQueryError::ContentChanged)?;
         if request.revision_id != current_revision {
             return Err(MemoryQueryError::ContentChanged);
+        }
+        let source_policy = self
+            .policy
+            .category(request.source_category)
+            .filter(|policy| policy.enabled)
+            .ok_or(MemoryQueryError::SourceNotAuthorized)?;
+        let evidence_is_span = matches!(
+            request.evidence.as_ref(),
+            Some(super::domain::MemoryEvidenceLocator::Span(_))
+        );
+        match source_policy.content_access {
+            MemoryContentAccess::StructureOnly | MemoryContentAccess::CuratedSections
+                if !evidence_is_span =>
+            {
+                return Err(MemoryQueryError::SourceNotAuthorized);
+            }
+            MemoryContentAccess::IdentityAndCountsOnly => {
+                return Err(MemoryQueryError::SourceNotAuthorized);
+            }
+            MemoryContentAccess::StructureOnly
+            | MemoryContentAccess::CuratedSections
+            | MemoryContentAccess::RawBody => {}
         }
         let material = self
             .materials
@@ -845,6 +867,7 @@ mod tests {
                 material.descriptor.category == MemorySourceCategory::RuntimeProvenance
             })
             .unwrap();
+        let runtime_descriptor = runtime.descriptor.clone();
         let MaterialContent::Sanitized(bytes) = &runtime.content else {
             panic!("runtime content must be sanitized");
         };
@@ -860,6 +883,20 @@ mod tests {
             assert!(!value.contains(forbidden));
         }
         assert!(value.contains("event:1"));
+        let error = source
+            .content(MemoryContentRequest {
+                project: project_ref(),
+                revision_id: source.manifest.revision_id().unwrap(),
+                source_category: runtime_descriptor.category,
+                locator: runtime_descriptor.locator,
+                expected_fingerprint: runtime_descriptor.fingerprint,
+                evidence: Some(MemoryEvidenceLocator::Record(
+                    MemoryRecordId::new("task:t-1").unwrap(),
+                )),
+                max_bytes: NonZeroU64::new(1024).unwrap(),
+            })
+            .unwrap_err();
+        assert_eq!(error, MemoryQueryError::SourceNotAuthorized);
     }
 
     #[test]
@@ -925,8 +962,36 @@ mod tests {
                 revision_id: source.manifest.revision_id().unwrap(),
                 source_category: descriptor.category,
                 locator: descriptor.locator.clone(),
+                expected_fingerprint: descriptor.fingerprint.clone(),
+                evidence: Some(MemoryEvidenceLocator::Record(
+                    MemoryRecordId::new("outcome").unwrap(),
+                )),
+                max_bytes: NonZeroU64::new(1024).unwrap(),
+            })
+            .unwrap_err();
+        assert_eq!(error, MemoryQueryError::SourceNotAuthorized);
+
+        let error = source
+            .content(MemoryContentRequest {
+                project: project_ref(),
+                revision_id: source.manifest.revision_id().unwrap(),
+                source_category: descriptor.category,
+                locator: descriptor.locator.clone(),
                 expected_fingerprint: Digest::new("sha256", "00").unwrap(),
-                evidence: None,
+                evidence: Some(MemoryEvidenceLocator::Span(
+                    crate::repository_graph::domain::SourceSpan {
+                        start: crate::repository_graph::domain::SourcePosition {
+                            byte_offset: start,
+                            line: None,
+                            column: None,
+                        },
+                        end: crate::repository_graph::domain::SourcePosition {
+                            byte_offset: start + 5,
+                            line: None,
+                            column: None,
+                        },
+                    },
+                )),
                 max_bytes: NonZeroU64::new(4).unwrap(),
             })
             .unwrap_err();

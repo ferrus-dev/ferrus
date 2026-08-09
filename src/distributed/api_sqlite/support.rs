@@ -429,6 +429,7 @@ pub(super) fn context_units(
         let (memory_units, depth) = memory_context_units(
             memory,
             seeds,
+            direction,
             memory_relationship_kinds,
             max_depth,
             started,
@@ -482,6 +483,7 @@ pub(super) fn graph_seed_ids(
 pub(super) fn memory_context_units(
     memory: &StoredRemoteMemoryRevision,
     seeds: &[RemoteContextSeed],
+    direction: EdgeDirection,
     relationship_kinds: &[crate::project_memory::domain::MemoryRelationshipKind],
     max_depth: u32,
     started: Instant,
@@ -512,13 +514,17 @@ pub(super) fn memory_context_units(
                 MemoryRelationshipTarget::MemoryEntity { entity_id } => Some(entity_id),
                 _ => None,
             };
-            if frontier.contains(&relationship.source)
-                || target.is_some_and(|target| frontier.contains(target))
-            {
+            let outgoing = frontier.contains(&relationship.source)
+                && matches!(direction, EdgeDirection::Outgoing | EdgeDirection::Both);
+            let incoming = target.is_some_and(|target| frontier.contains(target))
+                && matches!(direction, EdgeDirection::Incoming | EdgeDirection::Both);
+            if outgoing || incoming {
                 relationships.insert(relationship.id.clone());
-                next.insert(relationship.source.clone());
-                if let Some(target) = target {
+                if outgoing && let Some(target) = target {
                     next.insert(target.clone());
+                }
+                if incoming {
+                    next.insert(relationship.source.clone());
                 }
             }
         }

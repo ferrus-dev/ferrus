@@ -28,9 +28,10 @@ use crate::{
     project_memory::{
         domain::{
             MemoryBuildId, MemoryConfidence, MemoryEntityData, MemoryEntityId, MemoryExtractorId,
-            MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance,
-            MemoryResolutionState, MemoryRevisionId, MemorySourceCategory, MemorySourceLocator,
-            MemoryStatusToken, MemoryText, ProjectId, ProjectNamespace, ProjectRef,
+            MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance, MemoryRelationshipId,
+            MemoryRelationshipKind, MemoryResolutionState, MemoryRevisionId, MemorySourceCategory,
+            MemorySourceLocator, MemoryStatusToken, MemoryText, ProjectId, ProjectNamespace,
+            ProjectRef,
         },
         policy::{MEMORY_POLICY_SCHEMA_VERSION, MemoryContentAccess, MemorySourceSensitivity},
     },
@@ -807,6 +808,78 @@ fn memory_context_returns_only_authorized_sanitized_manifest_content() {
     };
     assert_eq!(text, "approved memory outcome");
     assert_eq!(verified_fingerprint, &digest("23"));
+}
+
+#[test]
+fn memory_context_traversal_honors_relationship_direction() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let mut memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+    let mut source = memory.entities[0].clone();
+    source.id = MemoryEntityId::new("memory-source").unwrap();
+    let mut target = memory.entities[0].clone();
+    target.id = MemoryEntityId::new("memory-target").unwrap();
+    memory.entities = vec![source.clone(), target.clone()];
+    memory.relationships = vec![MemoryRelationship {
+        project: source.project.clone(),
+        memory_revision_id: source.memory_revision_id.clone(),
+        id: MemoryRelationshipId::new("memory-direction-edge").unwrap(),
+        kind: MemoryRelationshipKind::Concerns,
+        source: source.id.clone(),
+        target: MemoryRelationshipTarget::MemoryEntity {
+            entity_id: target.id.clone(),
+        },
+        provenance: source.provenance,
+    }];
+    let loaded = LoadedTarget {
+        graph: None,
+        memory: Some(memory),
+    };
+    let traverse = |seed: &MemoryEntityId, direction| {
+        let (units, _) = context_units(
+            &loaded,
+            &[RemoteContextSeed::MemoryEntity(seed.clone())],
+            direction,
+            &[],
+            &[],
+            false,
+            false,
+            1,
+            Instant::now(),
+            Duration::from_secs(1),
+        );
+        let entities = units
+            .iter()
+            .filter_map(|unit| match unit {
+                ContextUnit::MemoryEntity(entity) => Some(entity.id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let relationships = units
+            .iter()
+            .filter(|unit| matches!(unit, ContextUnit::MemoryRelationship(_)))
+            .count();
+        (entities, relationships)
+    };
+
+    assert_eq!(
+        traverse(&source.id, EdgeDirection::Outgoing),
+        (BTreeSet::from([source.id.clone(), target.id.clone()]), 1)
+    );
+    assert_eq!(
+        traverse(&source.id, EdgeDirection::Incoming),
+        (BTreeSet::from([source.id.clone()]), 0)
+    );
+    assert_eq!(
+        traverse(&target.id, EdgeDirection::Outgoing),
+        (BTreeSet::from([target.id.clone()]), 0)
+    );
+    assert_eq!(
+        traverse(&target.id, EdgeDirection::Incoming),
+        (BTreeSet::from([source.id, target.id]), 1)
+    );
 }
 
 #[test]
