@@ -384,7 +384,7 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
         .unwrap();
     let memory_entity = memory_search.hits[0].entity.id.clone();
     let service = service(&fixture, &graph, &memory);
-    let request = |query_budget| FederatedContextRequest {
+    let request = |query_budget, cursor| FederatedContextRequest {
         scope: FederatedScope::current(
             fixture.project.clone(),
             target(&fixture, ContextDomain::All),
@@ -403,9 +403,11 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
             include_stale: false,
             include_snippets: false,
         },
-        cursor: None,
+        cursor,
     };
-    let complete = service.context(request(budget(&fixture.config))).unwrap();
+    let complete = service
+        .context(request(budget(&fixture.config), None))
+        .unwrap();
     assert!(!complete.cross_domain_links.is_empty());
     let primary_bytes = complete
         .items
@@ -418,13 +420,42 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
     let mut constrained_budget = budget(&fixture.config);
     constrained_budget.max_bytes = std::num::NonZeroU64::new(primary_bytes).unwrap();
 
-    let truncated = service.context(request(constrained_budget)).unwrap();
+    let truncated = service.context(request(constrained_budget, None)).unwrap();
     assert_eq!(truncated.items, complete.items);
     assert_eq!(
         truncated.page.truncation.as_ref().map(|value| value.reason),
         Some(MemoryTruncationReason::Bytes)
     );
     assert!(truncated.page.next_cursor.is_none());
+
+    assert!(complete.items.len() > 2);
+    let page_size = complete.items.len() - 1;
+    let page_primary_bytes = complete
+        .items
+        .iter()
+        .take(page_size)
+        .map(serialized_len)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .sum::<u64>();
+    let mut page_budget = budget(&fixture.config);
+    page_budget.max_results = NonZeroU32::new(u32::try_from(page_size).unwrap()).unwrap();
+    page_budget.max_bytes = NonZeroU64::new(page_primary_bytes).unwrap();
+
+    let first = service.context(request(page_budget.clone(), None)).unwrap();
+    assert_eq!(
+        first.page.truncation.as_ref().map(|value| value.reason),
+        Some(MemoryTruncationReason::Bytes)
+    );
+    let cursor = first
+        .page
+        .next_cursor
+        .clone()
+        .expect("remaining primary items must stay pageable");
+    let second = service.context(request(page_budget, Some(cursor))).unwrap();
+    assert!(!second.items.is_empty());
+    assert!(second.items.iter().all(|item| !first.items.contains(item)));
 }
 
 #[test]

@@ -645,6 +645,24 @@ fn partial_project_request(
     }
 }
 
+fn partial_repository_request(
+    repository: &RemoteRepositoryRef,
+    deletion: &str,
+    coverage: RetentionClass,
+) -> RemoteDeleteRequest {
+    RemoteDeleteRequest {
+        protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
+        request_id: RequestId::new(format!("request-{deletion}")).unwrap(),
+        deletion: DeleteDataRequest::new(
+            DeletionId::new(deletion).unwrap(),
+            DeletionTarget::Repository(repository.clone()),
+            BTreeSet::from([coverage]),
+            Utc::now(),
+        )
+        .unwrap(),
+    }
+}
+
 #[test]
 fn graph_only_project_deletion_preserves_memory_job_linkage() {
     let mut fixture = fixture();
@@ -738,6 +756,145 @@ fn memory_only_project_deletion_preserves_graph_job_linkage() {
             &fixture.project_a
         ),
         1
+    );
+}
+
+#[test]
+fn repository_job_mapping_survives_until_separate_fact_coverage_completes() {
+    let mut fixture = fixture();
+    let snapshot_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-snapshot-first",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    let snapshot_result = fixture
+        .maintenance
+        .delete(
+            &administrator(&fixture.project_a),
+            &snapshot_request,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        snapshot_result.counters.get(&AuditCounter::Snapshots),
+        Some(&1)
+    );
+    assert_eq!(snapshot_result.counters.get(&AuditCounter::Jobs), Some(&0));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        1
+    );
+    assert_eq!(
+        table_count(
+            &fixture.fact_path,
+            "unpublished_fact_batches",
+            &fixture.project_a
+        ),
+        1
+    );
+
+    let fact_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-facts-second",
+        RetentionClass::UnpublishedFact,
+    );
+    let fact_result = fixture
+        .maintenance
+        .delete(
+            &administrator(&fixture.project_a),
+            &fact_request,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        fact_result.counters.get(&AuditCounter::FactBatches),
+        Some(&1)
+    );
+    assert_eq!(fact_result.counters.get(&AuditCounter::Jobs), Some(&1));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        0
+    );
+    assert_eq!(
+        table_count(
+            &fixture.fact_path,
+            "unpublished_fact_batches",
+            &fixture.project_a
+        ),
+        0
+    );
+}
+
+#[test]
+fn repository_job_mapping_survives_until_snapshot_coverage_completes() {
+    let mut fixture = fixture();
+    let fact_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-facts-first",
+        RetentionClass::UnpublishedFact,
+    );
+    fixture
+        .maintenance
+        .delete(
+            &administrator(&fixture.project_a),
+            &fact_request,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        1
+    );
+    assert_eq!(
+        table_count(
+            &fixture.fact_path,
+            "unpublished_fact_batches",
+            &fixture.project_a
+        ),
+        0
+    );
+
+    let snapshot_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-snapshot-second",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    let snapshot_result = fixture
+        .maintenance
+        .delete(
+            &administrator(&fixture.project_a),
+            &snapshot_request,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        snapshot_result.counters.get(&AuditCounter::Snapshots),
+        Some(&1)
+    );
+    assert_eq!(snapshot_result.counters.get(&AuditCounter::Jobs), Some(&1));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        0
     );
 }
 

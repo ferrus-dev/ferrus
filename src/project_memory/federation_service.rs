@@ -860,7 +860,7 @@ where
             returned.len(),
             budget.max_bytes.saturating_sub(remaining_bytes),
             explored_depth,
-            has_more && !supplemental_truncated,
+            has_more,
             "context",
             &fingerprint,
             &revision_key,

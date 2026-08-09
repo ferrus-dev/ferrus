@@ -221,12 +221,35 @@ impl SqliteRemoteMaintenance {
             );
             self.record_progress(deletion, &mut counts, now)?;
         }
+        let repository_has_unpublished_facts = match &deletion.target {
+            DeletionTarget::Repository(repository)
+                if deletion
+                    .coverage
+                    .contains(&RetentionClass::PublishedGraphSnapshot)
+                    || deletion.coverage.contains(&RetentionClass::UnpublishedFact) =>
+            {
+                repository_jobs_have_unpublished_facts(
+                    &self.fact_path,
+                    repository,
+                    &repository_jobs,
+                )?
+            }
+            DeletionTarget::Repository(_) => true,
+            DeletionTarget::Project(_) => false,
+        };
 
         let mut connection = self.control_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
-        delete_control_data(&transaction, deletion, &repository_jobs, &mut counts, now)?;
+        delete_control_data(
+            &transaction,
+            deletion,
+            &repository_jobs,
+            repository_has_unpublished_facts,
+            &mut counts,
+            now,
+        )?;
         transaction
             .commit()
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
@@ -560,10 +583,40 @@ fn delete_unpublished_facts(
     u64::try_from(deleted).map_err(|_| MaintenanceStoreError::IntegrityFailure)
 }
 
+fn repository_jobs_have_unpublished_facts(
+    fact_path: &Path,
+    repository: &RemoteRepositoryRef,
+    repository_jobs: &[String],
+) -> Result<bool, MaintenanceStoreError> {
+    let connection = open_existing(fact_path)?;
+    ensure_schema(&connection, "fact_store_metadata", 1)?;
+    for job in repository_jobs {
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM unpublished_fact_batches
+                    WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3
+                 )",
+                params![
+                    repository.project.tenant_id.as_str(),
+                    repository.project.project_id.as_str(),
+                    job
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|_| MaintenanceStoreError::Unavailable)?;
+        if exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn delete_control_data(
     transaction: &Transaction<'_>,
     deletion: &DeleteDataRequest,
     repository_jobs: &[String],
+    repository_has_unpublished_facts: bool,
     counts: &mut DeletionCounts,
     now: DateTime<Utc>,
 ) -> Result<(), MaintenanceStoreError> {
@@ -702,7 +755,28 @@ fn delete_control_data(
         .coverage
         .contains(&RetentionClass::PublishedMemoryRevision)
         && matches!(deletion.target, DeletionTarget::Project(_));
-    if delete_graph_jobs || delete_memory_jobs {
+    let delete_repository_jobs = match &deletion.target {
+        DeletionTarget::Repository(repository) => {
+            !repository_has_unpublished_facts
+                && count(
+                    transaction,
+                    "SELECT COUNT(*) FROM remote_immutable_revisions
+                     WHERE tenant_id = ?1 AND project_id = ?2
+                       AND domain = 'repository_graph' AND repository_id = ?3",
+                    params![
+                        project.tenant_id.as_str(),
+                        project.project_id.as_str(),
+                        repository.repository_id.as_str()
+                    ],
+                )? == 0
+                && (deletion
+                    .coverage
+                    .contains(&RetentionClass::PublishedGraphSnapshot)
+                    || deletion.coverage.contains(&RetentionClass::UnpublishedFact))
+        }
+        DeletionTarget::Project(_) => false,
+    };
+    if delete_graph_jobs || delete_memory_jobs || delete_repository_jobs {
         let deleted = match &deletion.target {
             DeletionTarget::Project(_) => transaction
                 .execute(
@@ -718,7 +792,7 @@ fn delete_control_data(
                     ],
                 )
                 .map_err(|_| MaintenanceStoreError::Unavailable)?,
-            DeletionTarget::Repository(_) => {
+            DeletionTarget::Repository(_) if delete_repository_jobs => {
                 let mut total = 0usize;
                 for job in repository_jobs {
                     total = total.saturating_add(
@@ -737,6 +811,7 @@ fn delete_control_data(
                 }
                 total
             }
+            DeletionTarget::Repository(_) => 0,
         };
         counts.add(
             AuditCounter::Jobs,
