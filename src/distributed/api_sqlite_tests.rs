@@ -1422,6 +1422,11 @@ fn local_and_remote_sqlite_adapters_share_snapshot_query_semantics() {
         namespace: ProjectNamespace::new("local:parity").unwrap(),
         project_id: ProjectId::new("project").unwrap(),
     };
+    crate::project_memory::source::record_approved_outcome_for_test(
+        memory_data.path(),
+        "docs/specs/parity.md",
+        &fs::read_to_string(local_root.path().join("docs/specs/parity.md")).unwrap(),
+    );
     let memory_source = LocalMemorySource::discover_at(
         local_root.path().to_path_buf(),
         memory_data.path().to_path_buf(),

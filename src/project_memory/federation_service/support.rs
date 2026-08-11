@@ -251,6 +251,115 @@ pub(super) fn serialized_len(value: &impl Serialize) -> Result<u64, MemoryQueryE
         .map_err(|_| backend_error("federation.serialization"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_federated_search_response(
+    response: &mut FederatedSearchResponse,
+    max_bytes: u64,
+    initial_reason: Option<MemoryTruncationReason>,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+) -> Result<(), MemoryQueryError> {
+    set_federated_search_page(
+        response,
+        initial_reason,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )?;
+    if stabilize_federated_search_size(response)? <= max_bytes {
+        return Ok(());
+    }
+    if response.results.len() <= 1 {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Bytes,
+        ));
+    }
+
+    let original_results = response.results.clone();
+    let mut lower = 1usize;
+    let mut upper = original_results.len() - 1;
+    let mut best = None;
+    while lower <= upper {
+        let midpoint = lower + (upper - lower) / 2;
+        response.results = original_results[..midpoint].to_vec();
+        set_federated_search_page(
+            response,
+            Some(MemoryTruncationReason::Bytes),
+            offset,
+            total,
+            fingerprint,
+            revision_key,
+        )?;
+        if stabilize_federated_search_size(response)? <= max_bytes {
+            best = Some(midpoint);
+            lower = midpoint + 1;
+        } else {
+            upper = midpoint - 1;
+        }
+    }
+    let Some(best) = best else {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Bytes,
+        ));
+    };
+    response.results = original_results[..best].to_vec();
+    set_federated_search_page(
+        response,
+        Some(MemoryTruncationReason::Bytes),
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )?;
+    let encoded_bytes = stabilize_federated_search_size(response)?;
+    if encoded_bytes > max_bytes {
+        return Err(backend_error("federation.serialization"));
+    }
+    Ok(())
+}
+
+fn set_federated_search_page(
+    response: &mut FederatedSearchResponse,
+    reason: Option<MemoryTruncationReason>,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+) -> Result<(), MemoryQueryError> {
+    let has_more = offset + response.results.len() < total;
+    response.page = federated_page(
+        reason,
+        response.results.len(),
+        0,
+        0,
+        has_more,
+        "search",
+        fingerprint,
+        revision_key,
+        offset + response.results.len(),
+    )?;
+    Ok(())
+}
+
+fn stabilize_federated_search_size(
+    response: &mut FederatedSearchResponse,
+) -> Result<u64, MemoryQueryError> {
+    for _ in 0..32 {
+        let encoded_bytes = serialized_len(response)?;
+        let Some(truncation) = response.page.truncation.as_mut() else {
+            return Ok(encoded_bytes);
+        };
+        if truncation.returned_bytes == encoded_bytes {
+            return Ok(encoded_bytes);
+        }
+        truncation.returned_bytes = encoded_bytes;
+    }
+    Err(backend_error("federation.serialization"))
+}
+
 pub(super) fn snippet_span_key(snippet: &ContextSnippet) -> (u64, u64) {
     snippet.span.as_ref().map_or((0, 0), |span| {
         (span.start.byte_offset, span.end.byte_offset)

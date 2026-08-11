@@ -120,6 +120,11 @@ fn fixture() -> Fixture {
     let root = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     initialize(root.path());
+    super::super::source::record_approved_outcome_for_test(
+        data.path(),
+        "docs/specs/federation.md",
+        &fs::read_to_string(root.path().join("docs/specs/federation.md")).unwrap(),
+    );
     fs::create_dir_all(data.path().join("runs/t-1")).unwrap();
     fs::write(
         data.path().join("runs/t-1/SUBMISSION.md"),
@@ -493,6 +498,73 @@ fn combined_search_cursor_is_deterministic_and_does_not_repeat_results() {
     assert_ne!(
         search_result_key(&first.results[0]),
         search_result_key(&second.results[0])
+    );
+}
+
+#[test]
+fn combined_search_counts_the_complete_response_against_the_byte_budget() {
+    let fixture = fixture();
+    let graph = SqliteGraphQuery::new(
+        &fixture.graph_sidecar,
+        fixture.config.query_limits.clone(),
+        Some(fixture.graph_freshness.clone()),
+    );
+    let memory =
+        SqliteMemoryQuery::new(&fixture.memory_sidecar, fixture.config.query_limits.clone());
+    let service = service(&fixture, &graph, &memory);
+    let request = |query_budget| FederatedSearchRequest {
+        scope: FederatedScope::current(
+            fixture.project.clone(),
+            target(&fixture, ContextDomain::All),
+            query_budget,
+        ),
+        text: MemoryQueryText::new("federat").unwrap(),
+        repository_kinds: vec![],
+        repository_paths: vec![],
+        memory_kinds: vec![],
+        memory_sources: vec![],
+        cursor: None,
+    };
+
+    let complete = service.search(request(budget(&fixture.config))).unwrap();
+    assert!(complete.results.len() > 1);
+
+    let mut one_result_budget = budget(&fixture.config);
+    one_result_budget.max_results = NonZeroU32::new(1).unwrap();
+    let one_result = service.search(request(one_result_budget)).unwrap();
+    let one_response_bytes = one_result
+        .page
+        .truncation
+        .as_ref()
+        .expect("one-result response must be truncated")
+        .returned_bytes;
+    assert_eq!(
+        one_response_bytes,
+        serde_json::to_vec(&one_result).unwrap().len() as u64
+    );
+
+    let mut constrained_budget = budget(&fixture.config);
+    constrained_budget.max_bytes = NonZeroU64::new(one_response_bytes).unwrap();
+    let constrained = service.search(request(constrained_budget)).unwrap();
+    assert_eq!(constrained.results.len(), 1);
+    let encoded_bytes = serde_json::to_vec(&constrained).unwrap().len() as u64;
+    assert!(encoded_bytes <= one_response_bytes);
+    assert_eq!(
+        constrained
+            .page
+            .truncation
+            .as_ref()
+            .expect("response must report byte truncation")
+            .returned_bytes,
+        encoded_bytes
+    );
+
+    let bare_result_bytes = serialized_len(&complete.results[0]).unwrap();
+    let mut insufficient_budget = budget(&fixture.config);
+    insufficient_budget.max_bytes = NonZeroU64::new(bare_result_bytes + 1).unwrap();
+    assert_eq!(
+        service.search(request(insufficient_budget)).unwrap_err(),
+        MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Bytes)
     );
 }
 

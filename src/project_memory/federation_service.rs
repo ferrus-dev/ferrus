@@ -523,7 +523,6 @@ where
         let total = results.len();
         let mut candidates = results.into_iter().skip(offset).peekable();
         let mut returned = Vec::new();
-        let mut returned_bytes = 0_u64;
         let mut reason = None;
         for result in candidates.by_ref() {
             if returned.len() >= budget.max_results {
@@ -534,24 +533,13 @@ where
                 reason = Some(MemoryTruncationReason::Duration);
                 break;
             }
-            let bytes = serialized_len(&result)?;
-            if returned_bytes.saturating_add(bytes) > budget.max_bytes {
-                if returned.is_empty() {
-                    return Err(MemoryQueryError::BudgetExceeded(
-                        MemoryTruncationReason::Bytes,
-                    ));
-                }
-                reason = Some(MemoryTruncationReason::Bytes);
-                break;
-            }
-            returned_bytes = returned_bytes.saturating_add(bytes);
             returned.push(result);
         }
         let has_more = offset + returned.len() < total || candidates.peek().is_some();
         let page = federated_page(
             reason,
             returned.len(),
-            returned_bytes,
+            0,
             0,
             has_more,
             "search",
@@ -559,7 +547,7 @@ where
             &revision_key,
             offset + returned.len(),
         )?;
-        Ok(FederatedSearchResponse {
+        let mut response = FederatedSearchResponse {
             wire_version: FEDERATION_WIRE_VERSION,
             project: request.scope.project,
             requested_domain: request.scope.target.domain(),
@@ -568,7 +556,17 @@ where
             federation_diagnostics: vec![],
             page,
             results: returned,
-        })
+        };
+        fit_federated_search_response(
+            &mut response,
+            budget.max_bytes,
+            reason,
+            offset,
+            total,
+            &fingerprint,
+            &revision_key,
+        )?;
+        Ok(response)
     }
 
     fn context(

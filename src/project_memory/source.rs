@@ -130,7 +130,15 @@ impl LocalMemorySource {
         if policy.is_authorized(MemorySourceCategory::SpecificationStructure)
             || policy.is_authorized(MemorySourceCategory::ApprovedOutcome)
         {
-            discover_tracked_specs(&root, &project, &spec_directory, &policy, &mut materials)?;
+            let approved_outcomes = approved_outcome_fingerprints(&data_dir)?;
+            discover_tracked_specs(
+                &root,
+                &project,
+                &spec_directory,
+                &policy,
+                &approved_outcomes,
+                &mut materials,
+            )?;
         }
         if policy.is_authorized(MemorySourceCategory::ArchiveManifest) {
             discover_archives(&data_dir, &project, &mut materials)?;
@@ -326,6 +334,7 @@ fn discover_tracked_specs(
     project: &ProjectRef,
     spec_directory: &RepoPath,
     policy: &MemoryPolicy,
+    approved_outcomes: &BTreeMap<RepoPath, BTreeSet<Digest>>,
     materials: &mut Vec<SourceMaterial>,
 ) -> Result<()> {
     let output = Command::new("git")
@@ -385,13 +394,17 @@ fn discover_tracked_specs(
         }
         if policy.is_authorized(MemorySourceCategory::ApprovedOutcome)
             && let Some(outcome) = parsed.outcome
+            && let fingerprint = canonical_digest(&outcome)
+            && approved_outcomes
+                .get(&path)
+                .is_some_and(|approved| approved.contains(&fingerprint))
         {
             materials.push(SourceMaterial {
                 descriptor: AuthorizedSourceDescriptor {
                     project: project.clone(),
                     category: MemorySourceCategory::ApprovedOutcome,
                     locator: MemorySourceLocator::TrackedFile { path },
-                    fingerprint: canonical_digest(&outcome),
+                    fingerprint,
                     byte_len: outcome.text.len() as u64,
                 },
                 content: MaterialContent::TrackedSpec {
@@ -429,6 +442,104 @@ struct RawArchiveManifest {
 struct RawArchiveTask {
     id: String,
     milestone_id: Option<String>,
+}
+
+fn approved_outcome_fingerprints(data_dir: &Path) -> Result<BTreeMap<RepoPath, BTreeSet<Digest>>> {
+    let database_path = data_dir.join("ferrus.db");
+    let archive_root = data_dir.join("archive").join("specs");
+    if !database_path.is_file() || !archive_root.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let archive_root = fs::canonicalize(archive_root)?;
+    let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_archive_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spec_archives')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_archive_table {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut statement = connection
+        .prepare("SELECT spec_path, archive_dir, outcome FROM spec_archives ORDER BY id")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut fingerprints = BTreeMap::<RepoPath, BTreeSet<Digest>>::new();
+    let mut archive_count = 0usize;
+    for row in rows {
+        archive_count += 1;
+        if archive_count > MAX_SOURCES {
+            anyhow::bail!("approved Outcome archive proof limit exceeded");
+        }
+        let (spec_path, archive_dir, recorded_outcome) = row?;
+        let Ok(spec_path) = RepoPath::new(spec_path) else {
+            continue;
+        };
+        let Ok(archive_dir) = fs::canonicalize(archive_dir) else {
+            continue;
+        };
+        if !archive_dir.starts_with(&archive_root) {
+            continue;
+        }
+        let manifest_path = archive_dir.join("manifest.toml");
+        let spec_copy_path = archive_dir.join("spec.md");
+        if !bounded_regular_file(&manifest_path, MAX_ARCHIVE_MANIFEST_BYTES)
+            || !bounded_regular_file(&spec_copy_path, MAX_SPEC_BYTES)
+        {
+            continue;
+        }
+        let Ok(manifest) = fs::read_to_string(manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<RawArchiveManifest>(&manifest) else {
+            continue;
+        };
+        if RepoPath::new(manifest.spec_path).ok().as_ref() != Some(&spec_path) {
+            continue;
+        }
+        let Ok(spec_copy) = fs::read_to_string(spec_copy_path) else {
+            continue;
+        };
+        let Some(outcome) = parse_spec_memory(&spec_copy).outcome else {
+            continue;
+        };
+        let recorded_outcome = recorded_outcome.trim();
+        let recorded_outcome = if recorded_outcome.starts_with("## Outcome") {
+            recorded_outcome.to_string()
+        } else {
+            format!("## Outcome\n\n{recorded_outcome}")
+        };
+        let Some(recorded_outcome) = parse_spec_memory(&recorded_outcome).outcome else {
+            continue;
+        };
+        if outcome.text != recorded_outcome.text
+            || outcome.sections.len() != recorded_outcome.sections.len()
+            || !outcome.sections.iter().zip(&recorded_outcome.sections).all(
+                |(archived, recorded)| {
+                    archived.kind == recorded.kind && archived.text == recorded.text
+                },
+            )
+        {
+            continue;
+        }
+        let fingerprint = canonical_digest(&outcome);
+        fingerprints
+            .entry(spec_path)
+            .or_default()
+            .insert(fingerprint);
+    }
+    Ok(fingerprints)
+}
+
+fn bounded_regular_file(path: &Path, max_bytes: u64) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() <= max_bytes)
 }
 
 fn discover_archives(
@@ -726,6 +837,73 @@ fn material_key(material: &SourceMaterial) -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn record_approved_outcome_for_test(data: &Path, spec_path: &str, spec_content: &str) {
+    if parse_spec_memory(spec_content).outcome.is_none() {
+        return;
+    }
+    let connection = Connection::open(data.join("ferrus.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS spec_archives (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                spec_path TEXT NOT NULL, archive_dir TEXT NOT NULL, \
+                closed_at TEXT NOT NULL, task_count INTEGER NOT NULL, \
+                run_count INTEGER NOT NULL, outcome TEXT NOT NULL\
+            ); \
+            CREATE TABLE IF NOT EXISTS tasks (\
+                id TEXT, milestone_id TEXT, status TEXT, spec_path TEXT, \
+                baseline_snapshot_id TEXT, repository_view_snapshot_id TEXT\
+            ); \
+            CREATE TABLE IF NOT EXISTS runs (\
+                id TEXT, task_id TEXT, status TEXT, baseline_snapshot_id TEXT, \
+                repository_view_snapshot_id TEXT\
+            ); \
+            CREATE TABLE IF NOT EXISTS events (\
+                id INTEGER, run_id TEXT, type TEXT, payload_json TEXT\
+            );",
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare("SELECT archive_dir FROM spec_archives WHERE spec_path = ?1 ORDER BY id")
+        .unwrap();
+    let existing = statement
+        .query_map([spec_path], |row| row.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|archive_dir| {
+            fs::read_to_string(Path::new(&archive_dir).join("spec.md"))
+                .is_ok_and(|archived| archived == spec_content)
+        });
+    drop(statement);
+    if existing {
+        return;
+    }
+    let proof_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM spec_archives", [], |row| row.get(0))
+        .unwrap();
+    let archive_dir = data
+        .join("archive/specs")
+        .join(format!("proof-{}", proof_count + 1));
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::write(archive_dir.join("spec.md"), spec_content).unwrap();
+    fs::write(
+        archive_dir.join("manifest.toml"),
+        format!("spec_path = {spec_path:?}\narchived_at = \"2026-08-11T00:00:00Z\"\ntasks = []\n"),
+    )
+    .unwrap();
+    let outcome_start = spec_content.find("## Outcome").unwrap();
+    let recorded_outcome = spec_content[outcome_start..].trim();
+    connection
+        .execute(
+            "INSERT INTO spec_archives \
+             (spec_path, archive_dir, closed_at, task_count, run_count, outcome) \
+             VALUES (?1, ?2, '2026-08-11T00:00:00Z', 0, 0, ?3)",
+            rusqlite::params![spec_path, archive_dir.to_string_lossy(), recorded_outcome],
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU64;
@@ -766,17 +944,15 @@ mod tests {
     }
 
     #[test]
-    fn outcome_changes_do_not_invalidate_structure_sources() {
+    fn approved_outcomes_require_exact_archive_proof_without_affecting_structure() {
         let root = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
         init_git(root.path());
         let path = "docs/specs/example.md";
-        add_tracked(
-            root.path(),
-            path,
-            "# Example\n\n- [x] #1.0 Done\n\nID: one\nDepends on: none\n\n## Outcome\n\nFirst.\n",
-        );
-        let first = LocalMemorySource::discover_at(
+        let first_content =
+            "# Example\n\n- [x] #1.0 Done\n\nID: one\nDepends on: none\n\n## Outcome\n\nFirst.\n";
+        add_tracked(root.path(), path, first_content);
+        let unproved = LocalMemorySource::discover_at(
             root.path().to_path_buf(),
             data.path().to_path_buf(),
             project_ref(),
@@ -784,6 +960,31 @@ mod tests {
             MemoryPolicy::default(),
         )
         .unwrap();
+        assert!(
+            unproved
+                .manifest
+                .sources
+                .iter()
+                .all(|source| { source.category != MemorySourceCategory::ApprovedOutcome })
+        );
+
+        record_approved_outcome_for_test(data.path(), path, first_content);
+        let approved = LocalMemorySource::discover_at(
+            root.path().to_path_buf(),
+            data.path().to_path_buf(),
+            project_ref(),
+            RepoPath::new("docs/specs").unwrap(),
+            MemoryPolicy::default(),
+        )
+        .unwrap();
+        assert!(
+            approved
+                .manifest
+                .sources
+                .iter()
+                .any(|source| { source.category == MemorySourceCategory::ApprovedOutcome })
+        );
+
         fs::write(
             root.path().join(path),
             "# Example\n\n- [x] #1.0 Done\n\nID: one\nDepends on: none\n\n## Outcome\n\nSecond.\n",
@@ -797,23 +998,22 @@ mod tests {
             MemoryPolicy::default(),
         )
         .unwrap();
-        let fingerprint = |source: &LocalMemorySource, category| {
-            source
+        let structure_fingerprint = |source: &LocalMemorySource| {
+            source.manifest.sources.iter().find_map(|source| {
+                (source.category == MemorySourceCategory::SpecificationStructure)
+                    .then(|| source.fingerprint.clone())
+            })
+        };
+        assert_eq!(
+            structure_fingerprint(&approved),
+            structure_fingerprint(&second)
+        );
+        assert!(
+            second
                 .manifest
                 .sources
                 .iter()
-                .find(|source| source.category == category)
-                .unwrap()
-                .fingerprint
-                .clone()
-        };
-        assert_eq!(
-            fingerprint(&first, MemorySourceCategory::SpecificationStructure),
-            fingerprint(&second, MemorySourceCategory::SpecificationStructure)
-        );
-        assert_ne!(
-            fingerprint(&first, MemorySourceCategory::ApprovedOutcome),
-            fingerprint(&second, MemorySourceCategory::ApprovedOutcome)
+                .all(|source| { source.category != MemorySourceCategory::ApprovedOutcome })
         );
     }
 
@@ -906,6 +1106,11 @@ mod tests {
         init_git(root.path());
         add_tracked(
             root.path(),
+            "docs/specs/example.md",
+            "# Example\n\n## Outcome\n\ncaf\u{00e9}\n",
+        );
+        record_approved_outcome_for_test(
+            data.path(),
             "docs/specs/example.md",
             "# Example\n\n## Outcome\n\ncaf\u{00e9}\n",
         );

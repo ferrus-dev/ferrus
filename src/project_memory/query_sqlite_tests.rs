@@ -52,6 +52,11 @@ fn indexed_fixture() -> (TempDir, TempDir, ProjectRef, MemoryRevisionId) {
     let data = TempDir::new().unwrap();
     initialize_repository(root.path());
     let project = project();
+    crate::project_memory::source::record_approved_outcome_for_test(
+        data.path(),
+        "docs/specs/query.md",
+        &fs::read_to_string(root.path().join("docs/specs/query.md")).unwrap(),
+    );
     let source = LocalMemorySource::discover_at(
         root.path().to_path_buf(),
         data.path().to_path_buf(),
@@ -144,6 +149,11 @@ fn status_reports_source_policy_retention_and_stale_archive_freshness() {
             .status()
             .unwrap()
             .success()
+    );
+    crate::project_memory::source::record_approved_outcome_for_test(
+        data.path(),
+        "docs/specs/query.md",
+        &fs::read_to_string(root.path().join("docs/specs/query.md")).unwrap(),
     );
     let changed_source = LocalMemorySource::discover_at(
         root.path().to_path_buf(),

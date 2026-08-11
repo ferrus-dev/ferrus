@@ -175,6 +175,14 @@ fn write_spec(root: &Path, outcome: Option<&str>) {
 }
 
 fn source(root: &TempDir, data: &TempDir) -> LocalMemorySource {
+    let spec_path = "docs/specs/example.md";
+    if let Ok(spec_content) = fs::read_to_string(root.path().join(spec_path)) {
+        crate::project_memory::source::record_approved_outcome_for_test(
+            data.path(),
+            spec_path,
+            &spec_content,
+        );
+    }
     LocalMemorySource::discover_at(
         root.path().to_path_buf(),
         data.path().to_path_buf(),
@@ -278,7 +286,7 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
         .unwrap()
         .index(MemoryIndexOptions::default())
         .unwrap();
-    assert_eq!(first.metrics.extracted_sources, 2);
+    assert_eq!(first.metrics.extracted_sources, 3);
     assert_eq!(first.metrics.reused_sources, 0);
     let first_view = published_revision(&store, &first_source).unwrap().unwrap();
     assert_eq!(first_view.generation, 1);
@@ -299,7 +307,7 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
         .index(MemoryIndexOptions::default())
         .unwrap();
     assert_eq!(no_op.revision.id, first.revision.id);
-    assert_eq!(no_op.metrics.reused_sources, 2);
+    assert_eq!(no_op.metrics.reused_sources, 3);
     assert_eq!(
         published_revision(&store, &first_source)
             .unwrap()
@@ -315,8 +323,8 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
         .index(MemoryIndexOptions::default())
         .unwrap();
     assert_ne!(changed.revision.id, first.revision.id);
-    assert_eq!(changed.metrics.reused_sources, 1);
-    assert_eq!(changed.metrics.extracted_sources, 1);
+    assert_eq!(changed.metrics.reused_sources, 2);
+    assert_eq!(changed.metrics.extracted_sources, 2);
     assert_eq!(
         published_revision(&store, &changed_source)
             .unwrap()
@@ -356,7 +364,7 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
                     }
             })
     );
-    assert_eq!(removed.metrics.reused_sources, 1);
+    assert_eq!(removed.metrics.reused_sources, 3);
 
     assert!(
         Command::new("git")
@@ -371,11 +379,11 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
         .unwrap()
         .index(MemoryIndexOptions::default())
         .unwrap();
+    let deleted_entities = store.entities_for_revision(&deleted.revision.id).unwrap();
     assert!(
-        store
-            .entities_for_revision(&deleted.revision.id)
-            .unwrap()
-            .is_empty()
+        deleted_entities
+            .iter()
+            .all(|entity| matches!(entity.data, MemoryEntityData::ArchiveReference { .. }))
     );
     assert!(
         store
@@ -383,11 +391,16 @@ fn cold_no_op_incremental_and_deletion_builds_publish_atomically() {
             .unwrap()
             .is_empty()
     );
+    let deleted_entity_ids = deleted_entities
+        .iter()
+        .map(|entity| &entity.id)
+        .collect::<std::collections::BTreeSet<_>>();
     assert!(
         store
             .repository_links(&deleted.repository_link_set.id)
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|relationship| deleted_entity_ids.contains(&relationship.source))
     );
     assert_eq!(
         published_revision(&store, &deleted_source)
