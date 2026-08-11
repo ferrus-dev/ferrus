@@ -331,6 +331,7 @@ fn combined_context_crosses_only_the_exact_resolved_link_set() {
                 include_external: false,
             },
             memory_policy: MemoryContextPolicy {
+                direction: EdgeDirection::Both,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,
@@ -403,6 +404,7 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
             include_external: false,
         },
         memory_policy: MemoryContextPolicy {
+            direction: EdgeDirection::Both,
             relationship_kinds: vec![],
             include_unresolved: false,
             include_stale: false,
@@ -511,6 +513,7 @@ fn combined_context_counts_the_complete_response_against_the_byte_budget() {
             include_external: false,
         },
         memory_policy: MemoryContextPolicy {
+            direction: EdgeDirection::Both,
             relationship_kinds: vec![],
             include_unresolved: false,
             include_stale: false,
@@ -731,6 +734,7 @@ fn approved_history_reduces_raw_artifact_reading_without_displacing_source_evide
                     include_external: false,
                 },
                 memory_policy: MemoryContextPolicy {
+                    direction: EdgeDirection::Both,
                     relationship_kinds: vec![],
                     include_unresolved: false,
                     include_stale: false,

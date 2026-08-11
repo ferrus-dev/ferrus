@@ -5,7 +5,10 @@ use std::num::{NonZeroU32, NonZeroU64};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::repository_graph::domain::{Digest, RepoPath, SemanticKey};
+use crate::repository_graph::{
+    domain::{Digest, RepoPath, SemanticKey},
+    query::EdgeDirection,
+};
 
 use super::{
     MEMORY_QUERY_WIRE_VERSION,
@@ -255,6 +258,8 @@ pub enum MemoryContextSeed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryContextPolicy {
+    #[serde(default)]
+    pub direction: EdgeDirection,
     #[serde(default)]
     pub relationship_kinds: Vec<MemoryRelationshipKind>,
     #[serde(default)]

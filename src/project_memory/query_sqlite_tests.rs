@@ -11,7 +11,7 @@ use crate::project_memory::{
     source::LocalMemorySource,
     sqlite::{MEMORY_SIDECAR_FILE_NAME, OpenMemoryQuerySidecarResult, open_for_query_at},
 };
-use crate::repository_graph::domain::RepoPath;
+use crate::repository_graph::{domain::RepoPath, query::EdgeDirection};
 
 use super::*;
 
@@ -265,6 +265,7 @@ fn search_and_context_are_revision_bound_and_deterministic() {
                 MemoryRecordId::new("rg-test").unwrap(),
             )],
             policy: super::super::query::MemoryContextPolicy {
+                direction: crate::repository_graph::query::EdgeDirection::Both,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,
@@ -275,6 +276,109 @@ fn search_and_context_are_revision_bound_and_deterministic() {
         .unwrap();
     assert!(context.items.len() >= 2);
     assert!(!context.relationships.is_empty());
+}
+
+#[test]
+fn context_traversal_honors_relationship_direction() {
+    let (_root, data, project, revision_id) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let relationship = query
+        .relationships(&revision_id)
+        .unwrap()
+        .into_iter()
+        .find(|relationship| {
+            matches!(
+                relationship.target,
+                MemoryRelationshipTarget::MemoryEntity { ref entity_id }
+                    if entity_id != &relationship.source
+            )
+        })
+        .expect("fixture should contain a directed entity relationship");
+    let MemoryRelationshipTarget::MemoryEntity { entity_id: target } = relationship.target.clone()
+    else {
+        unreachable!("relationship was selected by target kind");
+    };
+    let source = relationship.source.clone();
+    let relationship_id = relationship.id.clone();
+
+    let context = |seed, direction| {
+        query
+            .context(MemoryContextRequest {
+                scope: published_scope(project.clone(), &limits),
+                seeds: vec![MemoryContextSeed::Entity(seed)],
+                policy: super::super::query::MemoryContextPolicy {
+                    direction,
+                    relationship_kinds: vec![],
+                    include_unresolved: false,
+                    include_stale: false,
+                    include_snippets: false,
+                },
+                page: MemoryPageRequest::default(),
+            })
+            .unwrap()
+    };
+
+    let outgoing_from_source = context(source.clone(), EdgeDirection::Outgoing);
+    assert!(
+        outgoing_from_source
+            .items
+            .iter()
+            .any(|item| item.entity.id == target)
+    );
+    assert!(
+        outgoing_from_source
+            .relationships
+            .iter()
+            .any(|item| item.id == relationship_id)
+    );
+
+    let outgoing_from_target = context(target.clone(), EdgeDirection::Outgoing);
+    assert!(
+        outgoing_from_target
+            .items
+            .iter()
+            .all(|item| item.entity.id != source)
+    );
+    assert!(
+        outgoing_from_target
+            .relationships
+            .iter()
+            .all(|item| item.id != relationship_id)
+    );
+
+    let incoming_from_target = context(target.clone(), EdgeDirection::Incoming);
+    assert!(
+        incoming_from_target
+            .items
+            .iter()
+            .any(|item| item.entity.id == source)
+    );
+    assert!(
+        incoming_from_target
+            .relationships
+            .iter()
+            .any(|item| item.id == relationship_id)
+    );
+
+    let incoming_from_source = context(source, EdgeDirection::Incoming);
+    assert!(
+        incoming_from_source
+            .items
+            .iter()
+            .all(|item| item.entity.id != target)
+    );
+    assert!(
+        incoming_from_source
+            .relationships
+            .iter()
+            .all(|item| item.id != relationship_id)
+    );
 }
 
 #[test]
@@ -325,6 +429,7 @@ fn context_bounds_relationship_expansion_by_the_effective_result_limit() {
                 MemoryRecordId::new("rg-test").unwrap(),
             )],
             policy: super::super::query::MemoryContextPolicy {
+                direction: crate::repository_graph::query::EdgeDirection::Both,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,
@@ -364,6 +469,7 @@ fn context_snippets_use_the_verified_content_boundary_and_effective_cap() {
                 MemoryRecordId::new("rg-test").unwrap(),
             )],
             policy: super::super::query::MemoryContextPolicy {
+                direction: crate::repository_graph::query::EdgeDirection::Both,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,

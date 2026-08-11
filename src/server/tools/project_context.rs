@@ -147,6 +147,7 @@ async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
             include_external: input.include_external,
         },
         memory_policy: MemoryContextPolicy {
+            direction: input.direction,
             relationship_kinds: input.memory_relationship_kinds,
             include_unresolved: input.include_unresolved,
             include_stale: input.include_stale,

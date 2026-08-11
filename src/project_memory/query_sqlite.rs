@@ -10,7 +10,7 @@ use rusqlite::{Connection, Error as SqliteError, ErrorCode, OptionalExtension, p
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::repository_graph::config::QueryLimitsConfig;
+use crate::repository_graph::{config::QueryLimitsConfig, query::EdgeDirection};
 
 use super::{
     MEMORY_QUERY_WIRE_VERSION,
@@ -424,14 +424,24 @@ impl<'a> SqliteMemoryQuery<'a> {
             let MemoryRelationshipTarget::MemoryEntity { entity_id } = &relationship.target else {
                 continue;
             };
-            adjacency
-                .entry(relationship.source.clone())
-                .or_default()
-                .push((entity_id.clone(), relationship.clone()));
-            adjacency
-                .entry(entity_id.clone())
-                .or_default()
-                .push((relationship.source.clone(), relationship.clone()));
+            if matches!(
+                request.policy.direction,
+                EdgeDirection::Outgoing | EdgeDirection::Both
+            ) {
+                adjacency
+                    .entry(relationship.source.clone())
+                    .or_default()
+                    .push((entity_id.clone(), relationship.clone()));
+            }
+            if matches!(
+                request.policy.direction,
+                EdgeDirection::Incoming | EdgeDirection::Both
+            ) {
+                adjacency
+                    .entry(entity_id.clone())
+                    .or_default()
+                    .push((relationship.source.clone(), relationship.clone()));
+            }
         }
         for neighbors in adjacency.values_mut() {
             neighbors.sort_by(|left, right| {

@@ -48,29 +48,44 @@ pub(super) fn matching_seed_entities(
                 _ => None,
             })
             .collect(),
-        MemoryContextSeed::RepositoryPath(path) => relationships
-            .iter()
-            .filter(|relationship| resolution_visible(relationship.provenance.resolution, policy))
-            .filter_map(|relationship| match &relationship.target {
-                MemoryRelationshipTarget::RepositoryPath { path: target, .. } if target == path => {
-                    Some(relationship.source.clone())
-                }
-                MemoryRelationshipTarget::RepositoryNode { .. } => None,
-                _ => None,
-            })
-            .collect(),
-        MemoryContextSeed::RepositorySymbol(symbol) => relationships
-            .iter()
-            .filter(|relationship| resolution_visible(relationship.provenance.resolution, policy))
-            .filter_map(|relationship| match &relationship.target {
-                MemoryRelationshipTarget::RepositorySymbol { semantic_key, .. }
-                    if semantic_key == symbol =>
-                {
-                    Some(relationship.source.clone())
-                }
-                _ => None,
-            })
-            .collect(),
+        MemoryContextSeed::RepositoryPath(path)
+            if !matches!(policy.direction, EdgeDirection::Outgoing) =>
+        {
+            relationships
+                .iter()
+                .filter(|relationship| {
+                    resolution_visible(relationship.provenance.resolution, policy)
+                })
+                .filter_map(|relationship| match &relationship.target {
+                    MemoryRelationshipTarget::RepositoryPath { path: target, .. }
+                        if target == path =>
+                    {
+                        Some(relationship.source.clone())
+                    }
+                    MemoryRelationshipTarget::RepositoryNode { .. } => None,
+                    _ => None,
+                })
+                .collect()
+        }
+        MemoryContextSeed::RepositorySymbol(symbol)
+            if !matches!(policy.direction, EdgeDirection::Outgoing) =>
+        {
+            relationships
+                .iter()
+                .filter(|relationship| {
+                    resolution_visible(relationship.provenance.resolution, policy)
+                })
+                .filter_map(|relationship| match &relationship.target {
+                    MemoryRelationshipTarget::RepositorySymbol { semantic_key, .. }
+                        if semantic_key == symbol =>
+                    {
+                        Some(relationship.source.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        MemoryContextSeed::RepositoryPath(_) | MemoryContextSeed::RepositorySymbol(_) => vec![],
     };
     matches.sort();
     matches.dedup();
@@ -402,6 +417,7 @@ pub(super) fn search_fingerprint(
 #[derive(Serialize)]
 struct ContextFingerprint<'a> {
     seeds: Vec<String>,
+    direction: EdgeDirection,
     relationship_kinds: Vec<MemoryRelationshipKind>,
     include_unresolved: bool,
     include_stale: bool,
@@ -427,6 +443,7 @@ pub(super) fn context_fingerprint(
     relationship_kinds.dedup();
     fingerprint(&ContextFingerprint {
         seeds,
+        direction: request.policy.direction,
         relationship_kinds,
         include_unresolved: request.policy.include_unresolved,
         include_stale: request.policy.include_stale,

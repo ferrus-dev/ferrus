@@ -178,6 +178,7 @@ fn repository_only_queries_ignore_an_incompatible_memory_sidecar() {
                 include_external: false,
             },
             memory_policy: crate::project_memory::query::MemoryContextPolicy {
+                direction: crate::repository_graph::query::EdgeDirection::Both,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,

@@ -882,6 +882,7 @@ async fn federated_context(args: ContextArgs) -> Result<()> {
             include_external: false,
         },
         memory_policy: MemoryContextPolicy {
+            direction: EdgeDirection::Both,
             relationship_kinds: vec![],
             include_unresolved: false,
             include_stale: false,
