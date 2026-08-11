@@ -231,6 +231,32 @@ fn repository_worker_recovers_the_pinned_builtin_extractor_subset() {
 }
 
 #[test]
+fn worker_deadline_budget_is_terminal_and_clamped_between_attempts() {
+    assert_eq!(remaining_duration_ms(100, 0), Ok(100));
+    assert_eq!(remaining_duration_ms(100, 99), Ok(1));
+    assert_eq!(
+        remaining_duration_ms(100, 100),
+        Err(WorkerError::DeadlineExceeded)
+    );
+    assert_eq!(
+        remaining_duration_ms(100, 101),
+        Err(WorkerError::DeadlineExceeded)
+    );
+
+    let context = ExtractionContext {
+        snapshot_id: crate::repository_graph::domain::SnapshotId::new("snapshot").unwrap(),
+        build_id: BuildId::new("build").unwrap(),
+        repository: local_repository(),
+        max_facts_per_file: 100,
+        max_parser_duration_ms: 5_000,
+        max_diagnostics: 50,
+    };
+    let attempt = extraction_context_for_attempt(&context, 7, 1);
+    assert_eq!(attempt.max_parser_duration_ms, 1);
+    assert_eq!(attempt.max_diagnostics, 7);
+}
+
+#[test]
 fn repository_worker_is_deterministic_and_reuses_durable_batches() {
     let repository_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(repository_dir.path().join("src")).unwrap();

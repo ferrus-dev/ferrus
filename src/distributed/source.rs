@@ -91,7 +91,7 @@ impl RepositorySourceManifest {
     ) -> Result<(), PackagingError<SourceError, StoreError>> {
         if self.body.protocol_version != DISTRIBUTED_SOURCE_MANIFEST_VERSION
             || self.body.policy_schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION
-            || self.body.source_revision.source_kind != SourceKind::CommittedTree
+            || !is_canonical_committed_revision(&self.body.source_revision)
             || self.body.repository != self.reference.repository
             || self.body.source_policy_digest != self.reference.source_policy_digest
             || !self
@@ -255,10 +255,7 @@ where
     if policy.schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION {
         return Err(PackagingError::InvalidManifest);
     }
-    if local.revision.source_kind != SourceKind::CommittedTree
-        || local.revision.dirty
-        || local.revision.includes_untracked
-    {
+    if !is_canonical_committed_revision(&local.revision) {
         return Err(PackagingError::NonCanonicalRepositorySource);
     }
     if (local.files.len() as u64).saturating_add(1) > limits.max_objects.get() {
@@ -335,6 +332,13 @@ where
     let manifest = RepositorySourceManifest { reference, body };
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn is_canonical_committed_revision(revision: &SourceRevision) -> bool {
+    revision.source_kind == SourceKind::CommittedTree
+        && !revision.dirty
+        && !revision.includes_untracked
+        && revision.base_revision.is_some()
 }
 
 pub fn package_memory_source<S, O>(
@@ -735,22 +739,41 @@ mod tests {
                 .any(|code| code.as_str() == "sensitive_path_excluded")
         );
 
-        let mut forged = packaged;
-        forged.body.source_revision.source_kind = SourceKind::NonGitManifest;
-        let manifest_digest = hash_manifest::<
-            anyhow::Error,
-            crate::distributed::object_store::ObjectStoreError,
-        >(&forged.body)
-        .unwrap();
-        forged.reference.manifest_id = RepositoryManifestId::new(manifest_digest.value()).unwrap();
-        forged.reference.manifest_digest = manifest_digest.clone();
-        forged.reference.manifest_object.object_id =
-            ObjectId::new(manifest_digest.value()).unwrap();
-        forged.reference.manifest_object.content_identity = manifest_digest;
-        assert!(matches!(
-            forged.validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(),
-            Err(PackagingError::InvalidManifest)
-        ));
+        let assert_invalid = |mut forged: RepositorySourceManifest| {
+            let manifest_digest = hash_manifest::<
+                anyhow::Error,
+                crate::distributed::object_store::ObjectStoreError,
+            >(&forged.body)
+            .unwrap();
+            forged.reference.manifest_id =
+                RepositoryManifestId::new(manifest_digest.value()).unwrap();
+            forged.reference.manifest_digest = manifest_digest.clone();
+            forged.reference.manifest_object.object_id =
+                ObjectId::new(manifest_digest.value()).unwrap();
+            forged.reference.manifest_object.content_identity = manifest_digest;
+            assert!(matches!(
+                forged
+                    .validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(
+                    ),
+                Err(PackagingError::InvalidManifest)
+            ));
+        };
+
+        let mut wrong_kind = packaged.clone();
+        wrong_kind.body.source_revision.source_kind = SourceKind::NonGitManifest;
+        assert_invalid(wrong_kind);
+
+        let mut dirty = packaged.clone();
+        dirty.body.source_revision.dirty = true;
+        assert_invalid(dirty);
+
+        let mut includes_untracked = packaged.clone();
+        includes_untracked.body.source_revision.includes_untracked = true;
+        assert_invalid(includes_untracked);
+
+        let mut missing_base = packaged;
+        missing_base.body.source_revision.base_revision = None;
+        assert_invalid(missing_base);
     }
 
     #[test]

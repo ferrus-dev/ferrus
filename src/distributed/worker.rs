@@ -472,12 +472,15 @@ impl StatelessIndexWorker {
         let mut extracted_facts = 0u64;
         let mut extracted_diagnostics = 0u64;
         if active.generic_enabled {
-            let extraction_context = extraction_context_with_diagnostic_limit(
+            let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
+            let extraction_context = extraction_context_for_attempt(
                 &context,
                 remaining_diagnostics(&self.limits, extracted_diagnostics),
+                remaining_job_duration_ms,
             );
             let fragment =
                 GenericExtractor::new().repository_fragment(&extraction_context, &manifest);
+            self.check_deadline(started)?;
             reserve_extracted_diagnostics(
                 &mut extracted_diagnostics,
                 fragment.diagnostics.len(),
@@ -545,9 +548,11 @@ impl StatelessIndexWorker {
                 .filter(|item| active.file_ids.contains(item.identity().id.as_str()))
                 .filter(|item| item.supports(file))
             {
-                let extraction_context = extraction_context_with_diagnostic_limit(
+                let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
+                let extraction_context = extraction_context_for_attempt(
                     &context,
                     remaining_diagnostics(&self.limits, extracted_diagnostics),
+                    remaining_job_duration_ms,
                 );
                 let fragment = extractor
                     .extract(FileExtractionInput {
@@ -556,6 +561,7 @@ impl StatelessIndexWorker {
                         content: &content,
                     })
                     .map_err(|_| WorkerError::ExtractionFailed)?;
+                self.check_deadline(started)?;
                 reserve_extracted_diagnostics(
                     &mut extracted_diagnostics,
                     fragment.diagnostics.len(),
@@ -580,6 +586,7 @@ impl StatelessIndexWorker {
             return Err(WorkerError::OutputLimitExceeded);
         }
         let graph = if active.resolver_enabled {
+            let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
             ConservativeResolver::new()
                 .resolve(CrossFileResolutionInput {
                     context: &context,
@@ -587,7 +594,11 @@ impl StatelessIndexWorker {
                     fragment: unresolved,
                     budget: ResolutionBudget {
                         max_relationships: self.limits.max_total_facts.get(),
-                        max_duration_ms: self.limits.max_resolver_duration_ms.get(),
+                        max_duration_ms: self
+                            .limits
+                            .max_resolver_duration_ms
+                            .get()
+                            .min(remaining_job_duration_ms),
                         max_diagnostics: remaining_diagnostics(&self.limits, extracted_diagnostics),
                     },
                 })
@@ -702,12 +713,17 @@ impl StatelessIndexWorker {
             else {
                 return Err(WorkerError::IncompatibleSemantics);
             };
+            let mut extraction_context = context.clone();
+            extraction_context.max_parser_duration_ms = extraction_context
+                .max_parser_duration_ms
+                .min(self.remaining_job_duration_ms(started)?);
             match extractor.extract(MemoryExtractionInput {
-                context: &context,
+                context: &extraction_context,
                 source,
                 content: &content,
             }) {
                 Ok(fragment) => {
+                    self.check_deadline(started)?;
                     let source_facts = memory_fragment_fact_count(&fragment)?;
                     if source_facts > self.limits.max_facts_per_source.get() {
                         return Err(WorkerError::OutputLimitExceeded);
@@ -720,6 +736,7 @@ impl StatelessIndexWorker {
                     merge_memory_fragment(&mut entities, &mut relationships, fragment)?;
                 }
                 Err(failure) => {
+                    self.check_deadline(started)?;
                     if diagnostics.len() as u64 >= self.limits.max_diagnostics.get() {
                         return Err(WorkerError::OutputLimitExceeded);
                     }
@@ -779,10 +796,12 @@ impl StatelessIndexWorker {
     }
 
     fn check_deadline(&self, started: Instant) -> Result<(), WorkerError> {
-        if started.elapsed().as_millis() as u64 > self.limits.max_job_duration_ms.get() {
-            return Err(WorkerError::DeadlineExceeded);
-        }
-        Ok(())
+        self.remaining_job_duration_ms(started).map(|_| ())
+    }
+
+    fn remaining_job_duration_ms(&self, started: Instant) -> Result<u64, WorkerError> {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        remaining_duration_ms(self.limits.max_job_duration_ms.get(), elapsed_ms)
     }
 }
 
@@ -820,14 +839,25 @@ fn reserve_extracted_facts(
     Ok(())
 }
 
-fn extraction_context_with_diagnostic_limit(
+fn extraction_context_for_attempt(
     context: &ExtractionContext,
     max_diagnostics: u64,
+    remaining_job_duration_ms: u64,
 ) -> ExtractionContext {
     ExtractionContext {
         max_diagnostics,
+        max_parser_duration_ms: context
+            .max_parser_duration_ms
+            .min(remaining_job_duration_ms),
         ..context.clone()
     }
+}
+
+fn remaining_duration_ms(limit_ms: u64, elapsed_ms: u64) -> Result<u64, WorkerError> {
+    limit_ms
+        .checked_sub(elapsed_ms)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(WorkerError::DeadlineExceeded)
 }
 
 fn remaining_diagnostics(limits: &WorkerLimits, used: u64) -> u64 {
