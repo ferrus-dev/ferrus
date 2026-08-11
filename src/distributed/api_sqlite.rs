@@ -11,7 +11,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     project_memory::domain::{
-        MemoryEntity, MemoryEntityData, MemoryRelationship, MemoryRelationshipTarget,
+        MemoryEntity, MemoryEntityData, MemoryEvidenceLocator, MemoryRelationship,
+        MemoryRelationshipTarget,
     },
     project_memory::policy::MemoryContentAccess,
     repository_graph::{
@@ -433,12 +434,18 @@ impl SqliteRemoteQueryApi {
                 }) else {
                     continue;
                 };
+                let MemoryEvidenceLocator::Span(span) = &entity.provenance.evidence else {
+                    continue;
+                };
                 let bytes = self
                     .objects
                     .read_verified_until(&descriptor.object, deadline)
                     .map_err(|error| query_object_error(request_id, error))?
                     .ok_or_else(|| query_budget(request_id))?;
-                let Some((text, truncated, used)) = bounded_utf8(&bytes, remaining) else {
+                let Some(slice) = evidence_slice(&bytes, Some(span)) else {
+                    continue;
+                };
+                let Some((text, truncated, used)) = bounded_utf8(slice, remaining) else {
                     continue;
                 };
                 remaining = remaining.saturating_sub(used);

@@ -34,7 +34,10 @@ async fn memory_only_loading_ignores_invalid_repository_graph_settings() {
     );
     std::fs::write(
         workspace.path().join("ferrus.toml"),
-        "[repository_graph]\nenabled = false\nunsupported_graph_setting = true\n",
+        "[repository_graph]\nenabled = false\nunsupported_graph_setting = true\n\
+         \n[repository_graph.query_limits]\nmax_results = 7\nmax_bytes = 8192\n\
+         max_snippet_bytes = 1024\nmax_depth = 2\nmax_duration_ms = 250\n\
+         max_diagnostics = 3\n",
     )
     .unwrap();
     std::fs::write(
@@ -73,7 +76,17 @@ async fn memory_only_loading_ignores_invalid_repository_graph_settings() {
 
     let memory = LocalProjectContext::load_for_cli(false).await.unwrap();
     assert!(memory.graph.is_none());
-    assert_eq!(memory.query_limits, QueryLimitsConfig::default());
+    assert_eq!(
+        memory.query_limits,
+        QueryLimitsConfig {
+            max_results: 7,
+            max_bytes: 8192,
+            max_snippet_bytes: 1024,
+            max_depth: 2,
+            max_duration_ms: 250,
+            max_diagnostics: 3,
+        }
+    );
     assert!(LocalProjectContext::load_for_cli(true).await.is_err());
 }
 

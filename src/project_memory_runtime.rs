@@ -128,11 +128,10 @@ impl LocalProjectContext {
         } else {
             None
         };
-        let query_limits = graph
-            .as_ref()
-            .map_or_else(QueryLimitsConfig::default, |graph| {
-                graph.config.query_limits.clone()
-            });
+        let query_limits = match graph.as_ref() {
+            Some(graph) => graph.config.query_limits.clone(),
+            None => load_memory_query_limits().await?,
+        };
         let project_id = project::current_project_id().await?;
         let data_dir = project::current_project_data_dir().await?;
         let project = ProjectRef {
@@ -460,6 +459,15 @@ impl LocalProjectContext {
             ),
         }
     }
+}
+
+async fn load_memory_query_limits() -> AnyResult<QueryLimitsConfig> {
+    let root = project::canonical_project_root().await?;
+    let contents = tokio::fs::read_to_string(root.join("ferrus.toml"))
+        .await
+        .context("ferrus.toml not found -- run ferrus init first")?;
+    QueryLimitsConfig::from_ferrus_toml(&contents)
+        .context("Invalid [repository_graph.query_limits] configuration")
 }
 
 fn repository_budget(budget: &MemoryQueryBudget) -> QueryBudget {

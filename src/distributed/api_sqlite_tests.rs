@@ -27,8 +27,9 @@ use crate::{
     },
     project_memory::{
         domain::{
-            MemoryBuildId, MemoryConfidence, MemoryEntityData, MemoryEntityId, MemoryExtractorId,
-            MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance, MemoryRelationshipId,
+            MemoryBuildId, MemoryConfidence, MemoryEntityData, MemoryEntityId,
+            MemoryEvidenceLocator, MemoryExtractorId, MemoryExtractorIdentity,
+            MemoryIndexTimestamps, MemoryProvenance, MemoryRecordId, MemoryRelationshipId,
             MemoryRelationshipKind, MemoryResolutionState, MemoryRevisionId, MemorySourceCategory,
             MemorySourceLocator, MemoryStatusToken, MemoryText, ProjectId, ProjectNamespace,
             ProjectRef,
@@ -43,13 +44,16 @@ use crate::{
             BuildId, Confidence, Digest, EdgeId, EdgeTarget, ExtractorId, ExtractorIdentity,
             FactProvenance, GraphEdge, GraphNode, PublishedViewName, RepoPath, RepositoryId,
             RepositoryNamespace, RepositoryRef, ResolutionState, SemanticKey, SnapshotId,
-            SourceEvidence, SourceKind, SourceRevision, SourceRevisionId,
+            SourceEvidence, SourceKind, SourcePosition, SourceRevision, SourceRevisionId,
+            SourceSpan,
         },
         ports::SourceFileMode,
     },
 };
 
 const KEY: [u8; 32] = [71; 32];
+const MEMORY_SOURCE_TEXT: &str = "unrelated milestone\napproved memory outcome\nunrelated decision";
+const MEMORY_SNIPPET_TEXT: &str = "approved memory outcome";
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -237,7 +241,7 @@ fn repository_manifest(
 }
 
 fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySourceManifest {
-    let content = b"approved memory outcome";
+    let content = MEMORY_SOURCE_TEXT.as_bytes();
     let policy_digest = MemoryPolicy::default().digest();
     let content_identity = sha256(content);
     let source_object = objects
@@ -344,7 +348,29 @@ fn publishing_job(
         .unwrap()
 }
 
+fn memory_evidence_span() -> SourceSpan {
+    let start = MEMORY_SOURCE_TEXT
+        .find(MEMORY_SNIPPET_TEXT)
+        .expect("memory snippet belongs to the fixture source");
+    SourceSpan {
+        start: SourcePosition {
+            byte_offset: start as u64,
+            line: Some(2),
+            column: Some(1),
+        },
+        end: SourcePosition {
+            byte_offset: (start + MEMORY_SNIPPET_TEXT.len()) as u64,
+            line: Some(2),
+            column: Some((MEMORY_SNIPPET_TEXT.len() + 1) as u32),
+        },
+    }
+}
+
 fn fixture() -> Fixture {
+    fixture_with_memory_evidence(MemoryEvidenceLocator::Span(memory_evidence_span()))
+}
+
+fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let control_path = directory.path().join("control.db");
     let object_root = directory.path().join("objects");
@@ -465,9 +491,7 @@ fn fixture() -> Fixture {
                 MemoryExtractorId::new("memory.test").unwrap(),
                 MemoryStatusToken::new("v1").unwrap(),
             ),
-            evidence: crate::project_memory::domain::MemoryEvidenceLocator::Record(
-                crate::project_memory::domain::MemoryRecordId::new("outcome").unwrap(),
-            ),
+            evidence: memory_evidence,
             resolution: MemoryResolutionState::Resolved,
             confidence: MemoryConfidence::Exact,
             timestamps: MemoryIndexTimestamps {
@@ -810,8 +834,42 @@ fn memory_context_returns_only_authorized_sanitized_manifest_content() {
     else {
         panic!("memory snippet expected");
     };
-    assert_eq!(text, "approved memory outcome");
+    assert_eq!(text, MEMORY_SNIPPET_TEXT);
     assert_eq!(verified_fingerprint, &digest("23"));
+}
+
+#[test]
+fn memory_context_rejects_non_span_evidence_for_curated_content() {
+    let fixture = fixture_with_memory_evidence(MemoryEvidenceLocator::Record(
+        MemoryRecordId::new("outcome").unwrap(),
+    ));
+    let authorization = auth(
+        CredentialClass::QueryAgent,
+        AuthorizationScope::Project(fixture.project.clone()),
+    );
+    let request = query_request(
+        &fixture,
+        RemoteQueryTarget::Memory(fixture.memory.clone()),
+        RemoteQueryOperation::Context {
+            seeds: vec![RemoteContextSeed::MemoryEntity(
+                MemoryEntityId::new("memory-important").unwrap(),
+            )],
+            direction: EdgeDirection::Both,
+            graph_edge_kinds: Vec::new(),
+            memory_relationship_kinds: Vec::new(),
+            include_unresolved: false,
+            include_external: false,
+            include_snippets: true,
+        },
+        10,
+        None,
+    );
+    let response = fixture.query.query(&authorization, &request).unwrap();
+    let RemoteQueryData::Context(data) = response.body.data else {
+        panic!("context response expected");
+    };
+    assert_eq!(data.memory_entities.len(), 1);
+    assert!(data.snippets.is_empty());
 }
 
 #[test]
