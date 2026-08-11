@@ -582,9 +582,15 @@ impl StatelessIndexWorker {
             }
         }
         let unresolved = merger.finish(&context);
-        if graph_fragment_fact_count(&unresolved)? > self.limits.max_total_facts.get() {
+        let unresolved_facts = graph_fragment_fact_count(&unresolved)?;
+        if unresolved_facts > self.limits.max_total_facts.get() {
             return Err(WorkerError::OutputLimitExceeded);
         }
+        let remaining_output_facts = self
+            .limits
+            .max_total_facts
+            .get()
+            .saturating_sub(unresolved_facts);
         let graph = if active.resolver_enabled {
             let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
             ConservativeResolver::new()
@@ -594,6 +600,7 @@ impl StatelessIndexWorker {
                     fragment: unresolved,
                     budget: ResolutionBudget {
                         max_relationships: self.limits.max_total_facts.get(),
+                        max_added_relationships: remaining_output_facts,
                         max_duration_ms: self
                             .limits
                             .max_resolver_duration_ms

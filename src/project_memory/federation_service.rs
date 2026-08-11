@@ -15,8 +15,8 @@ use crate::repository_graph::{
     ports::GraphQuery,
     query::{
         ContextData, ContextRequest, ContextResponse, ContextSeed, ContextSelectionKind,
-        ContextSelectionReason, ContextSnippet, PageRequest, QueryError, QueryErrorCode,
-        QueryScope, SearchRequest, SearchResponse, StatusRequest, StatusResponse,
+        ContextSelectionReason, ContextSnippet, EdgeDirection, PageRequest, QueryError,
+        QueryErrorCode, QueryScope, SearchRequest, SearchResponse, StatusRequest, StatusResponse,
     },
 };
 
@@ -36,10 +36,10 @@ use super::{
     policy::MemoryPolicy,
     ports::{ContextService, MemoryLinkStore, MemoryQuery},
     query::{
-        MemoryContextRequest, MemoryContextResponse, MemoryContextSeed, MemoryFreshnessComparison,
-        MemoryPageRequest, MemoryQueryBudget, MemoryQueryError, MemoryQueryScope,
-        MemoryRevisionSelector, MemorySearchRequest, MemorySearchResponse, MemoryStatusRequest,
-        MemoryStatusResponse, MemoryTruncation, MemoryTruncationReason,
+        MemoryContextPolicy, MemoryContextRequest, MemoryContextResponse, MemoryContextSeed,
+        MemoryFreshnessComparison, MemoryPageRequest, MemoryQueryBudget, MemoryQueryError,
+        MemoryQueryScope, MemoryRevisionSelector, MemorySearchRequest, MemorySearchResponse,
+        MemoryStatusRequest, MemoryStatusResponse, MemoryTruncation, MemoryTruncationReason,
     },
 };
 
@@ -656,13 +656,20 @@ where
                 link_results_truncated = links_truncated;
                 link_duration_exceeded = links_timed_out;
                 let (mut repository_seeds, mut memory_seeds) = split_all_seeds(&request.seeds);
-                for seed in &repository_seeds {
-                    for relationship in links.iter().filter(|relationship| {
-                        relationship.provenance.resolution == MemoryResolutionState::Resolved
-                            && repository_seed_matches(seed, &relationship.target, snapshot_id)
-                    }) {
-                        memory_seeds.push(MemoryContextSeed::Entity(relationship.source.clone()));
-                        cross_links.push(relationship.clone());
+                if matches!(
+                    request.memory_policy.direction,
+                    EdgeDirection::Incoming | EdgeDirection::Both
+                ) {
+                    for seed in &repository_seeds {
+                        for relationship in links.iter().filter(|relationship| {
+                            relationship.provenance.resolution == MemoryResolutionState::Resolved
+                                && cross_link_kind_allowed(&request.memory_policy, relationship)
+                                && repository_seed_matches(seed, &relationship.target, snapshot_id)
+                        }) {
+                            memory_seeds
+                                .push(MemoryContextSeed::Entity(relationship.source.clone()));
+                            cross_links.push(relationship.clone());
+                        }
                     }
                 }
                 let memory = self.memory_context(
@@ -684,15 +691,21 @@ where
                         })
                         .map(|item| item.entity.id.clone())
                         .collect::<BTreeSet<_>>();
-                    for relationship in links.iter().filter(|relationship| {
-                        relationship.provenance.resolution == MemoryResolutionState::Resolved
-                            && selected.contains(&relationship.source)
-                    }) {
-                        if let Some(seed) =
-                            repository_seed_from_target(&relationship.target, snapshot_id)
-                        {
-                            repository_seeds.push(seed);
-                            cross_links.push(relationship.clone());
+                    if matches!(
+                        request.memory_policy.direction,
+                        EdgeDirection::Outgoing | EdgeDirection::Both
+                    ) {
+                        for relationship in links.iter().filter(|relationship| {
+                            relationship.provenance.resolution == MemoryResolutionState::Resolved
+                                && cross_link_kind_allowed(&request.memory_policy, relationship)
+                                && selected.contains(&relationship.source)
+                        }) {
+                            if let Some(seed) =
+                                repository_seed_from_target(&relationship.target, snapshot_id)
+                            {
+                                repository_seeds.push(seed);
+                                cross_links.push(relationship.clone());
+                            }
                         }
                     }
                 }

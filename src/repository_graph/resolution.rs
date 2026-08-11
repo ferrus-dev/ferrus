@@ -71,7 +71,11 @@ impl CrossFileResolver for ConservativeResolver {
         let duration = Duration::from_millis(input.budget.max_duration_ms);
         let indexes = Indexes::new(&input.fragment);
         let mut diagnostics = DiagnosticBuffer::new(&input);
-        let mut plan = ResolutionPlan::new(input.budget.max_relationships, &input.fragment);
+        let mut plan = ResolutionPlan::new(
+            input.budget.max_relationships,
+            input.budget.max_added_relationships,
+            &input.fragment,
+        );
 
         let resolved_modules = resolve_module_declarations(
             &input,

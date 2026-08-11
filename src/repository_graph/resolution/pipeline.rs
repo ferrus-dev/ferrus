@@ -862,6 +862,8 @@ enum UseResolution {
 pub(super) struct ResolutionPlan {
     pub(super) limit: u64,
     pub(super) used: u64,
+    pub(super) addition_limit: u64,
+    pub(super) additions_used: u64,
     pub(super) truncated: bool,
     pub(super) replacements: BTreeMap<super::super::domain::EdgeId, GraphEdge>,
     pub(super) additions: BTreeMap<super::super::domain::EdgeId, GraphEdge>,
@@ -870,10 +872,12 @@ pub(super) struct ResolutionPlan {
 }
 
 impl ResolutionPlan {
-    pub(super) fn new(limit: u64, fragment: &GraphFragment) -> Self {
+    pub(super) fn new(limit: u64, addition_limit: u64, fragment: &GraphFragment) -> Self {
         Self {
             limit,
             used: 0,
+            addition_limit,
+            additions_used: 0,
             truncated: false,
             replacements: BTreeMap::new(),
             additions: BTreeMap::new(),
@@ -897,9 +901,14 @@ impl ResolutionPlan {
         if self.existing_edges.contains(&edge.id) || self.additions.contains_key(&edge.id) {
             return true;
         }
+        if self.additions_used >= self.addition_limit {
+            self.truncated = true;
+            return false;
+        }
         if !self.reserve() {
             return false;
         }
+        self.additions_used += 1;
         self.additions.insert(edge.id.clone(), edge);
         true
     }

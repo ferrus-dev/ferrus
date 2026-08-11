@@ -238,11 +238,13 @@ pub struct IndexCommit {
 /// Hard limits for one deterministic cross-file resolution pass.
 ///
 /// The resolver may retain the already-bounded extractor facts regardless of
-/// this budget. `max_relationships` limits only relationships that it resolves
-/// or adds, while the other limits bound diagnostics and wall-clock work.
+/// this budget. `max_relationships` limits relationships that it resolves or
+/// adds, `max_added_relationships` independently limits newly materialized
+/// edges, and the other limits bound diagnostics and wall-clock work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolutionBudget {
     pub max_relationships: u64,
+    pub max_added_relationships: u64,
     pub max_duration_ms: u64,
     pub max_diagnostics: u64,
 }

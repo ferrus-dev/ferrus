@@ -89,6 +89,7 @@ impl Fixture {
                 fragment: self.fragment,
                 budget: ResolutionBudget {
                     max_relationships: 10_000,
+                    max_added_relationships: 10_000,
                     max_duration_ms: 2_000,
                     max_diagnostics: 1_000,
                 },
@@ -453,6 +454,7 @@ fn rejects_facts_from_another_manifest_and_snapshot() {
             fragment: fixture.fragment,
             budget: ResolutionBudget {
                 max_relationships: 10,
+                max_added_relationships: 10,
                 max_duration_ms: 10,
                 max_diagnostics: 10,
             },
@@ -475,6 +477,7 @@ fn zero_duration_preserves_facts_and_reports_a_bounded_timeout() {
             fragment: fixture.fragment,
             budget: ResolutionBudget {
                 max_relationships: 10,
+                max_added_relationships: 10,
                 max_duration_ms: 0,
                 max_diagnostics: 1,
             },
@@ -499,6 +502,7 @@ fn relationship_limit_preserves_unresolved_facts() {
             fragment: fixture.fragment,
             budget: ResolutionBudget {
                 max_relationships: 0,
+                max_added_relationships: 0,
                 max_duration_ms: 1_000,
                 max_diagnostics: 1,
             },
@@ -506,6 +510,40 @@ fn relationship_limit_preserves_unresolved_facts() {
         .unwrap();
     assert!(fragment.edges.iter().any(|edge| {
         edge.kind == "declares_module" && matches!(edge.target, EdgeTarget::Unresolved(_))
+    }));
+    assert!(
+        fragment
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code.as_str() == "resolution.relationship_limit" })
+    );
+}
+
+#[test]
+fn addition_limit_blocks_new_edges_without_blocking_replacements() {
+    let fixture = Fixture::new(&[
+        ("Cargo.toml", b"[package]\nname='app'\nversion='0.1.0'\n"),
+        ("src/lib.rs", b"mod api;\nuse crate::api::Api;\n"),
+        ("src/api.rs", b"pub struct Api;\n"),
+    ]);
+    let original_edges = fixture.fragment.edges.len();
+    let fragment = ConservativeResolver
+        .resolve(CrossFileResolutionInput {
+            context: &fixture.context,
+            manifest: &fixture.manifest,
+            fragment: fixture.fragment,
+            budget: ResolutionBudget {
+                max_relationships: 1_000,
+                max_added_relationships: 0,
+                max_duration_ms: 1_000,
+                max_diagnostics: 10,
+            },
+        })
+        .unwrap();
+
+    assert!(fragment.edges.len() <= original_edges);
+    assert!(fragment.edges.iter().any(|edge| {
+        edge.kind == "declares_module" && matches!(edge.target, EdgeTarget::Node(_))
     }));
     assert!(
         fragment
@@ -524,6 +562,7 @@ fn resolution_is_idempotent() {
     ]);
     let budget = ResolutionBudget {
         max_relationships: 1_000,
+        max_added_relationships: 1_000,
         max_duration_ms: 1_000,
         max_diagnostics: 100,
     };

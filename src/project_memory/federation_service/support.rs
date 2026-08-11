@@ -52,6 +52,13 @@ pub(super) fn split_all_seeds(
     (repository, memory)
 }
 
+pub(super) fn cross_link_kind_allowed(
+    policy: &MemoryContextPolicy,
+    relationship: &MemoryRelationship,
+) -> bool {
+    policy.relationship_kinds.is_empty() || policy.relationship_kinds.contains(&relationship.kind)
+}
+
 pub(super) fn repository_seed_matches(
     seed: &ContextSeed,
     target: &MemoryRelationshipTarget,

@@ -464,6 +464,7 @@ where
                     fragment: unresolved,
                     budget: ResolutionBudget {
                         max_relationships: config.index_limits.max_resolved_relationships,
+                        max_added_relationships: config.index_limits.max_resolved_relationships,
                         max_duration_ms: config.index_limits.max_resolver_duration_ms,
                         max_diagnostics: config.index_limits.max_diagnostics,
                     },
