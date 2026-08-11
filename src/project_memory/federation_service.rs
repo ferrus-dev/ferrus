@@ -864,7 +864,7 @@ where
             &revision_key,
             offset + returned.len(),
         )?;
-        Ok(FederatedContextResponse {
+        let mut response = FederatedContextResponse {
             wire_version: FEDERATION_WIRE_VERSION,
             project: request.scope.project,
             requested_domain: request.scope.target.domain(),
@@ -876,7 +876,20 @@ where
             memory_relationships,
             cross_domain_links: cross_links,
             repository_snippets,
-        })
+        };
+        fit_federated_context_response(
+            &mut response,
+            budget.max_bytes,
+            reason,
+            explored_depth,
+            offset,
+            total,
+            &fingerprint,
+            &revision_key,
+            started,
+            budget.max_duration_ms,
+        )?;
+        Ok(response)
     }
 }
 

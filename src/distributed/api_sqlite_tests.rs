@@ -1061,6 +1061,42 @@ fn graph_context_seed_resolution_observes_an_expired_deadline() {
 }
 
 #[test]
+fn adjacency_and_materialization_observe_an_expired_deadline() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+    let memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+
+    let (graph_units, graph_depth) = graph_neighborhood(
+        &graph,
+        &[fixture.graph_node],
+        EdgeDirection::Both,
+        &[],
+        2,
+        Instant::now(),
+        Duration::ZERO,
+    );
+    assert!(graph_units.is_empty());
+    assert_eq!(graph_depth, 0);
+
+    let (memory_units, memory_depth) = memory_context_units(
+        &memory,
+        &[RemoteContextSeed::MemoryEntity(
+            memory.entities[0].id.clone(),
+        )],
+        EdgeDirection::Both,
+        &[],
+        2,
+        Instant::now(),
+        Duration::ZERO,
+    );
+    assert!(memory_units.is_empty());
+    assert_eq!(memory_depth, 0);
+}
+
+#[test]
 fn exact_response_budget_returns_a_smaller_page_instead_of_a_terminal_error() {
     let fixture = fixture();
     let store =

@@ -330,24 +330,31 @@ pub(super) fn graph_neighborhood(
     started: Instant,
     duration: Duration,
 ) -> (Vec<GraphUnit>, u32) {
-    let nodes = graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect::<BTreeMap<_, _>>();
+    let mut nodes = BTreeMap::new();
+    for node in &graph.nodes {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        nodes.insert(node.id.clone(), node);
+    }
     let mut selected_nodes = BTreeSet::new();
     let mut selected_edges = BTreeSet::new();
     let mut frontier = roots.iter().cloned().collect::<BTreeSet<_>>();
-    selected_nodes.extend(
-        frontier
-            .iter()
-            .filter(|id| nodes.contains_key(*id))
-            .cloned(),
-    );
+    for id in &frontier {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        if nodes.contains_key(id) {
+            selected_nodes.insert(id.clone());
+        }
+    }
     let mut explored = 0;
     while !frontier.is_empty() && explored < max_depth && started.elapsed() < duration {
         let mut next = BTreeSet::new();
         for edge in &graph.edges {
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
             if !edge_kinds.is_empty() && !edge_kinds.iter().any(|kind| kind == &edge.kind) {
                 continue;
             }
@@ -369,23 +376,36 @@ pub(super) fn graph_neighborhood(
                 }
             }
         }
-        next.retain(|id| !selected_nodes.contains(id));
-        selected_nodes.extend(next.iter().filter(|id| nodes.contains_key(*id)).cloned());
-        frontier = next;
+        let mut filtered = BTreeSet::new();
+        for id in next {
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
+            if !selected_nodes.contains(&id) && nodes.contains_key(&id) {
+                selected_nodes.insert(id.clone());
+                filtered.insert(id);
+            }
+        }
+        frontier = filtered;
         explored += 1;
     }
-    let mut units = selected_nodes
-        .into_iter()
-        .filter_map(|id| nodes.get(&id).map(|node| GraphUnit::Node((*node).clone())))
-        .collect::<Vec<_>>();
-    units.extend(
-        graph
-            .edges
-            .iter()
-            .filter(|edge| selected_edges.contains(&edge.id))
-            .cloned()
-            .map(GraphUnit::Edge),
-    );
+    let mut units = Vec::with_capacity(selected_nodes.len() + selected_edges.len());
+    for id in selected_nodes {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if let Some(node) = nodes.get(&id) {
+            units.push(GraphUnit::Node((*node).clone()));
+        }
+    }
+    for edge in &graph.edges {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if selected_edges.contains(&edge.id) {
+            units.push(GraphUnit::Edge(edge.clone()));
+        }
+    }
     (units, explored)
 }
 
@@ -540,7 +560,7 @@ fn federated_context_units(
         let mut next = BTreeSet::new();
         for edge in &graph.edges {
             if started.elapsed() >= duration {
-                break;
+                return (Vec::new(), explored);
             }
             if !graph_edge_kinds.is_empty()
                 && !graph_edge_kinds.iter().any(|kind| kind == &edge.kind)
@@ -571,14 +591,17 @@ fn federated_context_units(
 
         for relationship in &memory.relationships {
             if started.elapsed() >= duration {
-                break;
+                return (Vec::new(), explored);
             }
             if !memory_relationship_kinds.is_empty()
                 && !memory_relationship_kinds.contains(&relationship.kind)
             {
                 continue;
             }
-            let targets = federated_relationship_targets(graph, relationship);
+            let targets = federated_relationship_targets(graph, relationship, started, duration);
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
             let outgoing = frontier.contains(&FederatedNode::Memory(relationship.source.clone()))
                 && matches!(direction, EdgeDirection::Outgoing | EdgeDirection::Both);
             let incoming = targets.iter().any(|target| frontier.contains(target))
@@ -594,55 +617,69 @@ fn federated_context_units(
             }
         }
 
-        next.retain(|node| !selected.contains(node));
-        next.retain(|node| match node {
-            FederatedNode::Graph(id) => graph_nodes.contains_key(id),
-            FederatedNode::Memory(id) => memory_entities.contains_key(id),
-        });
-        selected.extend(next.iter().cloned());
-        frontier = next;
+        let mut filtered = BTreeSet::new();
+        for node in next {
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
+            let exists = match &node {
+                FederatedNode::Graph(id) => graph_nodes.contains_key(id),
+                FederatedNode::Memory(id) => memory_entities.contains_key(id),
+            };
+            if !selected.contains(&node) && exists {
+                selected.insert(node.clone());
+                filtered.insert(node);
+            }
+        }
+        frontier = filtered;
         explored += 1;
     }
 
-    let mut units = selected
-        .iter()
-        .filter_map(|node| match node {
-            FederatedNode::Graph(id) => graph_nodes
-                .get(id)
-                .map(|node| ContextUnit::GraphNode((*node).clone())),
-            FederatedNode::Memory(_) => None,
-        })
-        .collect::<Vec<_>>();
-    units.extend(
-        graph
-            .edges
-            .iter()
-            .filter(|edge| selected_graph_edges.contains(&edge.id))
-            .cloned()
-            .map(ContextUnit::GraphEdge),
-    );
-    units.extend(selected.iter().filter_map(|node| {
-        match node {
-            FederatedNode::Memory(id) => memory_entities
-                .get(id)
-                .map(|entity| ContextUnit::MemoryEntity((*entity).clone())),
-            FederatedNode::Graph(_) => None,
+    let mut units = Vec::new();
+    for node in &selected {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
         }
-    }));
-    units.extend(
-        memory
-            .relationships
-            .iter()
-            .filter(|relationship| selected_memory_relationships.contains(&relationship.id))
-            .cloned()
-            .map(ContextUnit::MemoryRelationship),
-    );
+        if let FederatedNode::Graph(id) = node
+            && let Some(node) = graph_nodes.get(id)
+        {
+            units.push(ContextUnit::GraphNode((*node).clone()));
+        }
+    }
+    for edge in &graph.edges {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if selected_graph_edges.contains(&edge.id) {
+            units.push(ContextUnit::GraphEdge(edge.clone()));
+        }
+    }
+    for node in &selected {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if let FederatedNode::Memory(id) = node
+            && let Some(entity) = memory_entities.get(id)
+        {
+            units.push(ContextUnit::MemoryEntity((*entity).clone()));
+        }
+    }
+    for relationship in &memory.relationships {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if selected_memory_relationships.contains(&relationship.id) {
+            units.push(ContextUnit::MemoryRelationship(relationship.clone()));
+        }
+    }
     (units, explored)
 }
 
 fn federated_relationship_targets(
     graph: &StoredRemoteGraphSnapshot,
     relationship: &MemoryRelationship,
+    started: Instant,
+    duration: Duration,
 ) -> BTreeSet<FederatedNode> {
     match &relationship.target {
         MemoryRelationshipTarget::MemoryEntity { entity_id } => {
@@ -666,17 +703,21 @@ fn federated_relationship_targets(
             == crate::project_memory::domain::MemoryResolutionState::Resolved
             && snapshot_id == &graph.record.snapshot.snapshot_id =>
         {
-            graph
-                .nodes
-                .iter()
-                .filter(|node| {
-                    node.provenance
-                        .evidence
-                        .as_ref()
-                        .is_some_and(|evidence| &evidence.path == path)
-                })
-                .map(|node| FederatedNode::Graph(node.id.clone()))
-                .collect()
+            let mut targets = BTreeSet::new();
+            for node in &graph.nodes {
+                if started.elapsed() >= duration {
+                    break;
+                }
+                if node
+                    .provenance
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| &evidence.path == path)
+                {
+                    targets.insert(FederatedNode::Graph(node.id.clone()));
+                }
+            }
+            targets
         }
         MemoryRelationshipTarget::RepositorySymbol {
             semantic_key,
@@ -686,12 +727,16 @@ fn federated_relationship_targets(
             == crate::project_memory::domain::MemoryResolutionState::Resolved
             && snapshot_id == &graph.record.snapshot.snapshot_id =>
         {
-            graph
-                .nodes
-                .iter()
-                .filter(|node| node.semantic_key.as_ref() == Some(semantic_key))
-                .map(|node| FederatedNode::Graph(node.id.clone()))
-                .collect()
+            let mut targets = BTreeSet::new();
+            for node in &graph.nodes {
+                if started.elapsed() >= duration {
+                    break;
+                }
+                if node.semantic_key.as_ref() == Some(semantic_key) {
+                    targets.insert(FederatedNode::Graph(node.id.clone()));
+                }
+            }
+            targets
         }
         MemoryRelationshipTarget::RepositoryNode { .. }
         | MemoryRelationshipTarget::RepositoryPath { .. }
@@ -757,24 +802,33 @@ pub(super) fn memory_context_units(
     started: Instant,
     duration: Duration,
 ) -> (Vec<ContextUnit>, u32) {
-    let entities = memory
-        .entities
-        .iter()
-        .map(|entity| (entity.id.clone(), entity))
-        .collect::<BTreeMap<_, _>>();
-    let mut selected = seeds
-        .iter()
-        .filter_map(|seed| match seed {
-            RemoteContextSeed::MemoryEntity(id) if entities.contains_key(id) => Some(id.clone()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let mut entities = BTreeMap::new();
+    for entity in &memory.entities {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        entities.insert(entity.id.clone(), entity);
+    }
+    let mut selected = BTreeSet::new();
+    for seed in seeds {
+        if started.elapsed() >= duration {
+            return (Vec::new(), 0);
+        }
+        if let RemoteContextSeed::MemoryEntity(id) = seed
+            && entities.contains_key(id)
+        {
+            selected.insert(id.clone());
+        }
+    }
     let mut frontier = selected.clone();
     let mut relationships = BTreeSet::new();
     let mut explored = 0;
     while !frontier.is_empty() && explored < max_depth && started.elapsed() < duration {
         let mut next = BTreeSet::new();
         for relationship in &memory.relationships {
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
             if !relationship_kinds.is_empty() && !relationship_kinds.contains(&relationship.kind) {
                 continue;
             }
@@ -796,27 +850,36 @@ pub(super) fn memory_context_units(
                 }
             }
         }
-        next.retain(|id| !selected.contains(id));
-        selected.extend(next.iter().filter(|id| entities.contains_key(*id)).cloned());
-        frontier = next;
+        let mut filtered = BTreeSet::new();
+        for id in next {
+            if started.elapsed() >= duration {
+                return (Vec::new(), explored);
+            }
+            if !selected.contains(&id) && entities.contains_key(&id) {
+                selected.insert(id.clone());
+                filtered.insert(id);
+            }
+        }
+        frontier = filtered;
         explored += 1;
     }
-    let mut units = selected
-        .into_iter()
-        .filter_map(|id| {
-            entities
-                .get(&id)
-                .map(|entity| ContextUnit::MemoryEntity((*entity).clone()))
-        })
-        .collect::<Vec<_>>();
-    units.extend(
-        memory
-            .relationships
-            .iter()
-            .filter(|relationship| relationships.contains(&relationship.id))
-            .cloned()
-            .map(ContextUnit::MemoryRelationship),
-    );
+    let mut units = Vec::with_capacity(selected.len() + relationships.len());
+    for id in selected {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if let Some(entity) = entities.get(&id) {
+            units.push(ContextUnit::MemoryEntity((*entity).clone()));
+        }
+    }
+    for relationship in &memory.relationships {
+        if started.elapsed() >= duration {
+            return (Vec::new(), explored);
+        }
+        if relationships.contains(&relationship.id) {
+            units.push(ContextUnit::MemoryRelationship(relationship.clone()));
+        }
+    }
     (units, explored)
 }
 

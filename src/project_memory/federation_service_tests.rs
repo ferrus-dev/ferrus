@@ -426,12 +426,21 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
     constrained_budget.max_bytes = std::num::NonZeroU64::new(primary_bytes).unwrap();
 
     let truncated = service.context(request(constrained_budget, None)).unwrap();
-    assert_eq!(truncated.items, complete.items);
+    assert!(!truncated.items.is_empty());
     assert_eq!(
         truncated.page.truncation.as_ref().map(|value| value.reason),
         Some(MemoryTruncationReason::Bytes)
     );
-    assert!(truncated.page.next_cursor.is_none());
+    let encoded_bytes = serde_json::to_vec(&truncated).unwrap().len() as u64;
+    assert!(encoded_bytes <= primary_bytes);
+    assert_eq!(
+        truncated.page.truncation.as_ref().unwrap().returned_bytes,
+        encoded_bytes
+    );
+    assert_eq!(
+        truncated.page.next_cursor.is_some(),
+        truncated.items.len() < complete.items.len()
+    );
 
     assert!(complete.items.len() > 2);
     let page_size = complete.items.len() - 1;
@@ -461,6 +470,94 @@ fn supplemental_byte_truncation_does_not_advertise_an_unusable_cursor() {
     let second = service.context(request(page_budget, Some(cursor))).unwrap();
     assert!(!second.items.is_empty());
     assert!(second.items.iter().all(|item| !first.items.contains(item)));
+}
+
+#[test]
+fn combined_context_counts_the_complete_response_against_the_byte_budget() {
+    let fixture = fixture();
+    let graph = SqliteGraphQuery::new(
+        &fixture.graph_sidecar,
+        fixture.config.query_limits.clone(),
+        Some(fixture.graph_freshness.clone()),
+    );
+    let memory =
+        SqliteMemoryQuery::new(&fixture.memory_sidecar, fixture.config.query_limits.clone());
+    let service = service(&fixture, &graph, &memory);
+    let memory_search = memory
+        .search(MemorySearchRequest {
+            scope: MemoryQueryScope::current(
+                fixture.project.clone(),
+                MemoryRevisionSelector::Published(MemoryViewName::new("project").unwrap()),
+                budget(&fixture.config),
+            ),
+            text: MemoryQueryText::new("src/lib.rs").unwrap(),
+            entity_kinds: vec![],
+            source_categories: vec![],
+            page: MemoryPageRequest::default(),
+        })
+        .unwrap();
+    let seed = memory_search.hits[0].entity.id.clone();
+    let request = |query_budget| FederatedContextRequest {
+        scope: FederatedScope::current(
+            fixture.project.clone(),
+            target(&fixture, ContextDomain::All),
+            query_budget,
+        ),
+        seeds: vec![FederatedContextSeed::MemoryEntity(seed.clone())],
+        repository_policy: ContextPolicy {
+            direction: EdgeDirection::Both,
+            edge_kinds: vec![],
+            include_unresolved: false,
+            include_external: false,
+        },
+        memory_policy: MemoryContextPolicy {
+            relationship_kinds: vec![],
+            include_unresolved: false,
+            include_stale: false,
+            include_snippets: false,
+        },
+        cursor: None,
+    };
+
+    let complete = service.context(request(budget(&fixture.config))).unwrap();
+    assert!(complete.items.len() > 1);
+    let mut one_item_budget = budget(&fixture.config);
+    one_item_budget.max_results = NonZeroU32::new(1).unwrap();
+    let one_item = service.context(request(one_item_budget)).unwrap();
+    let one_response_bytes = one_item
+        .page
+        .truncation
+        .as_ref()
+        .expect("one-item context must be truncated")
+        .returned_bytes;
+    assert_eq!(
+        one_response_bytes,
+        serde_json::to_vec(&one_item).unwrap().len() as u64
+    );
+
+    let mut constrained_budget = budget(&fixture.config);
+    constrained_budget.max_bytes = NonZeroU64::new(one_response_bytes).unwrap();
+    let constrained = service.context(request(constrained_budget)).unwrap();
+    assert_eq!(constrained.items.len(), 1);
+    let encoded_bytes = serde_json::to_vec(&constrained).unwrap().len() as u64;
+    assert!(encoded_bytes <= one_response_bytes);
+    assert_eq!(
+        constrained
+            .page
+            .truncation
+            .as_ref()
+            .expect("context must report byte truncation")
+            .returned_bytes,
+        encoded_bytes
+    );
+
+    let bare_item_bytes = serialized_len(&complete.items[0]).unwrap();
+    let mut insufficient_budget = budget(&fixture.config);
+    insufficient_budget.max_bytes = NonZeroU64::new(bare_item_bytes + 1).unwrap();
+    assert_eq!(
+        service.context(request(insufficient_budget)).unwrap_err(),
+        MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Bytes)
+    );
 }
 
 #[test]

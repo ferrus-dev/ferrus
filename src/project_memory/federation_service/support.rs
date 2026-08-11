@@ -360,6 +360,270 @@ fn stabilize_federated_search_size(
     Err(backend_error("federation.serialization"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_federated_context_response(
+    response: &mut FederatedContextResponse,
+    max_bytes: u64,
+    initial_reason: Option<MemoryTruncationReason>,
+    explored_depth: u32,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+    started: Instant,
+    max_duration_ms: u64,
+) -> Result<(), MemoryQueryError> {
+    let duration = std::time::Duration::from_millis(max_duration_ms);
+    set_federated_context_page(
+        response,
+        initial_reason,
+        explored_depth,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )?;
+    let encoded_bytes = stabilize_federated_context_size(response)?;
+    if started.elapsed() >= duration {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration,
+        ));
+    }
+    if encoded_bytes <= max_bytes {
+        return Ok(());
+    }
+    set_federated_context_page(
+        response,
+        Some(MemoryTruncationReason::Bytes),
+        explored_depth,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )?;
+    let diagnostics = std::mem::take(&mut response.federation_diagnostics);
+    if fit_context_collection(
+        response,
+        diagnostics,
+        |response, values| response.federation_diagnostics = values,
+        max_bytes,
+        started,
+        duration,
+    )? {
+        return Ok(());
+    }
+    let snippets = std::mem::take(&mut response.repository_snippets);
+    if fit_context_collection(
+        response,
+        snippets,
+        |response, values| response.repository_snippets = values,
+        max_bytes,
+        started,
+        duration,
+    )? {
+        return Ok(());
+    }
+    let cross_links = std::mem::take(&mut response.cross_domain_links);
+    if fit_context_collection(
+        response,
+        cross_links,
+        |response, values| response.cross_domain_links = values,
+        max_bytes,
+        started,
+        duration,
+    )? {
+        return Ok(());
+    }
+    let memory_relationships = std::mem::take(&mut response.memory_relationships);
+    if fit_context_collection(
+        response,
+        memory_relationships,
+        |response, values| response.memory_relationships = values,
+        max_bytes,
+        started,
+        duration,
+    )? {
+        return Ok(());
+    }
+
+    fit_federated_context_items(
+        response,
+        max_bytes,
+        explored_depth,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+        started,
+        duration,
+    )
+}
+
+fn fit_context_collection<T: Clone>(
+    response: &mut FederatedContextResponse,
+    original: Vec<T>,
+    mut assign: impl FnMut(&mut FederatedContextResponse, Vec<T>),
+    max_bytes: u64,
+    started: Instant,
+    duration: std::time::Duration,
+) -> Result<bool, MemoryQueryError> {
+    let mut lower = 0usize;
+    let mut upper = original.len() + 1;
+    let mut best = None;
+    while lower < upper {
+        if started.elapsed() >= duration {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
+        let midpoint = lower + (upper - lower) / 2;
+        assign(response, original[..midpoint].to_vec());
+        let encoded_bytes = stabilize_federated_context_size(response)?;
+        if started.elapsed() >= duration {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
+        if encoded_bytes <= max_bytes {
+            best = Some(midpoint);
+            lower = midpoint + 1;
+        } else {
+            upper = midpoint;
+        }
+    }
+    let Some(best) = best else {
+        assign(response, Vec::new());
+        return Ok(false);
+    };
+    assign(response, original[..best].to_vec());
+    let encoded_bytes = stabilize_federated_context_size(response)?;
+    if started.elapsed() >= duration {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration,
+        ));
+    }
+    Ok(encoded_bytes <= max_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_federated_context_items(
+    response: &mut FederatedContextResponse,
+    max_bytes: u64,
+    explored_depth: u32,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+    started: Instant,
+    duration: std::time::Duration,
+) -> Result<(), MemoryQueryError> {
+    let original = std::mem::take(&mut response.items);
+    if original.is_empty() {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Bytes,
+        ));
+    }
+    let mut lower = 1usize;
+    let mut upper = original.len() + 1;
+    let mut best = None;
+    while lower < upper {
+        if started.elapsed() >= duration {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
+        let midpoint = lower + (upper - lower) / 2;
+        response.items = original[..midpoint].to_vec();
+        set_federated_context_page(
+            response,
+            Some(MemoryTruncationReason::Bytes),
+            explored_depth,
+            offset,
+            total,
+            fingerprint,
+            revision_key,
+        )?;
+        let encoded_bytes = stabilize_federated_context_size(response)?;
+        if started.elapsed() >= duration {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
+        if encoded_bytes <= max_bytes {
+            best = Some(midpoint);
+            lower = midpoint + 1;
+        } else {
+            upper = midpoint;
+        }
+    }
+    let Some(best) = best else {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Bytes,
+        ));
+    };
+    response.items = original[..best].to_vec();
+    set_federated_context_page(
+        response,
+        Some(MemoryTruncationReason::Bytes),
+        explored_depth,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )?;
+    let encoded_bytes = stabilize_federated_context_size(response)?;
+    if started.elapsed() >= duration {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration,
+        ));
+    }
+    if encoded_bytes > max_bytes {
+        return Err(backend_error("federation.serialization"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_federated_context_page(
+    response: &mut FederatedContextResponse,
+    reason: Option<MemoryTruncationReason>,
+    explored_depth: u32,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+) -> Result<(), MemoryQueryError> {
+    let has_more = offset + response.items.len() < total;
+    response.page = federated_page(
+        reason,
+        response.items.len(),
+        0,
+        explored_depth,
+        has_more,
+        "context",
+        fingerprint,
+        revision_key,
+        offset + response.items.len(),
+    )?;
+    Ok(())
+}
+
+fn stabilize_federated_context_size(
+    response: &mut FederatedContextResponse,
+) -> Result<u64, MemoryQueryError> {
+    for _ in 0..32 {
+        let encoded_bytes = serialized_len(response)?;
+        let Some(truncation) = response.page.truncation.as_mut() else {
+            return Ok(encoded_bytes);
+        };
+        if truncation.returned_bytes == encoded_bytes {
+            return Ok(encoded_bytes);
+        }
+        truncation.returned_bytes = encoded_bytes;
+    }
+    Err(backend_error("federation.serialization"))
+}
+
 pub(super) fn snippet_span_key(snippet: &ContextSnippet) -> (u64, u64) {
     snippet.span.as_ref().map_or((0, 0), |span| {
         (span.start.byte_offset, span.end.byte_offset)
