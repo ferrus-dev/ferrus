@@ -277,24 +277,24 @@ impl LocalProjectContext {
             request.scope.target,
             FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
         );
+        let includes_memory = matches!(
+            request.scope.target,
+            FederatedTarget::Memory { .. } | FederatedTarget::All { .. }
+        );
         let graph_sidecar = if includes_repository {
             self.open_graph_query().map_err(runtime_error)?
         } else {
             None
         };
-        let memory_sidecar = self.open_memory_query().map_err(runtime_error)?;
-        if matches!(
-            request.scope.target,
-            FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
-        ) && graph_sidecar.is_none()
-        {
+        let memory_sidecar = if includes_memory {
+            self.open_memory_query().map_err(runtime_error)?
+        } else {
+            None
+        };
+        if includes_repository && graph_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
-        if matches!(
-            request.scope.target,
-            FederatedTarget::Memory { .. } | FederatedTarget::All { .. }
-        ) && memory_sidecar.is_none()
-        {
+        if includes_memory && memory_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
         let graph_query = OptionalGraphQuery::new(
@@ -314,7 +314,11 @@ impl LocalProjectContext {
             &backend,
             &backend,
             self.query_limits.clone(),
-            self.memory_freshness_comparison().map_err(runtime_error)?,
+            if includes_memory {
+                self.memory_freshness_comparison().map_err(runtime_error)?
+            } else {
+                None
+            },
         );
         let mut response = service.search(request)?;
         if let Some(repository) = response.repository.as_mut() {
@@ -334,24 +338,24 @@ impl LocalProjectContext {
             request.scope.target,
             FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
         );
+        let includes_memory = matches!(
+            request.scope.target,
+            FederatedTarget::Memory { .. } | FederatedTarget::All { .. }
+        );
         let graph_sidecar = if includes_repository {
             self.open_graph_query().map_err(runtime_error)?
         } else {
             None
         };
-        let memory_sidecar = self.open_memory_query().map_err(runtime_error)?;
-        if matches!(
-            request.scope.target,
-            FederatedTarget::Repository { .. } | FederatedTarget::All { .. }
-        ) && graph_sidecar.is_none()
-        {
+        let memory_sidecar = if includes_memory {
+            self.open_memory_query().map_err(runtime_error)?
+        } else {
+            None
+        };
+        if includes_repository && graph_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
-        if matches!(
-            request.scope.target,
-            FederatedTarget::Memory { .. } | FederatedTarget::All { .. }
-        ) && memory_sidecar.is_none()
-        {
+        if includes_memory && memory_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
         let graph_query = OptionalGraphQuery::new(
@@ -371,7 +375,11 @@ impl LocalProjectContext {
             &backend,
             &backend,
             self.query_limits.clone(),
-            self.memory_freshness_comparison().map_err(runtime_error)?,
+            if includes_memory {
+                self.memory_freshness_comparison().map_err(runtime_error)?
+            } else {
+                None
+            },
         );
         let mut response = service.context(request)?;
         if let Some(repository) = response.repository.as_mut() {

@@ -336,6 +336,78 @@ fn repository_worker_is_deterministic_and_reuses_durable_batches() {
     );
 }
 
+#[test]
+fn repository_worker_applies_one_diagnostic_budget_to_the_whole_job() {
+    let repository_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repository_dir.path().join("src")).unwrap();
+    for index in 0..4 {
+        std::fs::write(
+            repository_dir.path().join(format!("src/broken_{index}.rs")),
+            b"pub fn broken( {\n",
+        )
+        .unwrap();
+    }
+    commit_repository(repository_dir.path());
+    let config = RepositoryGraphConfig::default();
+    let identities = builtin_extractor_identities();
+    let context =
+        SourceDiscoveryContext::from_config(local_repository(), &config, &identities).unwrap();
+    let source = LocalRepositorySource::discover(repository_dir.path(), context).unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mut objects = object_store(&storage_dir.path().join("objects"));
+    let manifest = package_repository_source(
+        &source,
+        remote_repository(),
+        RepositoryPackagingPolicy {
+            schema_version: 1,
+            source_policy_digest: config.source_policy_digest().unwrap(),
+        },
+        packaging_limits(),
+        &mut objects,
+    )
+    .unwrap();
+    let mut jobs = coordinator(&storage_dir.path().join("jobs.db"));
+    let running = running_job(
+        &mut jobs,
+        IndexJobKind::RepositoryGraph,
+        IndexInputRef::Repository(manifest.reference.clone()),
+        IndexSemantics {
+            semantic_config_digest: manifest.body.source_revision.analysis_config_digest.clone(),
+            model_version: NonZeroU32::new(GRAPH_MODEL_VERSION).unwrap(),
+            extractor_set_digest: manifest.body.extractor_set_digest.clone(),
+        },
+    );
+    let request = execution_request(running);
+    let mut limits = worker_limits();
+    limits.max_diagnostics = NonZeroU64::new(1).unwrap();
+    let mut first_facts = fact_store(&storage_dir.path().join("diagnostic-facts.db"));
+    let first = StatelessIndexWorker::new(limits.clone())
+        .execute(&request, &jobs, &objects, &mut first_facts)
+        .unwrap();
+    let diagnostics = first_facts
+        .load_for_ingestion(&request.job.job)
+        .unwrap()
+        .iter()
+        .map(|batch| match &batch.payload {
+            FactBatchPayload::RepositoryGraph { diagnostics, .. } => diagnostics.len(),
+            FactBatchPayload::ProjectMemory { .. } => 0,
+        })
+        .sum::<usize>();
+    assert_eq!(diagnostics, 1);
+
+    // The generic and language extractors intentionally emit overlapping facts
+    // that the merger de-duplicates. This leaves ten fact slots above the final
+    // payload for those overlaps, but no room for one diagnostic per malformed
+    // file. A per-invocation diagnostic allowance would exceed this boundary.
+    limits.max_total_facts = NonZeroU64::new(first.emitted_facts + 10).unwrap();
+    let mut tightly_bounded_facts =
+        fact_store(&storage_dir.path().join("diagnostic-total-facts.db"));
+    let bounded = StatelessIndexWorker::new(limits)
+        .execute(&request, &jobs, &objects, &mut tightly_bounded_facts)
+        .unwrap();
+    assert_eq!(bounded.emitted_facts, first.emitted_facts);
+}
+
 struct FakeMemorySource {
     manifest: AuthorizedSourceManifest,
     content: Vec<u8>,

@@ -470,8 +470,19 @@ impl StatelessIndexWorker {
         };
         let mut merger = GraphMerger::default();
         let mut extracted_facts = 0u64;
+        let mut extracted_diagnostics = 0u64;
         if active.generic_enabled {
-            let fragment = GenericExtractor::new().repository_fragment(&context, &manifest);
+            let extraction_context = extraction_context_with_diagnostic_limit(
+                &context,
+                remaining_diagnostics(&self.limits, extracted_diagnostics),
+            );
+            let fragment =
+                GenericExtractor::new().repository_fragment(&extraction_context, &manifest);
+            reserve_extracted_diagnostics(
+                &mut extracted_diagnostics,
+                fragment.diagnostics.len(),
+                self.limits.max_diagnostics.get(),
+            )?;
             reserve_extracted_facts(
                 &mut extracted_facts,
                 graph_fragment_fact_count(&fragment)?,
@@ -483,6 +494,10 @@ impl StatelessIndexWorker {
             diagnostics: manifest
                 .diagnostics
                 .iter()
+                .take(
+                    usize::try_from(remaining_diagnostics(&self.limits, extracted_diagnostics))
+                        .unwrap_or(usize::MAX),
+                )
                 .map(|diagnostic| GraphDiagnostic {
                     build_id: build_id.clone(),
                     snapshot_id: Some(snapshot_id.clone()),
@@ -494,6 +509,11 @@ impl StatelessIndexWorker {
                 .collect(),
             ..GraphFragment::default()
         };
+        reserve_extracted_diagnostics(
+            &mut extracted_diagnostics,
+            source_diagnostics.diagnostics.len(),
+            self.limits.max_diagnostics.get(),
+        )?;
         reserve_extracted_facts(
             &mut extracted_facts,
             graph_fragment_fact_count(&source_diagnostics)?,
@@ -524,13 +544,22 @@ impl StatelessIndexWorker {
                 .filter(|item| active.file_ids.contains(item.identity().id.as_str()))
                 .filter(|item| item.supports(file))
             {
+                let extraction_context = extraction_context_with_diagnostic_limit(
+                    &context,
+                    remaining_diagnostics(&self.limits, extracted_diagnostics),
+                );
                 let fragment = extractor
                     .extract(FileExtractionInput {
-                        context: &context,
+                        context: &extraction_context,
                         file,
                         content: &content,
                     })
                     .map_err(|_| WorkerError::ExtractionFailed)?;
+                reserve_extracted_diagnostics(
+                    &mut extracted_diagnostics,
+                    fragment.diagnostics.len(),
+                    self.limits.max_diagnostics.get(),
+                )?;
                 source_facts = source_facts
                     .checked_add(graph_fragment_fact_count(&fragment)?)
                     .ok_or(WorkerError::OutputLimitExceeded)?;
@@ -558,7 +587,7 @@ impl StatelessIndexWorker {
                     budget: ResolutionBudget {
                         max_relationships: self.limits.max_total_facts.get(),
                         max_duration_ms: self.limits.max_resolver_duration_ms.get(),
-                        max_diagnostics: self.limits.max_diagnostics.get(),
+                        max_diagnostics: remaining_diagnostics(&self.limits, extracted_diagnostics),
                     },
                 })
                 .map_err(|_| WorkerError::ExtractionFailed)?
@@ -566,6 +595,9 @@ impl StatelessIndexWorker {
             unresolved
         };
         if graph_fragment_fact_count(&graph)? > self.limits.max_total_facts.get() {
+            return Err(WorkerError::OutputLimitExceeded);
+        }
+        if graph.diagnostics.len() as u64 > self.limits.max_diagnostics.get() {
             return Err(WorkerError::OutputLimitExceeded);
         }
         self.check_deadline(started)?;
@@ -784,6 +816,29 @@ fn reserve_extracted_facts(
     }
     *total = next;
     Ok(())
+}
+
+fn extraction_context_with_diagnostic_limit(
+    context: &ExtractionContext,
+    max_diagnostics: u64,
+) -> ExtractionContext {
+    ExtractionContext {
+        max_diagnostics,
+        ..context.clone()
+    }
+}
+
+fn remaining_diagnostics(limits: &WorkerLimits, used: u64) -> u64 {
+    limits.max_diagnostics.get().saturating_sub(used)
+}
+
+fn reserve_extracted_diagnostics(
+    total: &mut u64,
+    additional: usize,
+    limit: u64,
+) -> Result<(), WorkerError> {
+    let additional = u64::try_from(additional).map_err(|_| WorkerError::OutputLimitExceeded)?;
+    reserve_extracted_facts(total, additional, limit)
 }
 
 fn require_fact_protection<F: FactBatchStore>(facts: &F) -> Result<(), WorkerError> {
