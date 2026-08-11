@@ -12,7 +12,7 @@ use crate::{
             RemoteProjectId, RemoteRepositoryId, RemoteRepositoryRef, RepositoryManifestId,
             TenantId,
         },
-        object_store::{ObjectStoreProtection, ObjectStoreQuota},
+        object_store::{ObjectStoreProtection, ObjectStoreQuota, TenantObjectStore},
         protocol::{
             FactBatch, FactBatchPayload, FactTarget, IndexJobKind, IndexJobSpec, IndexSemantics,
             SubmitIndexJobRequest,
@@ -812,6 +812,46 @@ fn memory_context_returns_only_authorized_sanitized_manifest_content() {
     };
     assert_eq!(text, "approved memory outcome");
     assert_eq!(verified_fingerprint, &digest("23"));
+}
+
+#[test]
+fn snippet_manifest_loading_observes_an_expired_deadline_for_each_domain() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let context = RemoteContextData {
+        graph_nodes: Vec::new(),
+        graph_edges: Vec::new(),
+        memory_entities: Vec::new(),
+        memory_relationships: Vec::new(),
+        snippets: Vec::new(),
+    };
+    let targets = [
+        LoadedTarget {
+            graph: Some(store.graph_snapshot(&fixture.graph).unwrap().unwrap()),
+            memory: None,
+        },
+        LoadedTarget {
+            graph: None,
+            memory: Some(store.memory_revision(&fixture.memory).unwrap().unwrap()),
+        },
+    ];
+
+    for loaded in targets {
+        let error = fixture
+            .query
+            .snippets(
+                &RequestId::new("expired-snippet").unwrap(),
+                &loaded,
+                &context,
+                1024,
+                Instant::now(),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, RemoteErrorCode::BudgetExceeded);
+    }
 }
 
 #[test]

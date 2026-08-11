@@ -535,6 +535,7 @@ impl StatelessIndexWorker {
             let content = objects
                 .read_verified(&remote_file.object)
                 .map_err(|_| WorkerError::SourceUnavailable)?;
+            self.check_deadline(started)?;
             if content.len() as u64 != file.byte_len {
                 return Err(WorkerError::SourceUnavailable);
             }
@@ -691,6 +692,7 @@ impl StatelessIndexWorker {
             let content = objects
                 .read_verified(&remote_source.object)
                 .map_err(|_| WorkerError::SourceUnavailable)?;
+            self.check_deadline(started)?;
             if content.len() as u64 != remote_source.sanitized_byte_len {
                 return Err(WorkerError::SourceUnavailable);
             }

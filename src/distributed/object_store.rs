@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use ring::{
@@ -161,13 +162,51 @@ impl EncryptedFilesystemObjectStore {
         .into_bytes()
     }
 
-    fn decrypt_file(
+    fn contains(&self, object: &TenantObjectRef) -> Result<bool, ObjectStoreError> {
+        Ok(self
+            .database
+            .query_row(
+                "SELECT 1 FROM source_objects
+                 WHERE tenant_id = ?1 AND project_id = ?2 AND object_id = ?3
+                   AND digest_algorithm = ?4 AND digest_value = ?5",
+                params![
+                    object.project.tenant_id.as_str(),
+                    object.project.project_id.as_str(),
+                    object.object_id.as_str(),
+                    object.content_identity.algorithm(),
+                    object.content_identity.value()
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    fn decrypt_file_until(
         key: &LessSafeKey,
         object: &TenantObjectRef,
         path: &Path,
-    ) -> Result<Vec<u8>, ObjectStoreError> {
+        deadline: Option<Instant>,
+    ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
         let mut encoded = Vec::new();
-        File::open(path)?.read_to_end(&mut encoded)?;
+        let mut file = File::open(path)?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            encoded.extend_from_slice(&buffer[..read]);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
         if encoded.len() < ENVELOPE_MAGIC.len() + NONCE_BYTES + AES_256_GCM.tag_len()
             || &encoded[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC
         {
@@ -178,12 +217,28 @@ impl EncryptedFilesystemObjectStore {
         let nonce = Nonce::try_assume_unique_for_key(&encoded[nonce_start..payload_start])
             .map_err(|_| ObjectStoreError::IntegrityFailure)?;
         let mut payload = encoded[payload_start..].to_vec();
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
         let plaintext = key
             .open_in_place(nonce, Aad::from(Self::aad(object)), &mut payload)
             .map_err(|_| ObjectStoreError::IntegrityFailure)?;
         let plaintext = plaintext.to_vec();
-        verify_digest(&object.content_identity, &plaintext)?;
-        Ok(plaintext)
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        if !verify_digest_until(&object.content_identity, &plaintext, deadline)? {
+            return Ok(None);
+        }
+        Ok(Some(plaintext))
+    }
+
+    fn decrypt_file(
+        key: &LessSafeKey,
+        object: &TenantObjectRef,
+        path: &Path,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
+        Self::decrypt_file_until(key, object, path, None)?.ok_or(ObjectStoreError::IntegrityFailure)
     }
 
     fn write_encrypted(
@@ -237,6 +292,26 @@ impl EncryptedFilesystemObjectStore {
                 Err(ObjectStoreError::Io(error))
             }
         }
+    }
+
+    /// Reads and verifies an object only while the caller's deadline remains.
+    /// `None` means the deadline elapsed before verification completed.
+    pub fn read_verified_until(
+        &self,
+        object: &TenantObjectRef,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let exists = self.contains(object)?;
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if !exists {
+            return Err(ObjectStoreError::ObjectUnavailable);
+        }
+        Self::decrypt_file_until(&self.key, object, &self.object_path(object), Some(deadline))
     }
 }
 
@@ -334,24 +409,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
     }
 
     fn read_verified(&self, object: &TenantObjectRef) -> Result<Vec<u8>, Self::Error> {
-        let exists = self
-            .database
-            .query_row(
-                "SELECT 1 FROM source_objects
-                 WHERE tenant_id = ?1 AND project_id = ?2 AND object_id = ?3
-                   AND digest_algorithm = ?4 AND digest_value = ?5",
-                params![
-                    object.project.tenant_id.as_str(),
-                    object.project.project_id.as_str(),
-                    object.object_id.as_str(),
-                    object.content_identity.algorithm(),
-                    object.content_identity.value()
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
+        if !self.contains(object)? {
             return Err(ObjectStoreError::ObjectUnavailable);
         }
         Self::decrypt_file(&self.key, object, &self.object_path(object))
@@ -408,17 +466,43 @@ fn initialize_schema(connection: &Connection) -> Result<(), ObjectStoreError> {
 }
 
 fn verify_digest(expected: &Digest, content: &[u8]) -> Result<(), ObjectStoreError> {
+    if verify_digest_until(expected, content, None)? {
+        Ok(())
+    } else {
+        Err(ObjectStoreError::IntegrityFailure)
+    }
+}
+
+fn verify_digest_until(
+    expected: &Digest,
+    content: &[u8],
+    deadline: Option<Instant>,
+) -> Result<bool, ObjectStoreError> {
     if expected.algorithm() != "sha256" {
         return Err(ObjectStoreError::ContentIdentityMismatch);
     }
-    let actual = Sha256::digest(content)
+    let mut digest = Sha256::new();
+    for chunk in content.chunks(64 * 1024) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(false);
+        }
+        digest.update(chunk);
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Ok(false);
+    }
+    let actual = digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Ok(false);
+    }
     if actual != expected.value() {
         return Err(ObjectStoreError::ContentIdentityMismatch);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -469,6 +553,34 @@ mod tests {
             !encoded
                 .windows(content.len())
                 .any(|window| window == content)
+        );
+    }
+
+    #[test]
+    fn verified_reads_stop_at_the_caller_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store =
+            EncryptedFilesystemObjectStore::open(directory.path(), [8; 32], quota(), true).unwrap();
+        let content = b"deadline-bounded content";
+        let stored = store
+            .put_verified(&project("tenant-a"), &digest(content), content)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .read_verified_until(&stored.object, Instant::now())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .read_verified_until(
+                    &stored.object,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap()
+                .unwrap(),
+            content
         );
     }
 

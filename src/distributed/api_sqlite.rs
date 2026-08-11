@@ -35,7 +35,7 @@ use super::{
         RemoteGraphSnapshotRef, RemoteMemoryRevisionRef, RemotePageCursor, RemoteProjectRef,
         RequestId,
     },
-    object_store::{EncryptedFilesystemObjectStore, ObjectStoreError, TenantObjectStore},
+    object_store::{EncryptedFilesystemObjectStore, ObjectStoreError},
     protocol::{
         CancelIndexJobRequest, DistributedProtocolError, IndexInputRef, IndexJobRecord,
         InspectIndexJobRequest, RemoteError, RemoteErrorCode, RemoteQueryRequest,
@@ -367,10 +367,14 @@ impl SqliteRemoteQueryApi {
         started: Instant,
         duration: Duration,
     ) -> Result<Vec<RemoteVerifiedSnippet>, RemoteError> {
+        let deadline = started
+            .checked_add(duration)
+            .ok_or_else(|| query_budget(request_id))?;
         let mut remaining = max_bytes;
         let mut snippets = Vec::new();
         if let Some(snapshot) = &loaded.graph {
-            let manifest = self.repository_manifest(request_id, snapshot)?;
+            ensure_query_deadline(request_id, deadline)?;
+            let manifest = self.repository_manifest(request_id, snapshot, deadline)?;
             let mut seen = BTreeSet::new();
             for node in &context.graph_nodes {
                 if started.elapsed() >= duration || remaining == 0 {
@@ -391,8 +395,9 @@ impl SqliteRemoteQueryApi {
                 };
                 let bytes = self
                     .objects
-                    .read_verified(&descriptor.object)
-                    .map_err(|error| query_object_error(request_id, error))?;
+                    .read_verified_until(&descriptor.object, deadline)
+                    .map_err(|error| query_object_error(request_id, error))?
+                    .ok_or_else(|| query_budget(request_id))?;
                 let Some(slice) = evidence_slice(&bytes, evidence.span.as_ref()) else {
                     continue;
                 };
@@ -410,7 +415,8 @@ impl SqliteRemoteQueryApi {
             }
         }
         if let Some(revision) = &loaded.memory {
-            let manifest = self.memory_manifest(request_id, revision)?;
+            ensure_query_deadline(request_id, deadline)?;
+            let manifest = self.memory_manifest(request_id, revision, deadline)?;
             for entity in &context.memory_entities {
                 if started.elapsed() >= duration || remaining == 0 {
                     break;
@@ -429,8 +435,9 @@ impl SqliteRemoteQueryApi {
                 };
                 let bytes = self
                     .objects
-                    .read_verified(&descriptor.object)
-                    .map_err(|error| query_object_error(request_id, error))?;
+                    .read_verified_until(&descriptor.object, deadline)
+                    .map_err(|error| query_object_error(request_id, error))?
+                    .ok_or_else(|| query_budget(request_id))?;
                 let Some((text, truncated, used)) = bounded_utf8(&bytes, remaining) else {
                     continue;
                 };
@@ -451,21 +458,26 @@ impl SqliteRemoteQueryApi {
         &self,
         request_id: &RequestId,
         snapshot: &StoredRemoteGraphSnapshot,
+        deadline: Instant,
     ) -> Result<RepositorySourceManifest, RemoteError> {
+        ensure_query_deadline(request_id, deadline)?;
         let record = self.job(request_id, &snapshot.record.job)?;
+        ensure_query_deadline(request_id, deadline)?;
         let IndexInputRef::Repository(reference) = record.spec.input else {
             return Err(query_internal(request_id));
         };
         let bytes = self
             .objects
-            .read_verified(&reference.manifest_object)
-            .map_err(|error| query_object_error(request_id, error))?;
+            .read_verified_until(&reference.manifest_object, deadline)
+            .map_err(|error| query_object_error(request_id, error))?
+            .ok_or_else(|| query_budget(request_id))?;
         let body: RepositorySourceManifestBody =
             serde_json::from_slice(&bytes).map_err(|_| query_internal(request_id))?;
         let manifest = RepositorySourceManifest { reference, body };
         manifest
             .validate::<(), ()>()
             .map_err(|_| query_internal(request_id))?;
+        ensure_query_deadline(request_id, deadline)?;
         Ok(manifest)
     }
 
@@ -473,21 +485,26 @@ impl SqliteRemoteQueryApi {
         &self,
         request_id: &RequestId,
         revision: &StoredRemoteMemoryRevision,
+        deadline: Instant,
     ) -> Result<MemorySourceManifest, RemoteError> {
+        ensure_query_deadline(request_id, deadline)?;
         let record = self.job(request_id, &revision.record.job)?;
+        ensure_query_deadline(request_id, deadline)?;
         let IndexInputRef::Memory(reference) = record.spec.input else {
             return Err(query_internal(request_id));
         };
         let bytes = self
             .objects
-            .read_verified(&reference.manifest_object)
-            .map_err(|error| query_object_error(request_id, error))?;
+            .read_verified_until(&reference.manifest_object, deadline)
+            .map_err(|error| query_object_error(request_id, error))?
+            .ok_or_else(|| query_budget(request_id))?;
         let body: MemorySourceManifestBody =
             serde_json::from_slice(&bytes).map_err(|_| query_internal(request_id))?;
         let manifest = MemorySourceManifest { reference, body };
         manifest
             .validate::<(), ()>()
             .map_err(|_| query_internal(request_id))?;
+        ensure_query_deadline(request_id, deadline)?;
         Ok(manifest)
     }
 
@@ -505,6 +522,12 @@ impl SqliteRemoteQueryApi {
             .map_err(|_| query_internal(request_id))?
             .ok_or_else(|| query_internal(request_id))
     }
+}
+
+fn ensure_query_deadline(request_id: &RequestId, deadline: Instant) -> Result<(), RemoteError> {
+    (Instant::now() < deadline)
+        .then_some(())
+        .ok_or_else(|| query_budget(request_id))
 }
 
 impl RemoteSnapshotQueryApi for SqliteRemoteQueryApi {
