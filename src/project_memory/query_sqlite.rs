@@ -133,6 +133,11 @@ struct ContextAssembly {
     truncation: Option<MemoryTruncationReason>,
 }
 
+enum ContextPageEntry {
+    Entity(ContextCandidate),
+    Relationship(MemoryRelationship),
+}
+
 #[derive(Debug, Clone)]
 struct MemoryHitOrderKey {
     score: f64,
@@ -771,84 +776,89 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         };
         drop(deadline);
         let offset = usize::try_from(offset).map_err(|_| MemoryQueryError::StaleCursor)?;
-        if offset > assembly.candidates.len() {
+        let entries = assembly
+            .candidates
+            .into_iter()
+            .map(ContextPageEntry::Entity)
+            .chain(
+                assembly
+                    .relationships
+                    .into_iter()
+                    .map(ContextPageEntry::Relationship),
+            )
+            .collect::<Vec<_>>();
+        if offset > entries.len() {
             return Err(MemoryQueryError::StaleCursor);
         }
-        let total = assembly.candidates.len();
-        let mut candidates = assembly.candidates.into_iter().skip(offset).peekable();
+        let mut entries = entries.into_iter().skip(offset).peekable();
         let mut items = Vec::new();
+        let mut relationships = Vec::new();
         let mut returned_bytes = 0_u64;
         let mut snippet_bytes = 0_u64;
         let mut reason = assembly.truncation;
         if request.policy.include_snippets && self.content.is_none() && reason.is_none() {
             reason = Some(MemoryTruncationReason::Capability);
         }
-        for candidate in candidates.by_ref() {
-            if items.len() >= scope.budget.max_results as usize {
-                reason = Some(MemoryTruncationReason::Results);
+        let mut omitted_entry = false;
+        loop {
+            if items.len().saturating_add(relationships.len()) >= scope.budget.max_results as usize
+            {
+                if entries.peek().is_some() {
+                    reason = Some(MemoryTruncationReason::Results);
+                }
                 break;
             }
             if started.elapsed() >= scope.budget.duration() {
                 reason = Some(MemoryTruncationReason::Duration);
                 break;
             }
-            let snippet = if request.policy.include_snippets {
-                self.attach_snippet(
-                    &scope,
-                    &candidate.entity,
-                    scope.budget.max_snippet_bytes.saturating_sub(snippet_bytes),
-                )?
-            } else {
-                None
+            let Some(entry) = entries.next() else {
+                break;
             };
-            if let Some(snippet) = &snippet {
-                snippet_bytes = snippet_bytes.saturating_add(snippet.text.len() as u64);
-            }
-            let item = MemoryContextItem {
-                entity: candidate.entity,
-                snippet,
-                selection_reasons: candidate.selection_reasons,
+            let (bytes, item, relationship) = match entry {
+                ContextPageEntry::Entity(candidate) => {
+                    let snippet = if request.policy.include_snippets {
+                        self.attach_snippet(
+                            &scope,
+                            &candidate.entity,
+                            scope.budget.max_snippet_bytes.saturating_sub(snippet_bytes),
+                        )?
+                    } else {
+                        None
+                    };
+                    let item = MemoryContextItem {
+                        entity: candidate.entity,
+                        snippet,
+                        selection_reasons: candidate.selection_reasons,
+                    };
+                    (serialized_len(&item)?, Some(item), None)
+                }
+                ContextPageEntry::Relationship(relationship) => {
+                    (serialized_len(&relationship)?, None, Some(relationship))
+                }
             };
-            let bytes = serialized_len(&item)?;
             if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
-                if items.is_empty() {
+                if items.is_empty() && relationships.is_empty() {
                     return Err(MemoryQueryError::BudgetExceeded(
                         MemoryTruncationReason::Bytes,
                     ));
                 }
+                omitted_entry = true;
                 reason = Some(MemoryTruncationReason::Bytes);
                 break;
             }
             returned_bytes = returned_bytes.saturating_add(bytes);
-            items.push(item);
-        }
-        let has_more = offset + items.len() < total || candidates.peek().is_some();
-        let returned_ids = items
-            .iter()
-            .map(|item| item.entity.id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut relationships = Vec::new();
-        for relationship in assembly.relationships.into_iter().filter(|relationship| {
-            returned_ids.contains(&relationship.source)
-                || matches!(
-                    &relationship.target,
-                    MemoryRelationshipTarget::MemoryEntity { entity_id }
-                        if returned_ids.contains(entity_id)
-                )
-        }) {
-            if items.len().saturating_add(relationships.len()) >= scope.budget.max_results as usize
-            {
-                reason = Some(MemoryTruncationReason::Results);
-                break;
+            if let Some(item) = item {
+                if let Some(snippet) = &item.snippet {
+                    snippet_bytes = snippet_bytes.saturating_add(snippet.text.len() as u64);
+                }
+                items.push(item);
+            } else if let Some(relationship) = relationship {
+                relationships.push(relationship);
             }
-            let bytes = serialized_len(&relationship)?;
-            if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
-                reason = Some(MemoryTruncationReason::Bytes);
-                break;
-            }
-            returned_bytes = returned_bytes.saturating_add(bytes);
-            relationships.push(relationship);
         }
+        let returned_results = items.len().saturating_add(relationships.len());
+        let has_more = omitted_entry || entries.peek().is_some();
         let (diagnostics, diagnostics_timed_out) =
             self.diagnostics_with_deadline(&scope, started)?;
         if diagnostics_timed_out {
@@ -856,14 +866,14 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         }
         let page = memory_page(
             reason,
-            items.len().saturating_add(relationships.len()),
+            returned_results,
             returned_bytes,
             assembly.explored_depth,
             has_more,
             "context",
             &scope.revision.id,
             &fingerprint,
-            offset + items.len(),
+            offset + returned_results,
         )?;
         Ok(MemoryContextResponse {
             wire_version: MEMORY_QUERY_WIRE_VERSION,

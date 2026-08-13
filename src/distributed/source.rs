@@ -485,52 +485,53 @@ fn sanitize_memory_source<S, E>(
     descriptor: &AuthorizedSourceDescriptor,
     content: &[u8],
 ) -> Result<Vec<u8>, PackagingError<S, E>> {
-    match descriptor.category {
+    let (canonical, fingerprint) = canonical_memory_source(descriptor.category, content)
+        .ok_or(PackagingError::ContentIdentityMismatch)?;
+    if fingerprint != descriptor.fingerprint {
+        return Err(PackagingError::ContentIdentityMismatch);
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn verify_sanitized_memory_source(source: &MemorySourceObject, content: &[u8]) -> bool {
+    canonical_memory_source(source.category, content).is_some_and(|(canonical, fingerprint)| {
+        canonical == content && fingerprint == source.source_fingerprint
+    })
+}
+
+fn canonical_memory_source(
+    category: MemorySourceCategory,
+    content: &[u8],
+) -> Option<(Vec<u8>, Digest)> {
+    match category {
         MemorySourceCategory::SpecificationStructure | MemorySourceCategory::ApprovedOutcome => {
-            let text = std::str::from_utf8(content)
-                .map_err(|_| PackagingError::ContentIdentityMismatch)?;
-            let sanitized = sanitized_spec_source(descriptor.category, text)
-                .ok_or(PackagingError::ContentIdentityMismatch)?;
-            let parsed = parse_spec_memory(
-                std::str::from_utf8(&sanitized)
-                    .map_err(|_| PackagingError::ContentIdentityMismatch)?,
-            );
-            let fingerprint = match descriptor.category {
+            let text = std::str::from_utf8(content).ok()?;
+            let sanitized = sanitized_spec_source(category, text)?;
+            let parsed = parse_spec_memory(std::str::from_utf8(&sanitized).ok()?);
+            let fingerprint = match category {
                 MemorySourceCategory::SpecificationStructure => {
                     memory_canonical_digest(&parsed.structure)
                 }
-                MemorySourceCategory::ApprovedOutcome => memory_canonical_digest(
-                    &parsed
-                        .outcome
-                        .ok_or(PackagingError::ContentIdentityMismatch)?,
-                ),
+                MemorySourceCategory::ApprovedOutcome => memory_canonical_digest(&parsed.outcome?),
                 _ => unreachable!(),
             };
-            if fingerprint != descriptor.fingerprint {
-                return Err(PackagingError::ContentIdentityMismatch);
-            }
-            Ok(sanitized)
+            Some((sanitized, fingerprint))
         }
         MemorySourceCategory::ArchiveManifest | MemorySourceCategory::RuntimeProvenance => {
-            let canonical = match descriptor.category {
+            let canonical = match category {
                 MemorySourceCategory::ArchiveManifest => serde_json::to_vec(
-                    &serde_json::from_slice::<ArchiveSourceDocument>(content)
-                        .map_err(|_| PackagingError::ContentIdentityMismatch)?,
+                    &serde_json::from_slice::<ArchiveSourceDocument>(content).ok()?,
                 ),
                 MemorySourceCategory::RuntimeProvenance => serde_json::to_vec(
-                    &serde_json::from_slice::<RuntimeSourceDocument>(content)
-                        .map_err(|_| PackagingError::ContentIdentityMismatch)?,
+                    &serde_json::from_slice::<RuntimeSourceDocument>(content).ok()?,
                 ),
                 _ => unreachable!(),
             }
-            .map_err(|_| PackagingError::ContentIdentityMismatch)?;
-            if canonical != content || memory_canonical_digest(&canonical) != descriptor.fingerprint
-            {
-                return Err(PackagingError::ContentIdentityMismatch);
-            }
-            Ok(canonical)
+            .ok()?;
+            let fingerprint = memory_canonical_digest(&canonical);
+            Some((canonical, fingerprint))
         }
-        _ => Err(PackagingError::UnauthorizedMemoryCategory),
+        _ => None,
     }
 }
 

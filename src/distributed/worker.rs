@@ -55,7 +55,7 @@ use super::{
     },
     source::{
         MemorySourceManifest, MemorySourceManifestBody, RepositorySourceManifest,
-        RepositorySourceManifestBody,
+        RepositorySourceManifestBody, verify_sanitized_memory_source,
     },
 };
 
@@ -730,6 +730,9 @@ impl StatelessIndexWorker {
             self.check_deadline(deadline)?;
             if content.len() as u64 != remote_source.sanitized_byte_len {
                 return Err(WorkerError::SourceUnavailable);
+            }
+            if !verify_sanitized_memory_source(remote_source, &content) {
+                return Err(WorkerError::InvalidInput);
             }
             let Some(extractor) = extractors
                 .iter()

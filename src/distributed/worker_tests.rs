@@ -1,5 +1,7 @@
 use std::{cell::Cell, time::Duration};
 
+use sha2::{Digest as _, Sha256};
+
 use super::*;
 use crate::{
     distributed::{
@@ -8,8 +10,8 @@ use crate::{
         fact_store::{FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome},
         fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
         identity::{
-            RemoteProjectId, RemoteProjectRef, RemoteRepositoryId, RemoteRepositoryRef, RequestId,
-            TenantId,
+            MemoryManifestId, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
+            RemoteRepositoryRef, RequestId, TenantId,
         },
         object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
         protocol::{
@@ -695,4 +697,75 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
     assert!(outcome.emitted_facts > 0);
     assert!(encoded.contains("rg5.3"));
     assert!(!encoded.contains("Private body"));
+
+    let mut forged = manifest;
+    forged.body.sources[0].source_fingerprint = Digest::new("sha256", "00").unwrap();
+    let mut forged_sources = AuthorizedSourceManifest {
+        project: forged.body.project_identity.clone(),
+        policy_digest: forged.body.memory_policy_digest.clone(),
+        source_set_digest: forged.body.source_set_digest.clone(),
+        extractor_set_digest: forged.body.extractor_set_digest.clone(),
+        sources: forged
+            .body
+            .sources
+            .iter()
+            .map(|source| AuthorizedSourceDescriptor {
+                project: forged.body.project_identity.clone(),
+                category: source.category,
+                locator: source.locator.clone(),
+                fingerprint: source.source_fingerprint.clone(),
+                byte_len: source.sanitized_byte_len,
+            })
+            .collect(),
+    };
+    forged_sources.source_set_digest = forged_sources.computed_source_set_digest().unwrap();
+    forged.body.source_set_digest = forged_sources.source_set_digest;
+    let encoded_manifest = serde_json::to_vec(&forged.body).unwrap();
+    let manifest_digest = Digest::new(
+        "sha256",
+        Sha256::digest(&encoded_manifest)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    forged.reference.manifest_id = MemoryManifestId::new(manifest_digest.value()).unwrap();
+    forged.reference.manifest_digest = manifest_digest.clone();
+    forged.reference.manifest_object = objects
+        .put_verified(
+            &forged.reference.project,
+            &manifest_digest,
+            &encoded_manifest,
+        )
+        .unwrap()
+        .object;
+    forged.validate::<(), ()>().unwrap();
+
+    let running = running_job(
+        &mut jobs,
+        IndexJobKind::ProjectMemory,
+        IndexInputRef::Memory(forged.reference),
+        IndexSemantics {
+            semantic_config_digest: policy.digest(),
+            model_version: NonZeroU32::new(MEMORY_MODEL_VERSION).unwrap(),
+            extractor_set_digest: built_in_extractor_set_digest(),
+        },
+    );
+    let forged_request = execution_request(running);
+    let mut forged_facts = fact_store(&storage_dir.path().join("forged-memory-facts.db"));
+    assert_eq!(
+        StatelessIndexWorker::new(worker_limits()).execute(
+            &forged_request,
+            &jobs,
+            &objects,
+            &mut forged_facts,
+        ),
+        Err(WorkerError::InvalidInput)
+    );
+    assert!(
+        forged_facts
+            .load_for_ingestion(&forged_request.job.job)
+            .unwrap()
+            .is_empty()
+    );
 }

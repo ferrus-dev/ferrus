@@ -413,31 +413,44 @@ fn search_candidate_ranking_stops_when_the_deadline_expires() {
 
 #[test]
 fn context_counts_relationships_against_the_effective_result_limit() {
-    let (_root, data, project, _) = indexed_fixture();
+    let (_root, data, project, revision_id) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =
         open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
     else {
         panic!("memory query sidecar should be ready");
     };
     let limits = QueryLimitsConfig::default();
-    let mut scope = published_scope(project, &limits);
-    scope.budget.max_results = std::num::NonZeroU32::new(1).unwrap();
-    let response = SqliteMemoryQuery::new(&sidecar, limits)
-        .context(MemoryContextRequest {
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let relationship = query
+        .relationships(&revision_id)
+        .unwrap()
+        .into_iter()
+        .find(|relationship| {
+            matches!(
+                relationship.target,
+                MemoryRelationshipTarget::MemoryEntity { ref entity_id }
+                    if entity_id != &relationship.source
+            )
+        })
+        .expect("fixture should contain a directed entity relationship");
+    let relationship_id = relationship.id.clone();
+    let request = |cursor| {
+        let mut scope = published_scope(project.clone(), &limits);
+        scope.budget.max_results = std::num::NonZeroU32::new(1).unwrap();
+        MemoryContextRequest {
             scope,
-            seeds: vec![MemoryContextSeed::Milestone(
-                MemoryRecordId::new("rg-test").unwrap(),
-            )],
+            seeds: vec![MemoryContextSeed::Entity(relationship.source.clone())],
             policy: super::super::query::MemoryContextPolicy {
-                direction: crate::repository_graph::query::EdgeDirection::Both,
+                direction: crate::repository_graph::query::EdgeDirection::Outgoing,
                 relationship_kinds: vec![],
                 include_unresolved: false,
                 include_stale: false,
                 include_snippets: false,
             },
-            page: MemoryPageRequest::default(),
-        })
-        .unwrap();
+            page: MemoryPageRequest { cursor },
+        }
+    };
+    let mut response = query.context(request(None)).unwrap();
 
     assert!(
         response
@@ -448,9 +461,22 @@ fn context_counts_relationships_against_the_effective_result_limit() {
     );
     assert_eq!(response.relationships.len(), 0);
     assert_eq!(
-        response.page.truncation.map(|value| value.reason),
+        response.page.truncation.as_ref().map(|value| value.reason),
         Some(MemoryTruncationReason::Results)
     );
+    let mut pages = 1;
+    while response.relationships.is_empty() {
+        let cursor = response
+            .page
+            .next_cursor
+            .clone()
+            .expect("context relationships should remain pageable");
+        response = query.context(request(Some(cursor))).unwrap();
+        pages += 1;
+        assert!(pages < 32, "context cursor should make progress");
+    }
+    assert_eq!(response.relationships.len(), 1);
+    assert_eq!(response.relationships[0].id, relationship_id);
 }
 
 #[test]
