@@ -10,6 +10,7 @@ use crate::{
         },
         protocol::{IndexInputRef, IndexSemantics, SubmitIndexJobRequest},
     },
+    project_memory::domain::{ProjectId, ProjectNamespace, ProjectRef},
     repository_graph::domain::{
         Confidence, ExtractorId, ExtractorIdentity, FactProvenance, GraphValue, ResolutionState,
         SemanticKey,
@@ -24,6 +25,20 @@ fn project(tenant: &str) -> RemoteProjectRef {
     RemoteProjectRef {
         tenant_id: TenantId::new(tenant).unwrap(),
         project_id: RemoteProjectId::new("project").unwrap(),
+    }
+}
+
+fn local_project() -> ProjectRef {
+    ProjectRef {
+        namespace: ProjectNamespace::new("remote:test").unwrap(),
+        project_id: ProjectId::new("project").unwrap(),
+    }
+}
+
+fn foreign_local_project() -> ProjectRef {
+    ProjectRef {
+        namespace: ProjectNamespace::new("remote:test").unwrap(),
+        project_id: ProjectId::new("foreign").unwrap(),
     }
 }
 
@@ -81,6 +96,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str) -> IndexInputRef {
         IndexJobKind::ProjectMemory => {
             IndexInputRef::Memory(super::super::identity::MemoryManifestRef {
                 project,
+                project_identity: local_project(),
                 manifest_id: MemoryManifestId::new(identity.value()).unwrap(),
                 manifest_digest: identity,
                 memory_policy_digest: digest("22"),
@@ -242,6 +258,14 @@ fn graph_batch_with_final(
 }
 
 fn memory_batch(job: &IndexJobRef, revision: &str) -> FactBatch {
+    memory_batch_for_project(job, revision, local_project())
+}
+
+fn memory_batch_for_project(
+    job: &IndexJobRef,
+    revision: &str,
+    project_identity: ProjectRef,
+) -> FactBatch {
     FactBatch::new(
         job.clone(),
         FactTarget::ProjectMemory {
@@ -249,6 +273,7 @@ fn memory_batch(job: &IndexJobRef, revision: &str) -> FactBatch {
                 project: project("tenant-a"),
                 revision_id: MemoryRevisionId::new(revision).unwrap(),
             },
+            project_identity,
             build_id: MemoryBuildId::new(format!("build-{revision}")).unwrap(),
         },
         FactShardId::new("memory-all").unwrap(),
@@ -262,6 +287,22 @@ fn memory_batch(job: &IndexJobRef, revision: &str) -> FactBatch {
         },
     )
     .unwrap()
+}
+
+#[test]
+fn memory_publication_rejects_a_target_from_another_logical_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "19");
+    let request = memory_request(&job, "memory-project-revision", None);
+    let batch =
+        memory_batch_for_project(&job.job, "memory-project-revision", foreign_local_project());
+
+    assert!(matches!(
+        store(&path).publish_memory(&request, &[batch], Utc::now()),
+        Err(RemoteStoreError::InvalidInput)
+    ));
 }
 
 #[test]

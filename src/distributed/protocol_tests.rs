@@ -3,6 +3,16 @@ use crate::distributed::identity::{
     MemoryManifestId, ObjectId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId,
     TenantId, TenantObjectRef,
 };
+use crate::{
+    project_memory::domain::{
+        MemoryConfidence, MemoryEntityData, MemoryEntityId, MemoryEvidenceLocator,
+        MemoryExtractorId, MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance,
+        MemoryRelationshipId, MemoryRelationshipKind, MemoryRelationshipTarget,
+        MemoryResolutionState, MemorySourceCategory, MemorySourceLocator, MemoryStatusToken,
+        MemoryText, ProjectId, ProjectNamespace, ProjectRef,
+    },
+    repository_graph::domain::RepoPath,
+};
 
 fn digest(value: &str) -> Digest {
     Digest::new("sha256", value).unwrap()
@@ -12,6 +22,62 @@ fn project(tenant: &str) -> RemoteProjectRef {
     RemoteProjectRef {
         tenant_id: TenantId::new(tenant).unwrap(),
         project_id: RemoteProjectId::new("project").unwrap(),
+    }
+}
+
+fn local_project() -> ProjectRef {
+    ProjectRef {
+        namespace: ProjectNamespace::new("remote:test").unwrap(),
+        project_id: ProjectId::new("project").unwrap(),
+    }
+}
+
+fn foreign_local_project() -> ProjectRef {
+    ProjectRef {
+        namespace: ProjectNamespace::new("remote:test").unwrap(),
+        project_id: ProjectId::new("foreign").unwrap(),
+    }
+}
+
+fn memory_provenance() -> MemoryProvenance {
+    MemoryProvenance {
+        source_category: MemorySourceCategory::ApprovedOutcome,
+        source_locator: MemorySourceLocator::TrackedFile {
+            path: RepoPath::new("docs/spec.md").unwrap(),
+        },
+        source_fingerprint: digest("23"),
+        extractor: MemoryExtractorIdentity::current(
+            MemoryExtractorId::new("memory.test").unwrap(),
+            MemoryStatusToken::new("v1").unwrap(),
+        ),
+        evidence: MemoryEvidenceLocator::Record(
+            crate::project_memory::domain::MemoryRecordId::new("outcome").unwrap(),
+        ),
+        resolution: MemoryResolutionState::Resolved,
+        confidence: MemoryConfidence::Exact,
+        timestamps: MemoryIndexTimestamps {
+            source_observed_at: Utc::now(),
+            indexed_at: Utc::now(),
+        },
+    }
+}
+
+fn memory_job(tenant: &str) -> IndexJobRef {
+    IndexJobRef {
+        project: project(tenant),
+        job_id: IndexJobId::new("memory-job").unwrap(),
+        kind: IndexJobKind::ProjectMemory,
+    }
+}
+
+fn memory_target(revision_id: &MemoryRevisionId) -> FactTarget {
+    FactTarget::ProjectMemory {
+        revision: RemoteMemoryRevisionRef {
+            project: project("tenant-a"),
+            revision_id: revision_id.clone(),
+        },
+        project_identity: local_project(),
+        build_id: MemoryBuildId::new("memory-build").unwrap(),
     }
 }
 
@@ -57,6 +123,7 @@ fn graph_target(tenant: &str) -> FactTarget {
 fn memory_input(tenant: &str) -> IndexInputRef {
     IndexInputRef::Memory(MemoryManifestRef {
         project: project(tenant),
+        project_identity: local_project(),
         manifest_id: MemoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),
         memory_policy_digest: digest("22"),
@@ -174,6 +241,63 @@ fn fact_batches_are_idempotent_and_detect_tampering() {
     assert_eq!(
         tampered.validate(),
         Err(DistributedProtocolError::FactBatchIdentityMismatch)
+    );
+}
+
+#[test]
+fn memory_fact_batches_reject_foreign_logical_projects() {
+    let revision_id = MemoryRevisionId::new("memory-revision").unwrap();
+    let entity_id = MemoryEntityId::new("memory-entity").unwrap();
+    let entity = MemoryEntity {
+        project: foreign_local_project(),
+        memory_revision_id: revision_id.clone(),
+        id: entity_id.clone(),
+        data: MemoryEntityData::Outcome {
+            text: MemoryText::new("Approved outcome").unwrap(),
+        },
+        provenance: memory_provenance(),
+    };
+    assert_eq!(
+        FactBatch::new(
+            memory_job("tenant-a"),
+            memory_target(&revision_id),
+            FactShardId::new("memory-all").unwrap(),
+            0,
+            digest("44"),
+            true,
+            FactBatchPayload::ProjectMemory {
+                entities: vec![entity],
+                relationships: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        ),
+        Err(DistributedProtocolError::FactBatchMismatch)
+    );
+
+    let relationship = MemoryRelationship {
+        project: foreign_local_project(),
+        memory_revision_id: revision_id.clone(),
+        id: MemoryRelationshipId::new("memory-relationship").unwrap(),
+        kind: MemoryRelationshipKind::Contains,
+        source: entity_id.clone(),
+        target: MemoryRelationshipTarget::MemoryEntity { entity_id },
+        provenance: memory_provenance(),
+    };
+    assert_eq!(
+        FactBatch::new(
+            memory_job("tenant-a"),
+            memory_target(&revision_id),
+            FactShardId::new("memory-all").unwrap(),
+            0,
+            digest("44"),
+            true,
+            FactBatchPayload::ProjectMemory {
+                entities: Vec::new(),
+                relationships: vec![relationship],
+                diagnostics: Vec::new(),
+            },
+        ),
+        Err(DistributedProtocolError::FactBatchMismatch)
     );
 }
 

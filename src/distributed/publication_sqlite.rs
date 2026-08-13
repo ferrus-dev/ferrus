@@ -133,6 +133,7 @@ struct PreparedGraph {
 
 struct PreparedMemory {
     record: RemoteMemoryRevisionRecord,
+    project_identity: crate::project_memory::domain::ProjectRef,
     facts: Vec<PlainFact>,
 }
 
@@ -426,7 +427,9 @@ impl SqliteRemotePublicationStore {
             || job.spec.semantics.extractor_set_digest != prepared.record.extractor_set_digest
             || !matches!(
                 &job.spec.input,
-                IndexInputRef::Memory(manifest) if manifest.project == request.project
+                IndexInputRef::Memory(manifest)
+                    if manifest.project == request.project
+                        && manifest.project_identity == prepared.project_identity
             )
         {
             return Err(RemoteStoreError::InvalidInput);

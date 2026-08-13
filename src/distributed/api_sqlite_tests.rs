@@ -282,6 +282,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
     let manifest = MemorySourceManifest {
         reference: super::super::identity::MemoryManifestRef {
             project: project(),
+            project_identity: body.project_identity.clone(),
             manifest_id: MemoryManifestId::new(manifest_digest.value()).unwrap(),
             manifest_digest,
             memory_policy_digest: policy_digest,
@@ -507,6 +508,7 @@ fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixtu
                 project: project(),
                 revision_id: revision_id.clone(),
             },
+            project_identity: local_project(),
             build_id: MemoryBuildId::new("build-memory").unwrap(),
         },
         FactShardId::new("memory-all").unwrap(),

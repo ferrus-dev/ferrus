@@ -117,16 +117,23 @@ pub(super) fn prepare_memory(
     let mut target = None;
     let mut extractor_set_digest = None;
     for batch in batches {
-        let FactTarget::ProjectMemory { revision, build_id } = &batch.header.target else {
+        let FactTarget::ProjectMemory {
+            revision,
+            project_identity,
+            build_id,
+        } = &batch.header.target
+        else {
             return Err(RemoteStoreError::InvalidInput);
         };
         if revision.project != request.project || revision.revision_id != request.revision_id {
             return Err(RemoteStoreError::InvalidInput);
         }
         match &target {
-            None => target = Some((revision.clone(), build_id.clone())),
-            Some((existing_revision, existing_build))
-                if existing_revision == revision && existing_build == build_id => {}
+            None => target = Some((revision.clone(), project_identity.clone(), build_id.clone())),
+            Some((existing_revision, existing_project, existing_build))
+                if existing_revision == revision
+                    && existing_project == project_identity
+                    && existing_build == build_id => {}
             Some(_) => return Err(RemoteStoreError::InvalidInput),
         }
         match &extractor_set_digest {
@@ -173,7 +180,7 @@ pub(super) fn prepare_memory(
     if count > max_facts.get() {
         return Err(RemoteStoreError::QuotaExceeded);
     }
-    let (revision, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
+    let (revision, project_identity, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
     let extractor_set_digest = extractor_set_digest.ok_or(RemoteStoreError::InvalidInput)?;
     let fact_set_digest = canonical_digest(&(
         entities.values().collect::<Vec<_>>(),
@@ -216,6 +223,7 @@ pub(super) fn prepare_memory(
             },
             completed_at: now,
         },
+        project_identity,
         facts,
     })
 }

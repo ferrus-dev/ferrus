@@ -789,6 +789,7 @@ impl StatelessIndexWorker {
                     project: remote.body.project.clone(),
                     revision_id: revision.id,
                 },
+                project_identity: remote.body.project_identity.clone(),
                 build_id,
             },
             entities: entities.into_values().collect(),

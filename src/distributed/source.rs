@@ -168,6 +168,7 @@ impl MemorySourceManifest {
             || self.body.policy_schema_version
                 != crate::project_memory::policy::MEMORY_POLICY_SCHEMA_VERSION
             || self.body.project != self.reference.project
+            || self.body.project_identity != self.reference.project_identity
             || self.body.memory_policy_digest != self.reference.memory_policy_digest
             || self.body.memory_policy_digest != approved_policy.digest()
             || self.body.sources.iter().any(|source| {
@@ -429,6 +430,7 @@ where
         .object;
     let reference = MemoryManifestRef {
         project,
+        project_identity: body.project_identity.clone(),
         manifest_id: MemoryManifestId::new(manifest_digest.value())
             .map_err(|_| PackagingError::InvalidManifest)?,
         manifest_digest,

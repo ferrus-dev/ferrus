@@ -364,6 +364,7 @@ pub enum FactTarget {
     },
     ProjectMemory {
         revision: RemoteMemoryRevisionRef,
+        project_identity: crate::project_memory::domain::ProjectRef,
         build_id: MemoryBuildId,
     },
 }
@@ -536,23 +537,26 @@ fn validate_fact_targets(
                 })
         }
         (
-            FactTarget::ProjectMemory { revision, build_id },
+            FactTarget::ProjectMemory {
+                revision,
+                project_identity,
+                build_id,
+            },
             FactBatchPayload::ProjectMemory {
                 entities,
                 relationships,
                 diagnostics,
             },
         ) => {
-            entities
-                .iter()
-                .all(|entity| entity.memory_revision_id == revision.revision_id)
-                && relationships
-                    .iter()
-                    .all(|relationship| relationship.memory_revision_id == revision.revision_id)
-                && diagnostics.iter().all(|diagnostic| {
-                    diagnostic.build_id == *build_id
-                        && diagnostic.revision_id == revision.revision_id
-                })
+            entities.iter().all(|entity| {
+                entity.project == *project_identity
+                    && entity.memory_revision_id == revision.revision_id
+            }) && relationships.iter().all(|relationship| {
+                relationship.project == *project_identity
+                    && relationship.memory_revision_id == revision.revision_id
+            }) && diagnostics.iter().all(|diagnostic| {
+                diagnostic.build_id == *build_id && diagnostic.revision_id == revision.revision_id
+            })
         }
         _ => false,
     };

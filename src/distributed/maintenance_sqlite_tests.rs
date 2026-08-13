@@ -35,7 +35,10 @@ use super::{
         DeletionState, DeletionTarget, RetentionClass,
     },
 };
-use crate::repository_graph::domain::{BuildId, Digest, SnapshotId};
+use crate::{
+    project_memory::domain::{ProjectId, ProjectNamespace, ProjectRef},
+    repository_graph::domain::{BuildId, Digest, SnapshotId},
+};
 
 const KEY: [u8; 32] = [73; 32];
 const SOURCE: &[u8] = b"same private source bytes";
@@ -59,6 +62,13 @@ fn project(tenant: &str) -> RemoteProjectRef {
     RemoteProjectRef {
         tenant_id: TenantId::new(tenant).unwrap(),
         project_id: RemoteProjectId::new("project").unwrap(),
+    }
+}
+
+fn local_project() -> ProjectRef {
+    ProjectRef {
+        namespace: ProjectNamespace::new("remote:test").unwrap(),
+        project_id: ProjectId::new("project").unwrap(),
     }
 }
 
@@ -162,6 +172,7 @@ fn submit_memory_job(
 ) -> IndexJobRef {
     let input = IndexInputRef::Memory(super::identity::MemoryManifestRef {
         project: project.clone(),
+        project_identity: local_project(),
         manifest_id: MemoryManifestId::new(format!("memory-manifest-{suffix}")).unwrap(),
         manifest_digest: object.content_identity.clone(),
         memory_policy_digest: digest("22"),

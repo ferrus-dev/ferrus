@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
-    project_memory::domain::MemoryRevisionId,
+    project_memory::domain::{MemoryRevisionId, ProjectRef},
     repository_graph::domain::{Digest, SnapshotId},
 };
 
@@ -153,6 +153,7 @@ impl RepositoryManifestRef {
 #[serde(deny_unknown_fields)]
 pub struct MemoryManifestRef {
     pub project: RemoteProjectRef,
+    pub project_identity: ProjectRef,
     pub manifest_id: MemoryManifestId,
     pub manifest_digest: Digest,
     pub memory_policy_digest: Digest,
