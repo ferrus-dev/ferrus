@@ -1257,6 +1257,95 @@ fn exact_response_budget_returns_a_smaller_page_instead_of_a_terminal_error() {
 }
 
 #[test]
+fn exact_response_budget_trims_an_optional_snippet_before_rejecting_one_result() {
+    let fixture = fixture();
+    let authorization = auth(
+        CredentialClass::QueryAgent,
+        AuthorizationScope::Repository(fixture.repository.clone()),
+    );
+    let request = query_request(
+        &fixture,
+        RemoteQueryTarget::Repository(fixture.graph.clone()),
+        RemoteQueryOperation::Context {
+            seeds: vec![RemoteContextSeed::GraphNode(fixture.graph_node.clone())],
+            direction: EdgeDirection::Both,
+            graph_edge_kinds: Vec::new(),
+            memory_relationship_kinds: Vec::new(),
+            include_unresolved: false,
+            include_external: false,
+            include_snippets: true,
+        },
+        1,
+        None,
+    );
+    let result = fixture.query.query(&authorization, &request).unwrap().body;
+    let RemoteQueryData::Context(context) = &result.data else {
+        panic!("context response expected");
+    };
+    assert_eq!(
+        context
+            .graph_nodes
+            .len()
+            .saturating_add(context.graph_edges.len())
+            .saturating_add(context.memory_entities.len())
+            .saturating_add(context.memory_relationships.len()),
+        1
+    );
+    assert_eq!(context.snippets.len(), 1);
+    let original_text = match &context.snippets[0] {
+        RemoteVerifiedSnippet::Repository { text, .. }
+        | RemoteVerifiedSnippet::Memory { text, .. } => text.clone(),
+    };
+
+    let mut one_character = result.clone();
+    let RemoteQueryData::Context(context) = &mut one_character.data else {
+        unreachable!();
+    };
+    match &mut context.snippets[0] {
+        RemoteVerifiedSnippet::Repository {
+            text, truncated, ..
+        }
+        | RemoteVerifiedSnippet::Memory {
+            text, truncated, ..
+        } => {
+            *text = original_text[..1].to_string();
+            *truncated = true;
+        }
+    }
+    one_character.page.truncation = Some(RemoteTruncationReason::Bytes);
+    one_character.page.returned_bytes =
+        encoded_len(&(&one_character.diagnostics, &one_character.data)).unwrap();
+    let budget = encoded_len(&one_character).unwrap();
+
+    let fitted = fit_result_to_budget(
+        result,
+        budget,
+        None,
+        "snippet-response-budget",
+        &RequestId::new("snippet-response-budget").unwrap(),
+    )
+    .unwrap();
+    assert!(encoded_len(&fitted).unwrap() <= budget);
+    assert_eq!(fitted.page.returned_results, 1);
+    assert_eq!(fitted.page.truncation, Some(RemoteTruncationReason::Bytes));
+    let RemoteQueryData::Context(context) = fitted.data else {
+        panic!("context response expected");
+    };
+    assert_eq!(context.snippets.len(), 1);
+    let (text, truncated) = match &context.snippets[0] {
+        RemoteVerifiedSnippet::Repository {
+            text, truncated, ..
+        }
+        | RemoteVerifiedSnippet::Memory {
+            text, truncated, ..
+        } => (text, truncated),
+    };
+    assert!(!text.is_empty());
+    assert!(text.len() < original_text.len());
+    assert!(*truncated);
+}
+
+#[test]
 fn authorization_denies_foreign_queries_without_disclosing_target_existence() {
     let fixture = fixture();
     let authorization = auth(

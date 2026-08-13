@@ -970,12 +970,15 @@ pub(super) fn fit_result_to_budget(
 ) -> Result<RemoteQueryResult, RemoteError> {
     let offset = cursor_offset(cursor, fingerprint).map_err(|_| query_stale_cursor(request_id))?;
     loop {
-        result.page.returned_bytes = encoded_len(&(&result.diagnostics, &result.data))
-            .map_err(|_| query_internal(request_id))?;
+        update_returned_bytes(&mut result, request_id)?;
         if encoded_len(&result).map_err(|_| query_internal(request_id))? <= max_bytes {
             return Ok(result);
         }
         if result.diagnostics.pop().is_some() {
+            result.page.truncation = Some(RemoteTruncationReason::Bytes);
+            continue;
+        }
+        if fit_last_context_snippet(&mut result, max_bytes, request_id)? {
             result.page.truncation = Some(RemoteTruncationReason::Bytes);
             continue;
         }
@@ -990,6 +993,108 @@ pub(super) fn fit_result_to_budget(
                 .map_err(|_| query_internal(request_id))?,
         );
         result.page.truncation = Some(RemoteTruncationReason::Bytes);
+    }
+}
+
+fn update_returned_bytes(
+    result: &mut RemoteQueryResult,
+    request_id: &RequestId,
+) -> Result<(), RemoteError> {
+    result.page.returned_bytes = encoded_len(&(&result.diagnostics, &result.data))
+        .map_err(|_| query_internal(request_id))?;
+    Ok(())
+}
+
+fn fit_last_context_snippet(
+    result: &mut RemoteQueryResult,
+    max_bytes: u64,
+    request_id: &RequestId,
+) -> Result<bool, RemoteError> {
+    let RemoteQueryData::Context(context) = &mut result.data else {
+        return Ok(false);
+    };
+    let Some(snippet) = context.snippets.last() else {
+        return Ok(false);
+    };
+    let (original, was_truncated) = match snippet {
+        RemoteVerifiedSnippet::Repository {
+            text, truncated, ..
+        }
+        | RemoteVerifiedSnippet::Memory {
+            text, truncated, ..
+        } => (text.clone(), *truncated),
+    };
+
+    result.page.truncation = Some(RemoteTruncationReason::Bytes);
+    set_last_snippet_text(&mut result.data, "", true);
+    update_returned_bytes(result, request_id)?;
+    if encoded_len(&*result).map_err(|_| query_internal(request_id))? > max_bytes {
+        pop_last_context_snippet(&mut result.data);
+        return Ok(true);
+    }
+
+    let boundaries = std::iter::once(0)
+        .chain(original.char_indices().skip(1).map(|(index, _)| index))
+        .chain(std::iter::once(original.len()))
+        .collect::<Vec<_>>();
+    let mut fitting = 0usize;
+    let mut rejected = boundaries.len().saturating_sub(1);
+    while fitting + 1 < rejected {
+        let candidate = fitting + (rejected - fitting) / 2;
+        let end = boundaries[candidate];
+        set_last_snippet_text(
+            &mut result.data,
+            &original[..end],
+            was_truncated || end < original.len(),
+        );
+        update_returned_bytes(result, request_id)?;
+        if encoded_len(&*result).map_err(|_| query_internal(request_id))? <= max_bytes {
+            fitting = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+
+    if fitting == 0 {
+        pop_last_context_snippet(&mut result.data);
+    } else {
+        let end = boundaries[fitting];
+        set_last_snippet_text(
+            &mut result.data,
+            &original[..end],
+            was_truncated || end < original.len(),
+        );
+    }
+    Ok(true)
+}
+
+fn set_last_snippet_text(data: &mut RemoteQueryData, value: &str, truncated: bool) {
+    let RemoteQueryData::Context(context) = data else {
+        return;
+    };
+    let Some(snippet) = context.snippets.last_mut() else {
+        return;
+    };
+    match snippet {
+        RemoteVerifiedSnippet::Repository {
+            text,
+            truncated: snippet_truncated,
+            ..
+        }
+        | RemoteVerifiedSnippet::Memory {
+            text,
+            truncated: snippet_truncated,
+            ..
+        } => {
+            value.clone_into(text);
+            *snippet_truncated = truncated;
+        }
+    }
+}
+
+fn pop_last_context_snippet(data: &mut RemoteQueryData) {
+    if let RemoteQueryData::Context(context) = data {
+        context.snippets.pop();
     }
 }
 
