@@ -191,6 +191,9 @@ impl SqliteRemoteQueryApi {
     ) -> Result<RemoteQueryResult, RemoteError> {
         let budget = self.limits.clamp(request.body.budget);
         let duration = Duration::from_millis(budget.max_duration_ms.get());
+        let deadline = started
+            .checked_add(duration)
+            .ok_or_else(|| query_budget(&request.request_id))?;
         let fingerprint = query_fingerprint(
             &request.request_id,
             resolved_target,
@@ -351,6 +354,7 @@ impl SqliteRemoteQueryApi {
             budget.max_bytes.get(),
             request.body.page.cursor.as_ref(),
             &fingerprint,
+            deadline,
             &request.request_id,
         )?;
         if started.elapsed() >= duration {

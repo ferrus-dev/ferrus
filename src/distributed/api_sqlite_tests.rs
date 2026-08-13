@@ -1250,10 +1250,32 @@ fn exact_response_budget_returns_a_smaller_page_instead_of_a_terminal_error() {
         one_result_budget,
         None,
         fingerprint,
+        Instant::now() + Duration::from_secs(1),
         &RequestId::new("response-budget").unwrap(),
     )
     .unwrap();
     assert_eq!(fitted, one);
+}
+
+#[test]
+fn response_fitting_observes_an_expired_query_deadline() {
+    let request_id = RequestId::new("expired-response-fitting").unwrap();
+    let result = RemoteQueryResult {
+        page: empty_page(),
+        diagnostics: Vec::new(),
+        data: RemoteQueryData::Search(RemoteSearchData { items: Vec::new() }),
+    };
+
+    let error = fit_result_to_budget(
+        result,
+        u64::MAX,
+        None,
+        "expired-response-fitting",
+        Instant::now(),
+        &request_id,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, RemoteErrorCode::BudgetExceeded);
 }
 
 #[test]
@@ -1322,6 +1344,7 @@ fn exact_response_budget_trims_an_optional_snippet_before_rejecting_one_result()
         budget,
         None,
         "snippet-response-budget",
+        Instant::now() + Duration::from_secs(1),
         &RequestId::new("snippet-response-budget").unwrap(),
     )
     .unwrap();

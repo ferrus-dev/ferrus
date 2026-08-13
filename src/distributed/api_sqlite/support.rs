@@ -966,19 +966,22 @@ pub(super) fn fit_result_to_budget(
     max_bytes: u64,
     cursor: Option<&RemotePageCursor>,
     fingerprint: &str,
+    deadline: Instant,
     request_id: &RequestId,
 ) -> Result<RemoteQueryResult, RemoteError> {
+    super::ensure_query_deadline(request_id, deadline)?;
     let offset = cursor_offset(cursor, fingerprint).map_err(|_| query_stale_cursor(request_id))?;
     loop {
-        update_returned_bytes(&mut result, request_id)?;
-        if encoded_len(&result).map_err(|_| query_internal(request_id))? <= max_bytes {
+        super::ensure_query_deadline(request_id, deadline)?;
+        update_returned_bytes(&mut result, deadline, request_id)?;
+        if encoded_len_until(&result, deadline, request_id)? <= max_bytes {
             return Ok(result);
         }
         if result.diagnostics.pop().is_some() {
             result.page.truncation = Some(RemoteTruncationReason::Bytes);
             continue;
         }
-        if fit_last_context_snippet(&mut result, max_bytes, request_id)? {
+        if fit_last_context_snippet(&mut result, max_bytes, deadline, request_id)? {
             result.page.truncation = Some(RemoteTruncationReason::Bytes);
             continue;
         }
@@ -998,18 +1001,32 @@ pub(super) fn fit_result_to_budget(
 
 fn update_returned_bytes(
     result: &mut RemoteQueryResult,
+    deadline: Instant,
     request_id: &RequestId,
 ) -> Result<(), RemoteError> {
-    result.page.returned_bytes = encoded_len(&(&result.diagnostics, &result.data))
-        .map_err(|_| query_internal(request_id))?;
+    result.page.returned_bytes =
+        encoded_len_until(&(&result.diagnostics, &result.data), deadline, request_id)?;
     Ok(())
+}
+
+fn encoded_len_until(
+    value: &impl Serialize,
+    deadline: Instant,
+    request_id: &RequestId,
+) -> Result<u64, RemoteError> {
+    super::ensure_query_deadline(request_id, deadline)?;
+    let length = encoded_len(value).map_err(|_| query_internal(request_id))?;
+    super::ensure_query_deadline(request_id, deadline)?;
+    Ok(length)
 }
 
 fn fit_last_context_snippet(
     result: &mut RemoteQueryResult,
     max_bytes: u64,
+    deadline: Instant,
     request_id: &RequestId,
 ) -> Result<bool, RemoteError> {
+    super::ensure_query_deadline(request_id, deadline)?;
     let RemoteQueryData::Context(context) = &mut result.data else {
         return Ok(false);
     };
@@ -1027,8 +1044,8 @@ fn fit_last_context_snippet(
 
     result.page.truncation = Some(RemoteTruncationReason::Bytes);
     set_last_snippet_text(&mut result.data, "", true);
-    update_returned_bytes(result, request_id)?;
-    if encoded_len(&*result).map_err(|_| query_internal(request_id))? > max_bytes {
+    update_returned_bytes(result, deadline, request_id)?;
+    if encoded_len_until(&*result, deadline, request_id)? > max_bytes {
         pop_last_context_snippet(&mut result.data);
         return Ok(true);
     }
@@ -1040,6 +1057,7 @@ fn fit_last_context_snippet(
     let mut fitting = 0usize;
     let mut rejected = boundaries.len().saturating_sub(1);
     while fitting + 1 < rejected {
+        super::ensure_query_deadline(request_id, deadline)?;
         let candidate = fitting + (rejected - fitting) / 2;
         let end = boundaries[candidate];
         set_last_snippet_text(
@@ -1047,8 +1065,8 @@ fn fit_last_context_snippet(
             &original[..end],
             was_truncated || end < original.len(),
         );
-        update_returned_bytes(result, request_id)?;
-        if encoded_len(&*result).map_err(|_| query_internal(request_id))? <= max_bytes {
+        update_returned_bytes(result, deadline, request_id)?;
+        if encoded_len_until(&*result, deadline, request_id)? <= max_bytes {
             fitting = candidate;
         } else {
             rejected = candidate;

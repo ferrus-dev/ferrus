@@ -325,7 +325,9 @@ impl StatelessIndexWorker {
             if output_bytes > self.limits.max_output_bytes.get() {
                 return Err(WorkerError::OutputLimitExceeded);
             }
-            match facts.put(&batch).map_err(|_| WorkerError::FactStore)? {
+            let put = facts.put(&batch).map_err(|_| WorkerError::FactStore)?;
+            self.check_deadline(started)?;
+            match put {
                 PutFactBatchOutcome::Stored => stored_batches += 1,
                 PutFactBatchOutcome::Reused => reused_batches += 1,
             }
@@ -333,6 +335,7 @@ impl StatelessIndexWorker {
         let progress = facts
             .progress(&request.job.job)
             .map_err(|_| WorkerError::FactStore)?;
+        self.check_deadline(started)?;
         if !progress_is_complete(&progress) {
             return Err(WorkerError::FactStore);
         }

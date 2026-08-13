@@ -1,8 +1,11 @@
+use std::{cell::Cell, time::Duration};
+
 use super::*;
 use crate::{
     distributed::{
         coordinator::{AdvanceIndexJobRequest, ClaimIndexJobRequest},
         coordinator_sqlite::{CoordinatorLimits, SqliteIndexJobCoordinator},
+        fact_store::{FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome},
         fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
         identity::{
             RemoteProjectId, RemoteProjectRef, RemoteRepositoryId, RemoteRepositoryRef, RequestId,
@@ -10,8 +13,8 @@ use crate::{
         },
         object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
         protocol::{
-            CancelIndexJobRequest, IndexJobKind, IndexJobSpec, IndexSemantics,
-            SubmitIndexJobRequest,
+            CancelIndexJobRequest, FactBatch, IndexJobKind, IndexJobRef, IndexJobSpec,
+            IndexSemantics, SubmitIndexJobRequest,
         },
         source::{
             PackagingLimits, RepositoryPackagingPolicy, package_memory_source,
@@ -147,6 +150,64 @@ fn fact_store(path: &std::path::Path) -> SqliteFactBatchStore {
     .unwrap()
 }
 
+struct DelayedFactStore {
+    inner: SqliteFactBatchStore,
+    delay: Duration,
+    delay_put: bool,
+    delay_progress: bool,
+    put_calls: u64,
+    progress_calls: Cell<u64>,
+}
+
+impl DelayedFactStore {
+    fn new(
+        inner: SqliteFactBatchStore,
+        delay: Duration,
+        delay_put: bool,
+        delay_progress: bool,
+    ) -> Self {
+        Self {
+            inner,
+            delay,
+            delay_put,
+            delay_progress,
+            put_calls: 0,
+            progress_calls: Cell::new(0),
+        }
+    }
+}
+
+impl FactBatchStore for DelayedFactStore {
+    type Error = crate::distributed::fact_store_sqlite::FactStoreError;
+
+    fn protection(&self) -> FactStoreProtection {
+        self.inner.protection()
+    }
+
+    fn put(&mut self, batch: &FactBatch) -> Result<PutFactBatchOutcome, Self::Error> {
+        let outcome = self.inner.put(batch)?;
+        self.put_calls = self.put_calls.saturating_add(1);
+        if self.delay_put && self.put_calls == 1 {
+            std::thread::sleep(self.delay);
+        }
+        Ok(outcome)
+    }
+
+    fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error> {
+        let progress = self.inner.progress(job)?;
+        let calls = self.progress_calls.get().saturating_add(1);
+        self.progress_calls.set(calls);
+        if self.delay_progress && calls == 1 {
+            std::thread::sleep(self.delay);
+        }
+        Ok(progress)
+    }
+
+    fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error> {
+        self.inner.load_for_ingestion(job)
+    }
+}
+
 fn coordinator(path: &std::path::Path) -> SqliteIndexJobCoordinator {
     SqliteIndexJobCoordinator::open(
         path,
@@ -254,6 +315,76 @@ fn worker_deadline_budget_is_terminal_and_clamped_between_attempts() {
     let attempt = extraction_context_for_attempt(&context, 7, 1);
     assert_eq!(attempt.max_parser_duration_ms, 1);
     assert_eq!(attempt.max_diagnostics, 7);
+}
+
+#[test]
+fn worker_rechecks_the_deadline_after_fact_store_operations() {
+    let repository_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repository_dir.path().join("src")).unwrap();
+    std::fs::write(
+        repository_dir.path().join("src/lib.rs"),
+        b"pub struct Api;\nimpl Api { pub fn run(&self) {} }\n",
+    )
+    .unwrap();
+    commit_repository(repository_dir.path());
+    let config = RepositoryGraphConfig::default();
+    let identities = builtin_extractor_identities();
+    let context =
+        SourceDiscoveryContext::from_config(local_repository(), &config, &identities).unwrap();
+    let source = LocalRepositorySource::discover(repository_dir.path(), context).unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mut objects = object_store(&storage_dir.path().join("objects"));
+    let manifest = package_repository_source(
+        &source,
+        remote_repository(),
+        RepositoryPackagingPolicy {
+            schema_version: 1,
+            source_policy_digest: config.source_policy_digest().unwrap(),
+        },
+        packaging_limits(),
+        &mut objects,
+    )
+    .unwrap();
+    let mut jobs = coordinator(&storage_dir.path().join("jobs.db"));
+    let running = running_job(
+        &mut jobs,
+        IndexJobKind::RepositoryGraph,
+        IndexInputRef::Repository(manifest.reference.clone()),
+        IndexSemantics {
+            semantic_config_digest: manifest.body.source_revision.analysis_config_digest.clone(),
+            model_version: NonZeroU32::new(GRAPH_MODEL_VERSION).unwrap(),
+            extractor_set_digest: manifest.body.extractor_set_digest.clone(),
+        },
+    );
+    let request = execution_request(running);
+    let mut limits = worker_limits();
+    limits.max_job_duration_ms = NonZeroU64::new(1_000).unwrap();
+    let worker = StatelessIndexWorker::new(limits);
+    let delay = Duration::from_millis(1_100);
+
+    let mut delayed_put = DelayedFactStore::new(
+        fact_store(&storage_dir.path().join("delayed-put-facts.db")),
+        delay,
+        true,
+        false,
+    );
+    assert_eq!(
+        worker.execute(&request, &jobs, &objects, &mut delayed_put),
+        Err(WorkerError::DeadlineExceeded)
+    );
+    assert_eq!(delayed_put.put_calls, 1);
+
+    let mut delayed_progress = DelayedFactStore::new(
+        fact_store(&storage_dir.path().join("delayed-progress-facts.db")),
+        delay,
+        false,
+        true,
+    );
+    assert_eq!(
+        worker.execute(&request, &jobs, &objects, &mut delayed_progress),
+        Err(WorkerError::DeadlineExceeded)
+    );
+    assert_eq!(delayed_progress.progress_calls.get(), 1);
 }
 
 #[test]
