@@ -303,6 +303,15 @@ fn worker_deadline_budget_is_terminal_and_clamped_between_attempts() {
         remaining_duration_ms(100, 101),
         Err(WorkerError::DeadlineExceeded)
     );
+    let now = Utc::now();
+    assert_eq!(
+        effective_worker_duration_ms(30_000, now, now + chrono::Duration::milliseconds(250)),
+        Ok(250)
+    );
+    assert_eq!(
+        effective_worker_duration_ms(30_000, now, now - chrono::Duration::milliseconds(1)),
+        Err(WorkerError::DeadlineExceeded)
+    );
 
     let context = ExtractionContext {
         snapshot_id: crate::repository_graph::domain::SnapshotId::new("snapshot").unwrap(),

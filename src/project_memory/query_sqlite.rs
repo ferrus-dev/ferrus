@@ -827,18 +827,28 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             .iter()
             .map(|item| item.entity.id.clone())
             .collect::<BTreeSet<_>>();
-        let relationships = assembly
-            .relationships
-            .into_iter()
-            .filter(|relationship| {
-                returned_ids.contains(&relationship.source)
-                    || matches!(
-                        &relationship.target,
-                        MemoryRelationshipTarget::MemoryEntity { entity_id }
-                            if returned_ids.contains(entity_id)
-                    )
-            })
-            .collect();
+        let mut relationships = Vec::new();
+        for relationship in assembly.relationships.into_iter().filter(|relationship| {
+            returned_ids.contains(&relationship.source)
+                || matches!(
+                    &relationship.target,
+                    MemoryRelationshipTarget::MemoryEntity { entity_id }
+                        if returned_ids.contains(entity_id)
+                )
+        }) {
+            if items.len().saturating_add(relationships.len()) >= scope.budget.max_results as usize
+            {
+                reason = Some(MemoryTruncationReason::Results);
+                break;
+            }
+            let bytes = serialized_len(&relationship)?;
+            if returned_bytes.saturating_add(bytes) > scope.budget.max_bytes {
+                reason = Some(MemoryTruncationReason::Bytes);
+                break;
+            }
+            returned_bytes = returned_bytes.saturating_add(bytes);
+            relationships.push(relationship);
+        }
         let (diagnostics, diagnostics_timed_out) =
             self.diagnostics_with_deadline(&scope, started)?;
         if diagnostics_timed_out {
@@ -846,7 +856,7 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         }
         let page = memory_page(
             reason,
-            items.len(),
+            items.len().saturating_add(relationships.len()),
             returned_bytes,
             assembly.explored_depth,
             has_more,

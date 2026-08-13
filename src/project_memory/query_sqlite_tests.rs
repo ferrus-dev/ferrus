@@ -412,7 +412,7 @@ fn search_candidate_ranking_stops_when_the_deadline_expires() {
 }
 
 #[test]
-fn context_bounds_relationship_expansion_by_the_effective_result_limit() {
+fn context_counts_relationships_against_the_effective_result_limit() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =
         open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
@@ -439,10 +439,81 @@ fn context_bounds_relationship_expansion_by_the_effective_result_limit() {
         })
         .unwrap();
 
-    assert_eq!(response.relationships.len(), 1);
+    assert!(
+        response
+            .items
+            .len()
+            .saturating_add(response.relationships.len())
+            <= 1
+    );
+    assert_eq!(response.relationships.len(), 0);
     assert_eq!(
         response.page.truncation.map(|value| value.reason),
         Some(MemoryTruncationReason::Results)
+    );
+}
+
+#[test]
+fn context_counts_relationships_against_the_effective_byte_limit() {
+    let (_root, data, project, _) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let request = |scope| MemoryContextRequest {
+        scope,
+        seeds: vec![MemoryContextSeed::Milestone(
+            MemoryRecordId::new("rg-test").unwrap(),
+        )],
+        policy: super::super::query::MemoryContextPolicy {
+            direction: crate::repository_graph::query::EdgeDirection::Both,
+            relationship_kinds: vec![],
+            include_unresolved: false,
+            include_stale: false,
+            include_snippets: false,
+        },
+        page: MemoryPageRequest::default(),
+    };
+    let complete = query
+        .context(request(published_scope(project.clone(), &limits)))
+        .unwrap();
+    assert!(!complete.relationships.is_empty());
+    let item_bytes = complete
+        .items
+        .iter()
+        .map(serialized_len)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .sum::<u64>();
+    let mut constrained_scope = published_scope(project, &limits);
+    constrained_scope.budget.max_bytes = std::num::NonZeroU64::new(item_bytes).unwrap();
+
+    let constrained = query.context(request(constrained_scope)).unwrap();
+    let returned_bytes = constrained
+        .items
+        .iter()
+        .map(serialized_len)
+        .chain(constrained.relationships.iter().map(serialized_len))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .sum::<u64>();
+    assert!(returned_bytes <= item_bytes);
+    assert_eq!(
+        constrained
+            .page
+            .truncation
+            .as_ref()
+            .map(|value| value.returned_bytes),
+        Some(returned_bytes)
+    );
+    assert_eq!(
+        constrained.page.truncation.map(|value| value.reason),
+        Some(MemoryTruncationReason::Bytes)
     );
 }
 

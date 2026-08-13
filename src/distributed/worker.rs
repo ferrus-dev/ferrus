@@ -174,6 +174,12 @@ pub struct StatelessIndexWorker {
     limits: WorkerLimits,
 }
 
+#[derive(Clone, Copy)]
+struct WorkerDeadline {
+    started: Instant,
+    limit_ms: u64,
+}
+
 struct MemoryExtractionOutput {
     target: FactTarget,
     entities: Vec<MemoryEntity>,
@@ -206,6 +212,14 @@ impl StatelessIndexWorker {
     {
         let started = Instant::now();
         self.validate_request(request)?;
+        let deadline = WorkerDeadline {
+            started,
+            limit_ms: effective_worker_duration_ms(
+                self.limits.max_job_duration_ms.get(),
+                Utc::now(),
+                request.job.deadline_at,
+            )?,
+        };
         let object_protection = objects.protection();
         if !object_protection.authenticated_transport || !object_protection.encrypted_at_rest {
             return Err(WorkerError::InvalidSandbox);
@@ -218,7 +232,7 @@ impl StatelessIndexWorker {
                 let bytes = objects
                     .read_verified(&reference.manifest_object)
                     .map_err(|_| WorkerError::SourceUnavailable)?;
-                self.check_object_bytes(bytes.len(), started)?;
+                self.check_object_bytes(bytes.len(), deadline)?;
                 let body: RepositorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 let diagnostics =
@@ -239,7 +253,7 @@ impl StatelessIndexWorker {
                     .validate::<(), ()>()
                     .map_err(|_| WorkerError::InvalidInput)?;
                 let (target, fragment) =
-                    self.extract_repository(request, coordinator, objects, &manifest, started)?;
+                    self.extract_repository(request, coordinator, objects, &manifest, deadline)?;
                 (
                     target,
                     graph_payloads(fragment, self.limits.max_facts_per_batch)?,
@@ -249,7 +263,7 @@ impl StatelessIndexWorker {
                 let bytes = objects
                     .read_verified(&reference.manifest_object)
                     .map_err(|_| WorkerError::SourceUnavailable)?;
-                self.check_object_bytes(bytes.len(), started)?;
+                self.check_object_bytes(bytes.len(), deadline)?;
                 let body: MemorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 self.check_manifest_limits(
@@ -268,7 +282,7 @@ impl StatelessIndexWorker {
                     .validate::<(), ()>()
                     .map_err(|_| WorkerError::InvalidInput)?;
                 let extracted =
-                    self.extract_memory(request, coordinator, objects, &manifest, started)?;
+                    self.extract_memory(request, coordinator, objects, &manifest, deadline)?;
                 (
                     extracted.target,
                     memory_payloads(
@@ -300,7 +314,7 @@ impl StatelessIndexWorker {
         let mut output_bytes = 0u64;
         let last = payloads.len().saturating_sub(1);
         for (index, payload) in payloads.into_iter().enumerate() {
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             self.authorize(request, coordinator)?;
             let sequence = u32::try_from(index).map_err(|_| WorkerError::OutputLimitExceeded)?;
             let batch = FactBatch::new(
@@ -326,7 +340,7 @@ impl StatelessIndexWorker {
                 return Err(WorkerError::OutputLimitExceeded);
             }
             let put = facts.put(&batch).map_err(|_| WorkerError::FactStore)?;
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             match put {
                 PutFactBatchOutcome::Stored => stored_batches += 1,
                 PutFactBatchOutcome::Reused => reused_batches += 1,
@@ -335,7 +349,7 @@ impl StatelessIndexWorker {
         let progress = facts
             .progress(&request.job.job)
             .map_err(|_| WorkerError::FactStore)?;
-        self.check_deadline(started)?;
+        self.check_deadline(deadline)?;
         if !progress_is_complete(&progress) {
             return Err(WorkerError::FactStore);
         }
@@ -399,7 +413,7 @@ impl StatelessIndexWorker {
         coordinator: &C,
         objects: &O,
         remote: &RepositorySourceManifest,
-        started: Instant,
+        deadline: WorkerDeadline,
     ) -> Result<(FactTarget, GraphFragment), WorkerError>
     where
         C: IndexJobCoordinator,
@@ -475,7 +489,7 @@ impl StatelessIndexWorker {
         let mut extracted_facts = 0u64;
         let mut extracted_diagnostics = 0u64;
         if active.generic_enabled {
-            let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
+            let remaining_job_duration_ms = self.remaining_job_duration_ms(deadline)?;
             let extraction_context = extraction_context_for_attempt(
                 &context,
                 remaining_diagnostics(&self.limits, extracted_diagnostics),
@@ -483,7 +497,7 @@ impl StatelessIndexWorker {
             );
             let fragment =
                 GenericExtractor::new().repository_fragment(&extraction_context, &manifest);
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             reserve_extracted_diagnostics(
                 &mut extracted_diagnostics,
                 fragment.diagnostics.len(),
@@ -533,7 +547,7 @@ impl StatelessIndexWorker {
         let extractors: [&dyn DynExtractor; 3] = [&generic, &cargo, &rust];
         for (remote_file, file) in remote.body.files.iter().zip(&manifest.files) {
             let mut source_facts = 0u64;
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             self.authorize(request, coordinator)?;
             if remote_file.byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
@@ -541,7 +555,7 @@ impl StatelessIndexWorker {
             let content = objects
                 .read_verified(&remote_file.object)
                 .map_err(|_| WorkerError::SourceUnavailable)?;
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             if content.len() as u64 != file.byte_len {
                 return Err(WorkerError::SourceUnavailable);
             }
@@ -551,7 +565,7 @@ impl StatelessIndexWorker {
                 .filter(|item| active.file_ids.contains(item.identity().id.as_str()))
                 .filter(|item| item.supports(file))
             {
-                let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
+                let remaining_job_duration_ms = self.remaining_job_duration_ms(deadline)?;
                 let extraction_context = extraction_context_for_attempt(
                     &context,
                     remaining_diagnostics(&self.limits, extracted_diagnostics),
@@ -564,7 +578,7 @@ impl StatelessIndexWorker {
                         content: &content,
                     })
                     .map_err(|_| WorkerError::ExtractionFailed)?;
-                self.check_deadline(started)?;
+                self.check_deadline(deadline)?;
                 reserve_extracted_diagnostics(
                     &mut extracted_diagnostics,
                     fragment.diagnostics.len(),
@@ -595,7 +609,7 @@ impl StatelessIndexWorker {
             .get()
             .saturating_sub(unresolved_facts);
         let graph = if active.resolver_enabled {
-            let remaining_job_duration_ms = self.remaining_job_duration_ms(started)?;
+            let remaining_job_duration_ms = self.remaining_job_duration_ms(deadline)?;
             ConservativeResolver::new()
                 .resolve(CrossFileResolutionInput {
                     context: &context,
@@ -622,7 +636,7 @@ impl StatelessIndexWorker {
         if graph.diagnostics.len() as u64 > self.limits.max_diagnostics.get() {
             return Err(WorkerError::OutputLimitExceeded);
         }
-        self.check_deadline(started)?;
+        self.check_deadline(deadline)?;
         Ok((
             FactTarget::RepositoryGraph {
                 snapshot: RemoteGraphSnapshotRef {
@@ -641,7 +655,7 @@ impl StatelessIndexWorker {
         coordinator: &C,
         objects: &O,
         remote: &MemorySourceManifest,
-        started: Instant,
+        deadline: WorkerDeadline,
     ) -> Result<MemoryExtractionOutput, WorkerError>
     where
         C: IndexJobCoordinator,
@@ -705,7 +719,7 @@ impl StatelessIndexWorker {
         let mut diagnostics = Vec::new();
         let mut extracted_facts = 0u64;
         for (remote_source, source) in remote.body.sources.iter().zip(&manifest.sources) {
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             self.authorize(request, coordinator)?;
             if remote_source.sanitized_byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
@@ -713,7 +727,7 @@ impl StatelessIndexWorker {
             let content = objects
                 .read_verified(&remote_source.object)
                 .map_err(|_| WorkerError::SourceUnavailable)?;
-            self.check_deadline(started)?;
+            self.check_deadline(deadline)?;
             if content.len() as u64 != remote_source.sanitized_byte_len {
                 return Err(WorkerError::SourceUnavailable);
             }
@@ -726,14 +740,14 @@ impl StatelessIndexWorker {
             let mut extraction_context = context.clone();
             extraction_context.max_parser_duration_ms = extraction_context
                 .max_parser_duration_ms
-                .min(self.remaining_job_duration_ms(started)?);
+                .min(self.remaining_job_duration_ms(deadline)?);
             match extractor.extract(MemoryExtractionInput {
                 context: &extraction_context,
                 source,
                 content: &content,
             }) {
                 Ok(fragment) => {
-                    self.check_deadline(started)?;
+                    self.check_deadline(deadline)?;
                     let source_facts = memory_fragment_fact_count(&fragment)?;
                     if source_facts > self.limits.max_facts_per_source.get() {
                         return Err(WorkerError::OutputLimitExceeded);
@@ -746,7 +760,7 @@ impl StatelessIndexWorker {
                     merge_memory_fragment(&mut entities, &mut relationships, fragment)?;
                 }
                 Err(failure) => {
-                    self.check_deadline(started)?;
+                    self.check_deadline(deadline)?;
                     if diagnostics.len() as u64 >= self.limits.max_diagnostics.get() {
                         return Err(WorkerError::OutputLimitExceeded);
                     }
@@ -768,7 +782,7 @@ impl StatelessIndexWorker {
                 }
             }
         }
-        self.check_deadline(started)?;
+        self.check_deadline(deadline)?;
         Ok(MemoryExtractionOutput {
             target: FactTarget::ProjectMemory {
                 revision: RemoteMemoryRevisionRef {
@@ -798,20 +812,24 @@ impl StatelessIndexWorker {
         Ok(())
     }
 
-    fn check_object_bytes(&self, bytes: usize, started: Instant) -> Result<(), WorkerError> {
+    fn check_object_bytes(
+        &self,
+        bytes: usize,
+        deadline: WorkerDeadline,
+    ) -> Result<(), WorkerError> {
         if bytes as u64 > self.limits.max_object_bytes.get() {
             return Err(WorkerError::InputLimitExceeded);
         }
-        self.check_deadline(started)
+        self.check_deadline(deadline)
     }
 
-    fn check_deadline(&self, started: Instant) -> Result<(), WorkerError> {
-        self.remaining_job_duration_ms(started).map(|_| ())
+    fn check_deadline(&self, deadline: WorkerDeadline) -> Result<(), WorkerError> {
+        self.remaining_job_duration_ms(deadline).map(|_| ())
     }
 
-    fn remaining_job_duration_ms(&self, started: Instant) -> Result<u64, WorkerError> {
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        remaining_duration_ms(self.limits.max_job_duration_ms.get(), elapsed_ms)
+    fn remaining_job_duration_ms(&self, deadline: WorkerDeadline) -> Result<u64, WorkerError> {
+        let elapsed_ms = u64::try_from(deadline.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        remaining_duration_ms(deadline.limit_ms, elapsed_ms)
     }
 }
 
@@ -867,6 +885,23 @@ fn remaining_duration_ms(limit_ms: u64, elapsed_ms: u64) -> Result<u64, WorkerEr
     limit_ms
         .checked_sub(elapsed_ms)
         .filter(|remaining| *remaining > 0)
+        .ok_or(WorkerError::DeadlineExceeded)
+}
+
+fn effective_worker_duration_ms(
+    local_limit_ms: u64,
+    now: chrono::DateTime<Utc>,
+    durable_deadline: chrono::DateTime<Utc>,
+) -> Result<u64, WorkerError> {
+    let durable_remaining_ms = u64::try_from(
+        durable_deadline
+            .signed_duration_since(now)
+            .num_milliseconds(),
+    )
+    .map_err(|_| WorkerError::DeadlineExceeded)?;
+    let effective = local_limit_ms.min(durable_remaining_ms);
+    (effective > 0)
+        .then_some(effective)
         .ok_or(WorkerError::DeadlineExceeded)
 }
 
