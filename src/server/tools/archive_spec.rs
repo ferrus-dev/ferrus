@@ -79,7 +79,7 @@ fn validate_input(input: ArchiveSpecInput) -> Result<ArchiveSpecInput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
 
     #[test]
@@ -107,7 +107,8 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (Json<ArchiveSpecInput>,) = params.try_into().unwrap();
+        let (input,): (Json<ArchiveSpecInput>,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
         let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.spec_path, "docs/specs/example.md");

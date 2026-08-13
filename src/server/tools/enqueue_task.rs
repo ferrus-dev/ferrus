@@ -121,7 +121,7 @@ fn validate_input(input: EnqueueTaskInput) -> Result<EnqueueTaskInput> {
 mod tests {
     use super::*;
     use crate::project::LocalProjectRef;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -207,7 +207,8 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (Json<EnqueueTaskInput>,) = params.try_into().unwrap();
+        let (input,): (Json<EnqueueTaskInput>,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
         let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.description, "Build task");
@@ -225,7 +226,8 @@ mod tests {
             )])),
             meta: None,
         };
-        let result: std::result::Result<(Json<EnqueueTaskInput>,), Error> = params.try_into();
+        let result: std::result::Result<(Json<EnqueueTaskInput>,), Error> =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"]));
         let err = result.unwrap_err();
 
         assert!(err.to_string().contains("invalid type: string"));

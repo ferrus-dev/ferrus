@@ -241,7 +241,7 @@ fn requested_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
 
     #[test]
@@ -283,7 +283,8 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
+        let (input,): (serde_json::Value,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
         let input = parse_input(input).unwrap();
 
         assert_eq!(input.query, "RuntimeTaskContext");
