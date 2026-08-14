@@ -12,7 +12,8 @@ use crate::{
             ArchiveSourceDocument, RuntimeSourceDocument, parse_spec_memory, sanitized_spec_source,
         },
         domain::{
-            AuthorizedSourceDescriptor, MemorySourceCategory, MemorySourceLocator, ProjectRef,
+            AuthorizedSourceDescriptor, AuthorizedSourceManifest, MemorySourceCategory,
+            MemorySourceLocator, ProjectRef,
         },
         extractors::canonical_digest as memory_canonical_digest,
         policy::{MemoryContentAccess, MemoryPolicy, MemorySourceSensitivity},
@@ -20,6 +21,7 @@ use crate::{
     },
     repository_graph::{
         domain::{DiagnosticCode, Digest, RepoPath, SourceKind, SourceRevision},
+        index::{snapshot_identity, snapshot_identity_from_revision},
         ports::{RepositorySource, SourceFileDescriptor, SourceFileMode},
     },
 };
@@ -94,6 +96,10 @@ impl RepositorySourceManifest {
             || !is_canonical_committed_revision(&self.body.source_revision)
             || self.body.repository != self.reference.repository
             || self.body.source_policy_digest != self.reference.source_policy_digest
+            || snapshot_identity_from_revision(
+                &self.body.source_revision,
+                &self.body.extractor_set_digest,
+            ) != self.reference.expected_snapshot_id
             || !self
                 .body
                 .files
@@ -164,12 +170,34 @@ impl MemorySourceManifest {
         &self,
     ) -> Result<(), PackagingError<SourceError, StoreError>> {
         let approved_policy = MemoryPolicy::default();
+        let authorized_manifest = AuthorizedSourceManifest {
+            project: self.body.project_identity.clone(),
+            policy_digest: self.body.memory_policy_digest.clone(),
+            source_set_digest: self.body.source_set_digest.clone(),
+            extractor_set_digest: self.body.extractor_set_digest.clone(),
+            sources: self
+                .body
+                .sources
+                .iter()
+                .map(|source| AuthorizedSourceDescriptor {
+                    project: self.body.project_identity.clone(),
+                    category: source.category,
+                    locator: source.locator.clone(),
+                    fingerprint: source.source_fingerprint.clone(),
+                    byte_len: source.sanitized_byte_len,
+                })
+                .collect(),
+        };
+        let expected_revision_id = authorized_manifest
+            .revision_id()
+            .map_err(|_| PackagingError::InvalidManifest)?;
         if self.body.protocol_version != DISTRIBUTED_SOURCE_MANIFEST_VERSION
             || self.body.policy_schema_version
                 != crate::project_memory::policy::MEMORY_POLICY_SCHEMA_VERSION
             || self.body.project != self.reference.project
             || self.body.project_identity != self.reference.project_identity
             || self.body.memory_policy_digest != self.reference.memory_policy_digest
+            || expected_revision_id != self.reference.expected_revision_id
             || self.body.memory_policy_digest != approved_policy.digest()
             || self.body.sources.iter().any(|source| {
                 source.object.project != self.reference.project
@@ -303,6 +331,7 @@ where
         return Err(PackagingError::ContentIdentityMismatch);
     }
 
+    let expected_snapshot_id = snapshot_identity(local);
     let body = RepositorySourceManifestBody {
         protocol_version: DISTRIBUTED_SOURCE_MANIFEST_VERSION,
         repository: repository.clone(),
@@ -328,6 +357,7 @@ where
             .map_err(|_| PackagingError::InvalidManifest)?,
         manifest_digest,
         source_policy_digest: policy.source_policy_digest,
+        expected_snapshot_id,
         manifest_object,
     };
     let manifest = RepositorySourceManifest { reference, body };
@@ -403,6 +433,9 @@ where
     }
     source.revalidate(&local).map_err(PackagingError::Source)?;
 
+    let expected_revision_id = local
+        .revision_id()
+        .map_err(|_| PackagingError::InvalidManifest)?;
     let body = MemorySourceManifestBody {
         protocol_version: DISTRIBUTED_SOURCE_MANIFEST_VERSION,
         project: project.clone(),
@@ -435,6 +468,7 @@ where
             .map_err(|_| PackagingError::InvalidManifest)?,
         manifest_digest,
         memory_policy_digest: local.policy_digest,
+        expected_revision_id,
         manifest_object,
     };
     let manifest = MemorySourceManifest { reference, body };

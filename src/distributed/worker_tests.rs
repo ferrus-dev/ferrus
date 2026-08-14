@@ -777,6 +777,7 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
             .collect(),
     };
     forged_sources.source_set_digest = forged_sources.computed_source_set_digest().unwrap();
+    let expected_revision_id = forged_sources.revision_id().unwrap();
     forged.body.source_set_digest = forged_sources.source_set_digest;
     let encoded_manifest = serde_json::to_vec(&forged.body).unwrap();
     let manifest_digest = Digest::new(
@@ -789,6 +790,7 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
     .unwrap();
     forged.reference.manifest_id = MemoryManifestId::new(manifest_digest.value()).unwrap();
     forged.reference.manifest_digest = manifest_digest.clone();
+    forged.reference.expected_revision_id = expected_revision_id;
     forged.reference.manifest_object = objects
         .put_verified(
             &forged.reference.project,

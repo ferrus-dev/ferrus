@@ -351,7 +351,9 @@ impl SqliteRemotePublicationStore {
             || job.spec.semantics.extractor_set_digest != prepared.record.extractor_set_digest
             || !matches!(
                 &job.spec.input,
-                IndexInputRef::Repository(manifest) if manifest.repository == request.repository
+                IndexInputRef::Repository(manifest)
+                    if manifest.repository == request.repository
+                        && manifest.expected_snapshot_id == request.snapshot_id
             )
         {
             return Err(RemoteStoreError::InvalidInput);
@@ -432,6 +434,7 @@ impl SqliteRemotePublicationStore {
                 IndexInputRef::Memory(manifest)
                     if manifest.project == request.project
                         && manifest.project_identity == prepared.project_identity
+                        && manifest.expected_revision_id == request.revision_id
             )
         {
             return Err(RemoteStoreError::InvalidInput);

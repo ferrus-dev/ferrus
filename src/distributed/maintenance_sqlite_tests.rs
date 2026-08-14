@@ -36,7 +36,7 @@ use super::{
     },
 };
 use crate::{
-    project_memory::domain::{ProjectId, ProjectNamespace, ProjectRef},
+    project_memory::domain::{MemoryRevisionId, ProjectId, ProjectNamespace, ProjectRef},
     repository_graph::domain::{BuildId, Digest, SnapshotId},
 };
 
@@ -137,6 +137,7 @@ fn submit_job(
         manifest_id: RepositoryManifestId::new(format!("manifest-{suffix}")).unwrap(),
         manifest_digest: object.content_identity.clone(),
         source_policy_digest: digest("22"),
+        expected_snapshot_id: SnapshotId::new(format!("snapshot-{suffix}")).unwrap(),
         manifest_object: object.clone(),
     });
     let job = IndexJobSpec::new(
@@ -176,6 +177,7 @@ fn submit_memory_job(
         manifest_id: MemoryManifestId::new(format!("memory-manifest-{suffix}")).unwrap(),
         manifest_digest: object.content_identity.clone(),
         memory_policy_digest: digest("22"),
+        expected_revision_id: MemoryRevisionId::new(format!("memory-{suffix}")).unwrap(),
         manifest_object: object.clone(),
     });
     let job = IndexJobSpec::new(

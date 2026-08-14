@@ -134,6 +134,7 @@ pub struct RepositoryManifestRef {
     pub manifest_id: RepositoryManifestId,
     pub manifest_digest: Digest,
     pub source_policy_digest: Digest,
+    pub expected_snapshot_id: SnapshotId,
     pub manifest_object: TenantObjectRef,
 }
 
@@ -157,6 +158,7 @@ pub struct MemoryManifestRef {
     pub manifest_id: MemoryManifestId,
     pub manifest_digest: Digest,
     pub memory_policy_digest: Digest,
+    pub expected_revision_id: MemoryRevisionId,
     pub manifest_object: TenantObjectRef,
 }
 

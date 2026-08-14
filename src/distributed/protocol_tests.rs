@@ -87,6 +87,7 @@ fn repository_input(tenant: &str) -> IndexInputRef {
         manifest_id: RepositoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),
         source_policy_digest: digest("22"),
+        expected_snapshot_id: SnapshotId::new("snapshot-input").unwrap(),
         manifest_object: TenantObjectRef {
             project: project(tenant),
             object_id: ObjectId::new("11").unwrap(),
@@ -127,6 +128,7 @@ fn memory_input(tenant: &str) -> IndexInputRef {
         manifest_id: MemoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),
         memory_policy_digest: digest("22"),
+        expected_revision_id: MemoryRevisionId::new("memory-input").unwrap(),
         manifest_object: TenantObjectRef {
             project: project(tenant),
             object_id: ObjectId::new("11").unwrap(),
@@ -169,9 +171,21 @@ fn idempotency_is_deterministic_kind_specific_and_tenant_scoped() {
         semantics(),
     )
     .unwrap();
+    let mut changed_target_input = repository_input("tenant-a");
+    let IndexInputRef::Repository(manifest) = &mut changed_target_input else {
+        unreachable!("repository input helper always returns a repository manifest");
+    };
+    manifest.expected_snapshot_id = SnapshotId::new("snapshot-other").unwrap();
+    let changed_target = IndexJobSpec::new(
+        IndexJobKind::RepositoryGraph,
+        changed_target_input,
+        semantics(),
+    )
+    .unwrap();
     assert_eq!(first.idempotency_key, repeated.idempotency_key);
     assert_ne!(first.idempotency_key, foreign.idempotency_key);
     assert_ne!(first.idempotency_key, memory.idempotency_key);
+    assert_ne!(first.idempotency_key, changed_target.idempotency_key);
     assert!(first.validate().is_ok());
 }
 

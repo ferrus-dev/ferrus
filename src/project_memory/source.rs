@@ -547,18 +547,15 @@ fn discover_archives(
     project: &ProjectRef,
     materials: &mut Vec<SourceMaterial>,
 ) -> Result<()> {
-    let root = data_dir.join("archive").join("specs");
-    let Ok(entries) = fs::read_dir(&root) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    for archive_dir in durable_archive_directories(data_dir)? {
+        let Some(archive_id) = archive_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
             continue;
-        }
-        let archive_id = entry.file_name().to_string_lossy().to_string();
+        };
         MemoryRecordId::new(&archive_id)?;
-        let manifest_path = entry.path().join("manifest.toml");
+        let manifest_path = archive_dir.join("manifest.toml");
         let metadata = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata)
                 if metadata.file_type().is_file()
@@ -587,8 +584,8 @@ fn discover_archives(
             archive_id: archive_id.clone(),
             spec_path: RepoPath::new(raw.spec_path)?,
             archived_at: raw.archived_at,
-            task_count: count_regular_files(&entry.path().join("tasks"))?,
-            run_count: count_directories(&entry.path().join("runs"))?,
+            task_count: count_regular_files(&archive_dir.join("tasks"))?,
+            run_count: count_directories(&archive_dir.join("runs"))?,
             task_ids,
             milestone_ids,
         };
@@ -610,6 +607,42 @@ fn discover_archives(
         }
     }
     Ok(())
+}
+
+fn durable_archive_directories(data_dir: &Path) -> Result<Vec<PathBuf>> {
+    let database_path = data_dir.join("ferrus.db");
+    let archive_root = data_dir.join("archive").join("specs");
+    if !database_path.is_file() || !archive_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let archive_root = fs::canonicalize(archive_root)?;
+    let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_archive_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spec_archives')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_archive_table {
+        return Ok(Vec::new());
+    }
+
+    let mut statement = connection.prepare("SELECT archive_dir FROM spec_archives ORDER BY id")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut directories = BTreeSet::new();
+    let mut archive_count = 0usize;
+    for row in rows {
+        archive_count += 1;
+        if archive_count > MAX_SOURCES {
+            anyhow::bail!("durable archive record limit exceeded");
+        }
+        let Ok(directory) = fs::canonicalize(row?) else {
+            continue;
+        };
+        if directory != archive_root && directory.starts_with(&archive_root) && directory.is_dir() {
+            directories.insert(directory);
+        }
+    }
+    Ok(directories.into_iter().collect())
 }
 
 fn discover_runtime(
@@ -1015,6 +1048,44 @@ mod tests {
                 .iter()
                 .all(|source| { source.category != MemorySourceCategory::ApprovedOutcome })
         );
+    }
+
+    #[test]
+    fn archive_manifest_sources_require_durable_archive_records() {
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init_git(root.path());
+        let spec_path = "docs/specs/example.md";
+        let spec_content = "# Example\n\n## Outcome\n\nApproved.\n";
+        record_approved_outcome_for_test(data.path(), spec_path, spec_content);
+
+        let orphan = data.path().join("archive/specs/orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(
+            orphan.join("manifest.toml"),
+            "spec_path = \"docs/specs/orphan.md\"\narchived_at = \"2026-08-14T00:00:00Z\"\ntasks = []\n",
+        )
+        .unwrap();
+
+        let source = LocalMemorySource::discover_at(
+            root.path().to_path_buf(),
+            data.path().to_path_buf(),
+            project_ref(),
+            RepoPath::new("docs/specs").unwrap(),
+            MemoryPolicy::default(),
+        )
+        .unwrap();
+        let archive_ids = source
+            .manifest
+            .sources
+            .iter()
+            .filter_map(|source| match &source.locator {
+                MemorySourceLocator::ArchiveManifest { archive_id } => Some(archive_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(archive_ids, vec!["proof-1"]);
     }
 
     #[test]

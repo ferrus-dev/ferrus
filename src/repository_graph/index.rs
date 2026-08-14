@@ -731,13 +731,20 @@ struct SnapshotIdentity<'a> {
 }
 
 pub fn snapshot_identity(manifest: &SourceManifest) -> SnapshotId {
+    snapshot_identity_from_revision(&manifest.revision, &manifest.extractor_set_digest)
+}
+
+pub fn snapshot_identity_from_revision(
+    revision: &super::domain::SourceRevision,
+    extractor_set_digest: &super::domain::Digest,
+) -> SnapshotId {
     let identity = SnapshotIdentity {
         version: 1,
-        repository: &manifest.revision.repository,
-        source_manifest_digest: &manifest.revision.manifest_digest,
+        repository: &revision.repository,
+        source_manifest_digest: &revision.manifest_digest,
         graph_model_version: GRAPH_MODEL_VERSION,
-        analysis_config_digest: &manifest.revision.analysis_config_digest,
-        extractor_set_digest: &manifest.extractor_set_digest,
+        analysis_config_digest: &revision.analysis_config_digest,
+        extractor_set_digest,
     };
     let bytes = serde_json::to_vec(&identity)
         .expect("canonical snapshot identity serialization cannot fail");

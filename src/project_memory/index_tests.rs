@@ -725,7 +725,19 @@ archived_run_dir = "runs/t-1"
                     baseline_snapshot_id TEXT, repository_view_snapshot_id TEXT); \
                  CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT, baseline_snapshot_id TEXT, \
                     repository_view_snapshot_id TEXT); \
-                 CREATE TABLE events(id INTEGER, run_id TEXT, type TEXT, payload_json TEXT);",
+                 CREATE TABLE events(id INTEGER, run_id TEXT, type TEXT, payload_json TEXT); \
+                 CREATE TABLE spec_archives(\
+                    id INTEGER PRIMARY KEY, spec_path TEXT, archive_dir TEXT, closed_at TEXT, \
+                    task_count INTEGER, run_count INTEGER, outcome TEXT\
+                 );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO spec_archives VALUES (\
+                1, 'docs/specs/example.md', ?1, '2026-08-03T00:00:00Z', 1, 1, ''\
+             )",
+            [archive.to_string_lossy().as_ref()],
         )
         .unwrap();
     connection

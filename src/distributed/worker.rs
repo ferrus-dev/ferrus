@@ -471,6 +471,9 @@ impl StatelessIndexWorker {
             },
         };
         let snapshot_id = snapshot_identity(&manifest);
+        if snapshot_id != remote.reference.expected_snapshot_id {
+            return Err(WorkerError::InvalidInput);
+        }
         let build_id = BuildId::new(format!("remote-build:{}", request.job.job.job_id))
             .map_err(|_| WorkerError::InvalidInput)?;
         let context = ExtractionContext {
@@ -699,6 +702,9 @@ impl StatelessIndexWorker {
                 .map_err(|_| WorkerError::InvalidInput)?;
         let revision = MemoryRevision::from_manifest(&manifest, build_id.clone())
             .map_err(|_| WorkerError::InvalidInput)?;
+        if revision.id != remote.reference.expected_revision_id {
+            return Err(WorkerError::InvalidInput);
+        }
         let context = MemoryExtractionContext {
             project: manifest.project.clone(),
             revision_id: revision.id.clone(),

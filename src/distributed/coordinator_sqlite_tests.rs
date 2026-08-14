@@ -9,7 +9,7 @@ use crate::{
         },
         protocol::{IndexInputRef, IndexSemantics},
     },
-    repository_graph::domain::Digest,
+    repository_graph::domain::{Digest, SnapshotId},
 };
 
 fn digest(value: &str) -> Digest {
@@ -33,6 +33,7 @@ fn submit_request(tenant: &str) -> SubmitIndexJobRequest {
         manifest_id: RepositoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),
         source_policy_digest: digest("22"),
+        expected_snapshot_id: SnapshotId::new("snapshot-input").unwrap(),
         manifest_object: TenantObjectRef {
             project: project.clone(),
             object_id: ObjectId::new("11").unwrap(),

@@ -27,12 +27,12 @@ use crate::{
     },
     project_memory::{
         domain::{
-            MemoryBuildId, MemoryConfidence, MemoryEntityData, MemoryEntityId,
-            MemoryEvidenceLocator, MemoryExtractorId, MemoryExtractorIdentity,
-            MemoryIndexTimestamps, MemoryProvenance, MemoryRecordId, MemoryRelationshipId,
-            MemoryRelationshipKind, MemoryResolutionState, MemoryRevisionId, MemorySourceCategory,
-            MemorySourceLocator, MemoryStatusToken, MemoryText, ProjectId, ProjectNamespace,
-            ProjectRef,
+            AuthorizedSourceDescriptor, AuthorizedSourceManifest, MemoryBuildId, MemoryConfidence,
+            MemoryEntityData, MemoryEntityId, MemoryEvidenceLocator, MemoryExtractorId,
+            MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance, MemoryRecordId,
+            MemoryRelationshipId, MemoryRelationshipKind, MemoryResolutionState,
+            MemorySourceCategory, MemorySourceLocator, MemoryStatusToken, MemoryText, ProjectId,
+            ProjectNamespace, ProjectRef,
         },
         policy::{
             MEMORY_POLICY_SCHEMA_VERSION, MemoryContentAccess, MemoryPolicy,
@@ -226,12 +226,17 @@ fn repository_manifest(
         .put_verified(&project(), &manifest_digest, &encoded)
         .unwrap()
         .object;
+    let expected_snapshot_id = crate::repository_graph::index::snapshot_identity_from_revision(
+        &body.source_revision,
+        &body.extractor_set_digest,
+    );
     let manifest = RepositorySourceManifest {
         reference: super::super::identity::RepositoryManifestRef {
             repository: repository(),
             manifest_id: RepositoryManifestId::new(manifest_digest.value()).unwrap(),
             manifest_digest,
             source_policy_digest: digest("11"),
+            expected_snapshot_id,
             manifest_object,
         },
         body,
@@ -248,12 +253,31 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
         .put_verified(&project(), &content_identity, content)
         .unwrap()
         .object;
+    let source_descriptor = AuthorizedSourceDescriptor {
+        project: local_project(),
+        category: MemorySourceCategory::ApprovedOutcome,
+        locator: MemorySourceLocator::TrackedFile {
+            path: RepoPath::new("docs/spec.md").unwrap(),
+        },
+        fingerprint: digest("23"),
+        byte_len: content.len() as u64,
+    };
+    let mut authorized_manifest = AuthorizedSourceManifest {
+        project: local_project(),
+        policy_digest: policy_digest.clone(),
+        source_set_digest: digest("22"),
+        extractor_set_digest: digest("44"),
+        sources: vec![source_descriptor],
+    };
+    authorized_manifest.source_set_digest =
+        authorized_manifest.computed_source_set_digest().unwrap();
+    let expected_revision_id = authorized_manifest.revision_id().unwrap();
     let body = MemorySourceManifestBody {
         protocol_version: DISTRIBUTED_SOURCE_MANIFEST_VERSION,
         project: project(),
         memory_policy_digest: policy_digest.clone(),
         project_identity: local_project(),
-        source_set_digest: digest("22"),
+        source_set_digest: authorized_manifest.source_set_digest,
         extractor_set_digest: digest("44"),
         policy_schema_version: MEMORY_POLICY_SCHEMA_VERSION,
         sources: vec![MemorySourceObject {
@@ -286,6 +310,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
             manifest_id: MemoryManifestId::new(manifest_digest.value()).unwrap(),
             manifest_digest,
             memory_policy_digest: policy_digest,
+            expected_revision_id,
             manifest_object,
         },
         body,
@@ -385,7 +410,7 @@ fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixtu
         IndexJobKind::RepositoryGraph,
         "graph",
     );
-    let snapshot_id = SnapshotId::new("snapshot-query").unwrap();
+    let snapshot_id = repository_manifest.reference.expected_snapshot_id.clone();
     let node_id = NodeId::new("node-important").unwrap();
     let child_id = NodeId::new("node-child").unwrap();
     let provenance = FactProvenance {
@@ -474,7 +499,7 @@ fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixtu
         IndexJobKind::ProjectMemory,
         "memory",
     );
-    let revision_id = MemoryRevisionId::new("memory-query").unwrap();
+    let revision_id = memory_manifest.reference.expected_revision_id.clone();
     let entity = MemoryEntity {
         project: local_project(),
         memory_revision_id: revision_id.clone(),

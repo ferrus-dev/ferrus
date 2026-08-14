@@ -75,7 +75,7 @@ fn store(path: &Path) -> SqliteRemotePublicationStore {
     SqliteRemotePublicationStore::open(path, [53; 32], limits(), true).unwrap()
 }
 
-fn input(kind: IndexJobKind, tenant: &str, unique: &str) -> IndexInputRef {
+fn input(kind: IndexJobKind, tenant: &str, unique: &str, target: &str) -> IndexInputRef {
     let project = project(tenant);
     let identity = digest(unique);
     let object = TenantObjectRef {
@@ -90,6 +90,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str) -> IndexInputRef {
                 manifest_id: RepositoryManifestId::new(identity.value()).unwrap(),
                 manifest_digest: identity,
                 source_policy_digest: digest("22"),
+                expected_snapshot_id: SnapshotId::new(target).unwrap(),
                 manifest_object: object,
             })
         }
@@ -100,6 +101,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str) -> IndexInputRef {
                 manifest_id: MemoryManifestId::new(identity.value()).unwrap(),
                 manifest_digest: identity,
                 memory_policy_digest: digest("22"),
+                expected_revision_id: MemoryRevisionId::new(target).unwrap(),
                 manifest_object: object,
             })
         }
@@ -110,11 +112,12 @@ fn publishing_job(
     coordinator: &mut SqliteIndexJobCoordinator,
     kind: IndexJobKind,
     unique: &str,
+    target: &str,
 ) -> super::super::protocol::IndexJobRecord {
     let now = Utc::now();
     let spec = IndexJobSpec::new(
         kind,
-        input(kind, "tenant-a", unique),
+        input(kind, "tenant-a", unique, target),
         IndexSemantics {
             semantic_config_digest: digest("33"),
             model_version: std::num::NonZeroU32::new(1).unwrap(),
@@ -294,7 +297,12 @@ fn memory_publication_rejects_a_target_from_another_logical_project() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "19");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "19",
+        "memory-project-revision",
+    );
     let request = memory_request(&job, "memory-project-revision", None);
     let batch =
         memory_batch_for_project(&job.job, "memory-project-revision", foreign_local_project());
@@ -306,11 +314,70 @@ fn memory_publication_rejects_a_target_from_another_logical_project() {
 }
 
 #[test]
+fn graph_publication_rejects_a_target_not_bound_to_the_job_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1e",
+        "snapshot-expected",
+    );
+    let request = graph_request(&job, "snapshot-forged", None);
+    let batch = graph_batch(&job.job, "snapshot-forged", "internally-consistent");
+    let mut store = store(&path);
+
+    assert!(matches!(
+        store.publish_graph(&request, &[batch], Utc::now()),
+        Err(RemoteStoreError::InvalidInput)
+    ));
+    assert!(
+        store
+            .graph_view(&request.repository, &request.view_name)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn memory_publication_rejects_a_target_not_bound_to_the_job_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "1f",
+        "memory-expected",
+    );
+    let request = memory_request(&job, "memory-forged", None);
+    let batch = memory_batch(&job.job, "memory-forged");
+    let mut store = store(&path);
+
+    assert!(matches!(
+        store.publish_memory(&request, &[batch], Utc::now()),
+        Err(RemoteStoreError::InvalidInput)
+    ));
+    assert!(
+        store
+            .memory_view(&request.project, &request.view_name)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn graph_publication_is_atomic_encrypted_and_completes_the_job() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "11");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "11",
+        "snapshot-one",
+    );
     let request = graph_request(&job, "snapshot-one", None);
     let batch = graph_batch(&job.job, "snapshot-one", "private-symbol-name");
     let mut store = store(&path);
@@ -359,7 +426,12 @@ fn project_deletion_tombstone_rejects_publication() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1d");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1d",
+        "snapshot-deleted",
+    );
     let request = graph_request(&job, "snapshot-deleted", None);
     let batch = graph_batch(&job.job, "snapshot-deleted", "private-symbol-name");
     let mut store = store(&path);
@@ -397,7 +469,12 @@ fn partial_stream_and_cancelled_publication_remain_invisible() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "12");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "12",
+        "snapshot-partial",
+    );
     let request = graph_request(&job, "snapshot-partial", None);
     let batch = graph_batch_with_final(&job.job, "snapshot-partial", "private", false);
     let mut store = store(&path);
@@ -444,7 +521,12 @@ fn stale_graph_cas_cannot_replace_the_current_pointer() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let first_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "13");
+    let first_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "13",
+        "snapshot-first",
+    );
     let first_request = graph_request(&first_job, "snapshot-first", None);
     let mut store = store(&path);
     store
@@ -455,7 +537,12 @@ fn stale_graph_cas_cannot_replace_the_current_pointer() {
         )
         .unwrap();
 
-    let old_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "14");
+    let old_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "14",
+        "snapshot-old",
+    );
     let old_request = graph_request(&old_job, "snapshot-old", None);
     let outcome = store
         .publish_graph(
@@ -506,7 +593,12 @@ fn stale_memory_cas_target_is_retained_but_not_query_visible() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let first_job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "14a");
+    let first_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "14a",
+        "revision-first",
+    );
     let first_request = memory_request(&first_job, "revision-first", None);
     let mut store = store(&path);
     store
@@ -517,7 +609,12 @@ fn stale_memory_cas_target_is_retained_but_not_query_visible() {
         )
         .unwrap();
 
-    let old_job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "14b");
+    let old_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "14b",
+        "revision-old",
+    );
     let old_request = memory_request(&old_job, "revision-old", None);
     let outcome = store
         .publish_memory(
@@ -555,8 +652,18 @@ fn concurrent_graph_publishers_with_one_expectation_choose_one_winner() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let left_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "17");
-    let right_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "18");
+    let left_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "17",
+        "snapshot-left",
+    );
+    let right_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "18",
+        "snapshot-right",
+    );
     let left_request = graph_request(&left_job, "snapshot-left", None);
     let right_request = graph_request(&right_job, "snapshot-right", None);
     let left_batch = graph_batch(&left_job.job, "snapshot-left", "left");
@@ -604,7 +711,12 @@ fn same_snapshot_is_reused_only_after_expected_pointer_matches() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let first_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "19");
+    let first_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "19",
+        "snapshot-reused",
+    );
     let first_request = graph_request(&first_job, "snapshot-reused", None);
     let mut store = store(&path);
     let first = store
@@ -618,7 +730,12 @@ fn same_snapshot_is_reused_only_after_expected_pointer_matches() {
         panic!("initial publication must win");
     };
 
-    let retry_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1a");
+    let retry_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1a",
+        "snapshot-reused",
+    );
     let retry_request = graph_request(
         &retry_job,
         "snapshot-reused",
@@ -648,7 +765,12 @@ fn previously_published_snapshot_remains_query_visible_after_view_advances() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let first_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "19a");
+    let first_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "19a",
+        "snapshot-history-first",
+    );
     let first_request = graph_request(&first_job, "snapshot-history-first", None);
     let mut store = store(&path);
     let first_outcome = store
@@ -666,7 +788,12 @@ fn previously_published_snapshot_remains_query_visible_after_view_advances() {
         panic!("initial publication must win");
     };
 
-    let next_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "19b");
+    let next_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "19b",
+        "snapshot-history-next",
+    );
     let next_request = graph_request(
         &next_job,
         "snapshot-history-next",
@@ -703,7 +830,12 @@ fn encrypted_fact_tampering_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1b");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1b",
+        "snapshot-tampered",
+    );
     let request = graph_request(&job, "snapshot-tampered", None);
     let mut store = store(&path);
     store
@@ -734,7 +866,12 @@ fn bounded_snapshot_reads_stop_after_the_deadline() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1c");
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1c",
+        "snapshot-deadline",
+    );
     let request = graph_request(&job, "snapshot-deadline", None);
     let mut store = store(&path);
     store
@@ -762,7 +899,12 @@ fn graph_and_memory_pointers_advance_independently_and_form_explicit_pair() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
-    let graph_job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "15");
+    let graph_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "15",
+        "snapshot-pair",
+    );
     let graph_request = graph_request(&graph_job, "snapshot-pair", None);
     let mut store = store(&path);
     store
@@ -772,7 +914,12 @@ fn graph_and_memory_pointers_advance_independently_and_form_explicit_pair() {
             Utc::now(),
         )
         .unwrap();
-    let memory_job = publishing_job(&mut coordinator, IndexJobKind::ProjectMemory, "16");
+    let memory_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "16",
+        "revision-pair",
+    );
     let memory_request = memory_request(&memory_job, "revision-pair", None);
     store
         .publish_memory(

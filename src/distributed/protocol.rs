@@ -101,6 +101,13 @@ impl IndexInputRef {
         }
     }
 
+    fn expected_target_identity(&self) -> &str {
+        match self {
+            Self::Repository(manifest) => manifest.expected_snapshot_id.as_str(),
+            Self::Memory(manifest) => manifest.expected_revision_id.as_str(),
+        }
+    }
+
     fn validate(&self) -> Result<(), DistributedProtocolError> {
         let result = match self {
             Self::Repository(manifest) => manifest.validate(),
@@ -135,6 +142,7 @@ struct IdempotencyMaterial<'a> {
     kind: IndexJobKind,
     manifest_digest: &'a Digest,
     policy_digest: &'a Digest,
+    expected_target_identity: &'a str,
     semantics: &'a IndexSemantics,
 }
 
@@ -187,6 +195,7 @@ fn idempotency_key(
             kind,
             manifest_digest: input.manifest_digest(),
             policy_digest: input.policy_digest(),
+            expected_target_identity: input.expected_target_identity(),
             semantics,
         },
     )
