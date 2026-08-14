@@ -408,7 +408,14 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
         Some(_) => return Err(RemoteStoreError::IncompatibleSchema),
     }
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS remote_immutable_revisions (
+        "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             deletion_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id)
+         );
+         CREATE TABLE IF NOT EXISTS remote_immutable_revisions (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
              domain TEXT NOT NULL CHECK (domain IN ('repository_graph', 'project_memory')),

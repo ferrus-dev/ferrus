@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -46,9 +46,9 @@ use super::{
     fact_store::{FactBatchProgress, FactBatchStore, PutFactBatchOutcome},
     identity::{
         FactShardId, IndexJobFailureCode, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef,
-        RequestId, WorkerId,
+        RequestId, TenantObjectRef, WorkerId,
     },
-    object_store::TenantObjectStore,
+    object_store::{BoundedObjectRead, TenantObjectStore},
     protocol::{
         FactBatch, FactBatchPayload, FactTarget, IndexInputRef, IndexJobRecord, IndexJobState,
         InspectIndexJobRequest,
@@ -229,10 +229,8 @@ impl StatelessIndexWorker {
 
         let (target, payloads) = match &request.job.spec.input {
             IndexInputRef::Repository(reference) => {
-                let bytes = objects
-                    .read_verified(&reference.manifest_object)
-                    .map_err(|_| WorkerError::SourceUnavailable)?;
-                self.check_object_bytes(bytes.len(), deadline)?;
+                let bytes =
+                    self.read_manifest_object(objects, &reference.manifest_object, deadline)?;
                 let body: RepositorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 let diagnostics =
@@ -260,10 +258,8 @@ impl StatelessIndexWorker {
                 )
             }
             IndexInputRef::Memory(reference) => {
-                let bytes = objects
-                    .read_verified(&reference.manifest_object)
-                    .map_err(|_| WorkerError::SourceUnavailable)?;
-                self.check_object_bytes(bytes.len(), deadline)?;
+                let bytes =
+                    self.read_manifest_object(objects, &reference.manifest_object, deadline)?;
                 let body: MemorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 self.check_manifest_limits(
@@ -814,6 +810,29 @@ impl StatelessIndexWorker {
             return Err(WorkerError::InputLimitExceeded);
         }
         Ok(())
+    }
+
+    fn read_manifest_object<O: TenantObjectStore>(
+        &self,
+        objects: &O,
+        object: &TenantObjectRef,
+        deadline: WorkerDeadline,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let read_deadline = deadline
+            .started
+            .checked_add(Duration::from_millis(deadline.limit_ms))
+            .ok_or(WorkerError::DeadlineExceeded)?;
+        match objects
+            .read_verified_bounded(object, self.limits.max_object_bytes.get(), read_deadline)
+            .map_err(|_| WorkerError::SourceUnavailable)?
+        {
+            BoundedObjectRead::Content(bytes) => {
+                self.check_object_bytes(bytes.len(), deadline)?;
+                Ok(bytes)
+            }
+            BoundedObjectRead::DeadlineExceeded => Err(WorkerError::DeadlineExceeded),
+            BoundedObjectRead::SizeExceeded => Err(WorkerError::InputLimitExceeded),
+        }
     }
 
     fn check_object_bytes(

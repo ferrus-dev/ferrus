@@ -14,7 +14,7 @@ use super::{
     coordinator::IndexJobCoordinator,
     coordinator_sqlite::{CoordinatorLimits, SqliteIndexJobCoordinator},
     fact_store::FactBatchStore,
-    fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
+    fact_store_sqlite::{FactStoreError, FactStoreQuota, SqliteFactBatchStore},
     identity::{
         CredentialId, DeletionId, FactShardId, MemoryManifestId, PrincipalId,
         RemoteGraphSnapshotRef, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
@@ -498,6 +498,40 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
     ));
     assert_eq!(objects.read_verified(&fixture.object_b).unwrap(), SOURCE);
     drop(objects);
+
+    let object_database = fixture.object_root.join("object-store.db");
+    for path in [
+        fixture.control_path.as_path(),
+        fixture.fact_path.as_path(),
+        object_database.as_path(),
+    ] {
+        assert_eq!(
+            table_count(path, "project_deletion_tombstones", &fixture.project_a),
+            1
+        );
+        assert_eq!(
+            table_count(path, "project_deletion_tombstones", &fixture.project_b),
+            0
+        );
+    }
+
+    let mut objects =
+        EncryptedFilesystemObjectStore::open(&fixture.object_root, KEY, object_quota(), true)
+            .unwrap();
+    assert!(matches!(
+        objects.put_verified(
+            &fixture.project_a,
+            &digest_bytes(b"new source after deletion"),
+            b"new source after deletion",
+        ),
+        Err(ObjectStoreError::ProjectDeleted)
+    ));
+    let mut facts =
+        SqliteFactBatchStore::open(&fixture.fact_path, KEY, fact_quota(), true).unwrap();
+    assert!(matches!(
+        facts.put(&batch(&fixture.graph_job_a, "after-deletion")),
+        Err(FactStoreError::ProjectDeleted)
+    ));
 
     let repeated = full_request(&fixture.project_a, "delete-a-retry", "delete-a-retry");
     let repeated = fixture

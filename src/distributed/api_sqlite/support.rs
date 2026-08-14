@@ -1271,9 +1271,9 @@ pub(super) fn control_backend_error(
     let (code, retryable) = match error {
         CoordinatorError::InvalidRequest => (RemoteErrorCode::InvalidRequest, false),
         CoordinatorError::NotFound => (RemoteErrorCode::NotFound, false),
-        CoordinatorError::Conflict | CoordinatorError::LeaseLost => {
-            (RemoteErrorCode::Conflict, false)
-        }
+        CoordinatorError::Conflict
+        | CoordinatorError::LeaseLost
+        | CoordinatorError::ProjectDeleted => (RemoteErrorCode::Conflict, false),
         CoordinatorError::Cancelled => (RemoteErrorCode::Cancelled, false),
         CoordinatorError::IncompatibleSchema => (RemoteErrorCode::UnsupportedVersion, false),
         CoordinatorError::Database(_) => (RemoteErrorCode::TemporarilyUnavailable, true),
@@ -1337,6 +1337,7 @@ pub(super) fn query_object_error(request_id: &RequestId, error: ObjectStoreError
         | ObjectStoreError::ObjectUnavailable => {
             remote_error(request_id, RemoteErrorCode::TemporarilyUnavailable, true)
         }
+        ObjectStoreError::ProjectDeleted => query_not_found(request_id),
         ObjectStoreError::InsecureProtection
         | ObjectStoreError::ContentIdentityMismatch
         | ObjectStoreError::ObjectQuotaExceeded

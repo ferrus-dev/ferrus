@@ -42,6 +42,8 @@ pub enum CoordinatorError {
     LeaseLost,
     #[error("distributed index job was cancelled")]
     Cancelled,
+    #[error("distributed project has a durable full-deletion tombstone")]
+    ProjectDeleted,
     #[error("distributed coordinator schema is incompatible")]
     IncompatibleSchema,
     #[error("distributed coordinator database operation failed")]
@@ -166,6 +168,9 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if project_has_deletion_tombstone(&transaction, &request.project)? {
+            return Err(CoordinatorError::ProjectDeleted);
+        }
         if let Some(existing) = load_record(&transaction, &job)? {
             if existing.spec != request.job {
                 return Err(CoordinatorError::Conflict);
@@ -682,7 +687,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), CoordinatorError> {
         Some(_) => return Err(CoordinatorError::IncompatibleSchema),
     }
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS distributed_index_jobs (
+        "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             deletion_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id)
+         );
+         CREATE TABLE IF NOT EXISTS distributed_index_jobs (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
              job_id TEXT NOT NULL,
@@ -708,6 +720,21 @@ fn initialize_schema(connection: &Connection) -> Result<(), CoordinatorError> {
              ON distributed_index_jobs (tenant_id, project_id, kind, state, created_at_ms);",
     )?;
     Ok(())
+}
+
+fn project_has_deletion_tombstone(
+    connection: &Connection,
+    project: &super::identity::RemoteProjectRef,
+) -> Result<bool, CoordinatorError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM project_deletion_tombstones
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            params![project.tenant_id.as_str(), project.project_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn kind_token(kind: IndexJobKind) -> &'static str {

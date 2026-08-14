@@ -136,6 +136,7 @@ impl SqliteRemoteMaintenance {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
         if let Some(existing) = load_by_idempotency(&transaction, deletion)? {
+            install_control_tombstone(&transaction, &existing.request, now)?;
             transaction
                 .commit()
                 .map_err(|_| MaintenanceStoreError::Unavailable)?;
@@ -173,6 +174,7 @@ impl SqliteRemoteMaintenance {
                 ],
             )
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
+        install_control_tombstone(&transaction, deletion, now)?;
         transaction
             .commit()
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
@@ -210,14 +212,14 @@ impl SqliteRemoteMaintenance {
             };
             counts.add(
                 AuditCounter::Objects,
-                delete_project_objects(&self.object_root, project)?,
+                delete_project_objects(&self.object_root, deletion, project, now)?,
             );
             self.record_progress(deletion, &mut counts, now)?;
         }
         if deletion.coverage.contains(&RetentionClass::UnpublishedFact) {
             counts.add(
                 AuditCounter::FactBatches,
-                delete_unpublished_facts(&self.fact_path, &deletion.target, &repository_jobs)?,
+                delete_unpublished_facts(&self.fact_path, deletion, &repository_jobs, now)?,
             );
             self.record_progress(deletion, &mut counts, now)?;
         }
@@ -506,13 +508,17 @@ fn authorize_deletion(
 
 fn delete_project_objects(
     object_root: &Path,
+    deletion: &DeleteDataRequest,
     project: &RemoteProjectRef,
+    now: DateTime<Utc>,
 ) -> Result<u64, MaintenanceStoreError> {
     let mut connection = open_existing(&object_root.join("object-store.db"))?;
     ensure_schema(&connection, "object_store_metadata", 1)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| MaintenanceStoreError::Unavailable)?;
+    initialize_tombstone_schema(&transaction)?;
+    install_store_tombstone(&transaction, deletion, now)?;
     let count = count(
         &transaction,
         "SELECT COUNT(*) FROM source_objects WHERE tenant_id = ?1 AND project_id = ?2",
@@ -541,15 +547,18 @@ fn delete_project_objects(
 
 fn delete_unpublished_facts(
     fact_path: &Path,
-    target: &DeletionTarget,
+    deletion: &DeleteDataRequest,
     repository_jobs: &[String],
+    now: DateTime<Utc>,
 ) -> Result<u64, MaintenanceStoreError> {
     let mut connection = open_existing(fact_path)?;
     ensure_schema(&connection, "fact_store_metadata", 1)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| MaintenanceStoreError::Unavailable)?;
-    let deleted = match target {
+    initialize_tombstone_schema(&transaction)?;
+    install_store_tombstone(&transaction, deletion, now)?;
+    let deleted = match &deletion.target {
         DeletionTarget::Project(project) => transaction
             .execute(
                 "DELETE FROM unpublished_fact_batches
@@ -581,6 +590,61 @@ fn delete_unpublished_facts(
         .commit()
         .map_err(|_| MaintenanceStoreError::Unavailable)?;
     u64::try_from(deleted).map_err(|_| MaintenanceStoreError::IntegrityFailure)
+}
+
+fn is_full_project_deletion(deletion: &DeleteDataRequest) -> bool {
+    matches!(deletion.target, DeletionTarget::Project(_))
+        && RetentionClass::ALL
+            .iter()
+            .all(|class| deletion.coverage.contains(class))
+}
+
+fn initialize_tombstone_schema(connection: &Connection) -> Result<(), MaintenanceStoreError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+                 tenant_id TEXT NOT NULL,
+                 project_id TEXT NOT NULL,
+                 deletion_id TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (tenant_id, project_id)
+             );",
+        )
+        .map_err(|_| MaintenanceStoreError::Unavailable)
+}
+
+fn install_control_tombstone(
+    transaction: &Transaction<'_>,
+    deletion: &DeleteDataRequest,
+    now: DateTime<Utc>,
+) -> Result<(), MaintenanceStoreError> {
+    install_store_tombstone(transaction, deletion, now)
+}
+
+fn install_store_tombstone(
+    connection: &Connection,
+    deletion: &DeleteDataRequest,
+    now: DateTime<Utc>,
+) -> Result<(), MaintenanceStoreError> {
+    if !is_full_project_deletion(deletion) {
+        return Ok(());
+    }
+    let project = deletion.target.project();
+    connection
+        .execute(
+            "INSERT INTO project_deletion_tombstones (
+                 tenant_id, project_id, deletion_id, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (tenant_id, project_id) DO NOTHING",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                deletion.deletion_id.as_str(),
+                now.timestamp_millis()
+            ],
+        )
+        .map(|_| ())
+        .map_err(|_| MaintenanceStoreError::Unavailable)
 }
 
 fn repository_jobs_have_unpublished_facts(
@@ -1091,6 +1155,13 @@ fn initialize_schema(connection: &Connection) -> Result<(), MaintenanceStoreErro
             "CREATE TABLE IF NOT EXISTS remote_maintenance_metadata (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  schema_version INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+                 tenant_id TEXT NOT NULL,
+                 project_id TEXT NOT NULL,
+                 deletion_id TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (tenant_id, project_id)
              );
              CREATE TABLE IF NOT EXISTS remote_deletions (
                  tenant_id TEXT NOT NULL,

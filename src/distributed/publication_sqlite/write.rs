@@ -391,6 +391,21 @@ pub(super) fn require_publication_authority(
     lease_generation: NonZeroU64,
     now: DateTime<Utc>,
 ) -> Result<JobAuthority, RemoteStoreError> {
+    if transaction
+        .query_row(
+            "SELECT 1 FROM project_deletion_tombstones
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            params![
+                job.project.tenant_id.as_str(),
+                job.project.project_id.as_str()
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(RemoteStoreError::ProjectDeleted);
+    }
     let record = transaction
         .query_row(
             "SELECT kind, spec_json, state, cancellation_requested, lease_worker_id,

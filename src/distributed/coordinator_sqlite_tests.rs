@@ -116,6 +116,32 @@ fn repeated_submission_converges_and_survives_reopen() {
 }
 
 #[test]
+fn project_deletion_tombstone_rejects_new_job_submissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("coordinator.db");
+    let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(3)).unwrap();
+    let project = project("tenant-a");
+    coordinator
+        .connection
+        .execute(
+            "INSERT INTO project_deletion_tombstones (
+                 tenant_id, project_id, deletion_id, created_at_ms
+             ) VALUES (?1, ?2, 'delete-project', ?3)",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                now().timestamp_millis()
+            ],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        coordinator.submit(&submit_request("tenant-a"), now()),
+        Err(CoordinatorError::ProjectDeleted)
+    ));
+}
+
+#[test]
 fn concurrent_duplicate_submissions_create_one_durable_job() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("coordinator.db");

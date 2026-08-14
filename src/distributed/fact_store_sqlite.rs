@@ -42,6 +42,8 @@ pub enum FactStoreError {
     ProjectBatchQuotaExceeded,
     #[error("project fact-batch byte quota exceeded")]
     ProjectByteQuotaExceeded,
+    #[error("project has a durable full-deletion tombstone")]
+    ProjectDeleted,
     #[error("fact batch failed authenticated decryption or integrity verification")]
     IntegrityFailure,
     #[error("fact store schema is incompatible")]
@@ -193,6 +195,21 @@ impl FactBatchStore for SqliteFactBatchStore {
         let transaction = self
             .database
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM project_deletion_tombstones
+                 WHERE tenant_id = ?1 AND project_id = ?2",
+                params![
+                    batch.header.job.project.tenant_id.as_str(),
+                    batch.header.job.project.project_id.as_str()
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(FactStoreError::ProjectDeleted);
+        }
         let logical_existing = transaction
             .query_row(
                 "SELECT batch_id, nonce, ciphertext FROM unpublished_fact_batches
@@ -327,7 +344,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), FactStoreError> {
         Some(_) => return Err(FactStoreError::IncompatibleSchema),
     }
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS unpublished_fact_batches (
+        "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             deletion_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id)
+         );
+         CREATE TABLE IF NOT EXISTS unpublished_fact_batches (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
              job_id TEXT NOT NULL,
@@ -478,6 +502,29 @@ mod tests {
         assert!(matches!(
             completed.put(&batch("tenant-a", 1, false)),
             Err(FactStoreError::SequenceConflict)
+        ));
+    }
+
+    #[test]
+    fn project_deletion_tombstone_rejects_new_fact_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store =
+            SqliteFactBatchStore::open(directory.path().join("facts.db"), [39; 32], quota(), true)
+                .unwrap();
+        let project = project("tenant-a");
+        store
+            .database
+            .execute(
+                "INSERT INTO project_deletion_tombstones (
+                     tenant_id, project_id, deletion_id, created_at_ms
+                 ) VALUES (?1, ?2, 'delete-project', 1)",
+                params![project.tenant_id.as_str(), project.project_id.as_str()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.put(&batch("tenant-a", 0, true)),
+            Err(FactStoreError::ProjectDeleted)
         ));
     }
 

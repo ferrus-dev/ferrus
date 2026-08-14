@@ -355,6 +355,44 @@ fn graph_publication_is_atomic_encrypted_and_completes_the_job() {
 }
 
 #[test]
+fn project_deletion_tombstone_rejects_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let job = publishing_job(&mut coordinator, IndexJobKind::RepositoryGraph, "1d");
+    let request = graph_request(&job, "snapshot-deleted", None);
+    let batch = graph_batch(&job.job, "snapshot-deleted", "private-symbol-name");
+    let mut store = store(&path);
+    store
+        .connection
+        .execute(
+            "INSERT INTO project_deletion_tombstones (
+                 tenant_id, project_id, deletion_id, created_at_ms
+             ) VALUES (?1, ?2, 'delete-project', ?3)",
+            params![
+                request.job.project.tenant_id.as_str(),
+                request.job.project.project_id.as_str(),
+                Utc::now().timestamp_millis()
+            ],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.publish_graph(&request, &[batch], Utc::now()),
+        Err(RemoteStoreError::ProjectDeleted)
+    ));
+    assert!(
+        store
+            .graph_snapshot(&RemoteGraphSnapshotRef {
+                repository: request.repository,
+                snapshot_id: request.snapshot_id,
+            })
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn partial_stream_and_cancelled_publication_remain_invisible() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");

@@ -98,6 +98,8 @@ pub enum RemoteStoreError {
     InvalidInput,
     #[error("remote publication job is unavailable, cancelled, expired, or lost its lease")]
     AuthorityLost,
+    #[error("remote project has a durable full-deletion tombstone")]
+    ProjectDeleted,
     #[error("remote immutable target conflicts with existing facts")]
     ImmutableConflict,
     #[error("remote fact identities conflict or relationships reference missing facts")]

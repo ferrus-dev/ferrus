@@ -49,6 +49,13 @@ pub struct PutObjectResult {
     pub outcome: PutObjectOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedObjectRead {
+    Content(Vec<u8>),
+    DeadlineExceeded,
+    SizeExceeded,
+}
+
 pub trait TenantObjectStore {
     type Error;
 
@@ -60,6 +67,12 @@ pub trait TenantObjectStore {
         content: &[u8],
     ) -> Result<PutObjectResult, Self::Error>;
     fn read_verified(&self, object: &TenantObjectRef) -> Result<Vec<u8>, Self::Error>;
+    fn read_verified_bounded(
+        &self,
+        object: &TenantObjectRef,
+        max_bytes: u64,
+        deadline: Instant,
+    ) -> Result<BoundedObjectRead, Self::Error>;
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +87,8 @@ pub enum ObjectStoreError {
     ProjectObjectQuotaExceeded,
     #[error("project source-byte quota exceeded")]
     ProjectByteQuotaExceeded,
+    #[error("project has a durable full-deletion tombstone")]
+    ProjectDeleted,
     #[error("tenant object is unavailable or outside the requested scope")]
     ObjectUnavailable,
     #[error("tenant object failed authenticated decryption or integrity verification")]
@@ -182,30 +197,47 @@ impl EncryptedFilesystemObjectStore {
             .is_some())
     }
 
-    fn decrypt_file_until(
+    fn decrypt_file_bounded(
         key: &LessSafeKey,
         object: &TenantObjectRef,
         path: &Path,
         deadline: Option<Instant>,
-    ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+        max_plaintext_bytes: Option<u64>,
+    ) -> Result<BoundedObjectRead, ObjectStoreError> {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+            return Ok(BoundedObjectRead::DeadlineExceeded);
         }
         let mut encoded = Vec::new();
         let mut file = File::open(path)?;
+        let max_encoded_bytes = max_plaintext_bytes.map(|limit| {
+            limit.saturating_add(
+                u64::try_from(ENVELOPE_MAGIC.len() + NONCE_BYTES + AES_256_GCM.tag_len())
+                    .unwrap_or(u64::MAX),
+            )
+        });
+        if let Some(limit) = max_encoded_bytes
+            && file.metadata()?.len() > limit
+        {
+            return Ok(BoundedObjectRead::SizeExceeded);
+        }
         let mut buffer = [0u8; 64 * 1024];
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(None);
+                return Ok(BoundedObjectRead::DeadlineExceeded);
             }
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
+            if max_encoded_bytes.is_some_and(|limit| {
+                u64::try_from(encoded.len().saturating_add(read)).unwrap_or(u64::MAX) > limit
+            }) {
+                return Ok(BoundedObjectRead::SizeExceeded);
+            }
             encoded.extend_from_slice(&buffer[..read]);
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+            return Ok(BoundedObjectRead::DeadlineExceeded);
         }
         if encoded.len() < ENVELOPE_MAGIC.len() + NONCE_BYTES + AES_256_GCM.tag_len()
             || &encoded[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC
@@ -218,19 +250,24 @@ impl EncryptedFilesystemObjectStore {
             .map_err(|_| ObjectStoreError::IntegrityFailure)?;
         let mut payload = encoded[payload_start..].to_vec();
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+            return Ok(BoundedObjectRead::DeadlineExceeded);
         }
         let plaintext = key
             .open_in_place(nonce, Aad::from(Self::aad(object)), &mut payload)
             .map_err(|_| ObjectStoreError::IntegrityFailure)?;
         let plaintext = plaintext.to_vec();
+        if max_plaintext_bytes
+            .is_some_and(|limit| u64::try_from(plaintext.len()).unwrap_or(u64::MAX) > limit)
+        {
+            return Ok(BoundedObjectRead::SizeExceeded);
+        }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+            return Ok(BoundedObjectRead::DeadlineExceeded);
         }
         if !verify_digest_until(&object.content_identity, &plaintext, deadline)? {
-            return Ok(None);
+            return Ok(BoundedObjectRead::DeadlineExceeded);
         }
-        Ok(Some(plaintext))
+        Ok(BoundedObjectRead::Content(plaintext))
     }
 
     fn decrypt_file(
@@ -238,7 +275,12 @@ impl EncryptedFilesystemObjectStore {
         object: &TenantObjectRef,
         path: &Path,
     ) -> Result<Vec<u8>, ObjectStoreError> {
-        Self::decrypt_file_until(key, object, path, None)?.ok_or(ObjectStoreError::IntegrityFailure)
+        match Self::decrypt_file_bounded(key, object, path, None, None)? {
+            BoundedObjectRead::Content(content) => Ok(content),
+            BoundedObjectRead::DeadlineExceeded | BoundedObjectRead::SizeExceeded => {
+                Err(ObjectStoreError::IntegrityFailure)
+            }
+        }
     }
 
     fn write_encrypted(
@@ -311,7 +353,17 @@ impl EncryptedFilesystemObjectStore {
         if !exists {
             return Err(ObjectStoreError::ObjectUnavailable);
         }
-        Self::decrypt_file_until(&self.key, object, &self.object_path(object), Some(deadline))
+        match Self::decrypt_file_bounded(
+            &self.key,
+            object,
+            &self.object_path(object),
+            Some(deadline),
+            None,
+        )? {
+            BoundedObjectRead::Content(content) => Ok(Some(content)),
+            BoundedObjectRead::DeadlineExceeded => Ok(None),
+            BoundedObjectRead::SizeExceeded => Err(ObjectStoreError::IntegrityFailure),
+        }
     }
 }
 
@@ -346,6 +398,9 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         let transaction = self
             .database
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if project_has_deletion_tombstone(&transaction, project)? {
+            return Err(ObjectStoreError::ProjectDeleted);
+        }
         let existing = transaction
             .query_row(
                 "SELECT byte_len FROM source_objects
@@ -414,6 +469,65 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         }
         Self::decrypt_file(&self.key, object, &self.object_path(object))
     }
+
+    fn read_verified_bounded(
+        &self,
+        object: &TenantObjectRef,
+        max_bytes: u64,
+        deadline: Instant,
+    ) -> Result<BoundedObjectRead, Self::Error> {
+        if Instant::now() >= deadline {
+            return Ok(BoundedObjectRead::DeadlineExceeded);
+        }
+        let byte_len = self
+            .database
+            .query_row(
+                "SELECT byte_len FROM source_objects
+                 WHERE tenant_id = ?1 AND project_id = ?2 AND object_id = ?3
+                   AND digest_algorithm = ?4 AND digest_value = ?5",
+                params![
+                    object.project.tenant_id.as_str(),
+                    object.project.project_id.as_str(),
+                    object.object_id.as_str(),
+                    object.content_identity.algorithm(),
+                    object.content_identity.value()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if Instant::now() >= deadline {
+            return Ok(BoundedObjectRead::DeadlineExceeded);
+        }
+        let Some(byte_len) = byte_len else {
+            return Err(ObjectStoreError::ObjectUnavailable);
+        };
+        let byte_len = u64::try_from(byte_len).map_err(|_| ObjectStoreError::IntegrityFailure)?;
+        if byte_len > max_bytes {
+            return Ok(BoundedObjectRead::SizeExceeded);
+        }
+        Self::decrypt_file_bounded(
+            &self.key,
+            object,
+            &self.object_path(object),
+            Some(deadline),
+            Some(max_bytes),
+        )
+    }
+}
+
+fn project_has_deletion_tombstone(
+    connection: &Connection,
+    project: &RemoteProjectRef,
+) -> Result<bool, ObjectStoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM project_deletion_tombstones
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            params![project.tenant_id.as_str(), project.project_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), ObjectStoreError> {
@@ -452,7 +566,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), ObjectStoreError> {
         Some(_) => return Err(ObjectStoreError::IncompatibleSchema),
     }
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS source_objects (
+        "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             deletion_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id)
+         );
+         CREATE TABLE IF NOT EXISTS source_objects (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
              object_id TEXT NOT NULL,
@@ -582,6 +703,63 @@ mod tests {
                 .unwrap(),
             content
         );
+    }
+
+    #[test]
+    fn bounded_reads_reject_oversized_objects_before_returning_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store =
+            EncryptedFilesystemObjectStore::open(directory.path(), [10; 32], quota(), true)
+                .unwrap();
+        let content = b"manifest larger than worker limit";
+        let stored = store
+            .put_verified(&project("tenant-a"), &digest(content), content)
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            store
+                .read_verified_bounded(
+                    &stored.object,
+                    u64::try_from(content.len() - 1).unwrap(),
+                    deadline,
+                )
+                .unwrap(),
+            BoundedObjectRead::SizeExceeded
+        );
+        assert_eq!(
+            store
+                .read_verified_bounded(
+                    &stored.object,
+                    u64::try_from(content.len()).unwrap(),
+                    deadline,
+                )
+                .unwrap(),
+            BoundedObjectRead::Content(content.to_vec())
+        );
+    }
+
+    #[test]
+    fn project_deletion_tombstone_rejects_new_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store =
+            EncryptedFilesystemObjectStore::open(directory.path(), [11; 32], quota(), true)
+                .unwrap();
+        let project = project("tenant-a");
+        store
+            .database
+            .execute(
+                "INSERT INTO project_deletion_tombstones (
+                     tenant_id, project_id, deletion_id, created_at_ms
+                 ) VALUES (?1, ?2, 'delete-project', 1)",
+                params![project.tenant_id.as_str(), project.project_id.as_str()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.put_verified(&project, &digest(b"new source"), b"new source"),
+            Err(ObjectStoreError::ProjectDeleted)
+        ));
     }
 
     #[test]
