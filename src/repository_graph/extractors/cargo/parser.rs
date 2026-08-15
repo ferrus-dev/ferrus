@@ -85,6 +85,22 @@ pub(super) fn run_parser_with_deadline(
     run_parser_process(started, budget, source)
 }
 
+pub(super) fn run_parser_in_process_with_deadline(
+    started: Instant,
+    budget: Duration,
+    source: &str,
+) -> ParserDeadline {
+    if budget.saturating_sub(started.elapsed()).is_zero() {
+        return ParserDeadline::TimedOut;
+    }
+    let output = parse_manifest(source);
+    if started.elapsed() >= budget {
+        ParserDeadline::TimedOut
+    } else {
+        ParserDeadline::Completed(output)
+    }
+}
+
 pub(super) fn run_parser_process(
     started: Instant,
     budget: Duration,

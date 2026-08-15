@@ -40,12 +40,41 @@ const PARSER_WORKER_ARGUMENT: &str = "__ferrus-cargo-parser";
 const PARSER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Stateless Cargo manifest extractor.
+#[derive(Debug, Clone, Copy)]
+pub struct CargoExtractor {
+    parser_execution: ParserExecution,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CargoExtractor;
+enum ParserExecution {
+    #[default]
+    IsolatedProcess,
+    InProcessSandbox,
+}
+
+impl Default for CargoExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CargoExtractor {
     pub fn new() -> Self {
-        Self
+        Self {
+            parser_execution: ParserExecution::IsolatedProcess,
+        }
+    }
+
+    /// Uses the bundled parser without spawning a child process.
+    ///
+    /// This mode is for callers already running inside a hard CPU, memory, and
+    /// wall-clock sandbox, such as the distributed worker. The caller must
+    /// bound source bytes and enforce the outer deadline. Parser and fact
+    /// budgets are still checked before and after parsing and during traversal.
+    pub(crate) fn new_in_process_sandboxed() -> Self {
+        Self {
+            parser_execution: ParserExecution::InProcessSandbox,
+        }
     }
 }
 
@@ -91,7 +120,15 @@ impl Extractor for CargoExtractor {
         }
 
         let started = Instant::now();
-        let parsed = match run_parser_with_deadline(started, budget, source.to_owned()) {
+        let parsed = match self.parser_execution {
+            ParserExecution::IsolatedProcess => {
+                run_parser_with_deadline(started, budget, source.to_owned())
+            }
+            ParserExecution::InProcessSandbox => {
+                run_parser_in_process_with_deadline(started, budget, source)
+            }
+        };
+        let parsed = match parsed {
             ParserDeadline::Completed(ParserOutput::Parsed { manifest }) => manifest,
             ParserDeadline::Completed(ParserOutput::Malformed { span }) => {
                 diagnostics.push(

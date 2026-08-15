@@ -18,7 +18,7 @@ use super::{
 pub fn builtin_extractor_identities() -> Vec<ExtractorIdentity> {
     vec![
         generic::GenericExtractor.identity(),
-        cargo::CargoExtractor.identity(),
+        cargo::CargoExtractor::new().identity(),
         rust::RustSyntaxExtractor.identity(),
         super::resolution::resolver_identity(),
     ]

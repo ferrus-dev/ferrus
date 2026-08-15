@@ -541,7 +541,9 @@ impl StatelessIndexWorker {
         merger.merge(source_diagnostics)?;
 
         let generic = GenericExtractor::new();
-        let cargo = CargoExtractor::new();
+        // Remote workers already run inside the declared hard sandbox and
+        // cannot spawn the local extractor's parser subprocess.
+        let cargo = CargoExtractor::new_in_process_sandboxed();
         let rust = RustSyntaxExtractor::new();
         let extractors: [&dyn DynExtractor; 3] = [&generic, &cargo, &rust];
         for (remote_file, file) in remote.body.files.iter().zip(&manifest.files) {

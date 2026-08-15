@@ -30,7 +30,7 @@ fn fixture(path: &str, content: &[u8]) -> (ExtractionContext, SourceFileDescript
 
 fn extract(path: &str, content: &[u8]) -> GraphFragment {
     let (context, file) = fixture(path, content);
-    CargoExtractor
+    CargoExtractor::new()
         .extract(FileExtractionInput {
             context: &context,
             file: &file,
@@ -53,10 +53,11 @@ fn supports_only_cargo_manifests() {
     let (_, nested) = fixture("crates/core/Cargo.toml", b"");
     let (_, lowercase) = fixture("cargo.toml", b"");
     let (_, other) = fixture("Cargo.lock", b"");
-    assert!(CargoExtractor.supports(&root));
-    assert!(CargoExtractor.supports(&nested));
-    assert!(!CargoExtractor.supports(&lowercase));
-    assert!(!CargoExtractor.supports(&other));
+    let extractor = CargoExtractor::new();
+    assert!(extractor.supports(&root));
+    assert!(extractor.supports(&nested));
+    assert!(!extractor.supports(&lowercase));
+    assert!(!extractor.supports(&other));
 }
 
 #[test]
@@ -396,7 +397,7 @@ c = []
     let (mut context, file) = fixture("Cargo.toml", content);
     context.max_facts_per_file = 2;
     context.max_diagnostics = 1;
-    let fragment = CargoExtractor
+    let fragment = CargoExtractor::new()
         .extract(FileExtractionInput {
             context: &context,
             file: &file,
@@ -431,7 +432,7 @@ path = "src/tool.rs"
 "#;
     let (mut context, file) = fixture("Cargo.toml", content);
     context.max_facts_per_file = 9;
-    let fragment = CargoExtractor
+    let fragment = CargoExtractor::new()
         .extract(FileExtractionInput {
             context: &context,
             file: &file,
