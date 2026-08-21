@@ -591,6 +591,18 @@ fn context_pages_relationships_beyond_the_first_page_result_limit() {
 }
 
 #[test]
+fn context_candidate_cap_allows_edges_between_selected_entities() {
+    assert!(!context_candidate_limit_reached(
+        MAX_CONTEXT_CANDIDATES,
+        true,
+    ));
+    assert!(context_candidate_limit_reached(
+        MAX_CONTEXT_CANDIDATES,
+        false,
+    ));
+}
+
+#[test]
 fn context_counts_relationships_against_the_effective_byte_limit() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =

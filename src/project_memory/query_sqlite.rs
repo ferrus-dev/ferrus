@@ -139,6 +139,10 @@ enum ContextPageEntry {
     Relationship(MemoryRelationship),
 }
 
+fn context_candidate_limit_reached(selected_count: usize, neighbor_is_selected: bool) -> bool {
+    !neighbor_is_selected && selected_count >= MAX_CONTEXT_CANDIDATES
+}
+
 #[derive(Debug, Clone)]
 struct MemoryHitOrderKey {
     score: f64,
@@ -482,6 +486,11 @@ impl<'a> SqliteMemoryQuery<'a> {
                     truncation = Some(MemoryTruncationReason::Duration);
                     break 'traversal;
                 }
+                let neighbor_is_selected = selected.contains_key(neighbor);
+                if context_candidate_limit_reached(selected.len(), neighbor_is_selected) {
+                    truncation = Some(MemoryTruncationReason::Results);
+                    break 'traversal;
+                }
                 if !selected_relationships.contains_key(&relationship.id) {
                     if selected_relationships.len() >= MAX_CONTEXT_RELATIONSHIPS {
                         truncation = Some(MemoryTruncationReason::Results);
@@ -489,11 +498,7 @@ impl<'a> SqliteMemoryQuery<'a> {
                     }
                     selected_relationships.insert(relationship.id.clone(), relationship.clone());
                 }
-                if selected.len() >= MAX_CONTEXT_CANDIDATES {
-                    truncation = Some(MemoryTruncationReason::Results);
-                    break 'traversal;
-                }
-                if !selected.contains_key(neighbor) {
+                if !neighbor_is_selected {
                     selected.insert(
                         neighbor.clone(),
                         (depth + 1, vec![diagnostic_code("context.relationship")]),
