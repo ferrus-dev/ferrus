@@ -713,6 +713,19 @@ fn delete_control_data(
             DeletionTarget::Project(_) => {
                 execute_scope_delete(
                     transaction,
+                    "DELETE FROM remote_memory_repository_link_sets
+                     WHERE tenant_id = ?1 AND project_id = ?2",
+                    project,
+                )?;
+                execute_scope_delete(
+                    transaction,
+                    "DELETE FROM remote_immutable_revisions
+                     WHERE tenant_id = ?1 AND project_id = ?2
+                       AND domain = 'memory_repository_links'",
+                    project,
+                )?;
+                execute_scope_delete(
+                    transaction,
                     "DELETE FROM remote_graph_views WHERE tenant_id = ?1 AND project_id = ?2",
                     project,
                 )?;
@@ -724,6 +737,29 @@ fn delete_control_data(
                 )?;
             }
             DeletionTarget::Repository(repository) => {
+                transaction
+                    .execute(
+                        "DELETE FROM remote_memory_repository_link_sets
+                         WHERE tenant_id = ?1 AND project_id = ?2 AND repository_id = ?3",
+                        params![
+                            project.tenant_id.as_str(),
+                            project.project_id.as_str(),
+                            repository.repository_id.as_str()
+                        ],
+                    )
+                    .map_err(|_| MaintenanceStoreError::Unavailable)?;
+                transaction
+                    .execute(
+                        "DELETE FROM remote_immutable_revisions
+                         WHERE tenant_id = ?1 AND project_id = ?2
+                           AND domain = 'memory_repository_links' AND repository_id = ?3",
+                        params![
+                            project.tenant_id.as_str(),
+                            project.project_id.as_str(),
+                            repository.repository_id.as_str()
+                        ],
+                    )
+                    .map_err(|_| MaintenanceStoreError::Unavailable)?;
                 transaction
                     .execute(
                         "DELETE FROM remote_graph_views
@@ -755,6 +791,19 @@ fn delete_control_data(
         .contains(&RetentionClass::PublishedMemoryRevision)
         && matches!(deletion.target, DeletionTarget::Project(_))
     {
+        execute_scope_delete(
+            transaction,
+            "DELETE FROM remote_memory_repository_link_sets
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            project,
+        )?;
+        execute_scope_delete(
+            transaction,
+            "DELETE FROM remote_immutable_revisions
+             WHERE tenant_id = ?1 AND project_id = ?2
+               AND domain = 'memory_repository_links'",
+            project,
+        )?;
         counts.add(
             AuditCounter::Revisions,
             count(

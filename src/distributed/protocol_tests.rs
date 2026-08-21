@@ -11,7 +11,7 @@ use crate::{
         MemoryResolutionState, MemorySourceCategory, MemorySourceLocator, MemoryStatusToken,
         MemoryText, ProjectId, ProjectNamespace, ProjectRef,
     },
-    repository_graph::domain::RepoPath,
+    repository_graph::domain::{RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef},
 };
 
 fn digest(value: &str) -> Digest {
@@ -78,12 +78,17 @@ fn memory_target(revision_id: &MemoryRevisionId) -> FactTarget {
         },
         project_identity: local_project(),
         build_id: MemoryBuildId::new("memory-build").unwrap(),
+        repository_links: None,
     }
 }
 
 fn repository_input(tenant: &str) -> IndexInputRef {
     IndexInputRef::Repository(RepositoryManifestRef {
         repository: repository(tenant),
+        repository_identity: RepositoryRef {
+            namespace: RepositoryNamespace::new("remote:test").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
+        },
         manifest_id: RepositoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),
         source_policy_digest: digest("22"),
@@ -117,6 +122,10 @@ fn graph_target(tenant: &str) -> FactTarget {
             repository: repository(tenant),
             snapshot_id: SnapshotId::new("snapshot").unwrap(),
         },
+        repository_identity: RepositoryRef {
+            namespace: RepositoryNamespace::new("remote:test").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
+        },
         build_id: BuildId::new("build").unwrap(),
     }
 }
@@ -134,6 +143,7 @@ fn memory_input(tenant: &str) -> IndexInputRef {
             object_id: ObjectId::new("11").unwrap(),
             content_identity: digest("11"),
         },
+        repository_snapshot: None,
     })
 }
 

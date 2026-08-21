@@ -11,7 +11,8 @@ use crate::{
     project_memory::{
         diagnostics::MemoryDiagnostic,
         domain::{
-            MemoryBuildId, MemoryEntity, MemoryRelationship, MemoryRevisionId, MemoryViewName,
+            MemoryBuildId, MemoryEntity, MemoryRelationship, MemoryRepositoryLinkSet,
+            MemoryRevisionId, MemoryViewName,
         },
     },
     repository_graph::domain::{
@@ -108,6 +109,27 @@ impl IndexInputRef {
         }
     }
 
+    fn repository_snapshot(&self) -> Option<&RemoteGraphSnapshotRef> {
+        match self {
+            Self::Repository(_) => None,
+            Self::Memory(manifest) => manifest.repository_snapshot.as_ref(),
+        }
+    }
+
+    fn repository_identity(&self) -> Option<&crate::repository_graph::domain::RepositoryRef> {
+        match self {
+            Self::Repository(manifest) => Some(&manifest.repository_identity),
+            Self::Memory(_) => None,
+        }
+    }
+
+    fn project_identity(&self) -> Option<&crate::project_memory::domain::ProjectRef> {
+        match self {
+            Self::Repository(_) => None,
+            Self::Memory(manifest) => Some(&manifest.project_identity),
+        }
+    }
+
     fn validate(&self) -> Result<(), DistributedProtocolError> {
         let result = match self {
             Self::Repository(manifest) => manifest.validate(),
@@ -143,6 +165,9 @@ struct IdempotencyMaterial<'a> {
     manifest_digest: &'a Digest,
     policy_digest: &'a Digest,
     expected_target_identity: &'a str,
+    repository_snapshot: Option<&'a RemoteGraphSnapshotRef>,
+    repository_identity: Option<&'a crate::repository_graph::domain::RepositoryRef>,
+    project_identity: Option<&'a crate::project_memory::domain::ProjectRef>,
     semantics: &'a IndexSemantics,
 }
 
@@ -196,6 +221,9 @@ fn idempotency_key(
             manifest_digest: input.manifest_digest(),
             policy_digest: input.policy_digest(),
             expected_target_identity: input.expected_target_identity(),
+            repository_snapshot: input.repository_snapshot(),
+            repository_identity: input.repository_identity(),
+            project_identity: input.project_identity(),
             semantics,
         },
     )
@@ -369,13 +397,26 @@ impl HeartbeatJobRequest {
 pub enum FactTarget {
     RepositoryGraph {
         snapshot: RemoteGraphSnapshotRef,
+        repository_identity: crate::repository_graph::domain::RepositoryRef,
         build_id: BuildId,
     },
     ProjectMemory {
         revision: RemoteMemoryRevisionRef,
         project_identity: crate::project_memory::domain::ProjectRef,
         build_id: MemoryBuildId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_links: Option<Box<RemoteMemoryLinkSetTarget>>,
     },
+}
+
+/// Immutable repository-link resolution produced alongside a memory build.
+/// The graph target is part of the job and fact-batch identity, but not the
+/// semantic memory revision identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMemoryLinkSetTarget {
+    pub graph: RemoteGraphSnapshotRef,
+    pub link_set: MemoryRepositoryLinkSet,
 }
 
 impl FactTarget {
@@ -524,7 +565,11 @@ fn validate_fact_targets(
 ) -> Result<(), DistributedProtocolError> {
     let valid = match (target, payload) {
         (
-            FactTarget::RepositoryGraph { snapshot, build_id },
+            FactTarget::RepositoryGraph {
+                snapshot,
+                repository_identity: _,
+                build_id,
+            },
             FactBatchPayload::RepositoryGraph {
                 nodes,
                 edges,
@@ -550,6 +595,7 @@ fn validate_fact_targets(
                 revision,
                 project_identity,
                 build_id,
+                repository_links,
             },
             FactBatchPayload::ProjectMemory {
                 entities,
@@ -557,21 +603,64 @@ fn validate_fact_targets(
                 diagnostics,
             },
         ) => {
-            entities.iter().all(|entity| {
-                entity.project == *project_identity
-                    && entity.memory_revision_id == revision.revision_id
-            }) && relationships.iter().all(|relationship| {
-                relationship.project == *project_identity
-                    && relationship.memory_revision_id == revision.revision_id
-            }) && diagnostics.iter().all(|diagnostic| {
-                diagnostic.build_id == *build_id && diagnostic.revision_id == revision.revision_id
-            })
+            let link_target_is_valid = repository_links.as_ref().is_none_or(|links| {
+                links.graph.repository.project == revision.project
+                    && links.link_set.project == *project_identity
+                    && links.link_set.memory_revision_id == revision.revision_id
+                    && links.link_set.repository_snapshot_id.as_ref()
+                        == Some(&links.graph.snapshot_id)
+            });
+            link_target_is_valid
+                && entities.iter().all(|entity| {
+                    entity.project == *project_identity
+                        && entity.memory_revision_id == revision.revision_id
+                })
+                && relationships.iter().all(|relationship| {
+                    relationship.project == *project_identity
+                        && relationship.memory_revision_id == revision.revision_id
+                        && memory_relationship_matches_link_target(
+                            relationship,
+                            repository_links.as_deref(),
+                        )
+                })
+                && diagnostics.iter().all(|diagnostic| {
+                    diagnostic.build_id == *build_id
+                        && diagnostic.revision_id == revision.revision_id
+                })
         }
         _ => false,
     };
     valid
         .then_some(())
         .ok_or(DistributedProtocolError::FactBatchMismatch)
+}
+
+fn memory_relationship_matches_link_target(
+    relationship: &MemoryRelationship,
+    target: Option<&RemoteMemoryLinkSetTarget>,
+) -> bool {
+    let (repository, snapshot_id) = match &relationship.target {
+        crate::project_memory::domain::MemoryRelationshipTarget::RepositoryNode {
+            repository,
+            snapshot_id,
+            ..
+        } => (repository, Some(snapshot_id)),
+        crate::project_memory::domain::MemoryRelationshipTarget::RepositoryPath {
+            repository,
+            snapshot_id,
+            ..
+        }
+        | crate::project_memory::domain::MemoryRelationshipTarget::RepositorySymbol {
+            repository,
+            snapshot_id,
+            ..
+        } => (repository, snapshot_id.as_ref()),
+        _ => return true,
+    };
+    target.is_some_and(|target| {
+        repository == &target.link_set.repository
+            && snapshot_id.is_none_or(|snapshot| snapshot == &target.graph.snapshot_id)
+    })
 }
 
 fn fact_batch_id(

@@ -160,20 +160,36 @@ impl SqliteRemoteQueryApi {
                         .ok_or_else(|| query_not_found(request_id))?,
                 ),
             },
-            RemoteQueryTarget::Federated(view) => LoadedTarget {
-                graph: Some(
-                    self.publication
-                        .published_graph_snapshot_bounded(&view.graph, started, duration)
-                        .map_err(|error| query_store_error(request_id, error))?
-                        .ok_or_else(|| query_not_found(request_id))?,
-                ),
-                memory: Some(
-                    self.publication
-                        .published_memory_revision_bounded(&view.memory, started, duration)
-                        .map_err(|error| query_store_error(request_id, error))?
-                        .ok_or_else(|| query_not_found(request_id))?,
-                ),
-            },
+            RemoteQueryTarget::Federated(view) => {
+                let graph = self
+                    .publication
+                    .published_graph_snapshot_bounded(&view.graph, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
+                    .ok_or_else(|| query_not_found(request_id))?;
+                let mut memory = self
+                    .publication
+                    .published_memory_revision_bounded(&view.memory, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
+                    .ok_or_else(|| query_not_found(request_id))?;
+                if let Some(links) = self
+                    .publication
+                    .published_memory_repository_links_bounded(view, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
+                {
+                    memory.relationships.extend(links.relationships);
+                    memory.diagnostics.extend(links.diagnostics);
+                    memory
+                        .relationships
+                        .sort_by(|left, right| left.id.cmp(&right.id));
+                    memory
+                        .relationships
+                        .dedup_by(|left, right| left.id == right.id);
+                }
+                LoadedTarget {
+                    graph: Some(graph),
+                    memory: Some(memory),
+                }
+            }
             RemoteQueryTarget::RepositoryView { .. }
             | RemoteQueryTarget::MemoryView { .. }
             | RemoteQueryTarget::FederatedView { .. } => return Err(query_internal(request_id)),

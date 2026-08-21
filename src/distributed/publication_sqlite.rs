@@ -1,7 +1,7 @@
 //! Durable tenant-scoped remote fact storage and atomic publication prototype.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     path::Path,
     time::{Duration, Instant},
@@ -22,7 +22,7 @@ use crate::{
         diagnostics::MemoryDiagnostic,
         domain::{
             MemoryBuildId, MemoryEntity, MemoryEntityId, MemoryRelationship, MemoryRelationshipId,
-            MemoryRelationshipTarget, MemoryRevisionId, MemoryViewName,
+            MemoryRelationshipTarget, MemoryResolutionState, MemoryRevisionId, MemoryViewName,
         },
     },
     repository_graph::domain::{
@@ -41,17 +41,17 @@ use super::{
     protocol::{
         FactBatch, FactBatchPayload, FactTarget, GraphPublicationVersion, IndexInputRef,
         IndexJobKind, IndexJobRef, IndexJobSpec, MemoryPublicationVersion, PublishGraphRequest,
-        PublishMemoryRequest,
+        PublishMemoryRequest, RemoteMemoryLinkSetTarget,
     },
     publication::{
         GraphPublicationOutcome, MemoryPublicationOutcome, PublishedRemoteGraphView,
         PublishedRemoteMemoryView, RemoteFactCounts, RemoteGraphSnapshotRecord,
         RemoteMemoryRevisionRecord, RemotePublicationStore, StoredRemoteGraphSnapshot,
-        StoredRemoteMemoryRevision,
+        StoredRemoteMemoryRepositoryLinks, StoredRemoteMemoryRevision,
     },
 };
 
-pub(super) const STORAGE_SCHEMA_VERSION: u32 = 2;
+pub(super) const STORAGE_SCHEMA_VERSION: u32 = 3;
 const NONCE_BYTES: usize = 12;
 const SQLITE_PROGRESS_OPS: i32 = 100;
 
@@ -137,6 +137,15 @@ struct PreparedMemory {
     record: RemoteMemoryRevisionRecord,
     project_identity: crate::project_memory::domain::ProjectRef,
     facts: Vec<PlainFact>,
+    repository_links: Option<PreparedMemoryRepositoryLinks>,
+}
+
+struct PreparedMemoryRepositoryLinks {
+    target: RemoteMemoryLinkSetTarget,
+    relationships: Vec<MemoryRelationship>,
+    fact_set_digest: Digest,
+    counts: RemoteFactCounts,
+    facts: Vec<PlainFact>,
 }
 
 struct PlainFact {
@@ -207,6 +216,18 @@ impl SqliteRemotePublicationStore {
     ) -> Result<Option<StoredRemoteMemoryRevision>, RemoteStoreError> {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
         let result = self.load_memory_revision(revision, Some((started, duration)), true);
+        drop(deadline);
+        result
+    }
+
+    pub fn published_memory_repository_links_bounded(
+        &self,
+        view: &FederatedViewRef,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<StoredRemoteMemoryRepositoryLinks>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result = self.load_memory_repository_links(view, Some((started, duration)), true);
         drop(deadline);
         result
     }
@@ -323,6 +344,114 @@ impl SqliteRemotePublicationStore {
         }))
     }
 
+    fn load_memory_repository_links(
+        &self,
+        view: &FederatedViewRef,
+        deadline: Option<(Instant, Duration)>,
+        published_only: bool,
+    ) -> Result<Option<StoredRemoteMemoryRepositoryLinks>, RemoteStoreError> {
+        ensure_read_budget(deadline)?;
+        if published_only
+            && (!target_was_published(
+                &self.connection,
+                &view.graph.repository.project,
+                "repository_graph",
+                view.graph.repository.repository_id.as_str(),
+                view.graph.snapshot_id.as_str(),
+            )? || !target_was_published(
+                &self.connection,
+                &view.memory.project,
+                "project_memory",
+                "",
+                view.memory.revision_id.as_str(),
+            )?)
+        {
+            return Ok(None);
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT link_set_id, job_id, link_set_json
+                 FROM remote_memory_repository_link_sets
+                 WHERE tenant_id = ?1 AND project_id = ?2 AND repository_id = ?3
+                   AND memory_revision_id = ?4 AND snapshot_id = ?5",
+                params![
+                    view.graph.repository.project.tenant_id.as_str(),
+                    view.graph.repository.project.project_id.as_str(),
+                    view.graph.repository.repository_id.as_str(),
+                    view.memory.revision_id.as_str(),
+                    view.graph.snapshot_id.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((link_set_id, job_id, link_set_json)) = row else {
+            return Ok(None);
+        };
+        let link_set = decode(&link_set_json)?;
+        let target = RemoteMemoryLinkSetTarget {
+            graph: view.graph.clone(),
+            link_set,
+        };
+        if target.link_set.memory_revision_id != view.memory.revision_id
+            || target.link_set.repository_snapshot_id.as_ref() != Some(&view.graph.snapshot_id)
+        {
+            return Err(RemoteStoreError::IntegrityFailure);
+        }
+        let job = IndexJobRef {
+            project: view.memory.project.clone(),
+            job_id: IndexJobId::new(job_id).map_err(|_| RemoteStoreError::IntegrityFailure)?,
+            kind: IndexJobKind::ProjectMemory,
+        };
+        let record = load_revision_row(
+            &self.connection,
+            &view.memory.project,
+            "memory_repository_links",
+            view.graph.repository.repository_id.as_str(),
+            &link_set_id,
+        )?
+        .ok_or(RemoteStoreError::IntegrityFailure)?;
+        if record.job_id != job.job_id {
+            return Err(RemoteStoreError::IntegrityFailure);
+        }
+        let facts = load_facts(
+            &self.connection,
+            &self.key,
+            &job,
+            "memory_repository_links",
+            &link_set_id,
+            view.graph.repository.repository_id.as_str(),
+            deadline,
+        )?;
+        let mut relationships = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (kind, encoded) in facts {
+            ensure_read_budget(deadline)?;
+            match kind.as_str() {
+                "relationship" => relationships.push(decode(&encoded)?),
+                "diagnostic" => diagnostics.push(decode(&encoded)?),
+                _ => return Err(RemoteStoreError::IntegrityFailure),
+            }
+        }
+        if record.counts.primary != 0
+            || u64::try_from(relationships.len()).ok() != Some(record.counts.relationships)
+            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
+        {
+            return Err(RemoteStoreError::IntegrityFailure);
+        }
+        Ok(Some(StoredRemoteMemoryRepositoryLinks {
+            target,
+            relationships,
+            diagnostics,
+        }))
+    }
+
     fn publish_graph_prepared(
         &mut self,
         request: &PublishGraphRequest,
@@ -353,6 +482,7 @@ impl SqliteRemotePublicationStore {
                 &job.spec.input,
                 IndexInputRef::Repository(manifest)
                     if manifest.repository == request.repository
+                        && manifest.repository_identity == prepared.record.repository_identity
                         && manifest.expected_snapshot_id == request.snapshot_id
             )
         {
@@ -406,9 +536,31 @@ impl SqliteRemotePublicationStore {
     fn publish_memory_prepared(
         &mut self,
         request: &PublishMemoryRequest,
-        prepared: PreparedMemory,
+        mut prepared: PreparedMemory,
         now: DateTime<Utc>,
     ) -> Result<MemoryPublicationOutcome, RemoteStoreError> {
+        if let Some(links) = prepared.repository_links.as_ref() {
+            let graph = self
+                .load_graph_snapshot(&links.target.graph, None, true)?
+                .ok_or(RemoteStoreError::InvalidInput)?;
+            validate_repository_links_against_graph(links, &graph)?;
+        }
+        let prepared_links = prepared
+            .repository_links
+            .take()
+            .map(|mut links| {
+                let facts = std::mem::take(&mut links.facts);
+                let encrypted = encrypt_facts(
+                    &self.key,
+                    &request.job,
+                    "memory_repository_links",
+                    links.target.link_set.id.as_str(),
+                    facts,
+                    self.limits.max_fact_bytes,
+                )?;
+                Ok::<_, RemoteStoreError>((links, encrypted))
+            })
+            .transpose()?;
         let encrypted = encrypt_facts(
             &self.key,
             &request.job,
@@ -435,6 +587,8 @@ impl SqliteRemotePublicationStore {
                     if manifest.project == request.project
                         && manifest.project_identity == prepared.project_identity
                         && manifest.expected_revision_id == request.revision_id
+                        && manifest.repository_snapshot.as_ref()
+                            == prepared_links.as_ref().map(|(links, _)| &links.target.graph)
             )
         {
             return Err(RemoteStoreError::InvalidInput);
@@ -470,6 +624,30 @@ impl SqliteRemotePublicationStore {
             }
         };
         if matches!(&outcome, MemoryPublicationOutcome::Published { .. }) {
+            if let Some((links, encrypted_links)) = prepared_links {
+                if !target_was_published(
+                    &transaction,
+                    &links.target.graph.repository.project,
+                    "repository_graph",
+                    links.target.graph.repository.repository_id.as_str(),
+                    links.target.graph.snapshot_id.as_str(),
+                )? {
+                    return Err(RemoteStoreError::InvalidInput);
+                }
+                insert_memory_repository_links(
+                    &transaction,
+                    &request.project,
+                    &links.target,
+                    &request.job,
+                    &prepared.record.build_id,
+                    &prepared.record.extractor_set_digest,
+                    &links.fact_set_digest,
+                    links.counts,
+                    now,
+                    &encrypted_links,
+                    self.limits,
+                )?;
+            }
             mark_published_target(
                 &transaction,
                 &request.project,
@@ -483,6 +661,75 @@ impl SqliteRemotePublicationStore {
         transaction.commit()?;
         Ok(outcome)
     }
+}
+
+fn validate_repository_links_against_graph(
+    links: &PreparedMemoryRepositoryLinks,
+    graph: &StoredRemoteGraphSnapshot,
+) -> Result<(), RemoteStoreError> {
+    if links.target.graph != graph.record.snapshot
+        || links.target.link_set.repository != graph.record.repository_identity
+    {
+        return Err(RemoteStoreError::InvalidInput);
+    }
+    let node_ids = graph
+        .nodes
+        .iter()
+        .map(|node| &node.id)
+        .collect::<BTreeSet<_>>();
+    let paths = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.provenance
+                .evidence
+                .as_ref()
+                .map(|evidence| &evidence.path)
+        })
+        .collect::<BTreeSet<_>>();
+    let valid = links.relationships.iter().all(|relationship| {
+        match (&relationship.target, relationship.provenance.resolution) {
+            (
+                MemoryRelationshipTarget::RepositoryNode {
+                    repository,
+                    snapshot_id,
+                    node_id,
+                },
+                MemoryResolutionState::Resolved,
+            ) => {
+                repository == &graph.record.repository_identity
+                    && snapshot_id == &graph.record.snapshot.snapshot_id
+                    && node_ids.contains(node_id)
+            }
+            (
+                MemoryRelationshipTarget::RepositoryPath {
+                    repository,
+                    path,
+                    snapshot_id: Some(snapshot_id),
+                },
+                MemoryResolutionState::Resolved,
+            ) => {
+                repository == &graph.record.repository_identity
+                    && snapshot_id == &graph.record.snapshot.snapshot_id
+                    && paths.contains(path)
+            }
+            (
+                MemoryRelationshipTarget::RepositoryPath {
+                    repository,
+                    snapshot_id: None,
+                    ..
+                }
+                | MemoryRelationshipTarget::RepositorySymbol {
+                    repository,
+                    snapshot_id: None,
+                    ..
+                },
+                MemoryResolutionState::Unresolved,
+            ) => repository == &graph.record.repository_identity,
+            _ => false,
+        }
+    });
+    valid.then_some(()).ok_or(RemoteStoreError::InvalidInput)
 }
 
 impl RemotePublicationStore for SqliteRemotePublicationStore {
@@ -526,6 +773,13 @@ impl RemotePublicationStore for SqliteRemotePublicationStore {
         revision: &RemoteMemoryRevisionRef,
     ) -> Result<Option<StoredRemoteMemoryRevision>, Self::Error> {
         self.load_memory_revision(revision, None, false)
+    }
+
+    fn memory_repository_links(
+        &self,
+        view: &FederatedViewRef,
+    ) -> Result<Option<StoredRemoteMemoryRepositoryLinks>, Self::Error> {
+        self.load_memory_repository_links(view, None, true)
     }
 
     fn graph_view(

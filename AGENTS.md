@@ -149,6 +149,12 @@ must produce the same sequence and batch identities, and ordinary queries must n
 batches. OS or container adapters must enforce the secure-only sandbox declaration, including
 CPU, memory, ephemeral filesystem, short-lived credentials, and allowlisted egress.
 
+Remote memory jobs may resolve explicit repository evidence only against an immutable graph
+snapshot pinned in the job input. Keep the resulting repository link set independently identified
+and stored; the selected graph snapshot must not become an input to `memory_revision_id`.
+Federated reads may use only the link set matching their exact memory revision and graph snapshot
+pair.
+
 **Distributed publication**: keep immutable remote graph/memory records and publication ports
 vendor-neutral. The SQLite prototype shares the exact coordinator control-plane database so one
 transaction can revalidate job kind and scope, cancellation, worker lease generation, complete

@@ -109,6 +109,7 @@ impl RepositorySourceManifest {
             || self.body.policy_schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION
             || !is_canonical_committed_revision(&self.body.source_revision)
             || self.body.repository != self.reference.repository
+            || self.body.source_revision.repository != self.reference.repository_identity
             || self.body.source_policy_digest != self.reference.source_policy_digest
             || canonical_source_manifest_digest(&source_files, &self.body.source_policy_digest)
                 != self.body.source_revision.manifest_digest
@@ -369,6 +370,7 @@ where
         .object;
     let reference = RepositoryManifestRef {
         repository,
+        repository_identity: local.revision.repository.clone(),
         manifest_id: RepositoryManifestId::new(manifest_digest.value())
             .map_err(|_| PackagingError::InvalidManifest)?,
         manifest_digest,
@@ -486,6 +488,7 @@ where
         memory_policy_digest: local.policy_digest,
         expected_revision_id,
         manifest_object,
+        repository_snapshot: None,
     };
     let manifest = MemorySourceManifest { reference, body };
     manifest.validate()?;

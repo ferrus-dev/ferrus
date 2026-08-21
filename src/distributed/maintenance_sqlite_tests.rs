@@ -37,7 +37,9 @@ use super::{
 };
 use crate::{
     project_memory::domain::{MemoryRevisionId, ProjectId, ProjectNamespace, ProjectRef},
-    repository_graph::domain::{BuildId, Digest, SnapshotId},
+    repository_graph::domain::{
+        BuildId, Digest, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId,
+    },
 };
 
 const KEY: [u8; 32] = [73; 32];
@@ -134,6 +136,10 @@ fn submit_job(
 ) -> IndexJobRef {
     let input = IndexInputRef::Repository(super::identity::RepositoryManifestRef {
         repository: repository.clone(),
+        repository_identity: RepositoryRef {
+            namespace: RepositoryNamespace::new("remote:test").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
+        },
         manifest_id: RepositoryManifestId::new(format!("manifest-{suffix}")).unwrap(),
         manifest_digest: object.content_identity.clone(),
         source_policy_digest: digest("22"),
@@ -179,6 +185,7 @@ fn submit_memory_job(
         memory_policy_digest: digest("22"),
         expected_revision_id: MemoryRevisionId::new(format!("memory-{suffix}")).unwrap(),
         manifest_object: object.clone(),
+        repository_snapshot: None,
     });
     let job = IndexJobSpec::new(
         IndexJobKind::ProjectMemory,
@@ -212,6 +219,10 @@ fn batch(job: &IndexJobRef, suffix: &str) -> FactBatch {
             snapshot: RemoteGraphSnapshotRef {
                 repository: repository(&job.project),
                 snapshot_id: SnapshotId::new(format!("snapshot-{suffix}")).unwrap(),
+            },
+            repository_identity: RepositoryRef {
+                namespace: RepositoryNamespace::new("remote:test").unwrap(),
+                repository_id: RepositoryId::new("root").unwrap(),
             },
             build_id: BuildId::new(format!("build-{suffix}")).unwrap(),
         },

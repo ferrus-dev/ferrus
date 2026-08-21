@@ -22,7 +22,10 @@ use super::{
         FederatedViewRef, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef, RemoteProjectRef,
         RemoteRepositoryRef,
     },
-    protocol::{FactBatch, IndexJobRef, PublishGraphRequest, PublishMemoryRequest},
+    protocol::{
+        FactBatch, IndexJobRef, PublishGraphRequest, PublishMemoryRequest,
+        RemoteMemoryLinkSetTarget,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +40,7 @@ pub struct RemoteFactCounts {
 #[serde(deny_unknown_fields)]
 pub struct RemoteGraphSnapshotRecord {
     pub snapshot: RemoteGraphSnapshotRef,
+    pub repository_identity: crate::repository_graph::domain::RepositoryRef,
     pub job: IndexJobRef,
     pub build_id: BuildId,
     pub extractor_set_digest: Digest,
@@ -71,6 +75,14 @@ pub struct StoredRemoteGraphSnapshot {
 pub struct StoredRemoteMemoryRevision {
     pub record: RemoteMemoryRevisionRecord,
     pub entities: Vec<MemoryEntity>,
+    pub relationships: Vec<MemoryRelationship>,
+    pub diagnostics: Vec<MemoryDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredRemoteMemoryRepositoryLinks {
+    pub target: RemoteMemoryLinkSetTarget,
     pub relationships: Vec<MemoryRelationship>,
     pub diagnostics: Vec<MemoryDiagnostic>,
 }
@@ -142,6 +154,10 @@ pub trait RemotePublicationStore {
         &self,
         revision: &RemoteMemoryRevisionRef,
     ) -> Result<Option<StoredRemoteMemoryRevision>, Self::Error>;
+    fn memory_repository_links(
+        &self,
+        view: &FederatedViewRef,
+    ) -> Result<Option<StoredRemoteMemoryRepositoryLinks>, Self::Error>;
     fn graph_view(
         &self,
         repository: &RemoteRepositoryRef,

@@ -131,6 +131,7 @@ pub struct TenantObjectRef {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryManifestRef {
     pub repository: RemoteRepositoryRef,
+    pub repository_identity: crate::repository_graph::domain::RepositoryRef,
     pub manifest_id: RepositoryManifestId,
     pub manifest_digest: Digest,
     pub source_policy_digest: Digest,
@@ -160,6 +161,11 @@ pub struct MemoryManifestRef {
     pub memory_policy_digest: Digest,
     pub expected_revision_id: MemoryRevisionId,
     pub manifest_object: TenantObjectRef,
+    /// Optional immutable repository snapshot used only for cross-link
+    /// resolution. It is intentionally excluded from the semantic memory
+    /// revision identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_snapshot: Option<RemoteGraphSnapshotRef>,
 }
 
 impl MemoryManifestRef {
@@ -167,6 +173,10 @@ impl MemoryManifestRef {
         if self.manifest_object.project != self.project
             || self.manifest_object.content_identity != self.manifest_digest
             || self.manifest_object.object_id.as_str() != self.manifest_digest.value()
+            || self
+                .repository_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.repository.project != self.project)
         {
             return Err(RemoteIdentityError::ManifestObjectMismatch);
         }

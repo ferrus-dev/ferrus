@@ -3,14 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::repository_graph::{
     domain::{
-        NodeId, PublishedViewName, RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef,
-        SemanticKey, SnapshotId,
+        GraphNode, NodeId, PublishedViewName, RepoPath, RepositoryId, RepositoryNamespace,
+        RepositoryRef, SemanticKey, SnapshotId,
     },
     sqlite::{OpenQuerySidecarResult, SIDECAR_FILE_NAME, Sidecar, open_for_query_at},
 };
@@ -37,6 +37,193 @@ const MAX_ORIGIN_FILES: usize = 100_000;
 enum ExplicitRepositoryReference {
     Path(RepoPath),
     Symbol(SemanticKey),
+}
+
+/// Resolve the portable subset of repository evidence against one immutable
+/// graph snapshot. Remote workers use this pure boundary without opening a
+/// repository, sidecar, process, or network connection.
+pub(crate) fn resolve_repository_links_for_snapshot(
+    revision: &MemoryRevision,
+    entities: &[MemoryEntity],
+    repository: &RepositoryRef,
+    snapshot_id: &SnapshotId,
+    nodes: &[GraphNode],
+    indexed_at: DateTime<Utc>,
+) -> Result<MemoryRepositoryLinkCommit> {
+    anyhow::ensure!(nodes.iter().all(|node| node.snapshot_id == *snapshot_id));
+
+    let link_set_id = MemoryRepositoryLinkSetId::new(format!(
+        "memory-links:{}",
+        canonical_digest(&(
+            "repository-link-set",
+            &revision.project,
+            &revision.id,
+            repository,
+            &Some(snapshot_id),
+            Vec::<(SnapshotId, bool)>::new(),
+            resolver_identity(),
+        ))
+        .value()
+    ))
+    .expect("sha256 memory link-set identity is bounded");
+    let link_set = MemoryRepositoryLinkSet {
+        id: link_set_id,
+        project: revision.project.clone(),
+        memory_revision_id: revision.id.clone(),
+        repository: repository.clone(),
+        repository_snapshot_id: Some(snapshot_id.clone()),
+        resolver: resolver_identity(),
+    };
+
+    let mut candidates = BTreeMap::new();
+    for entity in entities {
+        if let MemorySourceLocator::TrackedFile { path } = &entity.provenance.source_locator {
+            insert_candidate(
+                &mut candidates,
+                revision,
+                entity.id.clone(),
+                MemoryRelationshipKind::Concerns,
+                ExplicitRepositoryReference::Path(path.clone()),
+                None,
+                entity.provenance.clone(),
+            );
+        }
+        if let MemoryEntityData::ArchiveReference { spec_path, .. } = &entity.data {
+            insert_candidate(
+                &mut candidates,
+                revision,
+                entity.id.clone(),
+                MemoryRelationshipKind::Concerns,
+                ExplicitRepositoryReference::Path(spec_path.clone()),
+                None,
+                entity.provenance.clone(),
+            );
+        }
+        if let Some(text) = curated_text(&entity.data) {
+            for reference in explicit_references(text) {
+                insert_candidate(
+                    &mut candidates,
+                    revision,
+                    entity.id.clone(),
+                    MemoryRelationshipKind::Touches,
+                    reference,
+                    None,
+                    entity.provenance.clone(),
+                );
+            }
+        }
+    }
+
+    let paths = nodes
+        .iter()
+        .filter_map(|node| {
+            node.provenance
+                .evidence
+                .as_ref()
+                .map(|evidence| evidence.path.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut symbols = BTreeMap::<SemanticKey, Vec<NodeId>>::new();
+    for node in nodes {
+        if let Some(key) = &node.semantic_key {
+            symbols
+                .entry(key.clone())
+                .or_default()
+                .push(node.id.clone());
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    if candidates.len() > MAX_REPOSITORY_LINKS {
+        push_diagnostic(
+            &mut diagnostics,
+            &revision.completed_by,
+            &revision.id,
+            diagnostic_code("link.limit"),
+            None,
+            None,
+        );
+    }
+    let mut relationships = Vec::with_capacity(candidates.len().min(MAX_REPOSITORY_LINKS));
+    for candidate in candidates.into_values().take(MAX_REPOSITORY_LINKS) {
+        let (target, resolution) = match &candidate.reference {
+            ExplicitRepositoryReference::Path(path) if paths.contains(path) => (
+                MemoryRelationshipTarget::RepositoryPath {
+                    repository: repository.clone(),
+                    path: path.clone(),
+                    snapshot_id: Some(snapshot_id.clone()),
+                },
+                MemoryResolutionState::Resolved,
+            ),
+            ExplicitRepositoryReference::Path(path) => (
+                MemoryRelationshipTarget::RepositoryPath {
+                    repository: repository.clone(),
+                    path: path.clone(),
+                    snapshot_id: None,
+                },
+                MemoryResolutionState::Unresolved,
+            ),
+            ExplicitRepositoryReference::Symbol(key)
+                if symbols.get(key).is_some_and(|matches| matches.len() == 1) =>
+            {
+                let node_id = symbols
+                    .get(key)
+                    .and_then(|matches| matches.first())
+                    .expect("unique semantic key has one node")
+                    .clone();
+                (
+                    MemoryRelationshipTarget::RepositoryNode {
+                        repository: repository.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                        node_id,
+                    },
+                    MemoryResolutionState::Resolved,
+                )
+            }
+            ExplicitRepositoryReference::Symbol(key) => (
+                MemoryRelationshipTarget::RepositorySymbol {
+                    repository: repository.clone(),
+                    semantic_key: key.clone(),
+                    snapshot_id: None,
+                },
+                MemoryResolutionState::Unresolved,
+            ),
+        };
+        let mut provenance = candidate.provenance;
+        provenance.extractor = resolver_identity();
+        provenance.resolution = resolution;
+        provenance.confidence = MemoryConfidence::Exact;
+        provenance.timestamps = MemoryIndexTimestamps {
+            source_observed_at: provenance.timestamps.source_observed_at,
+            indexed_at,
+        };
+        let relationship = MemoryRelationship {
+            project: revision.project.clone(),
+            memory_revision_id: revision.id.clone(),
+            id: candidate.id,
+            kind: candidate.kind,
+            source: candidate.source,
+            target,
+            provenance,
+        };
+        if relationship.provenance.resolution == MemoryResolutionState::Unresolved {
+            push_diagnostic(
+                &mut diagnostics,
+                &revision.completed_by,
+                &revision.id,
+                diagnostic_code("link.unresolved"),
+                Some(relationship.source.clone()),
+                Some(relationship.id.clone()),
+            );
+        }
+        relationships.push(relationship);
+    }
+    relationships.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(MemoryRepositoryLinkCommit {
+        link_set,
+        relationships,
+        diagnostics,
+    })
 }
 
 #[derive(Debug, Clone)]

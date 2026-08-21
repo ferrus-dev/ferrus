@@ -93,29 +93,44 @@ pub(super) fn load_graph_record(
     connection: &Connection,
     snapshot: &RemoteGraphSnapshotRef,
 ) -> Result<Option<RemoteGraphSnapshotRecord>, RemoteStoreError> {
-    load_revision_row(
+    let revision = load_revision_row(
         connection,
         &snapshot.repository.project,
         "repository_graph",
         snapshot.repository.repository_id.as_str(),
         snapshot.snapshot_id.as_str(),
-    )?
-    .map(|row| {
-        Ok(RemoteGraphSnapshotRecord {
-            snapshot: snapshot.clone(),
-            job: IndexJobRef {
-                project: snapshot.repository.project.clone(),
-                job_id: row.job_id,
-                kind: IndexJobKind::RepositoryGraph,
-            },
-            build_id: BuildId::new(row.build_id).map_err(|_| RemoteStoreError::IntegrityFailure)?,
-            extractor_set_digest: row.extractor_set_digest,
-            fact_set_digest: row.fact_set_digest,
-            counts: row.counts,
-            completed_at: row.completed_at,
+    )?;
+    revision
+        .map(|row| {
+            let repository_identity = connection.query_row(
+                "SELECT repository_identity_json FROM remote_graph_snapshot_metadata
+             WHERE tenant_id = ?1 AND project_id = ?2 AND repository_id = ?3
+               AND snapshot_id = ?4",
+                params![
+                    snapshot.repository.project.tenant_id.as_str(),
+                    snapshot.repository.project.project_id.as_str(),
+                    snapshot.repository.repository_id.as_str(),
+                    snapshot.snapshot_id.as_str()
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            Ok(RemoteGraphSnapshotRecord {
+                snapshot: snapshot.clone(),
+                repository_identity: decode(&repository_identity)?,
+                job: IndexJobRef {
+                    project: snapshot.repository.project.clone(),
+                    job_id: row.job_id,
+                    kind: IndexJobKind::RepositoryGraph,
+                },
+                build_id: BuildId::new(row.build_id)
+                    .map_err(|_| RemoteStoreError::IntegrityFailure)?,
+                extractor_set_digest: row.extractor_set_digest,
+                fact_set_digest: row.fact_set_digest,
+                counts: row.counts,
+                completed_at: row.completed_at,
+            })
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 pub(super) fn load_memory_record(
@@ -173,16 +188,16 @@ pub(super) fn target_was_published(
         .is_some())
 }
 
-struct RevisionRow {
-    job_id: IndexJobId,
-    build_id: String,
-    extractor_set_digest: Digest,
-    fact_set_digest: Digest,
-    counts: RemoteFactCounts,
-    completed_at: DateTime<Utc>,
+pub(super) struct RevisionRow {
+    pub(super) job_id: IndexJobId,
+    pub(super) build_id: String,
+    pub(super) extractor_set_digest: Digest,
+    pub(super) fact_set_digest: Digest,
+    pub(super) counts: RemoteFactCounts,
+    pub(super) completed_at: DateTime<Utc>,
 }
 
-fn load_revision_row(
+pub(super) fn load_revision_row(
     connection: &Connection,
     project: &RemoteProjectRef,
     domain: &str,
@@ -418,7 +433,9 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
          CREATE TABLE IF NOT EXISTS remote_immutable_revisions (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
-             domain TEXT NOT NULL CHECK (domain IN ('repository_graph', 'project_memory')),
+             domain TEXT NOT NULL CHECK (
+                 domain IN ('repository_graph', 'project_memory', 'memory_repository_links')
+             ),
              repository_id TEXT NOT NULL,
              target_id TEXT NOT NULL,
              job_id TEXT NOT NULL,
@@ -481,6 +498,20 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
                      tenant_id, project_id, domain, repository_id, target_id
                  ) ON DELETE RESTRICT
          );
+         CREATE TABLE IF NOT EXISTS remote_graph_snapshot_metadata (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             domain TEXT NOT NULL DEFAULT 'repository_graph'
+                 CHECK (domain = 'repository_graph'),
+             repository_id TEXT NOT NULL,
+             snapshot_id TEXT NOT NULL,
+             repository_identity_json BLOB NOT NULL,
+             PRIMARY KEY (tenant_id, project_id, repository_id, snapshot_id),
+             FOREIGN KEY (tenant_id, project_id, domain, repository_id, snapshot_id)
+                 REFERENCES remote_immutable_revisions (
+                     tenant_id, project_id, domain, repository_id, target_id
+                 ) ON DELETE CASCADE
+         );
          CREATE TABLE IF NOT EXISTS remote_memory_views (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,
@@ -495,6 +526,20 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
                  REFERENCES remote_immutable_revisions (
                      tenant_id, project_id, domain, repository_id, target_id
                  ) ON DELETE RESTRICT
+         );
+         CREATE TABLE IF NOT EXISTS remote_memory_repository_link_sets (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             repository_id TEXT NOT NULL,
+             memory_revision_id TEXT NOT NULL,
+             snapshot_id TEXT NOT NULL,
+             link_set_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             link_set_json BLOB NOT NULL,
+             PRIMARY KEY (
+                 tenant_id, project_id, repository_id, memory_revision_id, snapshot_id
+             ),
+             UNIQUE (tenant_id, project_id, repository_id, link_set_id)
          );",
     )?;
     Ok(())

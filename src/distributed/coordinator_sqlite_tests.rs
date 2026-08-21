@@ -9,7 +9,9 @@ use crate::{
         },
         protocol::{IndexInputRef, IndexSemantics},
     },
-    repository_graph::domain::{Digest, SnapshotId},
+    repository_graph::domain::{
+        Digest, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId,
+    },
 };
 
 fn digest(value: &str) -> Digest {
@@ -29,6 +31,10 @@ fn submit_request(tenant: &str) -> SubmitIndexJobRequest {
         repository: super::super::identity::RemoteRepositoryRef {
             project: project.clone(),
             repository_id: RemoteRepositoryId::new("repository").unwrap(),
+        },
+        repository_identity: RepositoryRef {
+            namespace: RepositoryNamespace::new("remote:test").unwrap(),
+            repository_id: RepositoryId::new("root").unwrap(),
         },
         manifest_id: RepositoryManifestId::new("manifest").unwrap(),
         manifest_digest: digest("11"),

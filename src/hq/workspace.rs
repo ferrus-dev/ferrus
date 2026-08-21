@@ -287,6 +287,13 @@ async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Pat
                 .await
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
+        if metadata.file_type().is_symlink() {
+            let target = tokio::fs::read_link(&source)
+                .await
+                .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+            recreate_symlink(target, destination, metadata.file_type()).await?;
+            continue;
+        }
         tokio::fs::copy(&source, &destination)
             .await
             .with_context(|| {
@@ -298,6 +305,40 @@ async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Pat
             })?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn recreate_symlink(
+    target: PathBuf,
+    destination: PathBuf,
+    _file_type: std::fs::FileType,
+) -> Result<()> {
+    let displayed = destination.clone();
+    tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(target, destination))
+        .await
+        .context("Failed to join symlink creation task")?
+        .with_context(|| format!("Failed to create symlink {}", displayed.display()))
+}
+
+#[cfg(windows)]
+async fn recreate_symlink(
+    target: PathBuf,
+    destination: PathBuf,
+    file_type: std::fs::FileType,
+) -> Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    let displayed = destination.clone();
+    tokio::task::spawn_blocking(move || {
+        if file_type.is_symlink_dir() {
+            std::os::windows::fs::symlink_dir(target, destination)
+        } else {
+            std::os::windows::fs::symlink_file(target, destination)
+        }
+    })
+    .await
+    .context("Failed to join symlink creation task")?
+    .with_context(|| format!("Failed to create symlink {}", displayed.display()))
 }
 
 async fn copy_canonical_agent_config_files(
@@ -367,4 +408,41 @@ async fn git_has_head(path: &Path) -> bool {
         .output()
         .await
         .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn untracked_symlinks_are_recreated_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let canonical = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(canonical.path())
+            .status()
+            .unwrap();
+        std::fs::write(canonical.path().join("target.txt"), "target").unwrap();
+        std::fs::create_dir(canonical.path().join("target-dir")).unwrap();
+        symlink("target.txt", canonical.path().join("file-link")).unwrap();
+        symlink("target-dir", canonical.path().join("dir-link")).unwrap();
+
+        copy_canonical_untracked_files(canonical.path(), workspace.path())
+            .await
+            .unwrap();
+
+        for (name, target) in [("file-link", "target.txt"), ("dir-link", "target-dir")] {
+            let copied = workspace.path().join(name);
+            assert!(
+                std::fs::symlink_metadata(&copied)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_link(copied).unwrap(), PathBuf::from(target));
+        }
+    }
 }

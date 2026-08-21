@@ -245,6 +245,7 @@ fn repository_manifest(
     let manifest = RepositorySourceManifest {
         reference: super::super::identity::RepositoryManifestRef {
             repository: repository(),
+            repository_identity: local_repository(),
             manifest_id: RepositoryManifestId::new(manifest_digest.value()).unwrap(),
             manifest_digest,
             source_policy_digest: digest("11"),
@@ -324,6 +325,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
             memory_policy_digest: policy_digest,
             expected_revision_id,
             manifest_object,
+            repository_snapshot: None,
         },
         body,
     };
@@ -446,6 +448,7 @@ fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixtu
                 repository: repository(),
                 snapshot_id: snapshot_id.clone(),
             },
+            repository_identity: local_repository(),
             build_id: BuildId::new("build-graph").unwrap(),
         },
         FactShardId::new("graph-all").unwrap(),
@@ -547,6 +550,7 @@ fn fixture_with_memory_evidence(memory_evidence: MemoryEvidenceLocator) -> Fixtu
             },
             project_identity: local_project(),
             build_id: MemoryBuildId::new("build-memory").unwrap(),
+            repository_links: None,
         },
         FactShardId::new("memory-all").unwrap(),
         0,

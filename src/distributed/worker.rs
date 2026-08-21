@@ -20,6 +20,7 @@ use crate::{
             MemoryRevision,
         },
         extractors::{built_in_extractor_set_digest, built_in_extractors},
+        links::resolve_repository_links_for_snapshot,
         ports::{MemoryExtractionContext, MemoryExtractionInput},
     },
     repository_graph::{
@@ -51,8 +52,9 @@ use super::{
     object_store::{BoundedObjectRead, TenantObjectStore},
     protocol::{
         FactBatch, FactBatchPayload, FactTarget, IndexInputRef, IndexJobRecord, IndexJobState,
-        InspectIndexJobRequest,
+        InspectIndexJobRequest, RemoteMemoryLinkSetTarget,
     },
+    publication::StoredRemoteGraphSnapshot,
     source::{
         MemorySourceManifest, MemorySourceManifestBody, RepositorySourceManifest,
         RepositorySourceManifestBody, verify_sanitized_memory_source,
@@ -210,6 +212,25 @@ impl StatelessIndexWorker {
         O: TenantObjectStore,
         F: FactBatchStore,
     {
+        self.execute_with_repository_snapshot(request, coordinator, objects, facts, None)
+    }
+
+    /// Execute a job with its optional immutable repository-link input. A
+    /// memory job that pins a repository snapshot fails closed unless the
+    /// caller supplies the exact stored snapshot selected by the job.
+    pub fn execute_with_repository_snapshot<C, O, F>(
+        &self,
+        request: &ExecuteIndexJobRequest,
+        coordinator: &C,
+        objects: &O,
+        facts: &mut F,
+        repository_snapshot: Option<&StoredRemoteGraphSnapshot>,
+    ) -> Result<WorkerExecutionOutcome, WorkerError>
+    where
+        C: IndexJobCoordinator,
+        O: TenantObjectStore,
+        F: FactBatchStore,
+    {
         let started = Instant::now();
         self.validate_request(request)?;
         let deadline = WorkerDeadline {
@@ -277,8 +298,14 @@ impl StatelessIndexWorker {
                 manifest
                     .validate::<(), ()>()
                     .map_err(|_| WorkerError::InvalidInput)?;
-                let extracted =
-                    self.extract_memory(request, coordinator, objects, &manifest, deadline)?;
+                let extracted = self.extract_memory(
+                    request,
+                    coordinator,
+                    objects,
+                    &manifest,
+                    repository_snapshot,
+                    deadline,
+                )?;
                 (
                     extracted.target,
                     memory_payloads(
@@ -642,6 +669,7 @@ impl StatelessIndexWorker {
                     repository: remote.body.repository.clone(),
                     snapshot_id,
                 },
+                repository_identity: remote.body.source_revision.repository.clone(),
                 build_id,
             },
             graph,
@@ -654,6 +682,7 @@ impl StatelessIndexWorker {
         coordinator: &C,
         objects: &O,
         remote: &MemorySourceManifest,
+        repository_snapshot: Option<&StoredRemoteGraphSnapshot>,
         deadline: WorkerDeadline,
     ) -> Result<MemoryExtractionOutput, WorkerError>
     where
@@ -786,6 +815,52 @@ impl StatelessIndexWorker {
             }
         }
         self.check_deadline(deadline)?;
+        let repository_links = match (
+            remote.reference.repository_snapshot.as_ref(),
+            repository_snapshot,
+        ) {
+            (None, None) => None,
+            (Some(expected), Some(snapshot)) if &snapshot.record.snapshot == expected => {
+                let commit = resolve_repository_links_for_snapshot(
+                    &revision,
+                    &entities.values().cloned().collect::<Vec<_>>(),
+                    &snapshot.record.repository_identity,
+                    &expected.snapshot_id,
+                    &snapshot.nodes,
+                    request.job.created_at,
+                )
+                .map_err(|_| WorkerError::ExtractionFailed)?;
+                let link_facts = checked_sum([
+                    commit.relationships.len() as u64,
+                    commit.diagnostics.len() as u64,
+                ])?;
+                reserve_extracted_facts(
+                    &mut extracted_facts,
+                    link_facts,
+                    self.limits.max_total_facts.get(),
+                )?;
+                if diagnostics.len().saturating_add(commit.diagnostics.len()) as u64
+                    > self.limits.max_diagnostics.get()
+                {
+                    return Err(WorkerError::OutputLimitExceeded);
+                }
+                for relationship in commit.relationships {
+                    if relationships
+                        .insert(relationship.id.clone(), relationship)
+                        .is_some()
+                    {
+                        return Err(WorkerError::FactConflict);
+                    }
+                }
+                diagnostics.extend(commit.diagnostics);
+                Some(Box::new(RemoteMemoryLinkSetTarget {
+                    graph: expected.clone(),
+                    link_set: commit.link_set,
+                }))
+            }
+            _ => return Err(WorkerError::InvalidInput),
+        };
+        self.check_deadline(deadline)?;
         Ok(MemoryExtractionOutput {
             target: FactTarget::ProjectMemory {
                 revision: RemoteMemoryRevisionRef {
@@ -794,6 +869,7 @@ impl StatelessIndexWorker {
                 },
                 project_identity: remote.body.project_identity.clone(),
                 build_id,
+                repository_links,
             },
             entities: entities.into_values().collect(),
             relationships: relationships.into_values().collect(),

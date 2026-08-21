@@ -27,9 +27,9 @@ mod contracts;
 mod maintenance_sqlite_tests;
 
 /// Version of distributed control-plane request and response envelopes.
-pub const DISTRIBUTED_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const DISTRIBUTED_CONTROL_PROTOCOL_VERSION: u32 = 3;
 /// Version of immutable worker fact-batch envelopes.
-pub const DISTRIBUTED_FACT_PROTOCOL_VERSION: u32 = 1;
+pub const DISTRIBUTED_FACT_PROTOCOL_VERSION: u32 = 2;
 /// Version of authenticated deletion, recovery, and audit envelopes.
 pub const DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION: u32 = 1;
 /// Version of snapshot-pinned remote query envelopes.
@@ -39,6 +39,6 @@ pub const DISTRIBUTED_POLICY_VERSION: u32 = 1;
 /// Version of privacy-filtered repository and memory source manifests.
 pub const DISTRIBUTED_SOURCE_MANIFEST_VERSION: u32 = 2;
 /// Version of stateless worker execution requests and sandbox declarations.
-pub const DISTRIBUTED_WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const DISTRIBUTED_WORKER_PROTOCOL_VERSION: u32 = 2;
 /// Version of immutable remote fact storage and publication pointers.
-pub const DISTRIBUTED_STORAGE_PROTOCOL_VERSION: u32 = 1;
+pub const DISTRIBUTED_STORAGE_PROTOCOL_VERSION: u32 = 2;

@@ -391,7 +391,9 @@ mod tests {
             },
             protocol::{FactBatchPayload, FactTarget},
         },
-        repository_graph::domain::{BuildId, Digest, SnapshotId},
+        repository_graph::domain::{
+            BuildId, Digest, RepositoryId, RepositoryNamespace, RepositoryRef, SnapshotId,
+        },
     };
 
     fn project(tenant: &str) -> RemoteProjectRef {
@@ -420,6 +422,10 @@ mod tests {
                         repository_id: RemoteRepositoryId::new("repository").unwrap(),
                     },
                     snapshot_id: SnapshotId::new("snapshot").unwrap(),
+                },
+                repository_identity: RepositoryRef {
+                    namespace: RepositoryNamespace::new("remote:test").unwrap(),
+                    repository_id: RepositoryId::new("root").unwrap(),
                 },
                 build_id: BuildId::new("build").unwrap(),
             },

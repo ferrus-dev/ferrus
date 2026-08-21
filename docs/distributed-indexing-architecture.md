@@ -254,6 +254,14 @@ byte quotas plus per-snapshot and per-fact limits fail closed before publication
 facts, missing internal relationship endpoints, incompatible schemas, and ciphertext or count
 tampering return typed errors without exposing source-derived text.
 
+A project-memory job may pin one already-published immutable graph snapshot for repository-link
+resolution. The pinned graph target participates in the job and fact-batch identities but not in
+`memory_revision_id`. The stateless worker resolves only explicit repository evidence against the
+supplied snapshot and emits an independently identified link set. Publication stores that set in a
+separate encrypted `memory_repository_links` domain only when the memory publication wins its CAS.
+Federated reads load links only for the exact memory revision and graph snapshot pair, so advancing
+either domain cannot rewrite semantic memory facts or reuse links resolved for another snapshot.
+
 The graph and memory CAS checks run before the same-target no-op branch. A stale publisher may
 leave an immutable unreferenced target for later retention, but it completes without changing the
 winner's pointer. Graph and memory generations advance independently. The prototype composes a

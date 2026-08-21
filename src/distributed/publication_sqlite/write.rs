@@ -13,7 +13,12 @@ pub(super) fn prepare_graph(
     let mut target = None;
     let mut extractor_set_digest = None;
     for batch in batches {
-        let FactTarget::RepositoryGraph { snapshot, build_id } = &batch.header.target else {
+        let FactTarget::RepositoryGraph {
+            snapshot,
+            repository_identity,
+            build_id,
+        } = &batch.header.target
+        else {
             return Err(RemoteStoreError::InvalidInput);
         };
         if snapshot.repository != request.repository || snapshot.snapshot_id != request.snapshot_id
@@ -21,9 +26,17 @@ pub(super) fn prepare_graph(
             return Err(RemoteStoreError::InvalidInput);
         }
         match &target {
-            None => target = Some((snapshot.clone(), build_id.clone())),
-            Some((existing_snapshot, existing_build))
-                if existing_snapshot == snapshot && existing_build == build_id => {}
+            None => {
+                target = Some((
+                    snapshot.clone(),
+                    repository_identity.clone(),
+                    build_id.clone(),
+                ))
+            }
+            Some((existing_snapshot, existing_repository, existing_build))
+                if existing_snapshot == snapshot
+                    && existing_repository == repository_identity
+                    && existing_build == build_id => {}
             Some(_) => return Err(RemoteStoreError::InvalidInput),
         }
         match &extractor_set_digest {
@@ -64,7 +77,7 @@ pub(super) fn prepare_graph(
     if count > max_facts.get() {
         return Err(RemoteStoreError::QuotaExceeded);
     }
-    let (snapshot, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
+    let (snapshot, repository_identity, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
     let extractor_set_digest = extractor_set_digest.ok_or(RemoteStoreError::InvalidInput)?;
     let fact_set_digest = canonical_digest(&(
         nodes.values().collect::<Vec<_>>(),
@@ -86,6 +99,7 @@ pub(super) fn prepare_graph(
     Ok(PreparedGraph {
         record: RemoteGraphSnapshotRecord {
             snapshot,
+            repository_identity,
             job: request.job.clone(),
             build_id,
             extractor_set_digest,
@@ -113,6 +127,7 @@ pub(super) fn prepare_memory(
     validate_batch_stream(&request.job, batches)?;
     let mut entities = BTreeMap::<MemoryEntityId, MemoryEntity>::new();
     let mut relationships = BTreeMap::<MemoryRelationshipId, MemoryRelationship>::new();
+    let mut repository_relationships = BTreeMap::<MemoryRelationshipId, MemoryRelationship>::new();
     let mut diagnostics = BTreeMap::<String, MemoryDiagnostic>::new();
     let mut target = None;
     let mut extractor_set_digest = None;
@@ -121,6 +136,7 @@ pub(super) fn prepare_memory(
             revision,
             project_identity,
             build_id,
+            repository_links,
         } = &batch.header.target
         else {
             return Err(RemoteStoreError::InvalidInput);
@@ -129,11 +145,19 @@ pub(super) fn prepare_memory(
             return Err(RemoteStoreError::InvalidInput);
         }
         match &target {
-            None => target = Some((revision.clone(), project_identity.clone(), build_id.clone())),
-            Some((existing_revision, existing_project, existing_build))
+            None => {
+                target = Some((
+                    revision.clone(),
+                    project_identity.clone(),
+                    build_id.clone(),
+                    repository_links.clone(),
+                ))
+            }
+            Some((existing_revision, existing_project, existing_build, existing_links))
                 if existing_revision == revision
                     && existing_project == project_identity
-                    && existing_build == build_id => {}
+                    && existing_build == build_id
+                    && existing_links == repository_links => {}
             Some(_) => return Err(RemoteStoreError::InvalidInput),
         }
         match &extractor_set_digest {
@@ -150,9 +174,18 @@ pub(super) fn prepare_memory(
             return Err(RemoteStoreError::InvalidInput);
         };
         merge_facts(&mut entities, batch_entities, |entity| &entity.id)?;
-        merge_facts(&mut relationships, batch_relationships, |relationship| {
-            &relationship.id
-        })?;
+        for relationship in batch_relationships {
+            let destination = if is_repository_relationship(relationship) {
+                &mut repository_relationships
+            } else {
+                &mut relationships
+            };
+            merge_facts(
+                destination,
+                std::slice::from_ref(relationship),
+                |relationship| &relationship.id,
+            )?;
+        }
         for diagnostic in batch_diagnostics {
             let encoded =
                 serde_json::to_vec(diagnostic).map_err(|_| RemoteStoreError::Serialization)?;
@@ -176,11 +209,41 @@ pub(super) fn prepare_memory(
             return Err(RemoteStoreError::FactConflict);
         }
     }
-    let count = checked_fact_count(entities.len(), relationships.len(), diagnostics.len())?;
+    let (revision, project_identity, build_id, repository_link_target) =
+        target.ok_or(RemoteStoreError::InvalidInput)?;
+    if (repository_link_target.is_none() && !repository_relationships.is_empty())
+        || repository_relationships.values().any(|relationship| {
+            !entities.contains_key(&relationship.source)
+                || repository_link_target
+                    .as_ref()
+                    .is_none_or(|target| !repository_relationship_matches(relationship, target))
+        })
+    {
+        return Err(RemoteStoreError::FactConflict);
+    }
+    let repository_relationship_ids = repository_relationships
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let (repository_diagnostics, diagnostics): (BTreeMap<_, _>, BTreeMap<_, _>) =
+        diagnostics.into_iter().partition(|(_, diagnostic)| {
+            diagnostic
+                .relationship_id
+                .as_ref()
+                .is_some_and(|id| repository_relationship_ids.contains(id))
+        });
+    let count = checked_fact_count(
+        entities.len(),
+        relationships
+            .len()
+            .saturating_add(repository_relationships.len()),
+        diagnostics
+            .len()
+            .saturating_add(repository_diagnostics.len()),
+    )?;
     if count > max_facts.get() {
         return Err(RemoteStoreError::QuotaExceeded);
     }
-    let (revision, project_identity, build_id) = target.ok_or(RemoteStoreError::InvalidInput)?;
     let extractor_set_digest = extractor_set_digest.ok_or(RemoteStoreError::InvalidInput)?;
     let fact_set_digest = canonical_digest(&(
         entities.values().collect::<Vec<_>>(),
@@ -203,6 +266,41 @@ pub(super) fn prepare_memory(
             .map(|(id, value)| (id.to_string(), value)),
     )?;
     append_facts(&mut facts, "diagnostic", diagnostics)?;
+    let repository_links = repository_link_target
+        .map(|target| {
+            let fact_set_digest = canonical_digest(&(
+                &target,
+                repository_relationships.values().collect::<Vec<_>>(),
+                repository_diagnostics.values().collect::<Vec<_>>(),
+            ))?;
+            let counts = RemoteFactCounts {
+                primary: 0,
+                relationships: repository_relationships.len() as u64,
+                diagnostics: repository_diagnostics.len() as u64,
+            };
+            let mut link_facts = Vec::with_capacity(
+                repository_relationships
+                    .len()
+                    .saturating_add(repository_diagnostics.len()),
+            );
+            let link_relationships = repository_relationships.values().cloned().collect();
+            append_facts(
+                &mut link_facts,
+                "relationship",
+                repository_relationships
+                    .into_iter()
+                    .map(|(id, value)| (id.to_string(), value)),
+            )?;
+            append_facts(&mut link_facts, "diagnostic", repository_diagnostics)?;
+            Ok::<_, RemoteStoreError>(PreparedMemoryRepositoryLinks {
+                target: *target,
+                relationships: link_relationships,
+                fact_set_digest,
+                counts,
+                facts: link_facts,
+            })
+        })
+        .transpose()?;
     Ok(PreparedMemory {
         record: RemoteMemoryRevisionRecord {
             revision,
@@ -225,7 +323,48 @@ pub(super) fn prepare_memory(
         },
         project_identity,
         facts,
+        repository_links,
     })
+}
+
+fn is_repository_relationship(relationship: &MemoryRelationship) -> bool {
+    matches!(
+        relationship.target,
+        MemoryRelationshipTarget::RepositoryNode { .. }
+            | MemoryRelationshipTarget::RepositoryPath { .. }
+            | MemoryRelationshipTarget::RepositorySymbol { .. }
+    )
+}
+
+fn repository_relationship_matches(
+    relationship: &MemoryRelationship,
+    target: &RemoteMemoryLinkSetTarget,
+) -> bool {
+    if relationship.project != target.link_set.project
+        || relationship.memory_revision_id != target.link_set.memory_revision_id
+    {
+        return false;
+    }
+    let (repository, snapshot) = match &relationship.target {
+        MemoryRelationshipTarget::RepositoryNode {
+            repository,
+            snapshot_id,
+            ..
+        } => (repository, Some(snapshot_id)),
+        MemoryRelationshipTarget::RepositoryPath {
+            repository,
+            snapshot_id,
+            ..
+        }
+        | MemoryRelationshipTarget::RepositorySymbol {
+            repository,
+            snapshot_id,
+            ..
+        } => (repository, snapshot_id.as_ref()),
+        _ => return false,
+    };
+    repository == &target.link_set.repository
+        && snapshot.is_none_or(|snapshot| snapshot == &target.graph.snapshot_id)
 }
 
 pub(super) fn validate_batch_stream(
@@ -518,7 +657,7 @@ pub(super) fn insert_graph_snapshot(
     facts: &[EncryptedFact],
     limits: RemoteStoreLimits,
 ) -> Result<bool, RemoteStoreError> {
-    insert_revision(
+    let reused = insert_revision(
         transaction,
         &record.snapshot.repository.project,
         "repository_graph",
@@ -532,7 +671,42 @@ pub(super) fn insert_graph_snapshot(
         record.completed_at,
         facts,
         limits,
-    )
+    )?;
+    let encoded = serde_json::to_vec(&record.repository_identity)
+        .map_err(|_| RemoteStoreError::Serialization)?;
+    let existing = transaction
+        .query_row(
+            "SELECT repository_identity_json FROM remote_graph_snapshot_metadata
+             WHERE tenant_id = ?1 AND project_id = ?2 AND repository_id = ?3
+               AND snapshot_id = ?4",
+            params![
+                record.snapshot.repository.project.tenant_id.as_str(),
+                record.snapshot.repository.project.project_id.as_str(),
+                record.snapshot.repository.repository_id.as_str(),
+                record.snapshot.snapshot_id.as_str()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing != encoded {
+            return Err(RemoteStoreError::ImmutableConflict);
+        }
+    } else {
+        transaction.execute(
+            "INSERT INTO remote_graph_snapshot_metadata (
+                 tenant_id, project_id, repository_id, snapshot_id, repository_identity_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.snapshot.repository.project.tenant_id.as_str(),
+                record.snapshot.repository.project.project_id.as_str(),
+                record.snapshot.repository.repository_id.as_str(),
+                record.snapshot.snapshot_id.as_str(),
+                encoded
+            ],
+        )?;
+    }
+    Ok(reused)
 }
 
 pub(super) fn insert_memory_revision(
@@ -556,6 +730,87 @@ pub(super) fn insert_memory_revision(
         facts,
         limits,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_memory_repository_links(
+    transaction: &Transaction<'_>,
+    project: &RemoteProjectRef,
+    target: &RemoteMemoryLinkSetTarget,
+    job: &IndexJobRef,
+    build_id: &MemoryBuildId,
+    extractor_set_digest: &Digest,
+    fact_set_digest: &Digest,
+    counts: RemoteFactCounts,
+    completed_at: DateTime<Utc>,
+    facts: &[EncryptedFact],
+    limits: RemoteStoreLimits,
+) -> Result<(), RemoteStoreError> {
+    insert_revision(
+        transaction,
+        project,
+        "memory_repository_links",
+        target.graph.repository.repository_id.as_str(),
+        target.link_set.id.as_str(),
+        job,
+        build_id.as_str(),
+        extractor_set_digest,
+        fact_set_digest,
+        counts,
+        completed_at,
+        facts,
+        limits,
+    )?;
+    let stored_job = load_revision_row(
+        transaction,
+        project,
+        "memory_repository_links",
+        target.graph.repository.repository_id.as_str(),
+        target.link_set.id.as_str(),
+    )?
+    .ok_or(RemoteStoreError::IntegrityFailure)?
+    .job_id;
+    let encoded =
+        serde_json::to_vec(&target.link_set).map_err(|_| RemoteStoreError::Serialization)?;
+    let existing = transaction
+        .query_row(
+            "SELECT link_set_id, link_set_json
+             FROM remote_memory_repository_link_sets
+             WHERE tenant_id = ?1 AND project_id = ?2 AND repository_id = ?3
+               AND memory_revision_id = ?4 AND snapshot_id = ?5",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                target.graph.repository.repository_id.as_str(),
+                target.link_set.memory_revision_id.as_str(),
+                target.graph.snapshot_id.as_str()
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    if let Some((link_set_id, link_set_json)) = existing {
+        if link_set_id != target.link_set.id.as_str() || link_set_json != encoded {
+            return Err(RemoteStoreError::ImmutableConflict);
+        }
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO remote_memory_repository_link_sets (
+             tenant_id, project_id, repository_id, memory_revision_id, snapshot_id,
+             link_set_id, job_id, link_set_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            project.tenant_id.as_str(),
+            project.project_id.as_str(),
+            target.graph.repository.repository_id.as_str(),
+            target.link_set.memory_revision_id.as_str(),
+            target.graph.snapshot_id.as_str(),
+            target.link_set.id.as_str(),
+            stored_job.as_str(),
+            encoded
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

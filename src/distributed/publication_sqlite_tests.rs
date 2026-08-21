@@ -8,12 +8,20 @@ use crate::{
             FactShardId, MemoryManifestId, ObjectId, RemoteProjectId, RemoteRepositoryId,
             RepositoryManifestId, RequestId, TenantId, TenantObjectRef,
         },
-        protocol::{IndexInputRef, IndexSemantics, SubmitIndexJobRequest},
+        protocol::{
+            IndexInputRef, IndexSemantics, RemoteMemoryLinkSetTarget, SubmitIndexJobRequest,
+        },
     },
-    project_memory::domain::{ProjectId, ProjectNamespace, ProjectRef},
+    project_memory::domain::{
+        MemoryConfidence, MemoryEntityData, MemoryEvidenceLocator, MemoryExtractorId,
+        MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance, MemoryRecordId,
+        MemoryRelationshipKind, MemoryRepositoryLinkSet, MemoryRepositoryLinkSetId,
+        MemoryResolutionState, MemorySourceCategory, MemorySourceLocator, MemoryStatusToken,
+        MemoryText, ProjectId, ProjectNamespace, ProjectRef,
+    },
     repository_graph::domain::{
-        Confidence, ExtractorId, ExtractorIdentity, FactProvenance, GraphValue, ResolutionState,
-        SemanticKey,
+        Confidence, ExtractorId, ExtractorIdentity, FactProvenance, GraphValue, RepoPath,
+        RepositoryId, RepositoryNamespace, RepositoryRef, ResolutionState, SemanticKey,
     },
 };
 
@@ -46,6 +54,13 @@ fn repository(tenant: &str) -> RemoteRepositoryRef {
     RemoteRepositoryRef {
         project: project(tenant),
         repository_id: RemoteRepositoryId::new("repository").unwrap(),
+    }
+}
+
+fn local_repository() -> RepositoryRef {
+    RepositoryRef {
+        namespace: RepositoryNamespace::new("remote:test").unwrap(),
+        repository_id: RepositoryId::new("root").unwrap(),
     }
 }
 
@@ -87,6 +102,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str, target: &str) -> IndexI
         IndexJobKind::RepositoryGraph => {
             IndexInputRef::Repository(super::super::identity::RepositoryManifestRef {
                 repository: repository(tenant),
+                repository_identity: local_repository(),
                 manifest_id: RepositoryManifestId::new(identity.value()).unwrap(),
                 manifest_digest: identity,
                 source_policy_digest: digest("22"),
@@ -103,6 +119,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str, target: &str) -> IndexI
                 memory_policy_digest: digest("22"),
                 expected_revision_id: MemoryRevisionId::new(target).unwrap(),
                 manifest_object: object,
+                repository_snapshot: None,
             })
         }
     }
@@ -114,10 +131,24 @@ fn publishing_job(
     unique: &str,
     target: &str,
 ) -> super::super::protocol::IndexJobRecord {
+    publishing_job_with_input(
+        coordinator,
+        kind,
+        unique,
+        input(kind, "tenant-a", unique, target),
+    )
+}
+
+fn publishing_job_with_input(
+    coordinator: &mut SqliteIndexJobCoordinator,
+    kind: IndexJobKind,
+    unique: &str,
+    input: IndexInputRef,
+) -> super::super::protocol::IndexJobRecord {
     let now = Utc::now();
     let spec = IndexJobSpec::new(
         kind,
-        input(kind, "tenant-a", unique, target),
+        input,
         IndexSemantics {
             semantic_config_digest: digest("33"),
             model_version: std::num::NonZeroU32::new(1).unwrap(),
@@ -245,6 +276,7 @@ fn graph_batch_with_final(
                 repository: repository("tenant-a"),
                 snapshot_id,
             },
+            repository_identity: local_repository(),
             build_id: BuildId::new(format!("build-{snapshot}")).unwrap(),
         },
         FactShardId::new("repository-all").unwrap(),
@@ -278,6 +310,7 @@ fn memory_batch_for_project(
             },
             project_identity,
             build_id: MemoryBuildId::new(format!("build-{revision}")).unwrap(),
+            repository_links: None,
         },
         FactShardId::new("memory-all").unwrap(),
         0,
@@ -365,6 +398,136 @@ fn memory_publication_rejects_a_target_not_bound_to_the_job_input() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let graph_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "aa",
+        "snapshot-linked",
+    );
+    let graph_request = graph_request(&graph_job, "snapshot-linked", None);
+    let graph_batch = graph_batch(&graph_job.job, "snapshot-linked", "linked repository node");
+    let mut store = store(&path);
+    store
+        .publish_graph(&graph_request, &[graph_batch], Utc::now())
+        .unwrap();
+    let graph = RemoteGraphSnapshotRef {
+        repository: repository("tenant-a"),
+        snapshot_id: SnapshotId::new("snapshot-linked").unwrap(),
+    };
+
+    let mut memory_input = input(
+        IndexJobKind::ProjectMemory,
+        "tenant-a",
+        "bb",
+        "memory-linked",
+    );
+    let IndexInputRef::Memory(manifest) = &mut memory_input else {
+        unreachable!();
+    };
+    manifest.repository_snapshot = Some(graph.clone());
+    let memory_job = publishing_job_with_input(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "bb",
+        memory_input,
+    );
+    let revision_id = MemoryRevisionId::new("memory-linked").unwrap();
+    let entity_id = MemoryEntityId::new("linked-memory-entity").unwrap();
+    let now = Utc::now();
+    let provenance = MemoryProvenance {
+        source_category: MemorySourceCategory::ApprovedOutcome,
+        source_locator: MemorySourceLocator::TrackedFile {
+            path: RepoPath::new("docs/spec.md").unwrap(),
+        },
+        source_fingerprint: digest("77"),
+        extractor: MemoryExtractorIdentity::current(
+            MemoryExtractorId::new("memory.test").unwrap(),
+            MemoryStatusToken::new("v1").unwrap(),
+        ),
+        evidence: MemoryEvidenceLocator::Record(MemoryRecordId::new("outcome").unwrap()),
+        resolution: MemoryResolutionState::Resolved,
+        confidence: MemoryConfidence::Exact,
+        timestamps: MemoryIndexTimestamps {
+            source_observed_at: now,
+            indexed_at: now,
+        },
+    };
+    let entity = MemoryEntity {
+        project: local_project(),
+        memory_revision_id: revision_id.clone(),
+        id: entity_id.clone(),
+        data: MemoryEntityData::Outcome {
+            text: MemoryText::new("Linked outcome").unwrap(),
+        },
+        provenance: provenance.clone(),
+    };
+    let link_set = MemoryRepositoryLinkSet {
+        id: MemoryRepositoryLinkSetId::new("memory-links:linked").unwrap(),
+        project: local_project(),
+        memory_revision_id: revision_id.clone(),
+        repository: local_repository(),
+        repository_snapshot_id: Some(graph.snapshot_id.clone()),
+        resolver: provenance.extractor.clone(),
+    };
+    let relationship = MemoryRelationship {
+        project: local_project(),
+        memory_revision_id: revision_id.clone(),
+        id: MemoryRelationshipId::new("linked-relationship").unwrap(),
+        kind: MemoryRelationshipKind::Touches,
+        source: entity_id,
+        target: MemoryRelationshipTarget::RepositoryNode {
+            repository: local_repository(),
+            snapshot_id: graph.snapshot_id.clone(),
+            node_id: NodeId::new("node-snapshot-linked").unwrap(),
+        },
+        provenance,
+    };
+    let batch = FactBatch::new(
+        memory_job.job.clone(),
+        FactTarget::ProjectMemory {
+            revision: RemoteMemoryRevisionRef {
+                project: project("tenant-a"),
+                revision_id: revision_id.clone(),
+            },
+            project_identity: local_project(),
+            build_id: MemoryBuildId::new("build-memory-linked").unwrap(),
+            repository_links: Some(Box::new(RemoteMemoryLinkSetTarget {
+                graph: graph.clone(),
+                link_set,
+            })),
+        },
+        FactShardId::new("memory-all").unwrap(),
+        0,
+        digest("44"),
+        true,
+        FactBatchPayload::ProjectMemory {
+            entities: vec![entity],
+            relationships: vec![relationship.clone()],
+            diagnostics: Vec::new(),
+        },
+    )
+    .unwrap();
+    let request = memory_request(&memory_job, "memory-linked", None);
+    store
+        .publish_memory(&request, &[batch], Utc::now())
+        .unwrap();
+
+    let memory_ref = RemoteMemoryRevisionRef {
+        project: project("tenant-a"),
+        revision_id,
+    };
+    let memory = store.memory_revision(&memory_ref).unwrap().unwrap();
+    assert!(memory.relationships.is_empty());
+    let federated = FederatedViewRef::new(graph, memory_ref).unwrap();
+    let links = store.memory_repository_links(&federated).unwrap().unwrap();
+    assert_eq!(links.relationships, vec![relationship]);
 }
 
 #[test]

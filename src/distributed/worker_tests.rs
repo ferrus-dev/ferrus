@@ -15,9 +15,10 @@ use crate::{
         },
         object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
         protocol::{
-            CancelIndexJobRequest, FactBatch, IndexJobKind, IndexJobRef, IndexJobSpec,
-            IndexSemantics, SubmitIndexJobRequest,
+            CancelIndexJobRequest, FactBatch, FactBatchPayload, IndexJobKind, IndexJobRef,
+            IndexJobSpec, IndexSemantics, SubmitIndexJobRequest,
         },
+        publication::{RemoteFactCounts, RemoteGraphSnapshotRecord, StoredRemoteGraphSnapshot},
         source::{
             PackagingLimits, RepositoryPackagingPolicy, package_memory_source,
             package_repository_source,
@@ -26,8 +27,8 @@ use crate::{
     project_memory::{
         documents::parse_spec_memory,
         domain::{
-            AuthorizedSourceDescriptor, MemorySourceCategory, MemorySourceLocator, ProjectId,
-            ProjectNamespace, ProjectRef,
+            AuthorizedSourceDescriptor, MemoryRelationshipTarget, MemorySourceCategory,
+            MemorySourceLocator, ProjectId, ProjectNamespace, ProjectRef,
         },
         extractors::canonical_digest as memory_digest,
         policy::MemoryPolicy,
@@ -35,7 +36,11 @@ use crate::{
     },
     repository_graph::{
         config::RepositoryGraphConfig,
-        domain::{Digest, RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef},
+        domain::{
+            BuildId, Confidence, Digest, ExtractorId, ExtractorIdentity, FactProvenance, GraphNode,
+            NodeId, RepoPath, RepositoryId, RepositoryNamespace, RepositoryRef, ResolutionState,
+            SemanticKey, SnapshotId, SourceEvidence,
+        },
         source::{LocalRepositorySource, SourceDiscoveryContext},
     },
 };
@@ -958,4 +963,141 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
+    let content = b"# Example\n\n## Outcome\n\nDelivered.\n\n### Decisions\n\nUse `path:src/lib.rs` and `symbol:important-type`.\n".to_vec();
+    let parsed = parse_spec_memory(std::str::from_utf8(&content).unwrap());
+    let policy = MemoryPolicy::default();
+    let descriptor = AuthorizedSourceDescriptor {
+        project: local_project(),
+        category: MemorySourceCategory::ApprovedOutcome,
+        locator: MemorySourceLocator::TrackedFile {
+            path: RepoPath::new("docs/specs/example.md").unwrap(),
+        },
+        fingerprint: memory_digest(parsed.outcome.as_ref().unwrap()),
+        byte_len: content.len() as u64,
+    };
+    let mut local_manifest = AuthorizedSourceManifest {
+        project: local_project(),
+        policy_digest: policy.digest(),
+        source_set_digest: Digest::new("sha256", "11").unwrap(),
+        extractor_set_digest: built_in_extractor_set_digest(),
+        sources: vec![descriptor],
+    };
+    local_manifest.source_set_digest = local_manifest.computed_source_set_digest().unwrap();
+    let source = FakeMemorySource {
+        manifest: local_manifest,
+        content,
+    };
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mut objects = object_store(&storage_dir.path().join("objects"));
+    let mut manifest = package_memory_source(
+        &source,
+        remote_project(),
+        &policy,
+        packaging_limits(),
+        &mut objects,
+    )
+    .unwrap();
+    let graph_ref = RemoteGraphSnapshotRef {
+        repository: remote_repository(),
+        snapshot_id: SnapshotId::new("graph-snapshot").unwrap(),
+    };
+    manifest.reference.repository_snapshot = Some(graph_ref.clone());
+    let graph = StoredRemoteGraphSnapshot {
+        record: RemoteGraphSnapshotRecord {
+            snapshot: graph_ref.clone(),
+            repository_identity: local_repository(),
+            job: IndexJobRef {
+                project: remote_project(),
+                job_id: crate::distributed::identity::IndexJobId::new("graph-job").unwrap(),
+                kind: IndexJobKind::RepositoryGraph,
+            },
+            build_id: BuildId::new("graph-build").unwrap(),
+            extractor_set_digest: Digest::new("sha256", "22").unwrap(),
+            fact_set_digest: Digest::new("sha256", "33").unwrap(),
+            counts: RemoteFactCounts {
+                primary: 1,
+                relationships: 0,
+                diagnostics: 0,
+            },
+            completed_at: Utc::now(),
+        },
+        nodes: vec![GraphNode {
+            snapshot_id: graph_ref.snapshot_id.clone(),
+            id: NodeId::new("important-node").unwrap(),
+            kind: "symbol".to_string(),
+            semantic_key: Some(SemanticKey::new("important-type").unwrap()),
+            provenance: FactProvenance {
+                extractor: ExtractorIdentity {
+                    id: ExtractorId::new("test.graph").unwrap(),
+                    version: "1".to_string(),
+                    contract_version: 1,
+                },
+                evidence: Some(SourceEvidence {
+                    path: RepoPath::new("src/lib.rs").unwrap(),
+                    content_identity: Digest::new("sha256", "44").unwrap(),
+                    span: None,
+                }),
+                resolution: ResolutionState::Resolved,
+                confidence: Confidence::Exact,
+            },
+            properties: BTreeMap::new(),
+        }],
+        edges: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut jobs = coordinator(&storage_dir.path().join("jobs.db"));
+    let running = running_job(
+        &mut jobs,
+        IndexJobKind::ProjectMemory,
+        IndexInputRef::Memory(manifest.reference.clone()),
+        IndexSemantics {
+            semantic_config_digest: policy.digest(),
+            model_version: NonZeroU32::new(MEMORY_MODEL_VERSION).unwrap(),
+            extractor_set_digest: built_in_extractor_set_digest(),
+        },
+    );
+    let request = execution_request(running);
+    let mut facts = fact_store(&storage_dir.path().join("linked-facts.db"));
+
+    StatelessIndexWorker::new(worker_limits())
+        .execute_with_repository_snapshot(&request, &jobs, &objects, &mut facts, Some(&graph))
+        .unwrap();
+
+    let batches = facts.load_for_ingestion(&request.job.job).unwrap();
+    assert!(batches.iter().all(|batch| {
+        matches!(
+            &batch.header.target,
+            FactTarget::ProjectMemory {
+                repository_links: Some(target),
+                ..
+            } if target.graph == graph_ref
+                && target.link_set.repository_snapshot_id.as_ref() == Some(&graph_ref.snapshot_id)
+        )
+    }));
+    let relationships = batches
+        .iter()
+        .flat_map(|batch| match &batch.payload {
+            FactBatchPayload::ProjectMemory { relationships, .. } => relationships.as_slice(),
+            FactBatchPayload::RepositoryGraph { .. } => &[],
+        })
+        .collect::<Vec<_>>();
+    assert!(relationships.iter().any(|relationship| matches!(
+        relationship.target,
+        MemoryRelationshipTarget::RepositoryPath {
+            snapshot_id: Some(ref snapshot_id),
+            ..
+        } if snapshot_id == &graph_ref.snapshot_id
+    )));
+    assert!(relationships.iter().any(|relationship| matches!(
+        relationship.target,
+        MemoryRelationshipTarget::RepositoryNode {
+            ref snapshot_id,
+            ref node_id,
+            ..
+        } if snapshot_id == &graph_ref.snapshot_id && node_id.as_str() == "important-node"
+    )));
 }
