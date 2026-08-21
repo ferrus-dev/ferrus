@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use super::{
     DiagnosticCollector, LocalRepositorySource, SourceContent, SourceDiscoveryContext, SourceError,
+    canonical_source_manifest_digest,
     git::{canonical_root, ensure_worktree_root, git_command, trim_ascii},
-    is_binary, manifest_digest, revision_id, sha256_digest,
+    is_binary, revision_id, sha256_digest,
 };
 use crate::repository_graph::{
     domain::{Digest, OverlayRevisionId, RepoPath, SourceKind, SourceRevision, WorkspaceRef},
@@ -185,7 +186,8 @@ impl TaskOverlaySource {
         }
         let files = effective_files.into_values().collect::<Vec<_>>();
         let included = files.len() as u64;
-        let effective_manifest_digest = manifest_digest(&files, &context.source_policy_digest);
+        let effective_manifest_digest =
+            canonical_source_manifest_digest(&files, &context.source_policy_digest);
         let source_manifest_digest = composed_manifest_digest(
             &effective_manifest_digest,
             &overlay.manifest().manifest_digest,
@@ -675,7 +677,8 @@ pub(super) fn discover_tree_manifest(
 
     metrics.directories = directories.len() as u64 + 1;
     metrics.suppressed_diagnostics = diagnostics.suppressed;
-    let source_manifest_digest = manifest_digest(&files, &context.source_policy_digest);
+    let source_manifest_digest =
+        canonical_source_manifest_digest(&files, &context.source_policy_digest);
     let revision = SourceRevision {
         id: revision_id(
             &context.repository,

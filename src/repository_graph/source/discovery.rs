@@ -224,7 +224,7 @@ pub(super) fn build_manifest(
     }
 
     metrics.suppressed_diagnostics = diagnostics.suppressed;
-    let manifest_digest = manifest_digest(&files, &context.source_policy_digest);
+    let manifest_digest = canonical_source_manifest_digest(&files, &context.source_policy_digest);
     let revision = SourceRevision {
         id: revision_id(
             &context.repository,
@@ -468,29 +468,6 @@ pub fn extractor_set_digest(extractors: &[ExtractorIdentity]) -> Digest {
         .collect::<BTreeSet<_>>();
     let bytes = serde_json::to_vec(&(SOURCE_MANIFEST_VERSION, canonical))
         .expect("canonical extractor-set serialization cannot fail");
-    sha256_digest(&bytes)
-}
-
-#[derive(Serialize)]
-struct CanonicalManifest<'a> {
-    version: u32,
-    source_policy_version: u32,
-    source_policy_digest: &'a Digest,
-    files: &'a [SourceFileDescriptor],
-}
-
-pub(super) fn manifest_digest(
-    files: &[SourceFileDescriptor],
-    source_policy_digest: &Digest,
-) -> Digest {
-    let canonical = CanonicalManifest {
-        version: SOURCE_MANIFEST_VERSION,
-        source_policy_version: SOURCE_POLICY_VERSION,
-        source_policy_digest,
-        files,
-    };
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical source manifest serialization cannot fail");
     sha256_digest(&bytes)
 }
 

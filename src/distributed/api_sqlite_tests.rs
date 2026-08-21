@@ -47,7 +47,7 @@ use crate::{
             SourceEvidence, SourceKind, SourcePosition, SourceRevision, SourceRevisionId,
             SourceSpan,
         },
-        ports::SourceFileMode,
+        ports::{SourceFileDescriptor, SourceFileMode, canonical_source_manifest_digest},
     },
 };
 
@@ -190,7 +190,7 @@ fn repository_manifest(
         .put_verified(&project(), &content_identity, source_text.as_bytes())
         .unwrap()
         .object;
-    let body = RepositorySourceManifestBody {
+    let mut body = RepositorySourceManifestBody {
         protocol_version: DISTRIBUTED_SOURCE_MANIFEST_VERSION,
         repository: repository(),
         source_policy_digest: digest("11"),
@@ -220,6 +220,18 @@ fn repository_manifest(
             source_diagnostic_codes: BTreeMap::new(),
         },
     };
+    let source_files = body
+        .files
+        .iter()
+        .map(|file| SourceFileDescriptor {
+            path: file.path.clone(),
+            content_identity: file.content_identity.clone(),
+            byte_len: file.byte_len,
+            file_mode: file.file_mode,
+        })
+        .collect::<Vec<_>>();
+    body.source_revision.manifest_digest =
+        canonical_source_manifest_digest(&source_files, &body.source_policy_digest);
     let encoded = serde_json::to_vec(&body).unwrap();
     let manifest_digest = sha256(&encoded);
     let manifest_object = objects

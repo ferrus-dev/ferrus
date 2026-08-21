@@ -138,6 +138,55 @@ fn object_store(path: &std::path::Path) -> EncryptedFilesystemObjectStore {
     .unwrap()
 }
 
+struct BoundedReadTracker<'a> {
+    inner: &'a EncryptedFilesystemObjectStore,
+    reads: Cell<usize>,
+}
+
+impl<'a> BoundedReadTracker<'a> {
+    fn new(inner: &'a EncryptedFilesystemObjectStore) -> Self {
+        Self {
+            inner,
+            reads: Cell::new(0),
+        }
+    }
+}
+
+impl crate::distributed::object_store::TenantObjectStore for BoundedReadTracker<'_> {
+    type Error = crate::distributed::object_store::ObjectStoreError;
+
+    fn protection(&self) -> crate::distributed::object_store::ObjectStoreProtection {
+        self.inner.protection()
+    }
+
+    fn put_verified(
+        &mut self,
+        _project: &RemoteProjectRef,
+        _content_identity: &Digest,
+        _content: &[u8],
+    ) -> Result<crate::distributed::object_store::PutObjectResult, Self::Error> {
+        unreachable!("workers never write source objects")
+    }
+
+    fn read_verified(
+        &self,
+        _object: &crate::distributed::identity::TenantObjectRef,
+    ) -> Result<Vec<u8>, Self::Error> {
+        panic!("worker source reads must use the bounded object boundary")
+    }
+
+    fn read_verified_bounded(
+        &self,
+        object: &crate::distributed::identity::TenantObjectRef,
+        max_bytes: u64,
+        deadline: std::time::Instant,
+    ) -> Result<crate::distributed::object_store::BoundedObjectRead, Self::Error> {
+        self.reads.set(self.reads.get().saturating_add(1));
+        self.inner
+            .read_verified_bounded(object, max_bytes, deadline)
+    }
+}
+
 fn fact_store(path: &std::path::Path) -> SqliteFactBatchStore {
     SqliteFactBatchStore::open(
         path,
@@ -436,10 +485,12 @@ fn repository_worker_extracts_cargo_facts_without_process_execution() {
         RepositoryExecutionPolicy::Denied
     );
     let mut facts = fact_store(&storage_dir.path().join("cargo-facts.db"));
+    let bounded_objects = BoundedReadTracker::new(&objects);
 
     StatelessIndexWorker::new(worker_limits())
-        .execute(&request, &jobs, &objects, &mut facts)
+        .execute(&request, &jobs, &bounded_objects, &mut facts)
         .unwrap();
+    assert_eq!(bounded_objects.reads.get(), manifest.body.files.len() + 1);
     let batches = facts.load_for_ingestion(&request.job.job).unwrap();
     let mut node_kinds = std::collections::BTreeSet::new();
     let mut diagnostic_codes = std::collections::BTreeSet::new();
@@ -824,9 +875,11 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
             .is_empty()
     );
     let mut facts = fact_store(&storage_dir.path().join("facts.db"));
+    let bounded_objects = BoundedReadTracker::new(&objects);
     let outcome = StatelessIndexWorker::new(worker_limits())
-        .execute(&request, &jobs, &objects, &mut facts)
+        .execute(&request, &jobs, &bounded_objects, &mut facts)
         .unwrap();
+    assert_eq!(bounded_objects.reads.get(), manifest.body.sources.len() + 1);
     let encoded =
         serde_json::to_string(&facts.load_for_ingestion(&request.job.job).unwrap()).unwrap();
     assert!(outcome.emitted_facts > 0);

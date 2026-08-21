@@ -22,7 +22,10 @@ use crate::{
     repository_graph::{
         domain::{DiagnosticCode, Digest, RepoPath, SourceKind, SourceRevision},
         index::{snapshot_identity, snapshot_identity_from_revision},
-        ports::{RepositorySource, SourceFileDescriptor, SourceFileMode},
+        ports::{
+            RepositorySource, SourceFileDescriptor, SourceFileMode,
+            canonical_source_manifest_digest,
+        },
     },
 };
 
@@ -91,11 +94,24 @@ impl RepositorySourceManifest {
     pub fn validate<SourceError, StoreError>(
         &self,
     ) -> Result<(), PackagingError<SourceError, StoreError>> {
+        let source_files = self
+            .body
+            .files
+            .iter()
+            .map(|file| SourceFileDescriptor {
+                path: file.path.clone(),
+                content_identity: file.content_identity.clone(),
+                byte_len: file.byte_len,
+                file_mode: file.file_mode,
+            })
+            .collect::<Vec<_>>();
         if self.body.protocol_version != DISTRIBUTED_SOURCE_MANIFEST_VERSION
             || self.body.policy_schema_version != REMOTE_REPOSITORY_SOURCE_POLICY_VERSION
             || !is_canonical_committed_revision(&self.body.source_revision)
             || self.body.repository != self.reference.repository
             || self.body.source_policy_digest != self.reference.source_policy_digest
+            || canonical_source_manifest_digest(&source_files, &self.body.source_policy_digest)
+                != self.body.source_revision.manifest_digest
             || snapshot_identity_from_revision(
                 &self.body.source_revision,
                 &self.body.extractor_set_digest,
@@ -807,6 +823,15 @@ mod tests {
         let mut includes_untracked = packaged.clone();
         includes_untracked.body.source_revision.includes_untracked = true;
         assert_invalid(includes_untracked);
+
+        let mut mismatched_manifest = packaged.clone();
+        mismatched_manifest.body.source_revision.manifest_digest =
+            Digest::new("sha256", "00").unwrap();
+        mismatched_manifest.reference.expected_snapshot_id = snapshot_identity_from_revision(
+            &mismatched_manifest.body.source_revision,
+            &mismatched_manifest.body.extractor_set_digest,
+        );
+        assert_invalid(mismatched_manifest);
 
         let mut missing_base = packaged;
         missing_base.body.source_revision.base_revision = None;

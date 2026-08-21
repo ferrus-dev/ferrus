@@ -40,7 +40,10 @@ use super::{
         DiagnosticCode, Digest, ExtractorIdentity, RepoPath, RepositoryRef, SnapshotId, SourceKind,
         SourceRevision, SourceRevisionId,
     },
-    ports::{RepositorySource, SnapshotContent, SourceFileDescriptor, SourceFileMode},
+    ports::{
+        RepositorySource, SOURCE_MANIFEST_VERSION, SnapshotContent, SourceFileDescriptor,
+        SourceFileMode, canonical_source_manifest_digest,
+    },
     query::{ContentRequest, ContentResponse, QueryError, QueryErrorCode, RetrievalAction},
 };
 
@@ -51,9 +54,6 @@ pub use worktree::{
     GitWorktreeChange, GitWorktreeInventory, TaskOverlaySource, TaskWorktreeOverlay,
     capture_worktree_tree, parse_git_tree_digest, pin_submitted_tree, release_submitted_tree_pin,
 };
-
-const SOURCE_MANIFEST_VERSION: u32 = 1;
-const SOURCE_POLICY_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum SourceError {

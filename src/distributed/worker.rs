@@ -230,7 +230,7 @@ impl StatelessIndexWorker {
         let (target, payloads) = match &request.job.spec.input {
             IndexInputRef::Repository(reference) => {
                 let bytes =
-                    self.read_manifest_object(objects, &reference.manifest_object, deadline)?;
+                    self.read_object_bounded(objects, &reference.manifest_object, deadline)?;
                 let body: RepositorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 let diagnostics =
@@ -259,7 +259,7 @@ impl StatelessIndexWorker {
             }
             IndexInputRef::Memory(reference) => {
                 let bytes =
-                    self.read_manifest_object(objects, &reference.manifest_object, deadline)?;
+                    self.read_object_bounded(objects, &reference.manifest_object, deadline)?;
                 let body: MemorySourceManifestBody =
                     serde_json::from_slice(&bytes).map_err(|_| WorkerError::InvalidInput)?;
                 self.check_manifest_limits(
@@ -553,9 +553,7 @@ impl StatelessIndexWorker {
             if remote_file.byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
             }
-            let content = objects
-                .read_verified(&remote_file.object)
-                .map_err(|_| WorkerError::SourceUnavailable)?;
+            let content = self.read_object_bounded(objects, &remote_file.object, deadline)?;
             self.check_deadline(deadline)?;
             if content.len() as u64 != file.byte_len {
                 return Err(WorkerError::SourceUnavailable);
@@ -728,9 +726,7 @@ impl StatelessIndexWorker {
             if remote_source.sanitized_byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
             }
-            let content = objects
-                .read_verified(&remote_source.object)
-                .map_err(|_| WorkerError::SourceUnavailable)?;
+            let content = self.read_object_bounded(objects, &remote_source.object, deadline)?;
             self.check_deadline(deadline)?;
             if content.len() as u64 != remote_source.sanitized_byte_len {
                 return Err(WorkerError::SourceUnavailable);
@@ -820,7 +816,7 @@ impl StatelessIndexWorker {
         Ok(())
     }
 
-    fn read_manifest_object<O: TenantObjectStore>(
+    fn read_object_bounded<O: TenantObjectStore>(
         &self,
         objects: &O,
         object: &TenantObjectRef,

@@ -1,6 +1,7 @@
 //! Storage-independent extension points for later index and query phases.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::domain::{
     BuildId, DiagnosticCode, Digest, GraphBuild, GraphDiagnostic, GraphEdge, GraphNode,
@@ -17,6 +18,9 @@ use super::{
     store::{BuildFailure, PublicationOutcome, PublishRequest, PublishedView},
 };
 
+pub(crate) const SOURCE_MANIFEST_VERSION: u32 = 1;
+const SOURCE_POLICY_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceFileMode {
@@ -30,6 +34,33 @@ pub struct SourceFileDescriptor {
     pub content_identity: super::domain::Digest,
     pub byte_len: u64,
     pub file_mode: SourceFileMode,
+}
+
+#[derive(Serialize)]
+struct CanonicalSourceManifest<'a> {
+    version: u32,
+    source_policy_version: u32,
+    source_policy_digest: &'a super::domain::Digest,
+    files: &'a [SourceFileDescriptor],
+}
+
+pub fn canonical_source_manifest_digest(
+    files: &[SourceFileDescriptor],
+    source_policy_digest: &super::domain::Digest,
+) -> super::domain::Digest {
+    let canonical = CanonicalSourceManifest {
+        version: SOURCE_MANIFEST_VERSION,
+        source_policy_version: SOURCE_POLICY_VERSION,
+        source_policy_digest,
+        files,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("canonical source manifest serialization cannot fail");
+    let value = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    super::domain::Digest::new("sha256", value).expect("sha256 source manifest digest is canonical")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
