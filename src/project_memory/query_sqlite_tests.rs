@@ -85,6 +85,28 @@ fn published_scope(project: ProjectRef, limits: &QueryLimitsConfig) -> MemoryQue
 
 struct RecordingContent {
     max_requested: Cell<u64>,
+    max_duration: Cell<Duration>,
+}
+
+struct ExpiredContent;
+
+impl MemoryContent for ExpiredContent {
+    fn content(
+        &self,
+        _request: MemoryContentRequest,
+    ) -> Result<super::super::query::MemoryContentResponse, MemoryQueryError> {
+        unreachable!("deadline-aware context reads use content_with_deadline")
+    }
+
+    fn content_with_deadline(
+        &self,
+        _request: MemoryContentRequest,
+        _max_duration: Duration,
+    ) -> Result<super::super::query::MemoryContentResponse, MemoryQueryError> {
+        Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration,
+        ))
+    }
 }
 
 impl MemoryContent for RecordingContent {
@@ -92,13 +114,22 @@ impl MemoryContent for RecordingContent {
         &self,
         request: MemoryContentRequest,
     ) -> Result<super::super::query::MemoryContentResponse, MemoryQueryError> {
-        self.max_requested
-            .set(self.max_requested.get().max(request.max_bytes.get()));
         Ok(super::super::query::MemoryContentResponse {
             verified_fingerprint: request.expected_fingerprint,
             bytes: vec![b'x'; request.max_bytes.get() as usize],
             truncated: true,
         })
+    }
+
+    fn content_with_deadline(
+        &self,
+        request: MemoryContentRequest,
+        max_duration: Duration,
+    ) -> Result<super::super::query::MemoryContentResponse, MemoryQueryError> {
+        self.max_requested
+            .set(self.max_requested.get().max(request.max_bytes.get()));
+        self.max_duration.set(max_duration);
+        self.content(request)
     }
 }
 
@@ -557,6 +588,7 @@ fn context_snippets_use_the_verified_content_boundary_and_effective_cap() {
     };
     let content = RecordingContent {
         max_requested: Cell::new(0),
+        max_duration: Cell::new(Duration::ZERO),
     };
     let query = SqliteMemoryQuery::new(&sidecar, limits.clone()).with_content(&content);
     let response = query
@@ -583,6 +615,42 @@ fn context_snippets_use_the_verified_content_boundary_and_effective_cap() {
         .sum::<usize>();
     assert_eq!(snippet_bytes, 7);
     assert_eq!(content.max_requested.get(), 7);
+    assert!(content.max_duration.get() <= Duration::from_millis(limits.max_duration_ms));
+    assert!(!content.max_duration.get().is_zero());
+}
+
+#[test]
+fn context_stops_before_accepting_a_snippet_that_exceeds_the_deadline() {
+    let (_root, data, project, _) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let response = SqliteMemoryQuery::new(&sidecar, limits.clone())
+        .with_content(&ExpiredContent)
+        .context(MemoryContextRequest {
+            scope: published_scope(project, &limits),
+            seeds: vec![MemoryContextSeed::Milestone(
+                MemoryRecordId::new("rg-test").unwrap(),
+            )],
+            policy: super::super::query::MemoryContextPolicy {
+                direction: EdgeDirection::Both,
+                relationship_kinds: vec![],
+                include_unresolved: false,
+                include_stale: false,
+                include_snippets: true,
+            },
+            page: MemoryPageRequest::default(),
+        })
+        .unwrap();
+
+    assert!(response.items.is_empty());
+    assert_eq!(
+        response.page.truncation.map(|value| value.reason),
+        Some(MemoryTruncationReason::Duration)
+    );
 }
 
 #[test]

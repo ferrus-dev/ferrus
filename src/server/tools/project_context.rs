@@ -119,7 +119,7 @@ async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
     }
     let context = LocalProjectContext::load_for_agent(
         agent_id,
-        input.include_snippets,
+        requires_memory_content(input.domain, input.include_snippets),
         matches!(input.domain, ContextDomain::Repository | ContextDomain::All),
     )
     .await?;
@@ -173,6 +173,10 @@ async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
     }
 }
 
+fn requires_memory_content(domain: ContextDomain, include_snippets: bool) -> bool {
+    include_snippets && matches!(domain, ContextDomain::Memory | ContextDomain::All)
+}
+
 fn seed(seed: SeedInput) -> Result<FederatedContextSeed> {
     Ok(match seed {
         SeedInput::Node(value) => {
@@ -209,4 +213,19 @@ fn validate_seed_domains(domain: ContextDomain, seeds: &[FederatedContextSeed]) 
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_content_discovery_is_gated_by_domain_and_snippet_request() {
+        assert!(!requires_memory_content(ContextDomain::Repository, true));
+        assert!(!requires_memory_content(ContextDomain::Repository, false));
+        assert!(!requires_memory_content(ContextDomain::Memory, false));
+        assert!(!requires_memory_content(ContextDomain::All, false));
+        assert!(requires_memory_content(ContextDomain::Memory, true));
+        assert!(requires_memory_content(ContextDomain::All, true));
+    }
 }

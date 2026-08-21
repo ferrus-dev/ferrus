@@ -3,8 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -254,6 +256,16 @@ impl MemoryContent for LocalMemorySource {
         &self,
         request: MemoryContentRequest,
     ) -> Result<MemoryContentResponse, MemoryQueryError> {
+        self.content_with_deadline(request, Duration::MAX)
+    }
+
+    fn content_with_deadline(
+        &self,
+        request: MemoryContentRequest,
+        max_duration: Duration,
+    ) -> Result<MemoryContentResponse, MemoryQueryError> {
+        let started = Instant::now();
+        ensure_content_read_deadline(started, max_duration)?;
         if request.project != self.project {
             return Err(MemoryQueryError::SourceNotAuthorized);
         }
@@ -295,9 +307,7 @@ impl MemoryContent for LocalMemorySource {
                     && material.descriptor.fingerprint == request.expected_fingerprint
             })
             .ok_or(MemoryQueryError::ContentChanged)?;
-        let content = self
-            .read_verified(&material.descriptor)
-            .map_err(|_| MemoryQueryError::ContentChanged)?;
+        let content = read_verified_content(material, started, max_duration)?;
         let (start, end) = match request.evidence.as_ref() {
             Some(super::domain::MemoryEvidenceLocator::Span(span)) => (
                 usize::try_from(span.start.byte_offset)
@@ -321,11 +331,83 @@ impl MemoryContent for LocalMemorySource {
         while length > 0 && !text.is_char_boundary(length) {
             length -= 1;
         }
+        ensure_content_read_deadline(started, max_duration)?;
         Ok(MemoryContentResponse {
             verified_fingerprint: material.descriptor.fingerprint.clone(),
             bytes: text.as_bytes()[..length].to_vec(),
             truncated: length < text.len(),
         })
+    }
+}
+
+fn read_verified_content(
+    material: &SourceMaterial,
+    started: Instant,
+    max_duration: Duration,
+) -> Result<MemorySourceContent, MemoryQueryError> {
+    ensure_content_read_deadline(started, max_duration)?;
+    let bytes = match &material.content {
+        MaterialContent::TrackedSpec {
+            absolute_path,
+            category,
+        } => {
+            let metadata = fs::symlink_metadata(absolute_path)
+                .map_err(|_| MemoryQueryError::ContentChanged)?;
+            ensure_content_read_deadline(started, max_duration)?;
+            if !metadata.file_type().is_file() || metadata.len() > MAX_SPEC_BYTES {
+                return Err(MemoryQueryError::ContentChanged);
+            }
+            let mut file =
+                fs::File::open(absolute_path).map_err(|_| MemoryQueryError::ContentChanged)?;
+            ensure_content_read_deadline(started, max_duration)?;
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(metadata.len()).unwrap_or(MAX_SPEC_BYTES as usize),
+            );
+            let mut chunk = [0_u8; 16 * 1024];
+            loop {
+                ensure_content_read_deadline(started, max_duration)?;
+                let read = file
+                    .read(&mut chunk)
+                    .map_err(|_| MemoryQueryError::ContentChanged)?;
+                ensure_content_read_deadline(started, max_duration)?;
+                if read == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(read) > MAX_SPEC_BYTES as usize {
+                    return Err(MemoryQueryError::ContentChanged);
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let fingerprint = spec_fingerprint(*category, &bytes)
+                .map_err(|_| MemoryQueryError::ContentChanged)?;
+            ensure_content_read_deadline(started, max_duration)?;
+            if fingerprint != material.descriptor.fingerprint {
+                return Err(MemoryQueryError::ContentChanged);
+            }
+            bytes
+        }
+        MaterialContent::Sanitized(bytes) => {
+            if canonical_digest(bytes) != material.descriptor.fingerprint {
+                return Err(MemoryQueryError::ContentChanged);
+            }
+            ensure_content_read_deadline(started, max_duration)?;
+            bytes.clone()
+        }
+    };
+    ensure_content_read_deadline(started, max_duration)?;
+    Ok(MemorySourceContent { bytes })
+}
+
+fn ensure_content_read_deadline(
+    started: Instant,
+    max_duration: Duration,
+) -> Result<(), MemoryQueryError> {
+    if started.elapsed() >= max_duration {
+        Err(MemoryQueryError::BudgetExceeded(
+            super::query::MemoryTruncationReason::Duration,
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -941,7 +1023,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use crate::project_memory::domain::MemoryEvidenceLocator;
+    use crate::project_memory::{domain::MemoryEvidenceLocator, query::MemoryTruncationReason};
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -1272,5 +1354,14 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, MemoryQueryError::ContentChanged);
+    }
+
+    #[test]
+    fn content_read_deadline_rejects_an_expired_budget() {
+        let error = ensure_content_read_deadline(Instant::now(), Duration::ZERO).unwrap_err();
+        assert_eq!(
+            error,
+            MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)
+        );
     }
 }

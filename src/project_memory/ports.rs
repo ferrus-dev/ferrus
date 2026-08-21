@@ -209,6 +209,29 @@ pub trait MemoryContent {
         &self,
         request: MemoryContentRequest,
     ) -> Result<MemoryContentResponse, MemoryQueryError>;
+
+    /// Reads verified content within the query's remaining duration budget.
+    /// Implementations with blocking storage should override this method.
+    fn content_with_deadline(
+        &self,
+        request: MemoryContentRequest,
+        max_duration: std::time::Duration,
+    ) -> Result<MemoryContentResponse, MemoryQueryError> {
+        if max_duration.is_zero() {
+            return Err(MemoryQueryError::BudgetExceeded(
+                super::query::MemoryTruncationReason::Duration,
+            ));
+        }
+        let started = std::time::Instant::now();
+        let response = self.content(request)?;
+        if started.elapsed() >= max_duration {
+            Err(MemoryQueryError::BudgetExceeded(
+                super::query::MemoryTruncationReason::Duration,
+            ))
+        } else {
+            Ok(response)
+        }
+    }
 }
 
 pub trait ContextService {

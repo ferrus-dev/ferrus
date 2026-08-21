@@ -543,6 +543,7 @@ impl<'a> SqliteMemoryQuery<'a> {
         scope: &ResolvedScope,
         entity: &MemoryEntity,
         remaining_snippet_bytes: u64,
+        started: Instant,
     ) -> Result<Option<MemorySnippet>, MemoryQueryError> {
         let Some(content) = self.content else {
             return Ok(None);
@@ -551,15 +552,35 @@ impl<'a> SqliteMemoryQuery<'a> {
         let Some(max_bytes) = NonZeroU64::new(max_bytes) else {
             return Ok(None);
         };
-        let response = content.content(MemoryContentRequest {
-            project: scope.revision.project.clone(),
-            revision_id: scope.revision.id.clone(),
-            source_category: entity.provenance.source_category,
-            locator: entity.provenance.source_locator.clone(),
-            expected_fingerprint: entity.provenance.source_fingerprint.clone(),
-            evidence: Some(entity.provenance.evidence.clone()),
-            max_bytes,
-        })?;
+        let remaining_duration = scope
+            .budget
+            .duration()
+            .checked_sub(started.elapsed())
+            .ok_or(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ))?;
+        if remaining_duration.is_zero() {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
+        let response = content.content_with_deadline(
+            MemoryContentRequest {
+                project: scope.revision.project.clone(),
+                revision_id: scope.revision.id.clone(),
+                source_category: entity.provenance.source_category,
+                locator: entity.provenance.source_locator.clone(),
+                expected_fingerprint: entity.provenance.source_fingerprint.clone(),
+                evidence: Some(entity.provenance.evidence.clone()),
+                max_bytes,
+            },
+            remaining_duration,
+        )?;
+        if started.elapsed() >= scope.budget.duration() {
+            return Err(MemoryQueryError::BudgetExceeded(
+                MemoryTruncationReason::Duration,
+            ));
+        }
         if response.verified_fingerprint != entity.provenance.source_fingerprint {
             return Err(MemoryQueryError::ContentChanged);
         }
@@ -818,11 +839,21 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             let (bytes, item, relationship) = match entry {
                 ContextPageEntry::Entity(candidate) => {
                     let snippet = if request.policy.include_snippets {
-                        self.attach_snippet(
+                        match self.attach_snippet(
                             &scope,
                             &candidate.entity,
                             scope.budget.max_snippet_bytes.saturating_sub(snippet_bytes),
-                        )?
+                            started,
+                        ) {
+                            Ok(snippet) => snippet,
+                            Err(MemoryQueryError::BudgetExceeded(
+                                MemoryTruncationReason::Duration,
+                            )) => {
+                                reason = Some(MemoryTruncationReason::Duration);
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         None
                     };
