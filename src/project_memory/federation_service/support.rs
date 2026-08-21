@@ -267,7 +267,11 @@ pub(super) fn fit_federated_search_response(
     total: usize,
     fingerprint: &str,
     revision_key: &str,
+    started: Instant,
+    max_duration_ms: u64,
 ) -> Result<(), MemoryQueryError> {
+    let duration = std::time::Duration::from_millis(max_duration_ms);
+    ensure_federated_search_fitting_deadline(started, duration)?;
     set_federated_search_page(
         response,
         initial_reason,
@@ -276,7 +280,7 @@ pub(super) fn fit_federated_search_response(
         fingerprint,
         revision_key,
     )?;
-    if stabilize_federated_search_size(response)? <= max_bytes {
+    if stabilize_federated_search_size(response, started, duration)? <= max_bytes {
         return Ok(());
     }
     if response.results.len() <= 1 {
@@ -285,11 +289,14 @@ pub(super) fn fit_federated_search_response(
         ));
     }
 
+    ensure_federated_search_fitting_deadline(started, duration)?;
     let original_results = response.results.clone();
+    ensure_federated_search_fitting_deadline(started, duration)?;
     let mut lower = 1usize;
     let mut upper = original_results.len() - 1;
     let mut best = None;
     while lower <= upper {
+        ensure_federated_search_fitting_deadline(started, duration)?;
         let midpoint = lower + (upper - lower) / 2;
         response.results = original_results[..midpoint].to_vec();
         set_federated_search_page(
@@ -300,7 +307,7 @@ pub(super) fn fit_federated_search_response(
             fingerprint,
             revision_key,
         )?;
-        if stabilize_federated_search_size(response)? <= max_bytes {
+        if stabilize_federated_search_size(response, started, duration)? <= max_bytes {
             best = Some(midpoint);
             lower = midpoint + 1;
         } else {
@@ -321,7 +328,7 @@ pub(super) fn fit_federated_search_response(
         fingerprint,
         revision_key,
     )?;
-    let encoded_bytes = stabilize_federated_search_size(response)?;
+    let encoded_bytes = stabilize_federated_search_size(response, started, duration)?;
     if encoded_bytes > max_bytes {
         return Err(backend_error("federation.serialization"));
     }
@@ -353,9 +360,13 @@ fn set_federated_search_page(
 
 fn stabilize_federated_search_size(
     response: &mut FederatedSearchResponse,
+    started: Instant,
+    duration: std::time::Duration,
 ) -> Result<u64, MemoryQueryError> {
     for _ in 0..32 {
+        ensure_federated_search_fitting_deadline(started, duration)?;
         let encoded_bytes = serialized_len(response)?;
+        ensure_federated_search_fitting_deadline(started, duration)?;
         let Some(truncation) = response.page.truncation.as_mut() else {
             return Ok(encoded_bytes);
         };
@@ -365,6 +376,18 @@ fn stabilize_federated_search_size(
         truncation.returned_bytes = encoded_bytes;
     }
     Err(backend_error("federation.serialization"))
+}
+
+fn ensure_federated_search_fitting_deadline(
+    started: Instant,
+    duration: std::time::Duration,
+) -> Result<(), MemoryQueryError> {
+    if started.elapsed() >= duration {
+        return Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

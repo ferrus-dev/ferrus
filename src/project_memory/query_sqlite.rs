@@ -834,31 +834,42 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             };
             let (bytes, item, relationship) = match entry {
                 ContextPageEntry::Entity(candidate) => {
-                    let snippet = if request.policy.include_snippets {
-                        match self.attach_snippet(
-                            &scope,
-                            &candidate.entity,
-                            scope.budget.max_snippet_bytes.saturating_sub(snippet_bytes),
-                            started,
-                        ) {
-                            Ok(snippet) => snippet,
-                            Err(MemoryQueryError::BudgetExceeded(
-                                MemoryTruncationReason::Duration,
-                            )) => {
-                                reason = Some(MemoryTruncationReason::Duration);
-                                break;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        None
-                    };
-                    let item = MemoryContextItem {
+                    let mut item = MemoryContextItem {
                         entity: candidate.entity,
-                        snippet,
+                        snippet: None,
                         selection_reasons: candidate.selection_reasons,
                     };
-                    (serialized_len(&item)?, Some(item), None)
+                    let base_bytes = serialized_len(&item)?;
+                    let remaining_response_bytes =
+                        scope.budget.max_bytes.saturating_sub(returned_bytes);
+                    if request.policy.include_snippets {
+                        let remaining_snippet_bytes =
+                            scope.budget.max_snippet_bytes.saturating_sub(snippet_bytes);
+                        let response_snippet_bytes =
+                            remaining_response_bytes.saturating_sub(base_bytes);
+                        let snippet_limit = remaining_snippet_bytes.min(response_snippet_bytes);
+                        item.snippet =
+                            match self.attach_snippet(&scope, &item.entity, snippet_limit, started)
+                            {
+                                Ok(snippet) => snippet,
+                                Err(MemoryQueryError::BudgetExceeded(
+                                    MemoryTruncationReason::Duration,
+                                )) => {
+                                    reason = Some(MemoryTruncationReason::Duration);
+                                    break;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                        if self.content.is_some() && snippet_limit < remaining_snippet_bytes {
+                            reason = Some(MemoryTruncationReason::Bytes);
+                        }
+                    }
+                    let mut bytes = serialized_len(&item)?;
+                    if bytes > remaining_response_bytes && item.snippet.take().is_some() {
+                        reason = Some(MemoryTruncationReason::Bytes);
+                        bytes = base_bytes;
+                    }
+                    (bytes, Some(item), None)
                 }
                 ContextPageEntry::Relationship(relationship) => {
                     (serialized_len(&relationship)?, None, Some(relationship))

@@ -712,6 +712,56 @@ fn context_snippets_use_the_verified_content_boundary_and_effective_cap() {
 }
 
 #[test]
+fn context_omits_an_optional_snippet_when_only_the_entity_fits() {
+    let (_root, data, project, _) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let request = |scope, include_snippets| MemoryContextRequest {
+        scope,
+        seeds: vec![MemoryContextSeed::Milestone(
+            MemoryRecordId::new("rg-test").unwrap(),
+        )],
+        policy: super::super::query::MemoryContextPolicy {
+            direction: EdgeDirection::Both,
+            relationship_kinds: vec![],
+            include_unresolved: false,
+            include_stale: false,
+            include_snippets,
+        },
+        page: MemoryPageRequest::default(),
+    };
+    let base = SqliteMemoryQuery::new(&sidecar, limits.clone())
+        .context(request(published_scope(project.clone(), &limits), false))
+        .unwrap();
+    let base_bytes = serialized_len(&base.items[0]).unwrap();
+    let response_snippet_allowance = 8;
+    let mut constrained_scope = published_scope(project, &limits);
+    constrained_scope.budget.max_bytes =
+        std::num::NonZeroU64::new(base_bytes + response_snippet_allowance).unwrap();
+    let content = RecordingContent {
+        max_requested: Cell::new(0),
+        max_duration: Cell::new(Duration::ZERO),
+    };
+
+    let response = SqliteMemoryQuery::new(&sidecar, limits)
+        .with_content(&content)
+        .context(request(constrained_scope, true))
+        .unwrap();
+
+    assert_eq!(response.items.len(), 1);
+    assert!(response.items[0].snippet.is_none());
+    assert_eq!(content.max_requested.get(), response_snippet_allowance);
+    assert_eq!(
+        response.page.truncation.map(|value| value.reason),
+        Some(MemoryTruncationReason::Bytes)
+    );
+}
+
+#[test]
 fn context_stops_before_accepting_a_snippet_that_exceeds_the_deadline() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =

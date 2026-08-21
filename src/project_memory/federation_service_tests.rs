@@ -1,4 +1,9 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use tempfile::TempDir;
 
@@ -798,6 +803,58 @@ fn combined_search_counts_the_complete_response_against_the_byte_budget() {
     assert_eq!(
         service.search(request(insufficient_budget)).unwrap_err(),
         MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Bytes)
+    );
+}
+
+#[test]
+fn federated_search_response_fitting_observes_the_request_deadline() {
+    let fixture = fixture();
+    let graph = SqliteGraphQuery::new(
+        &fixture.graph_sidecar,
+        fixture.config.query_limits.clone(),
+        Some(fixture.graph_freshness.clone()),
+    );
+    let memory =
+        SqliteMemoryQuery::new(&fixture.memory_sidecar, fixture.config.query_limits.clone());
+    let service = service(&fixture, &graph, &memory);
+    let mut response = service
+        .search(FederatedSearchRequest {
+            scope: FederatedScope::current(
+                fixture.project.clone(),
+                target(&fixture, ContextDomain::All),
+                budget(&fixture.config),
+            ),
+            text: MemoryQueryText::new("federat").unwrap(),
+            repository_kinds: vec![],
+            repository_paths: vec![],
+            memory_kinds: vec![],
+            memory_sources: vec![],
+            cursor: None,
+        })
+        .unwrap();
+    let total = response.results.len();
+    let response_revision_key =
+        revision_key(response.repository.as_ref(), response.memory.as_ref());
+    let started = Instant::now()
+        .checked_sub(Duration::from_millis(2))
+        .unwrap();
+
+    let error = fit_federated_search_response(
+        &mut response,
+        u64::MAX,
+        None,
+        0,
+        total,
+        "expired-search-fitting",
+        &response_revision_key,
+        started,
+        1,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)
     );
 }
 

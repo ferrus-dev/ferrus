@@ -565,6 +565,8 @@ where
             total,
             &fingerprint,
             &revision_key,
+            started,
+            budget.max_duration_ms,
         )?;
         Ok(response)
     }
