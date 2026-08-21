@@ -511,6 +511,86 @@ fn context_counts_relationships_against_the_effective_result_limit() {
 }
 
 #[test]
+fn context_pages_relationships_beyond_the_first_page_result_limit() {
+    let (_root, data, project, revision_id) = indexed_fixture();
+    let OpenMemoryQuerySidecarResult::Ready(sidecar) =
+        open_for_query_at(&data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap()
+    else {
+        panic!("memory query sidecar should be ready");
+    };
+    let limits = QueryLimitsConfig::default();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let relationships = query.relationships(&revision_id).unwrap();
+    let mut by_source = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for relationship in relationships {
+        if matches!(
+            relationship.target,
+            MemoryRelationshipTarget::MemoryEntity { .. }
+        ) {
+            by_source
+                .entry(relationship.source.clone())
+                .or_default()
+                .push(relationship);
+        }
+    }
+    let (source, expected_relationships) = by_source
+        .into_iter()
+        .find(|(_, relationships)| relationships.len() > 1)
+        .expect("fixture should contain a source with multiple outgoing relationships");
+    let expected_relationship_ids = expected_relationships
+        .iter()
+        .map(|relationship| relationship.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_neighbor_ids = expected_relationships
+        .iter()
+        .filter_map(|relationship| match &relationship.target {
+            MemoryRelationshipTarget::MemoryEntity { entity_id } => Some(entity_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let request = |cursor| {
+        let mut scope = published_scope(project.clone(), &limits);
+        scope.budget.max_results = std::num::NonZeroU32::new(1).unwrap();
+        scope.budget.max_depth = std::num::NonZeroU32::new(1).unwrap();
+        MemoryContextRequest {
+            scope,
+            seeds: vec![MemoryContextSeed::Entity(source.clone())],
+            policy: super::super::query::MemoryContextPolicy {
+                direction: crate::repository_graph::query::EdgeDirection::Outgoing,
+                relationship_kinds: vec![],
+                include_unresolved: false,
+                include_stale: false,
+                include_snippets: false,
+            },
+            page: MemoryPageRequest { cursor },
+        }
+    };
+    let mut cursor = None;
+    let mut returned_relationship_ids = std::collections::BTreeSet::new();
+    let mut returned_entity_ids = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let response = query.context(request(cursor)).unwrap();
+        returned_entity_ids.extend(response.items.into_iter().map(|item| item.entity.id));
+        returned_relationship_ids.extend(
+            response
+                .relationships
+                .into_iter()
+                .map(|relationship| relationship.id),
+        );
+        pages += 1;
+        assert!(pages < 32, "context cursor should make progress");
+        let Some(next_cursor) = response.page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    assert_eq!(returned_relationship_ids, expected_relationship_ids);
+    assert!(expected_neighbor_ids.is_subset(&returned_entity_ids));
+}
+
+#[test]
 fn context_counts_relationships_against_the_effective_byte_limit() {
     let (_root, data, project, _) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =

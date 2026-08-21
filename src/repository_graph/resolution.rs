@@ -557,7 +557,7 @@ fn is_file_module(node: &GraphNode) -> bool {
 }
 
 fn file_module_directory(path: &str) -> String {
-    let (directory, file) = path.rsplit_once('/').map_or(("", path), |parts| parts);
+    let (directory, file) = path.rsplit_once('/').unwrap_or(("", path));
     match file {
         "lib.rs" | "main.rs" | "mod.rs" => directory.to_string(),
         _ => path.strip_suffix(".rs").unwrap_or(path).to_string(),

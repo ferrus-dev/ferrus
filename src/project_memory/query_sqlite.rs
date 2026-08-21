@@ -36,6 +36,7 @@ use super::{
 
 const MAX_FILTERS: usize = 32;
 const MAX_CONTEXT_CANDIDATES: usize = 4_096;
+const MAX_CONTEXT_RELATIONSHIPS: usize = 4_096;
 const SQLITE_PROGRESS_OPS: i32 = 100;
 const CURSOR_VERSION: u32 = 1;
 
@@ -465,7 +466,6 @@ impl<'a> SqliteMemoryQuery<'a> {
             }
         }
         let mut selected_relationships = BTreeMap::new();
-        let mut selected_relationship_bytes = 0_u64;
         let mut explored_depth = 0_u32;
         let mut truncation = None;
         'traversal: while let Some((entity_id, depth)) = queue.pop_front() {
@@ -483,19 +483,10 @@ impl<'a> SqliteMemoryQuery<'a> {
                     break 'traversal;
                 }
                 if !selected_relationships.contains_key(&relationship.id) {
-                    if selected_relationships.len() >= scope.budget.max_results as usize {
+                    if selected_relationships.len() >= MAX_CONTEXT_RELATIONSHIPS {
                         truncation = Some(MemoryTruncationReason::Results);
                         break 'traversal;
                     }
-                    let relationship_bytes = serialized_len(relationship)?;
-                    if selected_relationship_bytes.saturating_add(relationship_bytes)
-                        > scope.budget.max_bytes
-                    {
-                        truncation = Some(MemoryTruncationReason::Bytes);
-                        break 'traversal;
-                    }
-                    selected_relationship_bytes =
-                        selected_relationship_bytes.saturating_add(relationship_bytes);
                     selected_relationships.insert(relationship.id.clone(), relationship.clone());
                 }
                 if selected.len() >= MAX_CONTEXT_CANDIDATES {
