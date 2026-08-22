@@ -39,6 +39,12 @@ enum ExplicitRepositoryReference {
     Symbol(SemanticKey),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotLinkResolutionError {
+    InvalidSnapshot,
+    DeadlineExceeded,
+}
+
 /// Resolve the portable subset of repository evidence against one immutable
 /// graph snapshot. Remote workers use this pure boundary without opening a
 /// repository, sidecar, process, or network connection.
@@ -49,8 +55,9 @@ pub(crate) fn resolve_repository_links_for_snapshot(
     snapshot_id: &SnapshotId,
     nodes: &[GraphNode],
     indexed_at: DateTime<Utc>,
-) -> Result<MemoryRepositoryLinkCommit> {
-    anyhow::ensure!(nodes.iter().all(|node| node.snapshot_id == *snapshot_id));
+    mut deadline_expired: impl FnMut() -> bool,
+) -> std::result::Result<MemoryRepositoryLinkCommit, SnapshotLinkResolutionError> {
+    check_snapshot_link_deadline(&mut deadline_expired)?;
 
     let link_set_id = MemoryRepositoryLinkSetId::new(format!(
         "memory-links:{}",
@@ -77,6 +84,7 @@ pub(crate) fn resolve_repository_links_for_snapshot(
 
     let mut candidates = BTreeMap::new();
     for entity in entities {
+        check_snapshot_link_deadline(&mut deadline_expired)?;
         if let MemorySourceLocator::TrackedFile { path } = &entity.provenance.source_locator {
             insert_candidate(
                 &mut candidates,
@@ -100,7 +108,8 @@ pub(crate) fn resolve_repository_links_for_snapshot(
             );
         }
         if let Some(text) = curated_text(&entity.data) {
-            for reference in explicit_references(text) {
+            for reference in explicit_references_until(text, &mut deadline_expired)? {
+                check_snapshot_link_deadline(&mut deadline_expired)?;
                 insert_candidate(
                     &mut candidates,
                     revision,
@@ -114,17 +123,16 @@ pub(crate) fn resolve_repository_links_for_snapshot(
         }
     }
 
-    let paths = nodes
-        .iter()
-        .filter_map(|node| {
-            node.provenance
-                .evidence
-                .as_ref()
-                .map(|evidence| evidence.path.clone())
-        })
-        .collect::<BTreeSet<_>>();
+    let mut paths = BTreeSet::new();
     let mut symbols = BTreeMap::<SemanticKey, Vec<NodeId>>::new();
     for node in nodes {
+        check_snapshot_link_deadline(&mut deadline_expired)?;
+        if node.snapshot_id != *snapshot_id {
+            return Err(SnapshotLinkResolutionError::InvalidSnapshot);
+        }
+        if let Some(evidence) = &node.provenance.evidence {
+            paths.insert(evidence.path.clone());
+        }
         if let Some(key) = &node.semantic_key {
             symbols
                 .entry(key.clone())
@@ -146,6 +154,7 @@ pub(crate) fn resolve_repository_links_for_snapshot(
     }
     let mut relationships = Vec::with_capacity(candidates.len().min(MAX_REPOSITORY_LINKS));
     for candidate in candidates.into_values().take(MAX_REPOSITORY_LINKS) {
+        check_snapshot_link_deadline(&mut deadline_expired)?;
         let (target, resolution) = match &candidate.reference {
             ExplicitRepositoryReference::Path(path) if paths.contains(path) => (
                 MemoryRelationshipTarget::RepositoryPath {
@@ -218,12 +227,21 @@ pub(crate) fn resolve_repository_links_for_snapshot(
         }
         relationships.push(relationship);
     }
-    relationships.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(MemoryRepositoryLinkCommit {
         link_set,
         relationships,
         diagnostics,
     })
+}
+
+fn check_snapshot_link_deadline(
+    deadline_expired: &mut impl FnMut() -> bool,
+) -> std::result::Result<(), SnapshotLinkResolutionError> {
+    if deadline_expired() {
+        Err(SnapshotLinkResolutionError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -839,8 +857,17 @@ fn repository_origin_snapshots(entity: &MemoryEntity) -> Vec<SnapshotId> {
 }
 
 fn explicit_references(text: &str) -> Vec<ExplicitRepositoryReference> {
+    explicit_references_until(text, &mut || false)
+        .expect("an unbounded reference scan cannot reach its deadline")
+}
+
+fn explicit_references_until(
+    text: &str,
+    deadline_expired: &mut impl FnMut() -> bool,
+) -> std::result::Result<Vec<ExplicitRepositoryReference>, SnapshotLinkResolutionError> {
     let mut references = BTreeSet::new();
     for (index, code) in text.split('`').enumerate() {
+        check_snapshot_link_deadline(deadline_expired)?;
         if index % 2 == 0 || code.contains(['\n', '\r']) {
             continue;
         }
@@ -855,7 +882,7 @@ fn explicit_references(text: &str) -> Vec<ExplicitRepositoryReference> {
             references.insert(ExplicitRepositoryReference::Symbol(symbol));
         }
     }
-    references.into_iter().collect()
+    Ok(references.into_iter().collect())
 }
 
 fn snapshot_files(
@@ -977,7 +1004,15 @@ fn link_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use crate::{
+        project_memory::domain::{MemoryRevisionId, ProjectId, ProjectNamespace},
+        repository_graph::domain::{
+            Confidence, Digest, ExtractorId, ExtractorIdentity, FactProvenance, ResolutionState,
+        },
+    };
 
     #[test]
     fn only_explicit_inline_repository_references_are_accepted() {
@@ -993,5 +1028,73 @@ mod tests {
             references[1],
             ExplicitRepositoryReference::Symbol(_)
         ));
+    }
+
+    #[test]
+    fn snapshot_link_resolution_checks_the_deadline_during_node_scans() {
+        let snapshot_id = SnapshotId::new("snapshot").unwrap();
+        let revision = MemoryRevision {
+            id: MemoryRevisionId::new("revision").unwrap(),
+            project: ProjectRef {
+                namespace: ProjectNamespace::new("local:test").unwrap(),
+                project_id: ProjectId::new("project").unwrap(),
+            },
+            source_set_digest: Digest::new("sha256", "11").unwrap(),
+            policy_digest: Digest::new("sha256", "22").unwrap(),
+            memory_model_version: 1,
+            extractor_set_digest: Digest::new("sha256", "33").unwrap(),
+            completed_by: MemoryBuildId::new("build").unwrap(),
+        };
+        let repository = RepositoryRef {
+            namespace: RepositoryNamespace::new("local:test").unwrap(),
+            repository_id: RepositoryId::new("repository").unwrap(),
+        };
+        let node = GraphNode {
+            snapshot_id: snapshot_id.clone(),
+            id: NodeId::new("node").unwrap(),
+            kind: "symbol".to_string(),
+            semantic_key: None,
+            provenance: FactProvenance {
+                extractor: ExtractorIdentity {
+                    id: ExtractorId::new("test.graph").unwrap(),
+                    version: "1".to_string(),
+                    contract_version: 1,
+                },
+                evidence: None,
+                resolution: ResolutionState::Resolved,
+                confidence: Confidence::Exact,
+            },
+            properties: BTreeMap::new(),
+        };
+        let checks = Cell::new(0usize);
+
+        let result = resolve_repository_links_for_snapshot(
+            &revision,
+            &[],
+            &repository,
+            &snapshot_id,
+            &[node],
+            Utc::now(),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+        );
+
+        assert_eq!(result, Err(SnapshotLinkResolutionError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn explicit_reference_scan_checks_the_deadline_between_candidates() {
+        let checks = Cell::new(0usize);
+        let result = explicit_references_until(
+            "`path:src/lib.rs` and `symbol:rust:function:src/lib.rs:run`",
+            &mut || {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+        );
+
+        assert_eq!(result, Err(SnapshotLinkResolutionError::DeadlineExceeded));
     }
 }

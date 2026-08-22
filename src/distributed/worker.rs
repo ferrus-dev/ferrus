@@ -20,7 +20,7 @@ use crate::{
             MemoryRevision,
         },
         extractors::{built_in_extractor_set_digest, built_in_extractors},
-        links::resolve_repository_links_for_snapshot,
+        links::{SnapshotLinkResolutionError, resolve_repository_links_for_snapshot},
         ports::{MemoryExtractionContext, MemoryExtractionInput},
     },
     repository_graph::{
@@ -828,8 +828,12 @@ impl StatelessIndexWorker {
                     &expected.snapshot_id,
                     &snapshot.nodes,
                     request.job.created_at,
+                    || self.check_deadline(deadline).is_err(),
                 )
-                .map_err(|_| WorkerError::ExtractionFailed)?;
+                .map_err(|error| match error {
+                    SnapshotLinkResolutionError::InvalidSnapshot => WorkerError::ExtractionFailed,
+                    SnapshotLinkResolutionError::DeadlineExceeded => WorkerError::DeadlineExceeded,
+                })?;
                 let link_facts = checked_sum([
                     commit.relationships.len() as u64,
                     commit.diagnostics.len() as u64,
