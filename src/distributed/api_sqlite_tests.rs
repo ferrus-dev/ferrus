@@ -796,6 +796,39 @@ fn latest_search_is_resolved_once_and_pagination_is_snapshot_bound() {
 }
 
 #[test]
+fn mutable_view_resolution_honors_the_query_deadline() {
+    let fixture = fixture();
+    let request_id = RequestId::new("expired-view-resolution").unwrap();
+    let started = Instant::now()
+        .checked_sub(Duration::from_millis(2))
+        .unwrap();
+    let duration = Duration::from_millis(1);
+    let targets = [
+        RemoteQueryTarget::RepositoryView {
+            repository: fixture.repository.clone(),
+            view_name: PublishedViewName::new("canonical").unwrap(),
+        },
+        RemoteQueryTarget::MemoryView {
+            project: fixture.project.clone(),
+            view_name: crate::project_memory::domain::MemoryViewName::new("project").unwrap(),
+        },
+        RemoteQueryTarget::FederatedView {
+            repository: fixture.repository.clone(),
+            graph_view: PublishedViewName::new("canonical").unwrap(),
+            memory_view: crate::project_memory::domain::MemoryViewName::new("project").unwrap(),
+        },
+    ];
+
+    for target in targets {
+        let error = fixture
+            .query
+            .resolve_target(&request_id, &target, started, duration)
+            .unwrap_err();
+        assert_eq!(error.code, RemoteErrorCode::BudgetExceeded);
+    }
+}
+
+#[test]
 fn context_snippets_are_manifest_scoped_hash_verified_and_bounded() {
     let fixture = fixture();
     let authorization = auth(

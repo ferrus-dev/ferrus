@@ -87,7 +87,7 @@ pub enum ObjectStoreError {
     ProjectObjectQuotaExceeded,
     #[error("project source-byte quota exceeded")]
     ProjectByteQuotaExceeded,
-    #[error("project has a durable full-deletion tombstone")]
+    #[error("project has a durable deletion tombstone")]
     ProjectDeleted,
     #[error("tenant object is unavailable or outside the requested scope")]
     ObjectUnavailable,

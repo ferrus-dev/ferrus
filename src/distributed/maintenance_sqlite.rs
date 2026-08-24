@@ -187,6 +187,15 @@ impl SqliteRemoteMaintenance {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_for_test(
+        &self,
+        deletion: &DeleteDataRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(), MaintenanceStoreError> {
+        self.begin(deletion, now).map(|_| ())
+    }
+
     fn execute_deletion(
         &self,
         deletion: &DeleteDataRequest,
@@ -355,13 +364,31 @@ impl SqliteRemoteMaintenance {
         transaction
             .commit()
             .map_err(|_| MaintenanceStoreError::Unavailable)?;
-        Ok(StoredDeletion {
+        let stored = StoredDeletion {
             request: current.request,
             state: DeletionState::Complete,
             counters: counts.counters,
             audit_event_id: Some(event_id),
             updated_at: now,
-        })
+        };
+        self.release_temporary_tombstones(&stored.request)?;
+        Ok(stored)
+    }
+
+    fn release_temporary_tombstones(
+        &self,
+        deletion: &DeleteDataRequest,
+    ) -> Result<(), MaintenanceStoreError> {
+        if is_full_project_deletion(deletion) {
+            return Ok(());
+        }
+        if deletion.coverage.contains(&RetentionClass::UnpublishedFact) {
+            release_store_tombstone(&self.fact_path, deletion)?;
+        }
+        if deletion.coverage.contains(&RetentionClass::UploadedSource) {
+            release_store_tombstone(&self.object_root.join("object-store.db"), deletion)?;
+        }
+        release_store_tombstone(&self.control_path, deletion)
     }
 
     fn record_failure(
@@ -444,6 +471,8 @@ impl RemoteMaintenanceApi for SqliteRemoteMaintenance {
             .begin(&request.deletion, now)
             .map_err(|error| store_error(&request.request_id, error))?;
         if existing.state == DeletionState::Complete {
+            self.release_temporary_tombstones(&existing.request)
+                .map_err(|error| store_error(&request.request_id, error))?;
             return Ok(result(&request.request_id, existing));
         }
         let started = Instant::now();
@@ -626,16 +655,27 @@ fn install_store_tombstone(
     deletion: &DeleteDataRequest,
     now: DateTime<Utc>,
 ) -> Result<(), MaintenanceStoreError> {
-    if !is_full_project_deletion(deletion) {
+    let project = deletion.target.project();
+    let existing = connection
+        .query_row(
+            "SELECT deletion_id FROM project_deletion_tombstones
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            params![project.tenant_id.as_str(), project.project_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| MaintenanceStoreError::Unavailable)?;
+    if existing.as_deref() == Some(deletion.deletion_id.as_str()) {
         return Ok(());
     }
-    let project = deletion.target.project();
+    if existing.is_some() {
+        return Err(MaintenanceStoreError::Conflict);
+    }
     connection
         .execute(
             "INSERT INTO project_deletion_tombstones (
                  tenant_id, project_id, deletion_id, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (tenant_id, project_id) DO NOTHING",
+             ) VALUES (?1, ?2, ?3, ?4)",
             params![
                 project.tenant_id.as_str(),
                 project.project_id.as_str(),
@@ -644,6 +684,31 @@ fn install_store_tombstone(
             ],
         )
         .map(|_| ())
+        .map_err(|_| MaintenanceStoreError::Unavailable)
+}
+
+fn release_store_tombstone(
+    path: &Path,
+    deletion: &DeleteDataRequest,
+) -> Result<(), MaintenanceStoreError> {
+    let mut connection = open_existing(path)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| MaintenanceStoreError::Unavailable)?;
+    let project = deletion.target.project();
+    transaction
+        .execute(
+            "DELETE FROM project_deletion_tombstones
+             WHERE tenant_id = ?1 AND project_id = ?2 AND deletion_id = ?3",
+            params![
+                project.tenant_id.as_str(),
+                project.project_id.as_str(),
+                deletion.deletion_id.as_str()
+            ],
+        )
+        .map_err(|_| MaintenanceStoreError::Unavailable)?;
+    transaction
+        .commit()
         .map_err(|_| MaintenanceStoreError::Unavailable)
 }
 
@@ -685,6 +750,7 @@ fn delete_control_data(
     now: DateTime<Utc>,
 ) -> Result<(), MaintenanceStoreError> {
     let project = deletion.target.project();
+    cancel_covered_jobs(transaction, deletion, repository_jobs, now)?;
     if deletion
         .coverage
         .contains(&RetentionClass::PublishedGraphSnapshot)
@@ -932,6 +998,59 @@ fn delete_control_data(
         );
     }
     persist_progress(transaction, deletion, counts, now)?;
+    Ok(())
+}
+
+fn cancel_covered_jobs(
+    transaction: &Transaction<'_>,
+    deletion: &DeleteDataRequest,
+    repository_jobs: &[String],
+    now: DateTime<Utc>,
+) -> Result<(), MaintenanceStoreError> {
+    let project = deletion.target.project();
+    match &deletion.target {
+        DeletionTarget::Project(_)
+            if deletion.coverage.contains(&RetentionClass::UnpublishedFact) =>
+        {
+            transaction
+                .execute(
+                    "UPDATE distributed_index_jobs
+                     SET state = 'cancelled', cancellation_requested = 1,
+                         lease_worker_id = NULL, lease_until_ms = NULL, updated_at_ms = ?3
+                     WHERE tenant_id = ?1 AND project_id = ?2",
+                    params![
+                        project.tenant_id.as_str(),
+                        project.project_id.as_str(),
+                        now.timestamp_millis()
+                    ],
+                )
+                .map_err(|_| MaintenanceStoreError::Unavailable)?;
+        }
+        DeletionTarget::Repository(_)
+            if deletion
+                .coverage
+                .contains(&RetentionClass::PublishedGraphSnapshot)
+                || deletion.coverage.contains(&RetentionClass::UnpublishedFact) =>
+        {
+            for job in repository_jobs {
+                transaction
+                    .execute(
+                        "UPDATE distributed_index_jobs
+                         SET state = 'cancelled', cancellation_requested = 1,
+                             lease_worker_id = NULL, lease_until_ms = NULL, updated_at_ms = ?4
+                         WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3",
+                        params![
+                            project.tenant_id.as_str(),
+                            project.project_id.as_str(),
+                            job,
+                            now.timestamp_millis()
+                        ],
+                    )
+                    .map_err(|_| MaintenanceStoreError::Unavailable)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 

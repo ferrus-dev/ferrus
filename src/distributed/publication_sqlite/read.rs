@@ -333,6 +333,18 @@ pub(super) fn ensure_read_budget(
     }
 }
 
+pub(super) fn finish_bounded_read<T>(
+    result: Result<T, RemoteStoreError>,
+    started: Instant,
+    duration: Duration,
+) -> Result<T, RemoteStoreError> {
+    if started.elapsed() >= duration {
+        Err(RemoteStoreError::ReadBudgetExceeded)
+    } else {
+        result
+    }
+}
+
 pub(super) fn decode<T: serde::de::DeserializeOwned>(
     encoded: &[u8],
 ) -> Result<T, RemoteStoreError> {

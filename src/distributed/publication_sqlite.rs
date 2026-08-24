@@ -54,6 +54,7 @@ use super::{
 pub(super) const STORAGE_SCHEMA_VERSION: u32 = 3;
 const NONCE_BYTES: usize = 12;
 const SQLITE_PROGRESS_OPS: i32 = 100;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ReadDeadline<'connection> {
     connection: &'connection Connection,
@@ -65,12 +66,20 @@ impl<'connection> ReadDeadline<'connection> {
         started: Instant,
         duration: Duration,
     ) -> Result<Self, RemoteStoreError> {
+        ensure_read_budget(Some((started, duration)))?;
+        let remaining = duration.saturating_sub(started.elapsed());
+        connection
+            .busy_timeout(remaining)
+            .map_err(RemoteStoreError::Database)?;
         connection
             .progress_handler(
                 SQLITE_PROGRESS_OPS,
                 Some(move || started.elapsed() >= duration),
             )
-            .map_err(RemoteStoreError::Database)?;
+            .map_err(|error| {
+                let _ = connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+                RemoteStoreError::Database(error)
+            })?;
         Ok(Self { connection })
     }
 }
@@ -78,6 +87,7 @@ impl<'connection> ReadDeadline<'connection> {
 impl Drop for ReadDeadline<'_> {
     fn drop(&mut self) {
         let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
     }
 }
 
@@ -98,7 +108,7 @@ pub enum RemoteStoreError {
     InvalidInput,
     #[error("remote publication job is unavailable, cancelled, expired, or lost its lease")]
     AuthorityLost,
-    #[error("remote project has a durable full-deletion tombstone")]
+    #[error("remote project has a durable deletion tombstone")]
     ProjectDeleted,
     #[error("remote immutable target conflicts with existing facts")]
     ImmutableConflict,
@@ -183,7 +193,7 @@ impl SqliteRemotePublicationStore {
             return Err(RemoteStoreError::InsecureProtection);
         }
         let connection = Connection::open(path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         initialize_schema(&connection)?;
         let key = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &encryption_key)
@@ -205,7 +215,7 @@ impl SqliteRemotePublicationStore {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
         let result = self.load_graph_snapshot(snapshot, Some((started, duration)), true);
         drop(deadline);
-        result
+        finish_bounded_read(result, started, duration)
     }
 
     pub fn published_memory_revision_bounded(
@@ -217,7 +227,7 @@ impl SqliteRemotePublicationStore {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
         let result = self.load_memory_revision(revision, Some((started, duration)), true);
         drop(deadline);
-        result
+        finish_bounded_read(result, started, duration)
     }
 
     pub fn published_memory_repository_links_bounded(
@@ -229,7 +239,48 @@ impl SqliteRemotePublicationStore {
         let deadline = ReadDeadline::install(&self.connection, started, duration)?;
         let result = self.load_memory_repository_links(view, Some((started, duration)), true);
         drop(deadline);
-        result
+        finish_bounded_read(result, started, duration)
+    }
+
+    pub fn graph_view_bounded(
+        &self,
+        repository: &RemoteRepositoryRef,
+        view_name: &PublishedViewName,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<PublishedRemoteGraphView>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result = RemotePublicationStore::graph_view(self, repository, view_name);
+        drop(deadline);
+        finish_bounded_read(result, started, duration)
+    }
+
+    pub fn memory_view_bounded(
+        &self,
+        project: &RemoteProjectRef,
+        view_name: &MemoryViewName,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<PublishedRemoteMemoryView>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result = RemotePublicationStore::memory_view(self, project, view_name);
+        drop(deadline);
+        finish_bounded_read(result, started, duration)
+    }
+
+    pub fn federated_view_bounded(
+        &self,
+        repository: &RemoteRepositoryRef,
+        graph_view: &PublishedViewName,
+        memory_view: &MemoryViewName,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Option<FederatedViewRef>, RemoteStoreError> {
+        let deadline = ReadDeadline::install(&self.connection, started, duration)?;
+        let result =
+            RemotePublicationStore::federated_view(self, repository, graph_view, memory_view);
+        drop(deadline);
+        finish_bounded_read(result, started, duration)
     }
 
     fn load_graph_snapshot(

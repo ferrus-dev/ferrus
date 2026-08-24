@@ -42,7 +42,7 @@ pub enum FactStoreError {
     ProjectBatchQuotaExceeded,
     #[error("project fact-batch byte quota exceeded")]
     ProjectByteQuotaExceeded,
-    #[error("project has a durable full-deletion tombstone")]
+    #[error("project has a durable deletion tombstone")]
     ProjectDeleted,
     #[error("fact batch failed authenticated decryption or integrity verification")]
     IntegrityFailure,

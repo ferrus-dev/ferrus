@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
     coordinator::IndexJobCoordinator,
-    coordinator_sqlite::{CoordinatorLimits, SqliteIndexJobCoordinator},
+    coordinator_sqlite::{CoordinatorError, CoordinatorLimits, SqliteIndexJobCoordinator},
     fact_store::FactBatchStore,
     fact_store_sqlite::{FactStoreError, FactStoreQuota, SqliteFactBatchStore},
     identity::{
@@ -27,7 +27,8 @@ use super::{
     },
     protocol::{
         FactBatch, FactBatchPayload, FactTarget, IndexInputRef, IndexJobKind, IndexJobRef,
-        IndexJobSpec, IndexSemantics, RemoteErrorCode, SubmitIndexJobRequest,
+        IndexJobSpec, IndexSemantics, InspectIndexJobRequest, RemoteErrorCode,
+        SubmitIndexJobRequest,
     },
     publication_sqlite::{RemoteStoreLimits, SqliteRemotePublicationStore},
     security::{
@@ -719,6 +720,84 @@ fn partial_repository_request(
         )
         .unwrap(),
     }
+}
+
+#[test]
+fn partial_project_deletion_quiesces_writers_until_completion() {
+    let fixture = fixture();
+    let request = partial_project_request(
+        &fixture.project_a,
+        "quiesce-partial-project",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    assert_deletion_quiesces_writers(fixture, request, "partial-project");
+}
+
+#[test]
+fn repository_deletion_quiesces_writers_until_completion() {
+    let fixture = fixture();
+    let request = partial_repository_request(
+        &fixture.repository_a,
+        "quiesce-repository",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    assert_deletion_quiesces_writers(fixture, request, "repository");
+}
+
+fn assert_deletion_quiesces_writers(
+    mut fixture: Fixture,
+    request: RemoteDeleteRequest,
+    request_suffix: &str,
+) {
+    let mut coordinator =
+        SqliteIndexJobCoordinator::open(&fixture.control_path, coordinator_limits()).unwrap();
+    let graph_job = coordinator
+        .inspect(&InspectIndexJobRequest {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            request_id: RequestId::new(format!("inspect-before-{request_suffix}-deletion"))
+                .unwrap(),
+            job: fixture.graph_job_a.clone(),
+        })
+        .unwrap()
+        .unwrap();
+    let submit = SubmitIndexJobRequest {
+        protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+        request_id: RequestId::new(format!("submit-during-{request_suffix}-deletion")).unwrap(),
+        project: fixture.project_a.clone(),
+        job: graph_job.spec,
+    };
+    fixture
+        .maintenance
+        .begin_for_test(&request.deletion, Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        table_count(
+            &fixture.control_path,
+            "project_deletion_tombstones",
+            &fixture.project_a
+        ),
+        1
+    );
+    assert!(matches!(
+        coordinator.submit(&submit, Utc::now()),
+        Err(CoordinatorError::ProjectDeleted)
+    ));
+
+    fixture
+        .maintenance
+        .delete(&administrator(&fixture.project_a), &request, Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        table_count(
+            &fixture.control_path,
+            "project_deletion_tombstones",
+            &fixture.project_a
+        ),
+        0
+    );
+    coordinator.submit(&submit, Utc::now()).unwrap();
 }
 
 #[test]

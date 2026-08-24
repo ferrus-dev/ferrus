@@ -42,7 +42,7 @@ pub enum CoordinatorError {
     LeaseLost,
     #[error("distributed index job was cancelled")]
     Cancelled,
-    #[error("distributed project has a durable full-deletion tombstone")]
+    #[error("distributed project has a durable deletion tombstone")]
     ProjectDeleted,
     #[error("distributed coordinator schema is incompatible")]
     IncompatibleSchema,

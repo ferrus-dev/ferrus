@@ -42,7 +42,7 @@ use super::{
         InspectIndexJobRequest, RemoteError, RemoteErrorCode, RemoteQueryRequest,
         RemoteQueryResponse, RemoteQueryTarget, SubmitIndexJobRequest,
     },
-    publication::{RemotePublicationStore, StoredRemoteGraphSnapshot, StoredRemoteMemoryRevision},
+    publication::{StoredRemoteGraphSnapshot, StoredRemoteMemoryRevision},
     publication_sqlite::{RemoteStoreError, SqliteRemotePublicationStore},
     security::{AuthorizationContext, AuthorizationScope, RemotePermission},
     source::{
@@ -80,6 +80,8 @@ impl SqliteRemoteQueryApi {
         &self,
         request_id: &RequestId,
         target: &RemoteQueryTarget,
+        started: Instant,
+        duration: Duration,
     ) -> Result<RemoteQueryTarget, RemoteError> {
         let resolved = match target {
             RemoteQueryTarget::Repository(snapshot) => {
@@ -93,8 +95,8 @@ impl SqliteRemoteQueryApi {
             } => {
                 let view = self
                     .publication
-                    .graph_view(repository, view_name)
-                    .map_err(|_| query_internal(request_id))?
+                    .graph_view_bounded(repository, view_name, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
                     .ok_or_else(|| query_not_found(request_id))?;
                 RemoteQueryTarget::Repository(RemoteGraphSnapshotRef {
                     repository: repository.clone(),
@@ -104,8 +106,8 @@ impl SqliteRemoteQueryApi {
             RemoteQueryTarget::MemoryView { project, view_name } => {
                 let view = self
                     .publication
-                    .memory_view(project, view_name)
-                    .map_err(|_| query_internal(request_id))?
+                    .memory_view_bounded(project, view_name, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
                     .ok_or_else(|| query_not_found(request_id))?;
                 RemoteQueryTarget::Memory(RemoteMemoryRevisionRef {
                     project: project.clone(),
@@ -119,8 +121,8 @@ impl SqliteRemoteQueryApi {
             } => {
                 let view = self
                     .publication
-                    .federated_view(repository, graph_view, memory_view)
-                    .map_err(|_| query_internal(request_id))?
+                    .federated_view_bounded(repository, graph_view, memory_view, started, duration)
+                    .map_err(|error| query_store_error(request_id, error))?
                     .ok_or_else(|| query_not_found(request_id))?;
                 RemoteQueryTarget::Federated(view)
             }
@@ -576,18 +578,15 @@ impl RemoteSnapshotQueryApi for SqliteRemoteQueryApi {
         }
         let started = Instant::now();
         let budget = self.limits.clamp(request.body.budget);
-        let resolved_target = self.resolve_target(&request.request_id, &request.target)?;
+        let duration = Duration::from_millis(budget.max_duration_ms.get());
+        let resolved_target =
+            self.resolve_target(&request.request_id, &request.target, started, duration)?;
         validate_operation_target(
             &request.request_id,
             &resolved_target,
             &request.body.operation,
         )?;
-        let loaded = self.load_target(
-            &request.request_id,
-            &resolved_target,
-            started,
-            Duration::from_millis(budget.max_duration_ms.get()),
-        )?;
+        let loaded = self.load_target(&request.request_id, &resolved_target, started, duration)?;
         let body = self.execute(request, &resolved_target, loaded, started)?;
         Ok(RemoteQueryResponse {
             protocol_version: DISTRIBUTED_QUERY_PROTOCOL_VERSION,
