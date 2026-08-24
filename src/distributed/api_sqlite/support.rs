@@ -593,6 +593,11 @@ fn federated_context_units(
             if started.elapsed() >= duration {
                 return (Vec::new(), explored);
             }
+            if relationship.provenance.resolution != MemoryResolutionState::Resolved
+                && !include_unresolved
+            {
+                continue;
+            }
             if !memory_relationship_kinds.is_empty()
                 && !memory_relationship_kinds.contains(&relationship.kind)
             {

@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     project_memory::domain::{
         MemoryEntity, MemoryEntityData, MemoryEvidenceLocator, MemoryRelationship,
-        MemoryRelationshipTarget,
+        MemoryRelationshipTarget, MemoryResolutionState,
     },
     project_memory::policy::MemoryContentAccess,
     repository_graph::{

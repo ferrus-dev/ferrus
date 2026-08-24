@@ -1158,6 +1158,60 @@ fn federated_context_rejects_repository_links_for_another_snapshot() {
 }
 
 #[test]
+fn federated_context_honors_include_unresolved_for_memory_links() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+    let mut memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+    let source = memory.entities[0].clone();
+    let mut provenance = source.provenance.clone();
+    provenance.resolution = MemoryResolutionState::Unresolved;
+    memory.relationships = vec![MemoryRelationship {
+        project: source.project.clone(),
+        memory_revision_id: source.memory_revision_id.clone(),
+        id: MemoryRelationshipId::new("unresolved-repository-link").unwrap(),
+        kind: MemoryRelationshipKind::Touches,
+        source: source.id.clone(),
+        target: MemoryRelationshipTarget::RepositoryPath {
+            repository: local_repository(),
+            path: RepoPath::new("missing.rs").unwrap(),
+            snapshot_id: None,
+        },
+        provenance,
+    }];
+    let loaded = LoadedTarget {
+        graph: Some(graph),
+        memory: Some(memory),
+    };
+    let traverse = |include_unresolved| {
+        context_units(
+            &loaded,
+            &[RemoteContextSeed::MemoryEntity(source.id.clone())],
+            EdgeDirection::Outgoing,
+            &[],
+            &[],
+            include_unresolved,
+            false,
+            1,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .0
+    };
+
+    assert!(!traverse(false).iter().any(
+        |unit| matches!(unit, ContextUnit::MemoryRelationship(relationship)
+            if relationship.id.as_str() == "unresolved-repository-link")
+    ));
+    assert!(traverse(true).iter().any(
+        |unit| matches!(unit, ContextUnit::MemoryRelationship(relationship)
+            if relationship.id.as_str() == "unresolved-repository-link")
+    ));
+}
+
+#[test]
 fn search_candidate_generation_observes_an_expired_deadline() {
     let fixture = fixture();
     let store =
