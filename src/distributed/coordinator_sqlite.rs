@@ -3,10 +3,14 @@
 use std::{
     num::{NonZeroU32, NonZeroU64},
     path::Path,
+    time::Instant,
 };
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, Error as SqliteError, ErrorCode, OptionalExtension, Row, Transaction,
+    TransactionBehavior, params,
+};
 use thiserror::Error;
 
 use super::{
@@ -22,6 +26,41 @@ use super::{
 };
 
 pub(crate) const COORDINATOR_SCHEMA_VERSION: u32 = 1;
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SQLITE_PROGRESS_OPS: i32 = 100;
+
+struct ReadDeadline<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> ReadDeadline<'connection> {
+    fn install(
+        connection: &'connection Connection,
+        deadline: Instant,
+    ) -> Result<Self, CoordinatorError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(CoordinatorError::ReadBudgetExceeded)?;
+        connection.busy_timeout(remaining)?;
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || Instant::now() >= deadline),
+            )
+            .map_err(|error| {
+                let _ = connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+                CoordinatorError::Database(error)
+            })?;
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for ReadDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorLimits {
@@ -46,6 +85,8 @@ pub enum CoordinatorError {
     ProjectDeleted,
     #[error("distributed coordinator schema is incompatible")]
     IncompatibleSchema,
+    #[error("distributed coordinator read exceeded its duration budget")]
+    ReadBudgetExceeded,
     #[error("distributed coordinator database operation failed")]
     Database(#[source] rusqlite::Error),
     #[error("distributed coordinator record serialization failed")]
@@ -69,7 +110,7 @@ impl SqliteIndexJobCoordinator {
         limits: CoordinatorLimits,
     ) -> Result<Self, CoordinatorError> {
         let connection = Connection::open(path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         initialize_schema(&connection)?;
         Ok(Self { connection, limits })
     }
@@ -86,6 +127,29 @@ impl SqliteIndexJobCoordinator {
             .map_err(|_| CoordinatorError::InvalidRequest)?;
         now.checked_add_signed(Duration::milliseconds(millis))
             .ok_or(CoordinatorError::InvalidRequest)
+    }
+
+    pub fn inspect_bounded(
+        &self,
+        request: &InspectIndexJobRequest,
+        deadline: Instant,
+    ) -> Result<Option<IndexJobRecord>, CoordinatorError> {
+        let read_deadline = ReadDeadline::install(&self.connection, deadline)?;
+        let result = IndexJobCoordinator::inspect(self, request);
+        drop(read_deadline);
+        if Instant::now() >= deadline
+            || matches!(
+                &result,
+                Err(CoordinatorError::Database(SqliteError::SqliteFailure(
+                    failure,
+                    _
+                ))) if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        {
+            Err(CoordinatorError::ReadBudgetExceeded)
+        } else {
+            result
+        }
     }
 
     fn transition_with_lease(

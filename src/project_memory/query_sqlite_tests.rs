@@ -443,6 +443,47 @@ fn search_candidate_ranking_stops_when_the_deadline_expires() {
 }
 
 #[test]
+fn memory_scope_resolution_stops_at_the_sqlite_lock_deadline() {
+    let (_root, data, project, _revision_id) = indexed_fixture();
+    let sidecar = MemorySidecar::open_at(data.path()).unwrap();
+    sidecar
+        .connection()
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap();
+    let blocker = Connection::open(data.path().join(MEMORY_SIDECAR_FILE_NAME)).unwrap();
+    blocker
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             UPDATE memory_published_views SET generation = generation;",
+        )
+        .unwrap();
+    let limits = QueryLimitsConfig::default();
+    let mut scope = published_scope(project, &limits);
+    scope.budget.max_duration_ms = NonZeroU64::new(25).unwrap();
+    let query = SqliteMemoryQuery::new(&sidecar, limits);
+    let started = Instant::now();
+
+    let result = query.search(MemorySearchRequest {
+        scope,
+        text: super::super::domain::MemoryQueryText::new("sqlite").unwrap(),
+        entity_kinds: vec![],
+        source_categories: vec![],
+        page: MemoryPageRequest::default(),
+    });
+
+    assert!(matches!(
+        result,
+        Err(MemoryQueryError::BudgetExceeded(
+            MemoryTruncationReason::Duration
+        ))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn context_counts_relationships_against_the_effective_result_limit() {
     let (_root, data, project, revision_id) = indexed_fixture();
     let OpenMemoryQuerySidecarResult::Ready(sidecar) =

@@ -38,6 +38,7 @@ const MAX_FILTERS: usize = 32;
 const MAX_CONTEXT_CANDIDATES: usize = 4_096;
 const MAX_CONTEXT_RELATIONSHIPS: usize = 4_096;
 const SQLITE_PROGRESS_OPS: i32 = 100;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_VERSION: u32 = 1;
 
 pub fn default_budget(limits: &QueryLimitsConfig) -> Result<MemoryQueryBudget, MemoryQueryError> {
@@ -69,12 +70,21 @@ impl<'connection> QueryDeadline<'connection> {
         started: Instant,
         duration: Duration,
     ) -> Result<Self, MemoryQueryError> {
+        if started.elapsed() >= duration {
+            return Err(duration_budget_error());
+        }
+        connection
+            .busy_timeout(duration.saturating_sub(started.elapsed()))
+            .map_err(sqlite_error)?;
         connection
             .progress_handler(
                 SQLITE_PROGRESS_OPS,
                 Some(move || started.elapsed() >= duration),
             )
-            .map_err(sqlite_error)?;
+            .map_err(|error| {
+                let _ = connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+                sqlite_error(error)
+            })?;
         Ok(Self { connection })
     }
 }
@@ -82,6 +92,7 @@ impl<'connection> QueryDeadline<'connection> {
 impl Drop for QueryDeadline<'_> {
     fn drop(&mut self) {
         let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
     }
 }
 
@@ -265,6 +276,20 @@ impl<'a> SqliteMemoryQuery<'a> {
             revision,
             budget: EffectiveBudget::new(&scope.budget, &self.limits),
         })
+    }
+
+    fn resolve_scope_bounded(
+        &self,
+        scope: &super::query::MemoryQueryScope,
+        started: Instant,
+        budget: EffectiveBudget,
+    ) -> Result<ResolvedScope, MemoryQueryError> {
+        validate_wire_version(scope.wire_version)?;
+        let deadline =
+            QueryDeadline::install(self.sidecar.connection(), started, budget.duration())?;
+        let resolved = self.resolve_scope(scope);
+        drop(deadline);
+        finish_at_deadline(resolved, started, budget.duration())
     }
 
     fn entities(
@@ -597,12 +622,9 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         &self,
         request: MemoryStatusRequest,
     ) -> Result<MemoryStatusResponse, MemoryQueryError> {
-        validate_wire_version(request.scope.wire_version)?;
         let budget = EffectiveBudget::new(&request.scope.budget, &self.limits);
         let started = Instant::now();
-        let deadline =
-            QueryDeadline::install(self.sidecar.connection(), started, budget.duration())?;
-        let resolved = self.resolve_scope(&request.scope);
+        let resolved = self.resolve_scope_bounded(&request.scope, started, budget);
         let scope = match resolved {
             Ok(scope) => scope,
             Err(MemoryQueryError::Unavailable)
@@ -611,6 +633,8 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
                     super::query::MemoryRevisionSelector::Published(_)
                 ) =>
             {
+                let deadline =
+                    QueryDeadline::install(self.sidecar.connection(), started, budget.duration())?;
                 let latest = self.latest_build(&request.scope.project)?;
                 let retention = self.retention_statistics(&request.scope.project)?;
                 drop(deadline);
@@ -639,6 +663,8 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             }
             Err(error) => return Err(error),
         };
+        let deadline =
+            QueryDeadline::install(self.sidecar.connection(), started, budget.duration())?;
         let latest = self.latest_build(&scope.revision.project)?;
         let statistics = self.statistics(&scope.revision.id)?;
         let retention = self.retention_statistics(&scope.revision.project)?;
@@ -677,7 +703,8 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             return Err(invalid_request("query.filters"));
         }
         let started = Instant::now();
-        let scope = self.resolve_scope(&request.scope)?;
+        let budget = EffectiveBudget::new(&request.scope.budget, &self.limits);
+        let scope = self.resolve_scope_bounded(&request.scope, started, budget)?;
         let fingerprint = search_fingerprint(&request)?;
         let offset = decode_cursor(
             request.page.cursor.as_ref(),
@@ -769,7 +796,8 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
             return Err(invalid_request("context.filters"));
         }
         let started = Instant::now();
-        let scope = self.resolve_scope(&request.scope)?;
+        let budget = EffectiveBudget::new(&request.scope.budget, &self.limits);
+        let scope = self.resolve_scope_bounded(&request.scope, started, budget)?;
         let fingerprint = context_fingerprint(&request, scope.budget.max_depth)?;
         let offset = decode_cursor(
             request.page.cursor.as_ref(),

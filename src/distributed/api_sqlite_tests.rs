@@ -989,6 +989,31 @@ fn snippet_manifest_loading_observes_an_expired_deadline_for_each_domain() {
 }
 
 #[test]
+fn snippet_manifest_job_lookup_observes_the_query_deadline() {
+    let fixture = fixture();
+    let store =
+        SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
+            .unwrap();
+    let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
+    let memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap();
+
+    for job in [&graph.record.job, &memory.record.job] {
+        let error = fixture
+            .query
+            .job(
+                &RequestId::new("expired-manifest-job").unwrap(),
+                job,
+                deadline,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, RemoteErrorCode::BudgetExceeded);
+    }
+}
+
+#[test]
 fn memory_context_traversal_honors_relationship_direction() {
     let fixture = fixture();
     let store =

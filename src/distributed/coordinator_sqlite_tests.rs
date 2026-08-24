@@ -123,6 +123,44 @@ fn repeated_submission_converges_and_survives_reopen() {
 }
 
 #[test]
+fn bounded_inspection_stops_at_the_sqlite_lock_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("coordinator.db");
+    let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(3)).unwrap();
+    let submitted = coordinator
+        .submit(&submit_request("tenant-a"), now())
+        .unwrap();
+    coordinator
+        .connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap();
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             UPDATE distributed_index_jobs SET updated_at_ms = updated_at_ms;",
+        )
+        .unwrap();
+    let started = Instant::now();
+    let deadline = started + std::time::Duration::from_millis(25);
+
+    let result = coordinator.inspect_bounded(
+        &InspectIndexJobRequest {
+            protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+            request_id: RequestId::new("bounded-inspect").unwrap(),
+            job: submitted.job,
+        },
+        deadline,
+    );
+
+    assert!(matches!(result, Err(CoordinatorError::ReadBudgetExceeded)));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn project_deletion_tombstone_rejects_new_job_submissions() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("coordinator.db");

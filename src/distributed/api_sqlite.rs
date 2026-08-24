@@ -490,7 +490,7 @@ impl SqliteRemoteQueryApi {
         deadline: Instant,
     ) -> Result<RepositorySourceManifest, RemoteError> {
         ensure_query_deadline(request_id, deadline)?;
-        let record = self.job(request_id, &snapshot.record.job)?;
+        let record = self.job(request_id, &snapshot.record.job, deadline)?;
         ensure_query_deadline(request_id, deadline)?;
         let IndexInputRef::Repository(reference) = record.spec.input else {
             return Err(query_internal(request_id));
@@ -517,7 +517,7 @@ impl SqliteRemoteQueryApi {
         deadline: Instant,
     ) -> Result<MemorySourceManifest, RemoteError> {
         ensure_query_deadline(request_id, deadline)?;
-        let record = self.job(request_id, &revision.record.job)?;
+        let record = self.job(request_id, &revision.record.job, deadline)?;
         ensure_query_deadline(request_id, deadline)?;
         let IndexInputRef::Memory(reference) = record.spec.input else {
             return Err(query_internal(request_id));
@@ -541,14 +541,22 @@ impl SqliteRemoteQueryApi {
         &self,
         request_id: &RequestId,
         job: &super::protocol::IndexJobRef,
+        deadline: Instant,
     ) -> Result<IndexJobRecord, RemoteError> {
         self.coordinator
-            .inspect(&InspectIndexJobRequest {
-                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                request_id: RequestId::new("query-manifest").expect("static request id is valid"),
-                job: job.clone(),
-            })
-            .map_err(|_| query_internal(request_id))?
+            .inspect_bounded(
+                &InspectIndexJobRequest {
+                    protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+                    request_id: RequestId::new("query-manifest")
+                        .expect("static request id is valid"),
+                    job: job.clone(),
+                },
+                deadline,
+            )
+            .map_err(|error| match error {
+                CoordinatorError::ReadBudgetExceeded => query_budget(request_id),
+                _ => query_internal(request_id),
+            })?
             .ok_or_else(|| query_internal(request_id))
     }
 }

@@ -1281,7 +1281,9 @@ pub(super) fn control_backend_error(
         | CoordinatorError::ProjectDeleted => (RemoteErrorCode::Conflict, false),
         CoordinatorError::Cancelled => (RemoteErrorCode::Cancelled, false),
         CoordinatorError::IncompatibleSchema => (RemoteErrorCode::UnsupportedVersion, false),
-        CoordinatorError::Database(_) => (RemoteErrorCode::TemporarilyUnavailable, true),
+        CoordinatorError::Database(_) | CoordinatorError::ReadBudgetExceeded => {
+            (RemoteErrorCode::TemporarilyUnavailable, true)
+        }
         CoordinatorError::Serialization => (RemoteErrorCode::Internal, false),
     };
     RemoteError {

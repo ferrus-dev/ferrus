@@ -254,23 +254,50 @@ pub(super) fn invalid_request(code: &str) -> MemoryQueryError {
     MemoryQueryError::Backend(diagnostic_code(code))
 }
 
+pub(super) fn duration_budget_error() -> MemoryQueryError {
+    MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)
+}
+
+pub(super) fn finish_at_deadline<T>(
+    result: Result<T, MemoryQueryError>,
+    started: Instant,
+    duration: Duration,
+) -> Result<T, MemoryQueryError> {
+    if started.elapsed() >= duration {
+        Err(duration_budget_error())
+    } else {
+        result
+    }
+}
+
 pub(super) fn store_error(error: MemoryStoreError) -> MemoryQueryError {
     match error {
         MemoryStoreError::RevisionNotFound => MemoryQueryError::RevisionNotFound,
         MemoryStoreError::RequiresRebuild => backend_error("storage.incompatible"),
+        MemoryStoreError::Database(ref error) if sqlite_budget_error(error) => {
+            duration_budget_error()
+        }
         _ => backend_error("storage.unavailable"),
     }
 }
 
 pub(super) fn sqlite_error(error: SqliteError) -> MemoryQueryError {
-    if matches!(
-        error,
-        SqliteError::SqliteFailure(ref failure, _) if failure.code == ErrorCode::OperationInterrupted
-    ) {
-        MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)
+    if sqlite_budget_error(&error) {
+        duration_budget_error()
     } else {
         backend_error("storage.unavailable")
     }
+}
+
+fn sqlite_budget_error(error: &SqliteError) -> bool {
+    matches!(
+        error,
+        SqliteError::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                ErrorCode::OperationInterrupted | ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 pub(super) fn serialization_error(_: serde_json::Error) -> MemoryQueryError {
