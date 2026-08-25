@@ -12,7 +12,9 @@ use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, Error as SqliteError, ErrorCode, OptionalExtension, TransactionBehavior, params,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -23,6 +25,54 @@ use super::identity::{ObjectId, RemoteProjectRef, TenantObjectRef};
 const OBJECT_SCHEMA_VERSION: u32 = 1;
 const ENVELOPE_MAGIC: &[u8; 8] = b"FERROBJ1";
 const NONCE_BYTES: usize = 12;
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SQLITE_PROGRESS_OPS: i32 = 100;
+
+struct ReadDeadline<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> ReadDeadline<'connection> {
+    fn install(
+        connection: &'connection Connection,
+        deadline: Instant,
+    ) -> Result<Option<Self>, ObjectStoreError> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(None);
+        };
+        connection.busy_timeout(remaining)?;
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || Instant::now() >= deadline),
+            )
+            .map_err(|error| {
+                let _ = connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+                ObjectStoreError::Database(error)
+            })?;
+        Ok(Some(Self { connection }))
+    }
+}
+
+impl Drop for ReadDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.connection.busy_timeout(SQLITE_BUSY_TIMEOUT);
+    }
+}
+
+fn sqlite_read_timed_out<T>(result: &Result<T, SqliteError>) -> bool {
+    matches!(
+        result,
+        Err(SqliteError::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                ErrorCode::DatabaseBusy
+                    | ErrorCode::DatabaseLocked
+                    | ErrorCode::OperationInterrupted
+            )
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectStoreProtection {
@@ -139,7 +189,7 @@ impl EncryptedFilesystemObjectStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("objects"))?;
         let database = Connection::open(root.join("object-store.db"))?;
-        database.busy_timeout(std::time::Duration::from_secs(5))?;
+        database.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         initialize_schema(&database)?;
         let key = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &encryption_key)
@@ -343,23 +393,7 @@ impl EncryptedFilesystemObjectStore {
         object: &TenantObjectRef,
         deadline: Instant,
     ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let exists = self.contains(object)?;
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        if !exists {
-            return Err(ObjectStoreError::ObjectUnavailable);
-        }
-        match Self::decrypt_file_bounded(
-            &self.key,
-            object,
-            &self.object_path(object),
-            Some(deadline),
-            None,
-        )? {
+        match self.read_verified_bounded(object, u64::MAX, deadline)? {
             BoundedObjectRead::Content(content) => Ok(Some(content)),
             BoundedObjectRead::DeadlineExceeded => Ok(None),
             BoundedObjectRead::SizeExceeded => Err(ObjectStoreError::IntegrityFailure),
@@ -479,6 +513,12 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if Instant::now() >= deadline {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+        let read_deadline = match ReadDeadline::install(&self.database, deadline)? {
+            Some(read_deadline) => read_deadline,
+            None => {
+                return Ok(BoundedObjectRead::DeadlineExceeded);
+            }
+        };
         let byte_len = self
             .database
             .query_row(
@@ -494,10 +534,12 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                 ],
                 |row| row.get::<_, i64>(0),
             )
-            .optional()?;
-        if Instant::now() >= deadline {
+            .optional();
+        drop(read_deadline);
+        if Instant::now() >= deadline || sqlite_read_timed_out(&byte_len) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+        let byte_len = byte_len?;
         let Some(byte_len) = byte_len else {
             return Err(ObjectStoreError::ObjectUnavailable);
         };
@@ -737,6 +779,45 @@ mod tests {
                 .unwrap(),
             BoundedObjectRead::Content(content.to_vec())
         );
+    }
+
+    #[test]
+    fn bounded_reads_stop_at_the_sqlite_lock_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("object-store.db");
+        let mut store =
+            EncryptedFilesystemObjectStore::open(directory.path(), [12; 32], quota(), true)
+                .unwrap();
+        let content = b"lock-bounded content";
+        let stored = store
+            .put_verified(&project("tenant-a"), &digest(content), content)
+            .unwrap();
+        store
+            .database
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let blocker = Connection::open(database_path).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN EXCLUSIVE;
+                 UPDATE source_objects SET byte_len = byte_len;",
+            )
+            .unwrap();
+        let started = Instant::now();
+
+        let result = store
+            .read_verified_bounded(
+                &stored.object,
+                u64::try_from(content.len()).unwrap(),
+                started + std::time::Duration::from_millis(25),
+            )
+            .unwrap();
+
+        assert_eq!(result, BoundedObjectRead::DeadlineExceeded);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        blocker.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
