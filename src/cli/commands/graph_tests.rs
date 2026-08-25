@@ -52,3 +52,27 @@ fn evidence_locations_are_repository_relative() {
     let path = RepoPath::new("src/main.rs").unwrap();
     assert_eq!(evidence_location(Some(&path), None), "src/main.rs");
 }
+
+#[test]
+fn combined_kind_filters_exclude_the_unselected_domain() {
+    let (domain, repository_kinds, memory_kinds) =
+        federated_kind_filters(GraphDomain::All, vec!["decision".to_string()]).unwrap();
+    assert_eq!(domain, GraphDomain::Memory);
+    assert!(repository_kinds.is_empty());
+    assert_eq!(memory_kinds, vec![MemoryEntityKind::Decision]);
+
+    let (domain, repository_kinds, memory_kinds) =
+        federated_kind_filters(GraphDomain::All, vec!["struct".to_string()]).unwrap();
+    assert_eq!(domain, GraphDomain::Repository);
+    assert_eq!(repository_kinds[0].as_str(), "struct");
+    assert!(memory_kinds.is_empty());
+
+    let (domain, repository_kinds, memory_kinds) = federated_kind_filters(
+        GraphDomain::All,
+        vec!["decision".to_string(), "struct".to_string()],
+    )
+    .unwrap();
+    assert_eq!(domain, GraphDomain::All);
+    assert_eq!(repository_kinds[0].as_str(), "struct");
+    assert_eq!(memory_kinds, vec![MemoryEntityKind::Decision]);
+}

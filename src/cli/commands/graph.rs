@@ -192,7 +192,7 @@ pub enum MemoryCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum GraphDomain {
     #[default]
     Repository,
@@ -617,26 +617,18 @@ async fn federated_search(
     limit: Option<u32>,
     json: bool,
 ) -> Result<()> {
-    let context = LocalProjectContext::load_for_cli(matches!(domain, GraphDomain::All)).await?;
+    let (effective_domain, repository_kinds, memory_kinds) = federated_kind_filters(domain, kinds)?;
+    let context = LocalProjectContext::load_for_cli(matches!(
+        effective_domain,
+        GraphDomain::Repository | GraphDomain::All
+    ))
+    .await?;
     let budget = context.requested_budget(limit, None, None, None, None, None)?;
-    if matches!(domain, GraphDomain::Memory) && path.is_some() {
+    if matches!(effective_domain, GraphDomain::Memory) && path.is_some() {
         anyhow::bail!("--path scopes repository results and requires --domain repository or all");
     }
-    let mut memory_kinds = Vec::new();
-    let mut repository_kinds = Vec::new();
-    for kind in kinds {
-        match domain {
-            GraphDomain::Memory => memory_kinds.push(parse_memory_kind(&kind)?),
-            GraphDomain::All => match parse_memory_kind(&kind) {
-                Ok(kind) => memory_kinds.push(kind),
-                Err(_) => repository_kinds
-                    .push(crate::project_memory::domain::MemoryStatusToken::new(kind)?),
-            },
-            GraphDomain::Repository => unreachable!("repository search uses the legacy path"),
-        }
-    }
     let response = context.search(FederatedSearchRequest {
-        scope: context.scope(domain.into(), budget)?,
+        scope: context.scope(effective_domain.into(), budget)?,
         text: MemoryQueryText::new(text)?,
         repository_kinds,
         repository_paths: path
@@ -673,6 +665,40 @@ async fn federated_search(
         }
     }
     Ok(())
+}
+
+fn federated_kind_filters(
+    domain: GraphDomain,
+    kinds: Vec<String>,
+) -> Result<(
+    GraphDomain,
+    Vec<crate::project_memory::domain::MemoryStatusToken>,
+    Vec<MemoryEntityKind>,
+)> {
+    let has_kind_filters = !kinds.is_empty();
+    let mut memory_kinds = Vec::new();
+    let mut repository_kinds = Vec::new();
+    for kind in kinds {
+        match domain {
+            GraphDomain::Memory => memory_kinds.push(parse_memory_kind(&kind)?),
+            GraphDomain::All => match parse_memory_kind(&kind) {
+                Ok(kind) => memory_kinds.push(kind),
+                Err(_) => repository_kinds
+                    .push(crate::project_memory::domain::MemoryStatusToken::new(kind)?),
+            },
+            GraphDomain::Repository => unreachable!("repository search uses the legacy path"),
+        }
+    }
+    let effective_domain = if matches!(domain, GraphDomain::All) && has_kind_filters {
+        match (repository_kinds.is_empty(), memory_kinds.is_empty()) {
+            (true, false) => GraphDomain::Memory,
+            (false, true) => GraphDomain::Repository,
+            _ => GraphDomain::All,
+        }
+    } else {
+        domain
+    };
+    Ok((effective_domain, repository_kinds, memory_kinds))
 }
 
 fn parse_memory_kind(value: &str) -> Result<MemoryEntityKind> {

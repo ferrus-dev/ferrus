@@ -401,6 +401,64 @@ fn memory_publication_rejects_a_target_not_bound_to_the_job_input() {
 }
 
 #[test]
+fn memory_publication_checks_authority_before_loading_repository_links() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "20",
+        "memory-authority-first",
+    );
+    let revision_id = MemoryRevisionId::new("memory-authority-first").unwrap();
+    let graph = RemoteGraphSnapshotRef {
+        repository: repository("tenant-a"),
+        snapshot_id: SnapshotId::new("missing-graph-snapshot").unwrap(),
+    };
+    let link_set = MemoryRepositoryLinkSet {
+        id: MemoryRepositoryLinkSetId::new("memory-links:authority-first").unwrap(),
+        project: local_project(),
+        memory_revision_id: revision_id.clone(),
+        repository: local_repository(),
+        repository_snapshot_id: Some(graph.snapshot_id.clone()),
+        resolver: MemoryExtractorIdentity::current(
+            MemoryExtractorId::new("memory.test").unwrap(),
+            MemoryStatusToken::new("v1").unwrap(),
+        ),
+    };
+    let batch = FactBatch::new(
+        job.job.clone(),
+        FactTarget::ProjectMemory {
+            revision: RemoteMemoryRevisionRef {
+                project: project("tenant-a"),
+                revision_id: revision_id.clone(),
+            },
+            project_identity: local_project(),
+            build_id: MemoryBuildId::new("build-memory-authority-first").unwrap(),
+            repository_links: Some(Box::new(RemoteMemoryLinkSetTarget { graph, link_set })),
+        },
+        FactShardId::new("memory-all").unwrap(),
+        0,
+        digest("44"),
+        true,
+        FactBatchPayload::ProjectMemory {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+    )
+    .unwrap();
+    let mut request = memory_request(&job, revision_id.as_str(), None);
+    request.worker_id = WorkerId::new("forged-worker").unwrap();
+
+    assert!(matches!(
+        store(&path).publish_memory(&request, &[batch], Utc::now()),
+        Err(RemoteStoreError::AuthorityLost)
+    ));
+}
+
+#[test]
 fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");

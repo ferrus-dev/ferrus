@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Instant};
 
 use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
@@ -72,6 +72,11 @@ pub trait IndexJobCoordinator {
     fn inspect(
         &self,
         request: &InspectIndexJobRequest,
+    ) -> Result<Option<IndexJobRecord>, Self::Error>;
+    fn inspect_bounded(
+        &self,
+        request: &InspectIndexJobRequest,
+        deadline: Instant,
     ) -> Result<Option<IndexJobRecord>, Self::Error>;
     fn claim(
         &mut self,

@@ -246,7 +246,7 @@ impl StatelessIndexWorker {
             return Err(WorkerError::InvalidSandbox);
         }
         require_fact_protection(facts)?;
-        self.authorize(request, coordinator)?;
+        self.authorize(request, coordinator, deadline)?;
 
         let (target, payloads) = match &request.job.spec.input {
             IndexInputRef::Repository(reference) => {
@@ -338,7 +338,7 @@ impl StatelessIndexWorker {
         let last = payloads.len().saturating_sub(1);
         for (index, payload) in payloads.into_iter().enumerate() {
             self.check_deadline(deadline)?;
-            self.authorize(request, coordinator)?;
+            self.authorize(request, coordinator, deadline)?;
             let sequence = u32::try_from(index).map_err(|_| WorkerError::OutputLimitExceeded)?;
             let batch = FactBatch::new(
                 request.job.job.clone(),
@@ -406,6 +406,7 @@ impl StatelessIndexWorker {
         &self,
         request: &ExecuteIndexJobRequest,
         coordinator: &C,
+        deadline: WorkerDeadline,
     ) -> Result<(), WorkerError> {
         let authorization = InspectIndexJobRequest {
             protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
@@ -413,8 +414,13 @@ impl StatelessIndexWorker {
                 .map_err(|_| WorkerError::InvalidInput)?,
             job: request.job.job.clone(),
         };
-        let current = coordinator
-            .inspect(&authorization)
+        let inspect_deadline = deadline
+            .started
+            .checked_add(Duration::from_millis(deadline.limit_ms))
+            .ok_or(WorkerError::DeadlineExceeded)?;
+        let inspected = coordinator.inspect_bounded(&authorization, inspect_deadline);
+        self.check_deadline(deadline)?;
+        let current = inspected
             .map_err(|_| WorkerError::AuthorityLost)?
             .ok_or(WorkerError::AuthorityLost)?;
         let now = Utc::now();
@@ -576,7 +582,7 @@ impl StatelessIndexWorker {
         for (remote_file, file) in remote.body.files.iter().zip(&manifest.files) {
             let mut source_facts = 0u64;
             self.check_deadline(deadline)?;
-            self.authorize(request, coordinator)?;
+            self.authorize(request, coordinator, deadline)?;
             if remote_file.byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
             }
@@ -751,7 +757,7 @@ impl StatelessIndexWorker {
         let mut extracted_facts = 0u64;
         for (remote_source, source) in remote.body.sources.iter().zip(&manifest.sources) {
             self.check_deadline(deadline)?;
-            self.authorize(request, coordinator)?;
+            self.authorize(request, coordinator, deadline)?;
             if remote_source.sanitized_byte_len > self.limits.max_object_bytes.get() {
                 return Err(WorkerError::InputLimitExceeded);
             }

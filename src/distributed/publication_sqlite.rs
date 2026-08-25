@@ -289,54 +289,13 @@ impl SqliteRemotePublicationStore {
         deadline: Option<(Instant, Duration)>,
         published_only: bool,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
-        ensure_read_budget(deadline)?;
-        if published_only
-            && !target_was_published(
-                &self.connection,
-                &snapshot.repository.project,
-                "repository_graph",
-                snapshot.repository.repository_id.as_str(),
-                snapshot.snapshot_id.as_str(),
-            )?
-        {
-            return Ok(None);
-        }
-        let Some(record) = load_graph_record(&self.connection, snapshot)? else {
-            return Ok(None);
-        };
-        let facts = load_facts(
+        load_graph_snapshot_from_connection(
             &self.connection,
             &self.key,
-            &record.job,
-            "repository_graph",
-            record.snapshot.snapshot_id.as_str(),
-            record.snapshot.repository.repository_id.as_str(),
+            snapshot,
             deadline,
-        )?;
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let mut diagnostics = Vec::new();
-        for (kind, encoded) in facts {
-            ensure_read_budget(deadline)?;
-            match kind.as_str() {
-                "node" => nodes.push(decode(&encoded)?),
-                "edge" => edges.push(decode(&encoded)?),
-                "diagnostic" => diagnostics.push(decode(&encoded)?),
-                _ => return Err(RemoteStoreError::IntegrityFailure),
-            }
-        }
-        if u64::try_from(nodes.len()).ok() != Some(record.counts.primary)
-            || u64::try_from(edges.len()).ok() != Some(record.counts.relationships)
-            || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
-        {
-            return Err(RemoteStoreError::IntegrityFailure);
-        }
-        Ok(Some(StoredRemoteGraphSnapshot {
-            record,
-            nodes,
-            edges,
-            diagnostics,
-        }))
+            published_only,
+        )
     }
 
     fn load_memory_revision(
@@ -590,12 +549,6 @@ impl SqliteRemotePublicationStore {
         mut prepared: PreparedMemory,
         now: DateTime<Utc>,
     ) -> Result<MemoryPublicationOutcome, RemoteStoreError> {
-        if let Some(links) = prepared.repository_links.as_ref() {
-            let graph = self
-                .load_graph_snapshot(&links.target.graph, None, true)?
-                .ok_or(RemoteStoreError::InvalidInput)?;
-            validate_repository_links_against_graph(links, &graph)?;
-        }
         let prepared_links = prepared
             .repository_links
             .take()
@@ -643,6 +596,17 @@ impl SqliteRemotePublicationStore {
             )
         {
             return Err(RemoteStoreError::InvalidInput);
+        }
+        if let Some((links, _)) = prepared_links.as_ref() {
+            let graph = load_graph_snapshot_from_connection(
+                &transaction,
+                &self.key,
+                &links.target.graph,
+                None,
+                true,
+            )?
+            .ok_or(RemoteStoreError::InvalidInput)?;
+            validate_repository_links_against_graph(links, &graph)?;
         }
         let reused_revision =
             insert_memory_revision(&transaction, &prepared.record, &encrypted, self.limits)?;
@@ -712,6 +676,63 @@ impl SqliteRemotePublicationStore {
         transaction.commit()?;
         Ok(outcome)
     }
+}
+
+fn load_graph_snapshot_from_connection(
+    connection: &Connection,
+    key: &LessSafeKey,
+    snapshot: &RemoteGraphSnapshotRef,
+    deadline: Option<(Instant, Duration)>,
+    published_only: bool,
+) -> Result<Option<StoredRemoteGraphSnapshot>, RemoteStoreError> {
+    ensure_read_budget(deadline)?;
+    if published_only
+        && !target_was_published(
+            connection,
+            &snapshot.repository.project,
+            "repository_graph",
+            snapshot.repository.repository_id.as_str(),
+            snapshot.snapshot_id.as_str(),
+        )?
+    {
+        return Ok(None);
+    }
+    let Some(record) = load_graph_record(connection, snapshot)? else {
+        return Ok(None);
+    };
+    let facts = load_facts(
+        connection,
+        key,
+        &record.job,
+        "repository_graph",
+        record.snapshot.snapshot_id.as_str(),
+        record.snapshot.repository.repository_id.as_str(),
+        deadline,
+    )?;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (kind, encoded) in facts {
+        ensure_read_budget(deadline)?;
+        match kind.as_str() {
+            "node" => nodes.push(decode(&encoded)?),
+            "edge" => edges.push(decode(&encoded)?),
+            "diagnostic" => diagnostics.push(decode(&encoded)?),
+            _ => return Err(RemoteStoreError::IntegrityFailure),
+        }
+    }
+    if u64::try_from(nodes.len()).ok() != Some(record.counts.primary)
+        || u64::try_from(edges.len()).ok() != Some(record.counts.relationships)
+        || u64::try_from(diagnostics.len()).ok() != Some(record.counts.diagnostics)
+    {
+        return Err(RemoteStoreError::IntegrityFailure);
+    }
+    Ok(Some(StoredRemoteGraphSnapshot {
+        record,
+        nodes,
+        edges,
+        diagnostics,
+    }))
 }
 
 fn validate_repository_links_against_graph(

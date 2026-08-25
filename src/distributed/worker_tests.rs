@@ -1,5 +1,6 @@
 use std::{cell::Cell, time::Duration};
 
+use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 
 use super::*;
@@ -10,8 +11,9 @@ use crate::{
         fact_store::{FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome},
         fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
         identity::{
-            MemoryManifestId, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
-            RemoteRepositoryRef, RequestId, TenantId,
+            MemoryManifestId, ObjectId, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
+            RemoteRepositoryRef, RepositoryManifestId, RepositoryManifestRef, RequestId, TenantId,
+            TenantObjectRef,
         },
         object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
         protocol::{
@@ -380,6 +382,56 @@ fn worker_deadline_budget_is_terminal_and_clamped_between_attempts() {
     let attempt = extraction_context_for_attempt(&context, 7, 1);
     assert_eq!(attempt.max_parser_duration_ms, 1);
     assert_eq!(attempt.max_diagnostics, 7);
+}
+
+#[test]
+fn worker_authorization_stops_at_the_coordinator_lock_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("jobs.db");
+    let mut jobs = coordinator(&database_path);
+    let manifest_digest = Digest::new("sha256", "aa").unwrap();
+    let running = running_job(
+        &mut jobs,
+        IndexJobKind::RepositoryGraph,
+        IndexInputRef::Repository(RepositoryManifestRef {
+            repository: remote_repository(),
+            repository_identity: local_repository(),
+            manifest_id: RepositoryManifestId::new("aa").unwrap(),
+            manifest_digest: manifest_digest.clone(),
+            source_policy_digest: Digest::new("sha256", "bb").unwrap(),
+            expected_snapshot_id: SnapshotId::new("snapshot-auth-deadline").unwrap(),
+            manifest_object: TenantObjectRef {
+                project: remote_project(),
+                object_id: ObjectId::new("aa").unwrap(),
+                content_identity: manifest_digest,
+            },
+        }),
+        IndexSemantics {
+            semantic_config_digest: Digest::new("sha256", "cc").unwrap(),
+            model_version: NonZeroU32::new(GRAPH_MODEL_VERSION).unwrap(),
+            extractor_set_digest: Digest::new("sha256", "dd").unwrap(),
+        },
+    );
+    let request = execution_request(running);
+    jobs.use_delete_journal_for_test().unwrap();
+    let blocker = Connection::open(&database_path).unwrap();
+    blocker
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             UPDATE distributed_index_jobs SET updated_at_ms = updated_at_ms;",
+        )
+        .unwrap();
+    let started = Instant::now();
+    let deadline = WorkerDeadline {
+        started,
+        limit_ms: 25,
+    };
+
+    let result = StatelessIndexWorker::new(worker_limits()).authorize(&request, &jobs, deadline);
+
+    assert_eq!(result, Err(WorkerError::DeadlineExceeded));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
 }
 
 #[test]

@@ -152,6 +152,15 @@ impl SqliteIndexJobCoordinator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_delete_journal_for_test(&self) -> Result<(), CoordinatorError> {
+        self.connection
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+                row.get::<_, String>(0)
+            })?;
+        Ok(())
+    }
+
     fn transition_with_lease(
         &mut self,
         request: &AdvanceIndexJobRequest,
@@ -212,6 +221,14 @@ impl SqliteIndexJobCoordinator {
 
 impl IndexJobCoordinator for SqliteIndexJobCoordinator {
     type Error = CoordinatorError;
+
+    fn inspect_bounded(
+        &self,
+        request: &InspectIndexJobRequest,
+        deadline: Instant,
+    ) -> Result<Option<IndexJobRecord>, Self::Error> {
+        SqliteIndexJobCoordinator::inspect_bounded(self, request, deadline)
+    }
 
     fn submit(
         &mut self,
