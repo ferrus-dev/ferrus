@@ -46,6 +46,10 @@ use super::{
 const MAX_FEDERATION_CANDIDATES: usize = 4_096;
 const CURSOR_VERSION: u32 = 1;
 
+fn candidate_cap_truncated(desired: usize, backend_has_more: bool) -> bool {
+    desired == MAX_FEDERATION_CANDIDATES && backend_has_more
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EffectiveBudget {
     max_results: usize,
@@ -112,6 +116,10 @@ impl EffectiveBudget {
             ..self
         })
     }
+
+    fn with_max_depth(self, max_depth: u32) -> Self {
+        Self { max_depth, ..self }
+    }
 }
 
 /// Stateless federation coordinator. Stores remain independently revisioned.
@@ -164,7 +172,7 @@ where
         target: &RepositoryContextTarget,
         budget: EffectiveBudget,
         desired: usize,
-    ) -> Result<(RepositoryDomainState, Vec<FederatedSearchResult>), MemoryQueryError> {
+    ) -> Result<(RepositoryDomainState, Vec<FederatedSearchResult>, bool), MemoryQueryError> {
         let started = Instant::now();
         let mut request = SearchRequest {
             scope: QueryScope::current(
@@ -183,6 +191,7 @@ where
         };
         let mut state = None;
         let mut results = Vec::new();
+        let mut backend_has_more = false;
         loop {
             let remaining = match budget.remaining(started) {
                 Ok(remaining) => remaining,
@@ -192,6 +201,7 @@ where
             request.scope.budget = remaining.repository_budget(budget.max_results);
             let response = self.repository.search(&request).map_err(graph_error)?;
             let next_cursor = response.page.next_cursor.clone();
+            backend_has_more = next_cursor.is_some();
             let returned = response.data.hits.len();
             state = Some(repository_state_from_search(&response));
             results.extend(
@@ -212,6 +222,7 @@ where
         Ok((
             state.ok_or_else(|| backend_error("federation.repositoryquery"))?,
             results,
+            backend_has_more,
         ))
     }
 
@@ -221,7 +232,7 @@ where
         selector: &MemoryRevisionSelector,
         budget: EffectiveBudget,
         desired: usize,
-    ) -> Result<(MemoryDomainState, Vec<FederatedSearchResult>), MemoryQueryError> {
+    ) -> Result<(MemoryDomainState, Vec<FederatedSearchResult>, bool), MemoryQueryError> {
         let started = Instant::now();
         let mut scope = MemoryQueryScope::current(
             project_request.scope.project.clone(),
@@ -238,6 +249,7 @@ where
         };
         let mut state = None;
         let mut results = Vec::new();
+        let mut backend_has_more = false;
         loop {
             let remaining = match budget.remaining(started) {
                 Ok(remaining) => remaining,
@@ -247,6 +259,7 @@ where
             request.scope.budget = remaining.memory_budget(budget.max_results);
             let response = self.memory.search(request.clone())?;
             let next_cursor = response.page.next_cursor.clone();
+            backend_has_more = next_cursor.is_some();
             let returned = response.hits.len();
             state = Some(memory_state_from_search(&response));
             results.extend(response.hits.into_iter().map(FederatedSearchResult::Memory));
@@ -261,6 +274,7 @@ where
         Ok((
             state.ok_or_else(|| backend_error("federation.memoryquery"))?,
             results,
+            backend_has_more,
         ))
     }
 
@@ -343,6 +357,26 @@ where
         }
         let mut response = aggregate.ok_or_else(|| backend_error("federation.repositoryquery"))?;
         response.data = ContextData { items, snippets };
+        if budget.max_depth == 0 {
+            response.data.items.retain(|item| {
+                item.selection_reasons
+                    .iter()
+                    .any(|reason| reason.kind == ContextSelectionKind::ExactSeed)
+            });
+            let seed_paths = response
+                .data
+                .items
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<BTreeSet<_>>();
+            response
+                .data
+                .snippets
+                .retain(|snippet| seed_paths.contains(&snippet.path));
+            if let Some(truncation) = &mut response.page.truncation {
+                truncation.explored_depth = 0;
+            }
+        }
         Ok(Some(response))
     }
 
@@ -404,6 +438,17 @@ where
         let mut response = aggregate.ok_or_else(|| backend_error("federation.memoryquery"))?;
         response.items = items;
         response.relationships = relationships.into_values().collect();
+        if budget.max_depth == 0 {
+            response.items.retain(|item| {
+                item.selection_reasons
+                    .iter()
+                    .any(|reason| reason.as_str() == "context.seed")
+            });
+            response.relationships.clear();
+            if let Some(truncation) = &mut response.page.truncation {
+                truncation.explored_depth = 0;
+            }
+        }
         Ok(Some(response))
     }
 
@@ -481,24 +526,26 @@ where
         let mut repository = None;
         let mut memory = None;
         let mut results = Vec::new();
-        match &request.scope.target {
+        let backend_has_more = match &request.scope.target {
             FederatedTarget::Repository { repository: target } => {
-                let (state, domain_results) =
+                let (state, domain_results, domain_has_more) =
                     self.repository_search(&request, target, budget.remaining(started)?, desired)?;
                 repository = Some(state);
                 results.extend(domain_results);
+                domain_has_more
             }
             FederatedTarget::Memory { memory: selector } => {
-                let (state, domain_results) =
+                let (state, domain_results, domain_has_more) =
                     self.memory_search(&request, selector, budget.remaining(started)?, desired)?;
                 memory = Some(state);
                 results.extend(domain_results);
+                domain_has_more
             }
             FederatedTarget::All {
                 repository: target,
                 memory: selector,
             } => {
-                let (repository_state, domain_results) =
+                let (repository_state, domain_results, repository_has_more) =
                     self.repository_search(&request, target, budget.remaining(started)?, desired)?;
                 repository = Some(repository_state);
                 results.extend(domain_results);
@@ -507,12 +554,13 @@ where
                         MemoryTruncationReason::Duration,
                     ));
                 }
-                let (memory_state, domain_results) =
+                let (memory_state, domain_results, memory_has_more) =
                     self.memory_search(&request, selector, budget.remaining(started)?, desired)?;
                 memory = Some(memory_state);
                 results.extend(domain_results);
+                repository_has_more || memory_has_more
             }
-        }
+        };
         results.sort_by(federated_search_order);
         results.dedup_by(|left, right| search_result_key(left) == search_result_key(right));
         let revision_key = revision_key(repository.as_ref(), memory.as_ref());
@@ -523,7 +571,8 @@ where
         let total = results.len();
         let mut candidates = results.into_iter().skip(offset).peekable();
         let mut returned = Vec::new();
-        let mut reason = None;
+        let candidate_cap_truncated = candidate_cap_truncated(desired, backend_has_more);
+        let mut reason = candidate_cap_truncated.then_some(MemoryTruncationReason::Results);
         for result in candidates.by_ref() {
             if returned.len() >= budget.max_results {
                 reason = Some(MemoryTruncationReason::Results);
@@ -591,8 +640,8 @@ where
             .min(MAX_FEDERATION_CANDIDATES);
         let mut repository_state = None;
         let mut memory_state = None;
-        let mut repository_response = None;
-        let mut memory_response = None;
+        let mut repository_responses: Vec<(ContextResponse, u32)> = Vec::new();
+        let mut memory_responses: Vec<(MemoryContextResponse, u32)> = Vec::new();
         let mut cross_links = Vec::new();
         let mut federation_diagnostics = Vec::new();
         let mut link_results_truncated = false;
@@ -611,7 +660,7 @@ where
                     )?
                     .ok_or_else(|| backend_error("context.seeds"))?;
                 repository_state = Some(repository_state_from_context(&response));
-                repository_response = Some(response);
+                repository_responses.push((response, 0));
             }
             FederatedTarget::Memory { memory: selector } => {
                 let memory_seeds = memory_only_seeds(&request.seeds)?;
@@ -626,7 +675,7 @@ where
                     )?
                     .ok_or_else(|| backend_error("context.seeds"))?;
                 memory_state = Some(memory_state_from_context(&response));
-                memory_response = Some(response);
+                memory_responses.push((response, 0));
             }
             FederatedTarget::All {
                 repository: target,
@@ -657,7 +706,8 @@ where
                 federation_diagnostics = diagnostics;
                 link_results_truncated = links_truncated;
                 link_duration_exceeded = links_timed_out;
-                let (mut repository_seeds, mut memory_seeds) = split_all_seeds(&request.seeds);
+                let (repository_seeds, memory_seeds) = split_all_seeds(&request.seeds);
+                let mut cross_memory_seeds = Vec::new();
                 if matches!(
                     request.memory_policy.direction,
                     EdgeDirection::Incoming | EdgeDirection::Both
@@ -668,24 +718,39 @@ where
                                 && cross_link_kind_allowed(&request.memory_policy, relationship)
                                 && repository_seed_matches(seed, &relationship.target, snapshot_id)
                         }) {
-                            memory_seeds
+                            cross_memory_seeds
                                 .push(MemoryContextSeed::Entity(relationship.source.clone()));
                             cross_links.push(relationship.clone());
                         }
                     }
                 }
-                let memory = self.memory_context(
+                if let Some(response) = self.memory_context(
                     &request.scope.project,
                     selector,
                     &request,
                     memory_seeds,
                     budget.remaining(started)?,
                     desired,
-                )?;
-                if let Some(response) = &memory {
-                    let selected = response
-                        .items
+                )? {
+                    memory_responses.push((response, 0));
+                }
+                if let Some(response) = self.memory_context(
+                    &request.scope.project,
+                    selector,
+                    &request,
+                    cross_memory_seeds,
+                    budget
+                        .remaining(started)?
+                        .with_max_depth(budget.max_depth.saturating_sub(1)),
+                    desired,
+                )? {
+                    memory_responses.push((response, 1));
+                }
+                let mut cross_repository_seeds = Vec::new();
+                if !memory_responses.is_empty() {
+                    let selected = memory_responses
                         .iter()
+                        .flat_map(|(response, _)| response.items.iter())
                         .filter(|item| {
                             item.selection_reasons
                                 .iter()
@@ -705,7 +770,7 @@ where
                             if let Some(seed) =
                                 repository_seed_from_target(&relationship.target, snapshot_id)
                             {
-                                repository_seeds.push(seed);
+                                cross_repository_seeds.push(seed);
                                 cross_links.push(relationship.clone());
                             }
                         }
@@ -713,30 +778,41 @@ where
                 }
                 cross_links.sort_by(|left, right| left.id.cmp(&right.id));
                 cross_links.dedup_by(|left, right| left.id == right.id);
-                let repository = self.repository_context(
+                if let Some(response) = self.repository_context(
                     target,
                     &request,
                     repository_seeds,
                     budget.remaining(started)?,
                     desired,
-                )?;
-                repository_state = Some(match &repository {
-                    Some(response) => repository_state_from_context(response),
-                    None => repository_state_from_status(&repository_status),
-                });
-                memory_state = Some(match &memory {
-                    Some(response) => memory_state_from_context(response),
-                    None => memory_state_from_status(&memory_status),
-                });
-                repository_response = repository;
-                memory_response = memory;
+                )? {
+                    repository_responses.push((response, 0));
+                }
+                if let Some(response) = self.repository_context(
+                    target,
+                    &request,
+                    cross_repository_seeds,
+                    budget
+                        .remaining(started)?
+                        .with_max_depth(budget.max_depth.saturating_sub(1)),
+                    desired,
+                )? {
+                    repository_responses.push((response, 1));
+                }
+                repository_state = Some(repository_responses.first().map_or_else(
+                    || repository_state_from_status(&repository_status),
+                    |(response, _)| repository_state_from_context(response),
+                ));
+                memory_state = Some(memory_responses.first().map_or_else(
+                    || memory_state_from_status(&memory_status),
+                    |(response, _)| memory_state_from_context(response),
+                ));
             }
         }
 
         let revision_key = revision_key(repository_state.as_ref(), memory_state.as_ref());
         validate_cursor_revision(pending_cursor.as_ref(), &revision_key)?;
         let mut items = Vec::new();
-        if let Some(response) = &repository_response {
+        for (response, _) in &repository_responses {
             items.extend(response.data.items.iter().cloned().map(|mut item| {
                 if cross_links
                     .iter()
@@ -751,7 +827,7 @@ where
                 FederatedContextItem::Repository(Box::new(item))
             }));
         }
-        if let Some(response) = &memory_response {
+        for (response, _) in &memory_responses {
             items.extend(response.items.iter().cloned().map(|mut item| {
                 if cross_links
                     .iter()
@@ -804,16 +880,28 @@ where
             returned.push(item);
         }
         let has_more = offset + returned.len() < total || candidates.peek().is_some();
-        let explored_depth = repository_response
-            .as_ref()
-            .and_then(|response| response.page.truncation.as_ref())
-            .map_or(0, |truncation| truncation.explored_depth)
-            .max(
-                memory_response
-                    .as_ref()
-                    .and_then(|response| response.page.truncation.as_ref())
-                    .map_or(0, |truncation| truncation.explored_depth),
-            );
+        let explored_depth = repository_responses
+            .iter()
+            .map(|(response, domain_hops)| {
+                (*domain_hops).saturating_add(
+                    response
+                        .page
+                        .truncation
+                        .as_ref()
+                        .map_or(0, |truncation| truncation.explored_depth),
+                )
+            })
+            .chain(memory_responses.iter().map(|(response, domain_hops)| {
+                (*domain_hops).saturating_add(
+                    response
+                        .page
+                        .truncation
+                        .as_ref()
+                        .map_or(0, |truncation| truncation.explored_depth),
+                )
+            }))
+            .max()
+            .unwrap_or(0);
         let returned_memory_ids = returned
             .iter()
             .filter_map(|item| match item {
@@ -828,10 +916,10 @@ where
                 FederatedContextItem::Memory(_) => None,
             })
             .collect::<BTreeSet<_>>();
-        let mut memory_relationships = memory_response
-            .as_ref()
-            .map(|response| response.relationships.clone())
-            .unwrap_or_default();
+        let mut memory_relationships = memory_responses
+            .iter()
+            .flat_map(|(response, _)| response.relationships.iter().cloned())
+            .collect::<Vec<_>>();
         memory_relationships.retain(|relationship| {
             returned_memory_ids.contains(&relationship.source)
                 || matches!(
@@ -841,15 +929,20 @@ where
                 )
         });
         memory_relationships.sort_by(|left, right| left.id.cmp(&right.id));
+        memory_relationships.dedup_by(|left, right| left.id == right.id);
         cross_links.retain(|relationship| returned_memory_ids.contains(&relationship.source));
-        let mut repository_snippets = repository_response
-            .map(|response| response.data.snippets)
-            .unwrap_or_default();
+        let mut repository_snippets = repository_responses
+            .into_iter()
+            .flat_map(|(response, _)| response.data.snippets)
+            .collect::<Vec<_>>();
         repository_snippets.retain(|snippet| returned_repository_paths.contains(&snippet.path));
         repository_snippets.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| snippet_span_key(left).cmp(&snippet_span_key(right)))
+        });
+        repository_snippets.dedup_by(|left, right| {
+            left.path == right.path && snippet_span_key(left) == snippet_span_key(right)
         });
         federation_diagnostics.truncate(budget.max_diagnostics);
         let mut remaining_bytes = budget.max_bytes.saturating_sub(returned_bytes);

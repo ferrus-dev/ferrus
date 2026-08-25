@@ -243,6 +243,16 @@ fn cursor_is_bound_to_both_domain_revisions() {
 }
 
 #[test]
+fn search_candidate_cap_is_reported_as_result_truncation() {
+    assert!(candidate_cap_truncated(MAX_FEDERATION_CANDIDATES, true));
+    assert!(!candidate_cap_truncated(MAX_FEDERATION_CANDIDATES, false));
+    assert!(!candidate_cap_truncated(
+        MAX_FEDERATION_CANDIDATES - 1,
+        true
+    ));
+}
+
+#[test]
 fn explicit_domain_seed_validation_never_broadens_scope() {
     let seed = FederatedContextSeed::MemoryEntity(
         super::super::domain::MemoryEntityId::new("memory-entity").unwrap(),
@@ -367,6 +377,86 @@ fn combined_context_crosses_only_the_exact_resolved_link_set() {
     assert_eq!(
         response.memory.as_ref().unwrap().freshness.freshness,
         super::super::query::MemoryFreshness::Fresh
+    );
+}
+
+#[test]
+fn combined_context_charges_cross_domain_links_against_depth() {
+    let fixture = fixture();
+    let graph = SqliteGraphQuery::new(
+        &fixture.graph_sidecar,
+        fixture.config.query_limits.clone(),
+        Some(fixture.graph_freshness.clone()),
+    );
+    let memory =
+        SqliteMemoryQuery::new(&fixture.memory_sidecar, fixture.config.query_limits.clone());
+    let memory_search = memory
+        .search(MemorySearchRequest {
+            scope: MemoryQueryScope::current(
+                fixture.project.clone(),
+                MemoryRevisionSelector::Published(MemoryViewName::new("project").unwrap()),
+                budget(&fixture.config),
+            ),
+            text: MemoryQueryText::new("src/lib.rs").unwrap(),
+            entity_kinds: vec![],
+            source_categories: vec![],
+            page: MemoryPageRequest::default(),
+        })
+        .unwrap();
+    let memory_entity = memory_search.hits[0].entity.id.clone();
+    let service = service(&fixture, &graph, &memory);
+    let request = |max_results| {
+        let mut query_budget = budget(&fixture.config);
+        query_budget.max_depth = NonZeroU32::new(1).unwrap();
+        query_budget.max_results = NonZeroU32::new(max_results).unwrap();
+        FederatedContextRequest {
+            scope: FederatedScope::current(
+                fixture.project.clone(),
+                target(&fixture, ContextDomain::All),
+                query_budget,
+            ),
+            seeds: vec![FederatedContextSeed::MemoryEntity(memory_entity.clone())],
+            repository_policy: ContextPolicy {
+                direction: EdgeDirection::Both,
+                edge_kinds: vec![],
+                include_unresolved: false,
+                include_external: false,
+            },
+            memory_policy: MemoryContextPolicy {
+                direction: EdgeDirection::Outgoing,
+                relationship_kinds: vec![],
+                include_unresolved: false,
+                include_stale: false,
+                include_snippets: false,
+            },
+            cursor: None,
+        }
+    };
+
+    let response = service.context(request(100)).unwrap();
+    let repository_items = response
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            FederatedContextItem::Repository(item) => Some(item),
+            FederatedContextItem::Memory(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!repository_items.is_empty());
+    assert!(repository_items.iter().all(|item| {
+        item.selection_reasons
+            .iter()
+            .any(|reason| reason.kind == ContextSelectionKind::ExactSeed)
+    }));
+
+    let paged = service.context(request(1)).unwrap();
+    assert_eq!(
+        paged
+            .page
+            .truncation
+            .as_ref()
+            .map(|truncation| truncation.explored_depth),
+        Some(1)
     );
 }
 

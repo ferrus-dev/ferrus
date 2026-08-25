@@ -226,8 +226,17 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
         &self,
         request: &InspectIndexJobRequest,
         deadline: Instant,
-    ) -> Result<Option<IndexJobRecord>, Self::Error> {
-        SqliteIndexJobCoordinator::inspect_bounded(self, request, deadline)
+    ) -> Result<super::coordinator::BoundedJobInspection, Self::Error> {
+        match SqliteIndexJobCoordinator::inspect_bounded(self, request, deadline) {
+            Ok(Some(record)) => Ok(super::coordinator::BoundedJobInspection::Found(Box::new(
+                record,
+            ))),
+            Ok(None) => Ok(super::coordinator::BoundedJobInspection::NotFound),
+            Err(CoordinatorError::ReadBudgetExceeded) => {
+                Ok(super::coordinator::BoundedJobInspection::DeadlineExceeded)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn submit(

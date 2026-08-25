@@ -43,7 +43,7 @@ use crate::{
 
 use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_WORKER_PROTOCOL_VERSION,
-    coordinator::IndexJobCoordinator,
+    coordinator::{BoundedJobInspection, IndexJobCoordinator},
     fact_store::{FactBatchProgress, FactBatchStore, PutFactBatchOutcome},
     identity::{
         FactShardId, IndexJobFailureCode, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef,
@@ -420,9 +420,13 @@ impl StatelessIndexWorker {
             .ok_or(WorkerError::DeadlineExceeded)?;
         let inspected = coordinator.inspect_bounded(&authorization, inspect_deadline);
         self.check_deadline(deadline)?;
-        let current = inspected
-            .map_err(|_| WorkerError::AuthorityLost)?
-            .ok_or(WorkerError::AuthorityLost)?;
+        let current = match inspected.map_err(|_| WorkerError::AuthorityLost)? {
+            BoundedJobInspection::Found(record) => *record,
+            BoundedJobInspection::NotFound => return Err(WorkerError::AuthorityLost),
+            BoundedJobInspection::DeadlineExceeded => {
+                return Err(WorkerError::DeadlineExceeded);
+            }
+        };
         let now = Utc::now();
         let authorized = current.spec == request.job.spec
             && current.state == IndexJobState::Running

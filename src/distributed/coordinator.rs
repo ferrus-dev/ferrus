@@ -61,6 +61,13 @@ pub struct ReclaimIndexJobsResult {
     pub cancelled: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedJobInspection {
+    Found(Box<IndexJobRecord>),
+    NotFound,
+    DeadlineExceeded,
+}
+
 pub trait IndexJobCoordinator {
     type Error;
 
@@ -77,7 +84,7 @@ pub trait IndexJobCoordinator {
         &self,
         request: &InspectIndexJobRequest,
         deadline: Instant,
-    ) -> Result<Option<IndexJobRecord>, Self::Error>;
+    ) -> Result<BoundedJobInspection, Self::Error>;
     fn claim(
         &mut self,
         request: &ClaimIndexJobRequest,
