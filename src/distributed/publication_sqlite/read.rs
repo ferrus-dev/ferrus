@@ -495,6 +495,26 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
                      tenant_id, project_id, domain, repository_id, target_id
                  ) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS remote_publication_receipts (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             domain TEXT NOT NULL CHECK (domain IN ('repository_graph', 'project_memory')),
+             repository_id TEXT NOT NULL,
+             target_id TEXT NOT NULL,
+             request_digest_algorithm TEXT NOT NULL,
+             request_digest_value TEXT NOT NULL,
+             outcome_json BLOB NOT NULL,
+             completed_at_ms INTEGER NOT NULL,
+             PRIMARY KEY (tenant_id, project_id, job_id),
+             FOREIGN KEY (tenant_id, project_id, job_id)
+                 REFERENCES distributed_index_jobs (tenant_id, project_id, job_id)
+                 ON DELETE CASCADE,
+             FOREIGN KEY (tenant_id, project_id, domain, repository_id, target_id)
+                 REFERENCES remote_immutable_revisions (
+                     tenant_id, project_id, domain, repository_id, target_id
+                 ) ON DELETE CASCADE
+         );
          CREATE TABLE IF NOT EXISTS remote_graph_views (
              tenant_id TEXT NOT NULL,
              project_id TEXT NOT NULL,

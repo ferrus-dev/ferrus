@@ -107,7 +107,8 @@ pub struct PublishedRemoteMemoryView {
     pub generation: NonZeroU64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GraphPublicationOutcome {
     Published {
         view: PublishedRemoteGraphView,
@@ -118,7 +119,8 @@ pub enum GraphPublicationOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemoryPublicationOutcome {
     Published {
         view: PublishedRemoteMemoryView,

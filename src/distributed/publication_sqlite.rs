@@ -468,6 +468,12 @@ impl SqliteRemotePublicationStore {
         prepared: PreparedGraph,
         now: DateTime<Utc>,
     ) -> Result<GraphPublicationOutcome, RemoteStoreError> {
+        let publication_digest = graph_publication_digest(request, &prepared)?;
+        if let Some(outcome) =
+            replay_graph_publication(&self.connection, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let encrypted = encrypt_facts(
             &self.key,
             &request.job,
@@ -479,6 +485,10 @@ impl SqliteRemotePublicationStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(outcome) = replay_graph_publication(&transaction, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let job = require_publication_authority(
             &transaction,
             &request.job,
@@ -538,6 +548,7 @@ impl SqliteRemotePublicationStore {
                 now,
             )?;
         }
+        record_graph_publication(&transaction, request, &publication_digest, &outcome, now)?;
         complete_job(&transaction, request, now)?;
         transaction.commit()?;
         Ok(outcome)
@@ -549,6 +560,12 @@ impl SqliteRemotePublicationStore {
         mut prepared: PreparedMemory,
         now: DateTime<Utc>,
     ) -> Result<MemoryPublicationOutcome, RemoteStoreError> {
+        let publication_digest = memory_publication_digest(request, &prepared)?;
+        if let Some(outcome) =
+            replay_memory_publication(&self.connection, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let prepared_links = prepared
             .repository_links
             .take()
@@ -576,6 +593,11 @@ impl SqliteRemotePublicationStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(outcome) =
+            replay_memory_publication(&transaction, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let job = require_publication_authority(
             &transaction,
             &request.job,
@@ -672,6 +694,7 @@ impl SqliteRemotePublicationStore {
                 now,
             )?;
         }
+        record_memory_publication(&transaction, request, &publication_digest, &outcome, now)?;
         complete_job(&transaction, request, now)?;
         transaction.commit()?;
         Ok(outcome)

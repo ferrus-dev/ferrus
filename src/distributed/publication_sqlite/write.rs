@@ -449,6 +449,40 @@ pub(super) fn canonical_digest(value: &impl Serialize) -> Result<Digest, RemoteS
     .expect("sha256 output is canonical"))
 }
 
+pub(super) fn graph_publication_digest(
+    request: &PublishGraphRequest,
+    prepared: &PreparedGraph,
+) -> Result<Digest, RemoteStoreError> {
+    canonical_digest(&(
+        "ferrus.remote.graph-publication.v1",
+        request,
+        &prepared.record.repository_identity,
+        &prepared.record.build_id,
+        &prepared.record.extractor_set_digest,
+        &prepared.record.fact_set_digest,
+        prepared.record.counts,
+    ))
+}
+
+pub(super) fn memory_publication_digest(
+    request: &PublishMemoryRequest,
+    prepared: &PreparedMemory,
+) -> Result<Digest, RemoteStoreError> {
+    canonical_digest(&(
+        "ferrus.remote.memory-publication.v1",
+        request,
+        &prepared.project_identity,
+        &prepared.record.build_id,
+        &prepared.record.extractor_set_digest,
+        &prepared.record.fact_set_digest,
+        prepared.record.counts,
+        prepared
+            .repository_links
+            .as_ref()
+            .map(|links| (&links.target, &links.fact_set_digest, links.counts)),
+    ))
+}
+
 pub(super) fn sha256_value(domain: &[u8], bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain);
@@ -523,21 +557,15 @@ pub(super) struct JobAuthority {
     pub(super) spec: IndexJobSpec,
 }
 
-pub(super) fn require_publication_authority(
-    transaction: &Transaction<'_>,
-    job: &IndexJobRef,
-    worker_id: &WorkerId,
-    lease_generation: NonZeroU64,
-    now: DateTime<Utc>,
-) -> Result<JobAuthority, RemoteStoreError> {
-    if transaction
+fn ensure_project_not_deleted(
+    connection: &Connection,
+    project: &RemoteProjectRef,
+) -> Result<(), RemoteStoreError> {
+    if connection
         .query_row(
             "SELECT 1 FROM project_deletion_tombstones
              WHERE tenant_id = ?1 AND project_id = ?2",
-            params![
-                job.project.tenant_id.as_str(),
-                job.project.project_id.as_str()
-            ],
+            params![project.tenant_id.as_str(), project.project_id.as_str()],
             |_| Ok(()),
         )
         .optional()?
@@ -545,6 +573,169 @@ pub(super) fn require_publication_authority(
     {
         return Err(RemoteStoreError::ProjectDeleted);
     }
+    Ok(())
+}
+
+fn replay_publication<T>(
+    connection: &Connection,
+    job: &IndexJobRef,
+    domain: &str,
+    repository_id: &str,
+    target_id: &str,
+    publication_digest: &Digest,
+) -> Result<Option<T>, RemoteStoreError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    ensure_project_not_deleted(connection, &job.project)?;
+    let encoded = connection
+        .query_row(
+            "SELECT receipt.outcome_json
+             FROM remote_publication_receipts AS receipt
+             JOIN distributed_index_jobs AS job
+               ON job.tenant_id = receipt.tenant_id
+              AND job.project_id = receipt.project_id
+              AND job.job_id = receipt.job_id
+             WHERE receipt.tenant_id = ?1 AND receipt.project_id = ?2
+               AND receipt.job_id = ?3 AND receipt.domain = ?4
+               AND receipt.repository_id = ?5 AND receipt.target_id = ?6
+               AND receipt.request_digest_algorithm = ?7
+               AND receipt.request_digest_value = ?8
+               AND job.state = 'complete'",
+            params![
+                job.project.tenant_id.as_str(),
+                job.project.project_id.as_str(),
+                job.job_id.as_str(),
+                domain,
+                repository_id,
+                target_id,
+                publication_digest.algorithm(),
+                publication_digest.value()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    encoded
+        .map(|value| serde_json::from_slice(&value).map_err(|_| RemoteStoreError::IntegrityFailure))
+        .transpose()
+}
+
+pub(super) fn replay_graph_publication(
+    connection: &Connection,
+    request: &PublishGraphRequest,
+    publication_digest: &Digest,
+) -> Result<Option<GraphPublicationOutcome>, RemoteStoreError> {
+    replay_publication::<GraphPublicationOutcome>(
+        connection,
+        &request.job,
+        "repository_graph",
+        request.repository.repository_id.as_str(),
+        request.snapshot_id.as_str(),
+        publication_digest,
+    )
+}
+
+pub(super) fn replay_memory_publication(
+    connection: &Connection,
+    request: &PublishMemoryRequest,
+    publication_digest: &Digest,
+) -> Result<Option<MemoryPublicationOutcome>, RemoteStoreError> {
+    replay_publication::<MemoryPublicationOutcome>(
+        connection,
+        &request.job,
+        "project_memory",
+        "",
+        request.revision_id.as_str(),
+        publication_digest,
+    )
+}
+
+struct PublicationReceiptTarget<'a> {
+    domain: &'a str,
+    repository_id: &'a str,
+    target_id: &'a str,
+}
+
+fn record_publication<T: Serialize>(
+    transaction: &Transaction<'_>,
+    job: &IndexJobRef,
+    target: PublicationReceiptTarget<'_>,
+    publication_digest: &Digest,
+    outcome: &T,
+    now: DateTime<Utc>,
+) -> Result<(), RemoteStoreError> {
+    let encoded = serde_json::to_vec(outcome).map_err(|_| RemoteStoreError::Serialization)?;
+    transaction.execute(
+        "INSERT INTO remote_publication_receipts (
+             tenant_id, project_id, job_id, domain, repository_id, target_id,
+             request_digest_algorithm, request_digest_value, outcome_json, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            job.project.tenant_id.as_str(),
+            job.project.project_id.as_str(),
+            job.job_id.as_str(),
+            target.domain,
+            target.repository_id,
+            target.target_id,
+            publication_digest.algorithm(),
+            publication_digest.value(),
+            encoded,
+            now.timestamp_millis()
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn record_graph_publication(
+    transaction: &Transaction<'_>,
+    request: &PublishGraphRequest,
+    publication_digest: &Digest,
+    outcome: &GraphPublicationOutcome,
+    now: DateTime<Utc>,
+) -> Result<(), RemoteStoreError> {
+    record_publication(
+        transaction,
+        &request.job,
+        PublicationReceiptTarget {
+            domain: "repository_graph",
+            repository_id: request.repository.repository_id.as_str(),
+            target_id: request.snapshot_id.as_str(),
+        },
+        publication_digest,
+        outcome,
+        now,
+    )
+}
+
+pub(super) fn record_memory_publication(
+    transaction: &Transaction<'_>,
+    request: &PublishMemoryRequest,
+    publication_digest: &Digest,
+    outcome: &MemoryPublicationOutcome,
+    now: DateTime<Utc>,
+) -> Result<(), RemoteStoreError> {
+    record_publication(
+        transaction,
+        &request.job,
+        PublicationReceiptTarget {
+            domain: "project_memory",
+            repository_id: "",
+            target_id: request.revision_id.as_str(),
+        },
+        publication_digest,
+        outcome,
+        now,
+    )
+}
+
+pub(super) fn require_publication_authority(
+    transaction: &Transaction<'_>,
+    job: &IndexJobRef,
+    worker_id: &WorkerId,
+    lease_generation: NonZeroU64,
+    now: DateTime<Utc>,
+) -> Result<JobAuthority, RemoteStoreError> {
+    ensure_project_not_deleted(transaction, &job.project)?;
     let record = transaction
         .query_row(
             "SELECT kind, spec_json, state, cancellation_requested, lease_worker_id,

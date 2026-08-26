@@ -643,6 +643,168 @@ fn graph_publication_is_atomic_encrypted_and_completes_the_job() {
 }
 
 #[test]
+fn completed_graph_and_memory_publications_replay_the_recorded_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let graph_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1101",
+        "snapshot-replay",
+    );
+    let graph_request = graph_request(&graph_job, "snapshot-replay", None);
+    let graph_facts = graph_batch(&graph_job.job, "snapshot-replay", "same");
+    let mut store = store(&path);
+    let graph_outcome = store
+        .publish_graph(
+            &graph_request,
+            std::slice::from_ref(&graph_facts),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .publish_graph(
+                &graph_request,
+                std::slice::from_ref(&graph_facts),
+                Utc::now(),
+            )
+            .unwrap(),
+        graph_outcome
+    );
+    assert!(matches!(
+        store.publish_graph(
+            &graph_request,
+            &[graph_batch(&graph_job.job, "snapshot-replay", "different")],
+            Utc::now(),
+        ),
+        Err(RemoteStoreError::AuthorityLost)
+    ));
+
+    let memory_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::ProjectMemory,
+        "1102",
+        "revision-replay",
+    );
+    let memory_request = memory_request(&memory_job, "revision-replay", None);
+    let memory_facts = memory_batch(&memory_job.job, "revision-replay");
+    let memory_outcome = store
+        .publish_memory(
+            &memory_request,
+            std::slice::from_ref(&memory_facts),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .publish_memory(
+                &memory_request,
+                std::slice::from_ref(&memory_facts),
+                Utc::now(),
+            )
+            .unwrap(),
+        memory_outcome
+    );
+}
+
+#[test]
+fn completed_superseded_retry_keeps_its_original_current_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.db");
+    let mut coordinator = coordinator(&path);
+    let first_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1103",
+        "snapshot-replay-first",
+    );
+    let first_request = graph_request(&first_job, "snapshot-replay-first", None);
+    let mut store = store(&path);
+    let first_outcome = store
+        .publish_graph(
+            &first_request,
+            &[graph_batch(
+                &first_job.job,
+                "snapshot-replay-first",
+                "first",
+            )],
+            Utc::now(),
+        )
+        .unwrap();
+    let GraphPublicationOutcome::Published {
+        view: first_view, ..
+    } = first_outcome
+    else {
+        panic!("initial publication must win");
+    };
+
+    let loser_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1104",
+        "snapshot-replay-loser",
+    );
+    let loser_request = graph_request(&loser_job, "snapshot-replay-loser", None);
+    let loser_batch = graph_batch(&loser_job.job, "snapshot-replay-loser", "loser");
+    let loser_outcome = store
+        .publish_graph(
+            &loser_request,
+            std::slice::from_ref(&loser_batch),
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(matches!(
+        &loser_outcome,
+        GraphPublicationOutcome::Superseded { current: Some(view) }
+            if view == &first_view
+    ));
+
+    let next_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "1105",
+        "snapshot-replay-next",
+    );
+    let next_request = graph_request(
+        &next_job,
+        "snapshot-replay-next",
+        Some(GraphPublicationVersion {
+            snapshot_id: first_view.snapshot_id,
+            generation: first_view.generation,
+        }),
+    );
+    store
+        .publish_graph(
+            &next_request,
+            &[graph_batch(&next_job.job, "snapshot-replay-next", "next")],
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .publish_graph(
+                &loser_request,
+                std::slice::from_ref(&loser_batch),
+                Utc::now(),
+            )
+            .unwrap(),
+        loser_outcome
+    );
+    assert_eq!(
+        store
+            .graph_view(&next_request.repository, &next_request.view_name)
+            .unwrap()
+            .unwrap()
+            .generation
+            .get(),
+        2
+    );
+}
+
+#[test]
 fn project_deletion_tombstone_rejects_publication() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
