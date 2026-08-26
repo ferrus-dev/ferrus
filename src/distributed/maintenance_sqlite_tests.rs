@@ -397,7 +397,9 @@ fn fixture() -> Fixture {
         &[(&graph_job_a, &memory_job_a), (&graph_job_b, &memory_job_b)],
     );
     {
-        let mut facts = SqliteFactBatchStore::open(&fact_path, KEY, fact_quota(), true).unwrap();
+        let mut facts =
+            SqliteFactBatchStore::open_uncoordinated_for_test(&fact_path, KEY, fact_quota(), true)
+                .unwrap();
         facts.put(&batch(&graph_job_a, "a")).unwrap();
         facts.put(&batch(&graph_job_b, "b")).unwrap();
     }
@@ -540,8 +542,13 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
         ),
         Err(ObjectStoreError::ProjectDeleted)
     ));
-    let mut facts =
-        SqliteFactBatchStore::open(&fixture.fact_path, KEY, fact_quota(), true).unwrap();
+    let mut facts = SqliteFactBatchStore::open_uncoordinated_for_test(
+        &fixture.fact_path,
+        KEY,
+        fact_quota(),
+        true,
+    )
+    .unwrap();
     assert!(matches!(
         facts.put(&batch(&fixture.graph_job_a, "after-deletion")),
         Err(FactStoreError::ProjectDeleted)

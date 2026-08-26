@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
 use super::{
+    coordinator_sqlite::COORDINATOR_SCHEMA_VERSION,
     fact_store::{
         FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome,
         progress_from_headers,
@@ -44,6 +45,8 @@ pub enum FactStoreError {
     ProjectByteQuotaExceeded,
     #[error("project has a durable deletion tombstone")]
     ProjectDeleted,
+    #[error("fact batches may be written only for a running coordinator job")]
+    JobNotWritable,
     #[error("fact batch failed authenticated decryption or integrity verification")]
     IntegrityFailure,
     #[error("fact store schema is incompatible")]
@@ -67,11 +70,47 @@ pub struct SqliteFactBatchStore {
     key: LessSafeKey,
     quota: FactStoreQuota,
     protection: FactStoreProtection,
+    coordinator_attached: bool,
 }
 
 impl SqliteFactBatchStore {
+    /// Opens a worker-facing fact store bound to the separate coordinator
+    /// database for live-job validation and terminal-batch reclamation.
     pub fn open(
         path: impl AsRef<Path>,
+        coordinator_path: impl AsRef<Path>,
+        encryption_key: [u8; 32],
+        quota: FactStoreQuota,
+        authenticated_transport: bool,
+    ) -> Result<Self, FactStoreError> {
+        Self::open_inner(
+            path.as_ref(),
+            Some(coordinator_path.as_ref()),
+            encryption_key,
+            quota,
+            authenticated_transport,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_uncoordinated_for_test(
+        path: impl AsRef<Path>,
+        encryption_key: [u8; 32],
+        quota: FactStoreQuota,
+        authenticated_transport: bool,
+    ) -> Result<Self, FactStoreError> {
+        Self::open_inner(
+            path.as_ref(),
+            None,
+            encryption_key,
+            quota,
+            authenticated_transport,
+        )
+    }
+
+    fn open_inner(
+        path: &Path,
+        coordinator_path: Option<&Path>,
         encryption_key: [u8; 32],
         quota: FactStoreQuota,
         authenticated_transport: bool,
@@ -82,6 +121,24 @@ impl SqliteFactBatchStore {
         let database = Connection::open(path)?;
         database.busy_timeout(std::time::Duration::from_secs(5))?;
         initialize_schema(&database)?;
+        if let Some(coordinator_path) = coordinator_path {
+            database.execute(
+                "ATTACH DATABASE ?1 AS coordinator",
+                [coordinator_path.to_string_lossy().as_ref()],
+            )?;
+            let version = database
+                .query_row(
+                    "SELECT schema_version
+                     FROM coordinator.distributed_coordinator_metadata
+                     WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .optional()?;
+            if version != Some(COORDINATOR_SCHEMA_VERSION) {
+                return Err(FactStoreError::IncompatibleSchema);
+            }
+        }
         let key = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &encryption_key)
                 .map_err(|_| FactStoreError::Encryption)?,
@@ -94,6 +151,7 @@ impl SqliteFactBatchStore {
                 authenticated_transport,
                 encrypted_at_rest: true,
             },
+            coordinator_attached: coordinator_path.is_some(),
         })
     }
 
@@ -209,6 +267,40 @@ impl FactBatchStore for SqliteFactBatchStore {
             .is_some()
         {
             return Err(FactStoreError::ProjectDeleted);
+        }
+        if self.coordinator_attached {
+            transaction.execute(
+                "DELETE FROM unpublished_fact_batches
+                 WHERE tenant_id = ?1 AND project_id = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM coordinator.distributed_index_jobs AS jobs
+                       WHERE jobs.tenant_id = unpublished_fact_batches.tenant_id
+                         AND jobs.project_id = unpublished_fact_batches.project_id
+                         AND jobs.job_id = unpublished_fact_batches.job_id
+                         AND jobs.kind = unpublished_fact_batches.job_kind
+                         AND jobs.state IN ('complete', 'failed', 'cancelled')
+                   )",
+                params![
+                    batch.header.job.project.tenant_id.as_str(),
+                    batch.header.job.project.project_id.as_str()
+                ],
+            )?;
+            let state = transaction
+                .query_row(
+                    "SELECT state FROM coordinator.distributed_index_jobs
+                     WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3 AND kind = ?4",
+                    params![
+                        batch.header.job.project.tenant_id.as_str(),
+                        batch.header.job.project.project_id.as_str(),
+                        batch.header.job.job_id.as_str(),
+                        job_kind(batch.header.job.kind)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("running") {
+                return Err(FactStoreError::JobNotWritable);
+            }
         }
         let logical_existing = transaction
             .query_row(
@@ -403,16 +495,19 @@ mod tests {
         }
     }
 
-    fn job(tenant: &str) -> IndexJobRef {
+    fn job_named(tenant: &str, job_id: &str) -> IndexJobRef {
         IndexJobRef {
             project: project(tenant),
-            job_id: IndexJobId::new("job").unwrap(),
+            job_id: IndexJobId::new(job_id).unwrap(),
             kind: IndexJobKind::RepositoryGraph,
         }
     }
 
-    fn batch(tenant: &str, sequence: u32, final_batch: bool) -> FactBatch {
-        let job = job(tenant);
+    fn job(tenant: &str) -> IndexJobRef {
+        job_named(tenant, "job")
+    }
+
+    fn batch_for_job(job: IndexJobRef, sequence: u32, final_batch: bool) -> FactBatch {
         FactBatch::new(
             job.clone(),
             FactTarget::RepositoryGraph {
@@ -442,6 +537,10 @@ mod tests {
         .unwrap()
     }
 
+    fn batch(tenant: &str, sequence: u32, final_batch: bool) -> FactBatch {
+        batch_for_job(job(tenant), sequence, final_batch)
+    }
+
     fn quota() -> FactStoreQuota {
         FactStoreQuota {
             max_batches_per_project: NonZeroU64::new(100).unwrap(),
@@ -456,7 +555,9 @@ mod tests {
         let path = directory.path().join("facts.db");
         let expected = batch("tenant-a", 0, true);
         {
-            let mut store = SqliteFactBatchStore::open(&path, [23; 32], quota(), true).unwrap();
+            let mut store =
+                SqliteFactBatchStore::open_uncoordinated_for_test(&path, [23; 32], quota(), true)
+                    .unwrap();
             assert_eq!(store.put(&expected).unwrap(), PutFactBatchOutcome::Stored);
             assert_eq!(store.put(&expected).unwrap(), PutFactBatchOutcome::Reused);
             let progress = store.progress(&expected.header.job).unwrap();
@@ -469,7 +570,9 @@ mod tests {
                 .windows(b"payload_digest".len())
                 .any(|window| window == b"payload_digest")
         );
-        let store = SqliteFactBatchStore::open(&path, [23; 32], quota(), true).unwrap();
+        let store =
+            SqliteFactBatchStore::open_uncoordinated_for_test(&path, [23; 32], quota(), true)
+                .unwrap();
         assert_eq!(
             store.load_for_ingestion(&expected.header.job).unwrap(),
             vec![expected]
@@ -477,11 +580,114 @@ mod tests {
     }
 
     #[test]
+    fn terminal_batches_are_reclaimed_before_project_quota_is_charged() {
+        let directory = tempfile::tempdir().unwrap();
+        let fact_path = directory.path().join("facts.db");
+        let coordinator_path = directory.path().join("jobs.db");
+        let jobs = ["one", "two", "tri", "end"].map(|id| job_named("tenant-a", id));
+        let batches = jobs
+            .iter()
+            .cloned()
+            .map(|job| batch_for_job(job, 0, true))
+            .collect::<Vec<_>>();
+        let batch_bytes = u64::try_from(serde_json::to_vec(&batches[0]).unwrap().len()).unwrap();
+        assert!(batches.iter().all(|batch| {
+            serde_json::to_vec(batch).unwrap().len() == usize::try_from(batch_bytes).unwrap()
+        }));
+
+        let coordinator = Connection::open(&coordinator_path).unwrap();
+        coordinator
+            .execute_batch(
+                "CREATE TABLE distributed_coordinator_metadata (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL
+                 );
+                 INSERT INTO distributed_coordinator_metadata VALUES (1, 1);
+                 CREATE TABLE distributed_index_jobs (
+                     tenant_id TEXT NOT NULL,
+                     project_id TEXT NOT NULL,
+                     job_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     state TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, project_id, job_id)
+                 );",
+            )
+            .unwrap();
+        coordinator
+            .execute(
+                "INSERT INTO distributed_index_jobs
+                 (tenant_id, project_id, job_id, kind, state)
+                 VALUES (?1, ?2, ?3, 'repository_graph', 'running')",
+                params![
+                    jobs[0].project.tenant_id.as_str(),
+                    jobs[0].project.project_id.as_str(),
+                    jobs[0].job_id.as_str()
+                ],
+            )
+            .unwrap();
+
+        let mut store = SqliteFactBatchStore::open(
+            &fact_path,
+            &coordinator_path,
+            [47; 32],
+            FactStoreQuota {
+                max_batches_per_project: NonZeroU64::new(1).unwrap(),
+                max_bytes_per_project: NonZeroU64::new(batch_bytes).unwrap(),
+                max_batch_bytes: NonZeroU64::new(batch_bytes).unwrap(),
+            },
+            true,
+        )
+        .unwrap();
+        for (index, terminal_state) in ["complete", "failed", "cancelled"].into_iter().enumerate() {
+            assert_eq!(
+                store.put(&batches[index]).unwrap(),
+                PutFactBatchOutcome::Stored
+            );
+            coordinator
+                .execute(
+                    "UPDATE distributed_index_jobs SET state = ?1
+                     WHERE tenant_id = ?2 AND project_id = ?3 AND job_id = ?4",
+                    params![
+                        terminal_state,
+                        jobs[index].project.tenant_id.as_str(),
+                        jobs[index].project.project_id.as_str(),
+                        jobs[index].job_id.as_str()
+                    ],
+                )
+                .unwrap();
+            coordinator
+                .execute(
+                    "INSERT INTO distributed_index_jobs
+                     (tenant_id, project_id, job_id, kind, state)
+                     VALUES (?1, ?2, ?3, 'repository_graph', 'running')",
+                    params![
+                        jobs[index + 1].project.tenant_id.as_str(),
+                        jobs[index + 1].project.project_id.as_str(),
+                        jobs[index + 1].job_id.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.put(&batches[3]).unwrap(), PutFactBatchOutcome::Stored);
+        for job in &jobs[..3] {
+            assert!(store.load_for_ingestion(job).unwrap().is_empty());
+        }
+        assert_eq!(
+            store.load_for_ingestion(&jobs[3]).unwrap(),
+            vec![batches[3].clone()]
+        );
+    }
+
+    #[test]
     fn sequence_conflicts_and_foreign_scope_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            SqliteFactBatchStore::open(directory.path().join("facts.db"), [31; 32], quota(), true)
-                .unwrap();
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            directory.path().join("facts.db"),
+            [31; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
         let first = batch("tenant-a", 0, false);
         store.put(&first).unwrap();
         let conflicting_final = batch("tenant-a", 0, true);
@@ -497,7 +703,7 @@ mod tests {
         );
 
         let directory = tempfile::tempdir().unwrap();
-        let mut completed = SqliteFactBatchStore::open(
+        let mut completed = SqliteFactBatchStore::open_uncoordinated_for_test(
             directory.path().join("complete.db"),
             [37; 32],
             quota(),
@@ -514,9 +720,13 @@ mod tests {
     #[test]
     fn project_deletion_tombstone_rejects_new_fact_batches() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            SqliteFactBatchStore::open(directory.path().join("facts.db"), [39; 32], quota(), true)
-                .unwrap();
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            directory.path().join("facts.db"),
+            [39; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
         let project = project("tenant-a");
         store
             .database
@@ -537,9 +747,13 @@ mod tests {
     #[test]
     fn ciphertext_tampering_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            SqliteFactBatchStore::open(directory.path().join("facts.db"), [41; 32], quota(), true)
-                .unwrap();
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            directory.path().join("facts.db"),
+            [41; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
         let expected = batch("tenant-a", 0, true);
         store.put(&expected).unwrap();
         store
@@ -571,7 +785,7 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(matches!(
-            SqliteFactBatchStore::open(&path, [7; 32], quota(), true),
+            SqliteFactBatchStore::open_uncoordinated_for_test(&path, [7; 32], quota(), true),
             Err(FactStoreError::IncompatibleSchema)
         ));
         let connection = Connection::open(path).unwrap();

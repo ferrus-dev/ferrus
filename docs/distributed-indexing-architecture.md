@@ -220,6 +220,12 @@ enforces project and batch quotas; rejects sequence/final-marker conflicts and c
 tampering; and converges repeated writes on the same batch. Partial rows survive worker loss but
 remain outside every ordinary query path.
 
+Worker-facing SQLite deployments open the fact store with its separate coordinator database.
+Before charging project quota for a new batch, the adapter physically removes intermediate batches
+owned by `complete`, `failed`, or `cancelled` jobs and verifies that the current job is still
+`running`. This keeps retry state for live jobs while preventing terminal indexing history from
+permanently consuming the unpublished-fact batch and byte quotas.
+
 The Rust worker intentionally has no repository filesystem, process-command, or network API.
 `WorkerSandbox` has secure-only variants for repository execution, egress, and filesystem
 access, plus nonzero memory, CPU-time, and concurrency limits. A deployment adapter must apply

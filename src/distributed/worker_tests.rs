@@ -197,6 +197,7 @@ impl crate::distributed::object_store::TenantObjectStore for BoundedReadTracker<
 fn fact_store(path: &std::path::Path) -> SqliteFactBatchStore {
     SqliteFactBatchStore::open(
         path,
+        path.parent().unwrap().join("jobs.db"),
         [29; 32],
         FactStoreQuota {
             max_batches_per_project: NonZeroU64::new(1_000).unwrap(),
