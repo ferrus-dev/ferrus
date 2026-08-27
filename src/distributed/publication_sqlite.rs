@@ -468,7 +468,7 @@ impl SqliteRemotePublicationStore {
         prepared: PreparedGraph,
         now: DateTime<Utc>,
     ) -> Result<GraphPublicationOutcome, RemoteStoreError> {
-        let publication_digest = graph_publication_digest(request, &prepared)?;
+        let publication_digest = graph_publication_digest(request)?;
         if let Some(outcome) =
             replay_graph_publication(&self.connection, request, &publication_digest)?
         {
@@ -560,7 +560,7 @@ impl SqliteRemotePublicationStore {
         mut prepared: PreparedMemory,
         now: DateTime<Utc>,
     ) -> Result<MemoryPublicationOutcome, RemoteStoreError> {
-        let publication_digest = memory_publication_digest(request, &prepared)?;
+        let publication_digest = memory_publication_digest(request)?;
         if let Some(outcome) =
             replay_memory_publication(&self.connection, request, &publication_digest)?
         {
@@ -839,6 +839,12 @@ impl RemotePublicationStore for SqliteRemotePublicationStore {
         request
             .validate()
             .map_err(|_| RemoteStoreError::InvalidInput)?;
+        let publication_digest = graph_publication_digest(request)?;
+        if let Some(outcome) =
+            replay_graph_publication(&self.connection, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let prepared = prepare_graph(request, batches, now, self.limits.max_facts_per_snapshot)?;
         self.publish_graph_prepared(request, prepared, now)
     }
@@ -852,6 +858,12 @@ impl RemotePublicationStore for SqliteRemotePublicationStore {
         request
             .validate()
             .map_err(|_| RemoteStoreError::InvalidInput)?;
+        let publication_digest = memory_publication_digest(request)?;
+        if let Some(outcome) =
+            replay_memory_publication(&self.connection, request, &publication_digest)?
+        {
+            return Ok(outcome);
+        }
         let prepared = prepare_memory(request, batches, now, self.limits.max_facts_per_snapshot)?;
         self.publish_memory_prepared(request, prepared, now)
     }

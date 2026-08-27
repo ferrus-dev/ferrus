@@ -451,35 +451,33 @@ pub(super) fn canonical_digest(value: &impl Serialize) -> Result<Digest, RemoteS
 
 pub(super) fn graph_publication_digest(
     request: &PublishGraphRequest,
-    prepared: &PreparedGraph,
 ) -> Result<Digest, RemoteStoreError> {
     canonical_digest(&(
         "ferrus.remote.graph-publication.v1",
-        request,
-        &prepared.record.repository_identity,
-        &prepared.record.build_id,
-        &prepared.record.extractor_set_digest,
-        &prepared.record.fact_set_digest,
-        prepared.record.counts,
+        request.protocol_version,
+        &request.job,
+        &request.worker_id,
+        request.lease_generation,
+        &request.repository,
+        &request.view_name,
+        &request.snapshot_id,
+        &request.expected,
     ))
 }
 
 pub(super) fn memory_publication_digest(
     request: &PublishMemoryRequest,
-    prepared: &PreparedMemory,
 ) -> Result<Digest, RemoteStoreError> {
     canonical_digest(&(
         "ferrus.remote.memory-publication.v1",
-        request,
-        &prepared.project_identity,
-        &prepared.record.build_id,
-        &prepared.record.extractor_set_digest,
-        &prepared.record.fact_set_digest,
-        prepared.record.counts,
-        prepared
-            .repository_links
-            .as_ref()
-            .map(|links| (&links.target, &links.fact_set_digest, links.counts)),
+        request.protocol_version,
+        &request.job,
+        &request.worker_id,
+        request.lease_generation,
+        &request.project,
+        &request.view_name,
+        &request.revision_id,
+        &request.expected,
     ))
 }
 

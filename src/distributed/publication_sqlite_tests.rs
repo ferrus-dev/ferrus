@@ -663,24 +663,12 @@ fn completed_graph_and_memory_publications_replay_the_recorded_outcome() {
             Utc::now(),
         )
         .unwrap();
+    let mut graph_retry = graph_request.clone();
+    graph_retry.request_id = RequestId::new("publish-snapshot-replay-retry").unwrap();
     assert_eq!(
-        store
-            .publish_graph(
-                &graph_request,
-                std::slice::from_ref(&graph_facts),
-                Utc::now(),
-            )
-            .unwrap(),
+        store.publish_graph(&graph_retry, &[], Utc::now()).unwrap(),
         graph_outcome
     );
-    assert!(matches!(
-        store.publish_graph(
-            &graph_request,
-            &[graph_batch(&graph_job.job, "snapshot-replay", "different")],
-            Utc::now(),
-        ),
-        Err(RemoteStoreError::AuthorityLost)
-    ));
 
     let memory_job = publishing_job(
         &mut coordinator,
@@ -697,13 +685,11 @@ fn completed_graph_and_memory_publications_replay_the_recorded_outcome() {
             Utc::now(),
         )
         .unwrap();
+    let mut memory_retry = memory_request.clone();
+    memory_retry.request_id = RequestId::new("publish-revision-replay-retry").unwrap();
     assert_eq!(
         store
-            .publish_memory(
-                &memory_request,
-                std::slice::from_ref(&memory_facts),
-                Utc::now(),
-            )
+            .publish_memory(&memory_retry, &[], Utc::now())
             .unwrap(),
         memory_outcome
     );
@@ -783,14 +769,10 @@ fn completed_superseded_retry_keeps_its_original_current_view() {
         )
         .unwrap();
 
+    let mut loser_retry = loser_request.clone();
+    loser_retry.request_id = RequestId::new("publish-snapshot-replay-loser-retry").unwrap();
     assert_eq!(
-        store
-            .publish_graph(
-                &loser_request,
-                std::slice::from_ref(&loser_batch),
-                Utc::now(),
-            )
-            .unwrap(),
+        store.publish_graph(&loser_retry, &[], Utc::now()).unwrap(),
         loser_outcome
     );
     assert_eq!(
