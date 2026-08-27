@@ -492,6 +492,7 @@ pub(super) fn context_units(
             seeds,
             direction,
             memory_relationship_kinds,
+            include_unresolved,
             max_depth,
             started,
             duration,
@@ -798,11 +799,13 @@ pub(super) fn graph_seed_ids(
     roots.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn memory_context_units(
     memory: &StoredRemoteMemoryRevision,
     seeds: &[RemoteContextSeed],
     direction: EdgeDirection,
     relationship_kinds: &[crate::project_memory::domain::MemoryRelationshipKind],
+    include_unresolved: bool,
     max_depth: u32,
     started: Instant,
     duration: Duration,
@@ -833,6 +836,11 @@ pub(super) fn memory_context_units(
         for relationship in &memory.relationships {
             if started.elapsed() >= duration {
                 return (Vec::new(), explored);
+            }
+            if relationship.provenance.resolution != MemoryResolutionState::Resolved
+                && !include_unresolved
+            {
+                continue;
             }
             if !relationship_kinds.is_empty() && !relationship_kinds.contains(&relationship.kind) {
                 continue;

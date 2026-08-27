@@ -363,6 +363,9 @@ async fn copy_canonical_entry(
 }
 
 async fn remove_existing_file_or_symlink(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileTypeExt;
+
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -374,10 +377,7 @@ async fn remove_existing_file_or_symlink(path: &Path) -> Result<()> {
         anyhow::bail!("Refusing to replace directory {}", path.display());
     }
     #[cfg(windows)]
-    if {
-        use std::os::windows::fs::FileTypeExt;
-        metadata.file_type().is_symlink_dir()
-    } {
+    if metadata.file_type().is_symlink_dir() {
         return tokio::fs::remove_dir(path)
             .await
             .with_context(|| format!("Failed to remove symlink {}", path.display()));

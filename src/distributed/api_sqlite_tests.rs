@@ -1216,7 +1216,7 @@ fn federated_context_rejects_repository_links_for_another_snapshot() {
 }
 
 #[test]
-fn federated_context_honors_include_unresolved_for_memory_links() {
+fn remote_context_honors_include_unresolved_for_memory_links() {
     let fixture = fixture();
     let store =
         SqliteRemotePublicationStore::open(&fixture.control_path, KEY, publication_limits(), true)
@@ -1241,7 +1241,7 @@ fn federated_context_honors_include_unresolved_for_memory_links() {
     }];
     let loaded = LoadedTarget {
         graph: Some(graph),
-        memory: Some(memory),
+        memory: Some(memory.clone()),
     };
     let traverse = |include_unresolved| {
         context_units(
@@ -1264,6 +1264,34 @@ fn federated_context_honors_include_unresolved_for_memory_links() {
             if relationship.id.as_str() == "unresolved-repository-link")
     ));
     assert!(traverse(true).iter().any(
+        |unit| matches!(unit, ContextUnit::MemoryRelationship(relationship)
+            if relationship.id.as_str() == "unresolved-repository-link")
+    ));
+
+    let memory_only = LoadedTarget {
+        graph: None,
+        memory: Some(memory),
+    };
+    let traverse_memory_only = |include_unresolved| {
+        context_units(
+            &memory_only,
+            &[RemoteContextSeed::MemoryEntity(source.id.clone())],
+            EdgeDirection::Outgoing,
+            &[],
+            &[],
+            include_unresolved,
+            false,
+            1,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .0
+    };
+    assert!(!traverse_memory_only(false).iter().any(
+        |unit| matches!(unit, ContextUnit::MemoryRelationship(relationship)
+            if relationship.id.as_str() == "unresolved-repository-link")
+    ));
+    assert!(traverse_memory_only(true).iter().any(
         |unit| matches!(unit, ContextUnit::MemoryRelationship(relationship)
             if relationship.id.as_str() == "unresolved-repository-link")
     ));
@@ -1341,6 +1369,7 @@ fn adjacency_and_materialization_observe_an_expired_deadline() {
         )],
         EdgeDirection::Both,
         &[],
+        false,
         2,
         Instant::now(),
         Duration::ZERO,
