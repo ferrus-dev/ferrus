@@ -109,6 +109,8 @@ async fn seed_executor_workspace_from_canonical_changes(
 ) -> Result<()> {
     if git_has_head(project_root).await {
         apply_canonical_tracked_diff(project_root, workspace_dir).await?;
+    } else {
+        copy_canonical_index_files(project_root, workspace_dir).await?;
     }
     copy_canonical_untracked_files(project_root, workspace_dir).await?;
     copy_canonical_agent_config_files(project_root, workspace_dir).await
@@ -240,20 +242,48 @@ async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path)
 }
 
 async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    copy_canonical_listed_files(
+        project_root,
+        workspace_dir,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        "untracked",
+        false,
+    )
+    .await
+}
+
+async fn copy_canonical_index_files(project_root: &Path, workspace_dir: &Path) -> Result<()> {
+    copy_canonical_listed_files(
+        project_root,
+        workspace_dir,
+        &["ls-files", "--cached", "-z"],
+        "index",
+        true,
+    )
+    .await
+}
+
+async fn copy_canonical_listed_files(
+    project_root: &Path,
+    workspace_dir: &Path,
+    arguments: &[&str],
+    source_kind: &str,
+    skip_missing: bool,
+) -> Result<()> {
     let workspace_dir = tokio::fs::canonicalize(workspace_dir)
         .await
         .unwrap_or_else(|_| workspace_dir.to_path_buf());
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .args(arguments)
         .output()
         .await
-        .context("Failed to list canonical untracked files")?;
+        .with_context(|| format!("Failed to list canonical {source_kind} files"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
-            "Failed to list canonical untracked files from {}: {}",
+            "Failed to list canonical {source_kind} files from {}: {}",
             project_root.display(),
             if stderr.is_empty() {
                 output.status.to_string()
@@ -275,36 +305,86 @@ async fn copy_canonical_untracked_files(project_root: &Path, workspace_dir: &Pat
         if canonical_source.starts_with(&workspace_dir) {
             continue;
         }
-        let metadata = tokio::fs::symlink_metadata(&source)
-            .await
-            .with_context(|| format!("Failed to stat {}", source.display()))?;
+        let metadata = match tokio::fs::symlink_metadata(&source).await {
+            Ok(metadata) => metadata,
+            Err(error) if skip_missing && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to stat {}", source.display()));
+            }
+        };
         if metadata.is_dir() {
             continue;
         }
         let destination = workspace_dir.join(&relative);
-        if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        if metadata.file_type().is_symlink() {
-            let target = tokio::fs::read_link(&source)
-                .await
-                .with_context(|| format!("Failed to read symlink {}", source.display()))?;
-            recreate_symlink(target, destination, metadata.file_type()).await?;
-            continue;
-        }
-        tokio::fs::copy(&source, &destination)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to copy canonical untracked file {} to {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
+        copy_canonical_entry(&source, &destination, metadata).await?;
     }
     Ok(())
+}
+
+async fn copy_canonical_entry(
+    source: &Path,
+    destination: &Path,
+    source_metadata: std::fs::Metadata,
+) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    if source_metadata.file_type().is_symlink() {
+        let target = tokio::fs::read_link(source)
+            .await
+            .with_context(|| format!("Failed to read symlink {}", source.display()))?;
+        remove_existing_file_or_symlink(destination).await?;
+        recreate_symlink(
+            target,
+            destination.to_path_buf(),
+            source_metadata.file_type(),
+        )
+        .await?;
+        return Ok(());
+    }
+    if tokio::fs::symlink_metadata(destination)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        remove_existing_file_or_symlink(destination).await?;
+    }
+    tokio::fs::copy(source, destination)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to copy canonical file {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    Ok(())
+}
+
+async fn remove_existing_file_or_symlink(path: &Path) -> Result<()> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to stat {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        anyhow::bail!("Refusing to replace directory {}", path.display());
+    }
+    #[cfg(windows)]
+    if {
+        use std::os::windows::fs::FileTypeExt;
+        metadata.file_type().is_symlink_dir()
+    } {
+        return tokio::fs::remove_dir(path)
+            .await
+            .with_context(|| format!("Failed to remove symlink {}", path.display()));
+    }
+    tokio::fs::remove_file(path)
+        .await
+        .with_context(|| format!("Failed to remove file or symlink {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -373,21 +453,7 @@ async fn copy_canonical_file_if_present(
     }
 
     let destination = workspace_dir.join(relative);
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    tokio::fs::copy(&source, &destination)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to copy canonical agent config {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-    Ok(())
+    copy_canonical_entry(&source, &destination, metadata).await
 }
 
 pub(super) async fn git_is_work_tree(path: &Path) -> bool {
@@ -444,5 +510,36 @@ mod tests {
             );
             assert_eq!(std::fs::read_link(copied).unwrap(), PathBuf::from(target));
         }
+    }
+
+    #[tokio::test]
+    async fn agent_config_copy_never_writes_through_a_seeded_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let canonical = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let shared = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(shared.path(), "shared config\n").unwrap();
+        std::fs::create_dir_all(canonical.path().join(".codex")).unwrap();
+        std::fs::create_dir_all(workspace.path().join(".codex")).unwrap();
+        symlink(shared.path(), canonical.path().join(".codex/config.toml")).unwrap();
+        symlink(shared.path(), workspace.path().join(".codex/config.toml")).unwrap();
+
+        copy_canonical_agent_config_files(canonical.path(), workspace.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(shared.path()).unwrap(),
+            "shared config\n"
+        );
+        let copied = workspace.path().join(".codex/config.toml");
+        assert!(
+            std::fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(copied).unwrap(), shared.path());
     }
 }

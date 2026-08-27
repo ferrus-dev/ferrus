@@ -422,6 +422,13 @@ async fn executor_workspace_starts_from_unborn_git_project() {
     tokio::fs::write("seed.txt", "uncommitted project file\n")
         .await
         .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "seed.txt"])
+            .status()
+            .unwrap()
+            .success()
+    );
 
     let data_dir = dir.path().join("runtime");
     tokio::fs::create_dir_all(&data_dir).await.unwrap();
