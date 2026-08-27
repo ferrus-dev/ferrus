@@ -1,7 +1,7 @@
 //! Stateless, resource-bounded extraction workers for immutable remote input.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     num::{NonZeroU32, NonZeroU64},
     time::{Duration, Instant},
 };
@@ -318,6 +318,13 @@ impl StatelessIndexWorker {
             }
         };
 
+        let shard = FactShardId::new(match request.job.job.kind {
+            super::protocol::IndexJobKind::RepositoryGraph => "repository-all",
+            super::protocol::IndexJobKind::ProjectMemory => "memory-all",
+        })
+        .map_err(|_| WorkerError::InvalidInput)?;
+        let payloads =
+            self.size_payloads_for_batches(request, &target, &shard, payloads, deadline)?;
         let emitted_facts = payloads
             .iter()
             .map(payload_fact_count)
@@ -327,11 +334,6 @@ impl StatelessIndexWorker {
             return Err(WorkerError::OutputLimitExceeded);
         }
 
-        let shard = FactShardId::new(match request.job.job.kind {
-            super::protocol::IndexJobKind::RepositoryGraph => "repository-all",
-            super::protocol::IndexJobKind::ProjectMemory => "memory-all",
-        })
-        .map_err(|_| WorkerError::InvalidInput)?;
         let mut stored_batches = 0u64;
         let mut reused_batches = 0u64;
         let mut output_bytes = 0u64;
@@ -940,6 +942,48 @@ impl StatelessIndexWorker {
         self.check_deadline(deadline)
     }
 
+    fn size_payloads_for_batches(
+        &self,
+        request: &ExecuteIndexJobRequest,
+        target: &FactTarget,
+        shard: &FactShardId,
+        payloads: Vec<FactBatchPayload>,
+        deadline: WorkerDeadline,
+    ) -> Result<Vec<FactBatchPayload>, WorkerError> {
+        let mut pending = VecDeque::from(payloads);
+        let mut sized = Vec::new();
+        while let Some(payload) = pending.pop_front() {
+            self.check_deadline(deadline)?;
+            let sequence =
+                u32::try_from(sized.len()).map_err(|_| WorkerError::OutputLimitExceeded)?;
+            let final_batch = pending.is_empty();
+            let candidate = FactBatch::new(
+                request.job.job.clone(),
+                target.clone(),
+                shard.clone(),
+                sequence,
+                request.job.spec.semantics.extractor_set_digest.clone(),
+                final_batch,
+                payload.clone(),
+            )
+            .map_err(|_| WorkerError::FactConflict)?;
+            let byte_len = u64::try_from(
+                serde_json::to_vec(&candidate)
+                    .map_err(|_| WorkerError::FactConflict)?
+                    .len(),
+            )
+            .map_err(|_| WorkerError::OutputLimitExceeded)?;
+            if byte_len <= self.limits.max_batch_bytes.get() {
+                sized.push(payload);
+                continue;
+            }
+            let (first, second) = split_payload(payload)?;
+            pending.push_front(second);
+            pending.push_front(first);
+        }
+        Ok(sized)
+    }
+
     fn check_deadline(&self, deadline: WorkerDeadline) -> Result<(), WorkerError> {
         self.remaining_job_duration_ms(deadline).map(|_| ())
     }
@@ -1227,6 +1271,54 @@ fn take_prefix<T>(items: &mut Vec<T>, remaining: &mut usize) -> Vec<T> {
     let count = items.len().min(*remaining);
     *remaining -= count;
     items.drain(..count).collect()
+}
+
+fn split_payload(
+    payload: FactBatchPayload,
+) -> Result<(FactBatchPayload, FactBatchPayload), WorkerError> {
+    let count = usize::try_from(payload_fact_count(&payload))
+        .map_err(|_| WorkerError::OutputLimitExceeded)?;
+    if count < 2 {
+        return Err(WorkerError::OutputLimitExceeded);
+    }
+    let mut remaining = count / 2;
+    let split = match payload {
+        FactBatchPayload::RepositoryGraph {
+            mut nodes,
+            mut edges,
+            mut diagnostics,
+        } => {
+            let first = FactBatchPayload::RepositoryGraph {
+                nodes: take_prefix(&mut nodes, &mut remaining),
+                edges: take_prefix(&mut edges, &mut remaining),
+                diagnostics: take_prefix(&mut diagnostics, &mut remaining),
+            };
+            let second = FactBatchPayload::RepositoryGraph {
+                nodes,
+                edges,
+                diagnostics,
+            };
+            (first, second)
+        }
+        FactBatchPayload::ProjectMemory {
+            mut entities,
+            mut relationships,
+            mut diagnostics,
+        } => {
+            let first = FactBatchPayload::ProjectMemory {
+                entities: take_prefix(&mut entities, &mut remaining),
+                relationships: take_prefix(&mut relationships, &mut remaining),
+                diagnostics: take_prefix(&mut diagnostics, &mut remaining),
+            };
+            let second = FactBatchPayload::ProjectMemory {
+                entities,
+                relationships,
+                diagnostics,
+            };
+            (first, second)
+        }
+    };
+    Ok(split)
 }
 
 fn payload_fact_count(payload: &FactBatchPayload) -> u64 {

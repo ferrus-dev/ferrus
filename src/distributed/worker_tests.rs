@@ -120,6 +120,17 @@ fn worker_limits() -> WorkerLimits {
     }
 }
 
+fn max_encoded_batch_bytes(batches: &[FactBatch]) -> NonZeroU64 {
+    NonZeroU64::new(
+        batches
+            .iter()
+            .map(|batch| serde_json::to_vec(batch).unwrap().len() as u64)
+            .max()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 fn sandbox() -> WorkerSandbox {
     WorkerSandbox {
         repository_execution: RepositoryExecutionPolicy::Denied,
@@ -724,6 +735,34 @@ fn repository_worker_is_deterministic_and_reuses_durable_batches() {
     assert!(batches.len() > 1);
     assert!(batches.iter().all(|batch| batch.validate().is_ok()));
 
+    let mut singleton_limits = worker_limits();
+    singleton_limits.max_facts_per_batch = NonZeroU64::new(1).unwrap();
+    let mut singleton_facts = fact_store(&storage_dir.path().join("singleton-facts.db"));
+    StatelessIndexWorker::new(singleton_limits)
+        .execute(&request, &jobs, &objects, &mut singleton_facts)
+        .unwrap();
+    let singleton_batches = singleton_facts
+        .load_for_ingestion(&request.job.job)
+        .unwrap();
+    let batch_cap = max_encoded_batch_bytes(&singleton_batches);
+    let mut byte_limited = worker_limits();
+    byte_limited.max_facts_per_batch = NonZeroU64::new(100_000).unwrap();
+    byte_limited.max_batch_bytes = batch_cap;
+    let mut byte_sized_facts = fact_store(&storage_dir.path().join("byte-sized-facts.db"));
+    let byte_sized = StatelessIndexWorker::new(byte_limited)
+        .execute(&request, &jobs, &objects, &mut byte_sized_facts)
+        .unwrap();
+    let byte_sized_batches = byte_sized_facts
+        .load_for_ingestion(&request.job.job)
+        .unwrap();
+    assert_eq!(byte_sized.emitted_facts, first.emitted_facts);
+    assert!(byte_sized_batches.len() > 1);
+    assert!(
+        byte_sized_batches
+            .iter()
+            .all(|batch| { serde_json::to_vec(batch).unwrap().len() as u64 <= batch_cap.get() })
+    );
+
     let repeated = worker
         .execute(&request, &jobs, &objects, &mut facts)
         .unwrap();
@@ -943,6 +982,34 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
     assert!(outcome.emitted_facts > 0);
     assert!(encoded.contains("rg5.3"));
     assert!(!encoded.contains("Private body"));
+
+    let mut singleton_limits = worker_limits();
+    singleton_limits.max_facts_per_batch = NonZeroU64::new(1).unwrap();
+    let mut singleton_facts = fact_store(&storage_dir.path().join("memory-singleton-facts.db"));
+    StatelessIndexWorker::new(singleton_limits)
+        .execute(&request, &jobs, &objects, &mut singleton_facts)
+        .unwrap();
+    let singleton_batches = singleton_facts
+        .load_for_ingestion(&request.job.job)
+        .unwrap();
+    let batch_cap = max_encoded_batch_bytes(&singleton_batches);
+    let mut byte_limited = worker_limits();
+    byte_limited.max_facts_per_batch = NonZeroU64::new(100_000).unwrap();
+    byte_limited.max_batch_bytes = batch_cap;
+    let mut byte_sized_facts = fact_store(&storage_dir.path().join("memory-byte-sized-facts.db"));
+    let byte_sized = StatelessIndexWorker::new(byte_limited)
+        .execute(&request, &jobs, &objects, &mut byte_sized_facts)
+        .unwrap();
+    let byte_sized_batches = byte_sized_facts
+        .load_for_ingestion(&request.job.job)
+        .unwrap();
+    assert_eq!(byte_sized.emitted_facts, outcome.emitted_facts);
+    assert!(byte_sized_batches.len() > 1);
+    assert!(
+        byte_sized_batches
+            .iter()
+            .all(|batch| { serde_json::to_vec(batch).unwrap().len() as u64 <= batch_cap.get() })
+    );
 
     let mut forged = manifest;
     forged.body.sources[0].source_fingerprint = Digest::new("sha256", "00").unwrap();
