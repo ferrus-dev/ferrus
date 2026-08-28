@@ -22,7 +22,15 @@ pub(super) fn memory_only_seeds(
             FederatedContextSeed::Milestone(id) => Ok(MemoryContextSeed::Milestone(id.clone())),
             FederatedContextSeed::Task(id) => Ok(MemoryContextSeed::Task(id.clone())),
             FederatedContextSeed::Run(id) => Ok(MemoryContextSeed::Run(id.clone())),
-            FederatedContextSeed::Repository(_) => Err(backend_error("context.domainmismatch")),
+            FederatedContextSeed::Repository(ContextSeed::Path(path)) => {
+                Ok(MemoryContextSeed::RepositoryPath(path.clone()))
+            }
+            FederatedContextSeed::Repository(ContextSeed::Symbol(symbol)) => {
+                Ok(MemoryContextSeed::RepositorySymbol(symbol.clone()))
+            }
+            FederatedContextSeed::Repository(ContextSeed::Node(_)) => {
+                Err(backend_error("context.domainmismatch"))
+            }
         })
         .collect()
 }

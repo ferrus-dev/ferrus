@@ -885,9 +885,9 @@ async fn federated_context(args: ContextArgs) -> Result<()> {
         )?)
     };
     if matches!(domain, ContextDomain::Memory)
-        && matches!(seed, FederatedContextSeed::Repository(_))
+        && matches!(seed, FederatedContextSeed::Repository(ContextSeed::Node(_)))
     {
-        anyhow::bail!("repository seed selectors require --domain repository or --domain all");
+        anyhow::bail!("repository node selectors require --domain repository or --domain all");
     }
     let context = LocalProjectContext::load_for_cli(matches!(domain, ContextDomain::All)).await?;
     let budget = context.requested_budget(

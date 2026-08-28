@@ -217,15 +217,16 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
 ];
 
 pub(super) fn migrate_runtime_schema(connection: &mut Connection) -> Result<()> {
-    validate_runtime_migration_history(connection)?;
-
-    for migration in RUNTIME_MIGRATIONS {
+    loop {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_runtime_migration_history(&transaction)?;
         let current_version = runtime_schema_version(&transaction)?;
-        if current_version >= migration.version {
+        if current_version == RUNTIME_SCHEMA_VERSION {
             transaction.commit()?;
-            continue;
+            break;
         }
+
+        let migration = &RUNTIME_MIGRATIONS[current_version as usize];
         if current_version + 1 != migration.version {
             anyhow::bail!(
                 "Cannot apply ferrus.db migration {} after schema version {}",

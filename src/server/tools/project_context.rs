@@ -198,18 +198,18 @@ fn seed(seed: SeedInput) -> Result<FederatedContextSeed> {
 }
 
 fn validate_seed_domains(domain: ContextDomain, seeds: &[FederatedContextSeed]) -> Result<()> {
-    let has_repository = seeds
+    let has_repository_node = seeds
         .iter()
-        .any(|seed| matches!(seed, FederatedContextSeed::Repository(_)));
+        .any(|seed| matches!(seed, FederatedContextSeed::Repository(ContextSeed::Node(_))));
     let has_memory = seeds
         .iter()
         .any(|seed| !matches!(seed, FederatedContextSeed::Repository(_)));
     if matches!(domain, ContextDomain::Repository) && has_memory {
         anyhow::bail!("project_context repository domain accepts only node, symbol, or path seeds");
     }
-    if matches!(domain, ContextDomain::Memory) && has_repository {
+    if matches!(domain, ContextDomain::Memory) && has_repository_node {
         anyhow::bail!(
-            "project_context memory domain accepts only memory entity, milestone, task, or run seeds"
+            "project_context memory domain accepts memory seeds and repository path or symbol references"
         );
     }
     Ok(())
@@ -227,5 +227,20 @@ mod tests {
         assert!(!requires_memory_content(ContextDomain::All, false));
         assert!(requires_memory_content(ContextDomain::Memory, true));
         assert!(requires_memory_content(ContextDomain::All, true));
+    }
+
+    #[test]
+    fn memory_domain_accepts_repository_reference_seeds_but_not_nodes() {
+        let path = FederatedContextSeed::Repository(ContextSeed::Path(
+            RepoPath::new("src/lib.rs").unwrap(),
+        ));
+        let symbol = FederatedContextSeed::Repository(ContextSeed::Symbol(
+            SemanticKey::new("crate::api::Service").unwrap(),
+        ));
+        assert!(validate_seed_domains(ContextDomain::Memory, &[path, symbol]).is_ok());
+
+        let node =
+            FederatedContextSeed::Repository(ContextSeed::Node(NodeId::new("node-id").unwrap()));
+        assert!(validate_seed_domains(ContextDomain::Memory, &[node]).is_err());
     }
 }
