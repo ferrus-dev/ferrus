@@ -22,34 +22,32 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
     let baseline_path = executor_workspace_baseline_path(&registration.data_dir, task_id);
     if tokio::fs::try_exists(&workspace_dir).await? {
         if git_is_work_tree(&workspace_dir).await {
-            copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
-            let mut baseline_tree = read_executor_workspace_baseline_tree(&baseline_path).await?;
-            if baseline_tree.is_none() {
-                let captured = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
-                persist_executor_workspace_baseline(
-                    &project_root,
-                    &registration.data_dir,
-                    &baseline_path,
-                    task_id,
-                    &captured,
-                )
-                .await?;
-                baseline_tree = Some(captured);
-            }
-            if let Some(baseline_tree) = baseline_tree.as_deref() {
-                crate::project::pin_executor_baseline_tree(&project_root, task_id, baseline_tree)
+            if let Some(baseline_tree) =
+                read_executor_workspace_baseline_tree(&baseline_path).await?
+            {
+                copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
+                crate::project::pin_executor_baseline_tree(&project_root, task_id, &baseline_tree)
                     .await?;
+                return Ok(ExecutorWorkspace {
+                    project_root,
+                    workspace_dir,
+                    baseline_tree: Some(baseline_tree),
+                });
             }
-            return Ok(ExecutorWorkspace {
-                project_root,
-                workspace_dir,
-                baseline_tree,
-            });
+            cleanup_failed_executor_workspace(
+                &project_root,
+                &registration.data_dir,
+                &workspace_dir,
+                task_id,
+            )
+            .await
+            .context("Failed to discard executor workspace without baseline metadata")?;
+        } else {
+            anyhow::bail!(
+                "Cannot start isolated executor workspace: {} already exists and is not a git worktree.",
+                workspace_dir.display()
+            );
         }
-        anyhow::bail!(
-            "Cannot start isolated executor workspace: {} already exists and is not a git worktree.",
-            workspace_dir.display()
-        );
     }
 
     let parent = workspace_dir

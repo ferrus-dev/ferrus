@@ -548,6 +548,22 @@ async fn executor_workspace_starts_from_unborn_git_project() {
         baseline_tree.as_deref().unwrap()
     );
 
+    tokio::fs::remove_file(executor_workspace_baseline_path(&data_dir, "t-unborn"))
+        .await
+        .unwrap();
+    tokio::fs::remove_file(resumed_workspace.workspace_dir.join("seed.txt"))
+        .await
+        .unwrap();
+
+    let rebuilt_workspace = prepare_executor_workspace("t-unborn").await.unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(rebuilt_workspace.workspace_dir.join("seed.txt"))
+            .await
+            .unwrap(),
+        "uncommitted project file\n"
+    );
+    assert!(executor_workspace_baseline_path(&data_dir, "t-unborn").exists());
+
     std::env::set_current_dir(previous).unwrap();
 }
 
