@@ -544,6 +544,7 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
             repository: local_repository(),
             snapshot_id: graph.snapshot_id.clone(),
             node_id: NodeId::new("node-snapshot-linked").unwrap(),
+            semantic_key: Some(SemanticKey::new("symbol-snapshot-linked").unwrap()),
         },
         provenance,
     };

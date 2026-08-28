@@ -1217,7 +1217,9 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         MemoryRelationshipTarget::RepositoryNode {
             ref snapshot_id,
             ref node_id,
+            ref semantic_key,
             ..
         } if snapshot_id == &graph_ref.snapshot_id && node_id.as_str() == "important-node"
+            && semantic_key.as_ref().is_some_and(|key| key.as_str() == "important-type")
     )));
 }

@@ -88,6 +88,14 @@ pub(super) fn repository_seed_matches(
         }
         (
             ContextSeed::Symbol(symbol),
+            MemoryRelationshipTarget::RepositoryNode {
+                semantic_key,
+                snapshot_id: target_snapshot,
+                ..
+            },
+        ) => semantic_key.as_ref() == Some(symbol) && Some(target_snapshot) == snapshot_id,
+        (
+            ContextSeed::Symbol(symbol),
             MemoryRelationshipTarget::RepositorySymbol {
                 semantic_key,
                 snapshot_id: target_snapshot,

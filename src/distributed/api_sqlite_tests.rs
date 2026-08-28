@@ -1099,6 +1099,7 @@ fn federated_context_traverses_resolved_repository_links_in_both_directions() {
             repository: local_repository(),
             snapshot_id: fixture.graph.snapshot_id.clone(),
             node_id: fixture.graph_node.clone(),
+            semantic_key: Some(SemanticKey::new("important-type").unwrap()),
         },
         MemoryRelationshipTarget::RepositoryPath {
             repository: local_repository(),
@@ -1189,6 +1190,7 @@ fn federated_context_rejects_repository_links_for_another_snapshot() {
             repository: local_repository(),
             snapshot_id: SnapshotId::new("another-snapshot").unwrap(),
             node_id: fixture.graph_node.clone(),
+            semantic_key: Some(SemanticKey::new("important-type").unwrap()),
         },
         provenance: source.provenance,
     }];

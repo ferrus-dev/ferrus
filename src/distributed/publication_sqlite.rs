@@ -767,11 +767,11 @@ fn validate_repository_links_against_graph(
     {
         return Err(RemoteStoreError::InvalidInput);
     }
-    let node_ids = graph
+    let nodes = graph
         .nodes
         .iter()
-        .map(|node| &node.id)
-        .collect::<BTreeSet<_>>();
+        .map(|node| (&node.id, node.semantic_key.as_ref()))
+        .collect::<BTreeMap<_, _>>();
     let paths = graph
         .nodes
         .iter()
@@ -789,12 +789,17 @@ fn validate_repository_links_against_graph(
                     repository,
                     snapshot_id,
                     node_id,
+                    semantic_key,
                 },
                 MemoryResolutionState::Resolved,
             ) => {
                 repository == &graph.record.repository_identity
                     && snapshot_id == &graph.record.snapshot.snapshot_id
-                    && node_ids.contains(node_id)
+                    && nodes.get(node_id).is_some_and(|stored| {
+                        semantic_key
+                            .as_ref()
+                            .is_none_or(|semantic_key| *stored == Some(semantic_key))
+                    })
             }
             (
                 MemoryRelationshipTarget::RepositoryPath {

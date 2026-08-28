@@ -499,8 +499,14 @@ fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
         relationship.provenance.resolution == MemoryResolutionState::Resolved
             && matches!(
                 &relationship.target,
-                MemoryRelationshipTarget::RepositoryNode { snapshot_id, .. }
-                    if snapshot_id.as_str() == "snapshot-old"
+                MemoryRelationshipTarget::RepositoryNode {
+                    snapshot_id,
+                    semantic_key,
+                    ..
+                } if snapshot_id.as_str() == "snapshot-old"
+                    && semantic_key.as_ref().is_some_and(|key| {
+                        key.as_str() == "rust:function:src/old.rs:run"
+                    })
             )
     }));
     assert!(first_links.iter().any(|relationship| {
@@ -570,8 +576,14 @@ fn repository_links_preserve_resolved_stale_and_unresolved_evidence() {
         relationship.provenance.resolution == MemoryResolutionState::Stale
             && matches!(
                 &relationship.target,
-                MemoryRelationshipTarget::RepositoryNode { snapshot_id, .. }
-                    if snapshot_id.as_str() == "snapshot-old"
+                MemoryRelationshipTarget::RepositoryNode {
+                    snapshot_id,
+                    semantic_key,
+                    ..
+                } if snapshot_id.as_str() == "snapshot-old"
+                    && semantic_key.as_ref().is_some_and(|key| {
+                        key.as_str() == "rust:function:src/old.rs:run"
+                    })
             )
     }));
 }

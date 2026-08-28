@@ -387,6 +387,8 @@ pub enum MemoryRelationshipTarget {
         repository: RepositoryRef,
         snapshot_id: SnapshotId,
         node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        semantic_key: Option<SemanticKey>,
     },
     RepositoryPath {
         repository: RepositoryRef,
@@ -683,6 +685,36 @@ mod tests {
             "path": "/Users/example/private/spec.md"
         });
         assert!(serde_json::from_value::<MemorySourceLocator>(json).is_err());
+    }
+
+    #[test]
+    fn repository_node_targets_preserve_symbols_and_read_legacy_links() {
+        use crate::repository_graph::domain::{RepositoryId, RepositoryNamespace};
+
+        let target = MemoryRelationshipTarget::RepositoryNode {
+            repository: RepositoryRef {
+                namespace: RepositoryNamespace::new("local:test").unwrap(),
+                repository_id: RepositoryId::new("repository").unwrap(),
+            },
+            snapshot_id: SnapshotId::new("snapshot-current").unwrap(),
+            node_id: NodeId::new("node-run").unwrap(),
+            semantic_key: Some(SemanticKey::new("rust:function:src/lib.rs:run").unwrap()),
+        };
+        let encoded = serde_json::to_value(&target).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MemoryRelationshipTarget>(encoded.clone()).unwrap(),
+            target
+        );
+
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("semantic_key");
+        assert!(matches!(
+            serde_json::from_value::<MemoryRelationshipTarget>(legacy).unwrap(),
+            MemoryRelationshipTarget::RepositoryNode {
+                semantic_key: None,
+                ..
+            }
+        ));
     }
 
     #[test]

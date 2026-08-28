@@ -76,6 +76,11 @@ pub(super) fn matching_seed_entities(
                     resolution_visible(relationship.provenance.resolution, policy)
                 })
                 .filter_map(|relationship| match &relationship.target {
+                    MemoryRelationshipTarget::RepositoryNode { semantic_key, .. }
+                        if semantic_key.as_ref() == Some(symbol) =>
+                    {
+                        Some(relationship.source.clone())
+                    }
                     MemoryRelationshipTarget::RepositorySymbol { semantic_key, .. }
                         if semantic_key == symbol =>
                     {

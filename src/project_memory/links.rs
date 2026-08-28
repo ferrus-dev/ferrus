@@ -185,6 +185,7 @@ pub(crate) fn resolve_repository_links_for_snapshot(
                         repository: repository.clone(),
                         snapshot_id: snapshot_id.clone(),
                         node_id,
+                        semantic_key: Some(key.clone()),
                     },
                     MemoryResolutionState::Resolved,
                 )
@@ -650,6 +651,7 @@ impl LocalRepositoryLinkResolver {
                             repository: self.repository.clone(),
                             snapshot_id: current.expect("current snapshot was queried").clone(),
                             node_id: current_matches[0].clone(),
+                            semantic_key: Some(semantic_key.clone()),
                         },
                         MemoryResolutionState::Resolved,
                     )
@@ -670,6 +672,7 @@ impl LocalRepositoryLinkResolver {
                                 repository: self.repository.clone(),
                                 snapshot_id: origin.clone(),
                                 node_id: origin_matches[0].clone(),
+                                semantic_key: Some(semantic_key.clone()),
                             },
                             MemoryResolutionState::Stale,
                         )
