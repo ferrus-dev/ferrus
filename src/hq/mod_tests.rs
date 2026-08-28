@@ -464,6 +464,29 @@ async fn executor_workspace_starts_from_unborn_git_project() {
     .await
     .unwrap();
 
+    let worktrees_dir = data_dir.join("worktrees");
+    tokio::fs::create_dir_all(&worktrees_dir).await.unwrap();
+    let baseline_metadata_dir = worktrees_dir.join(".baseline-trees");
+    tokio::fs::write(&baseline_metadata_dir, "blocks baseline metadata directory")
+        .await
+        .unwrap();
+
+    prepare_executor_workspace("t-unborn").await.unwrap_err();
+    assert!(!worktrees_dir.join("t-unborn").exists());
+    assert!(
+        !std::process::Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/ferrus/baselines/t-unborn"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    tokio::fs::remove_file(baseline_metadata_dir).await.unwrap();
     let workspace = prepare_executor_workspace("t-unborn").await.unwrap();
 
     assert!(workspace.baseline_tree.is_some());

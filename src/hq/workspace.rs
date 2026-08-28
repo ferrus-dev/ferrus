@@ -85,22 +85,85 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
             }
         );
     }
-    seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
-    let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
-    persist_executor_workspace_baseline(
-        &project_root,
-        &registration.data_dir,
-        &baseline_path,
-        task_id,
-        &baseline_tree,
-    )
-    .await?;
+    let setup = async {
+        seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
+        let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
+        persist_executor_workspace_baseline(
+            &project_root,
+            &registration.data_dir,
+            &baseline_path,
+            task_id,
+            &baseline_tree,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(baseline_tree)
+    }
+    .await;
+    let baseline_tree = match setup {
+        Ok(baseline_tree) => baseline_tree,
+        Err(error) => {
+            if let Err(cleanup_error) = cleanup_failed_executor_workspace(
+                &project_root,
+                &registration.data_dir,
+                &workspace_dir,
+                task_id,
+            )
+            .await
+            {
+                return Err(error.context(format!(
+                    "Failed to clean up incomplete executor workspace: {cleanup_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+    };
 
     Ok(ExecutorWorkspace {
         project_root,
         workspace_dir,
         baseline_tree: Some(baseline_tree),
     })
+}
+
+async fn cleanup_failed_executor_workspace(
+    project_root: &Path,
+    data_dir: &Path,
+    workspace_dir: &Path,
+    task_id: &str,
+) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(workspace_dir)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to run git worktree remove for {}",
+                workspace_dir.display()
+            )
+        });
+    let worktree_result = match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(anyhow::anyhow!(
+                "Failed to remove incomplete executor workspace at {}: {}",
+                workspace_dir.display(),
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            ))
+        }
+        Err(error) => Err(error),
+    };
+    let baseline_result =
+        crate::project::remove_executor_baseline(project_root, data_dir, task_id).await;
+    worktree_result?;
+    baseline_result
 }
 
 async fn seed_executor_workspace_from_canonical_changes(
