@@ -784,6 +784,7 @@ fn discover_runtime(
                     runs.repository_view_snapshot_id FROM runs \
              JOIN tasks ON tasks.id = runs.task_id \
              WHERE tasks.spec_path IS NOT NULL AND tasks.status IN ('complete', 'failed') \
+               AND runs.status IN ('completed', 'failed', 'interrupted') \
              ORDER BY runs.id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1201,8 +1202,20 @@ mod tests {
             .unwrap();
         connection
             .execute(
+                "INSERT INTO runs VALUES (?1, ?2, 'running', ?3, 1000, ?4, NULL, NULL)",
+                params!["run-2", "t-1", "active-agent", "/active/worktree"],
+            )
+            .unwrap();
+        connection
+            .execute(
                 "INSERT INTO events VALUES (1, ?1, 'check_passed', ?2)",
                 params!["run-1", r#"{"commands":3,"secret":"hidden"}"#],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events VALUES (2, ?1, 'check_passed', ?2)",
+                params!["run-2", r#"{"commands":4}"#],
             )
             .unwrap();
         let source = LocalMemorySource::discover_at(
@@ -1236,6 +1249,8 @@ mod tests {
             assert!(!value.contains(forbidden));
         }
         assert!(value.contains("event:1"));
+        assert!(!value.contains("run-2"));
+        assert!(!value.contains("event:2"));
         let error = source
             .content(MemoryContentRequest {
                 project: project_ref(),

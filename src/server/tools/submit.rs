@@ -303,7 +303,7 @@ async fn tree_patch_between(
             }
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    submitted_patch_from_utf8(output.stdout)
 }
 
 fn baseline_tree(context: &RuntimeTaskContext) -> Option<String> {
@@ -397,7 +397,7 @@ async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<S
                 }
             );
         }
-        patch.push_str(&String::from_utf8_lossy(&output.stdout));
+        patch.push_str(&submitted_patch_from_utf8(output.stdout)?);
     }
     Ok(patch)
 }
@@ -487,12 +487,19 @@ async fn no_index_patch(
             }
         );
     }
+    let patch = submitted_patch_from_utf8(output.stdout)?;
     Ok(rewrite_no_index_patch_paths(
-        &String::from_utf8_lossy(&output.stdout),
-        path,
-        old_null,
-        new_null,
+        &patch, path, old_null, new_null,
     ))
+}
+
+fn submitted_patch_from_utf8(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(|error| {
+        let offset = error.utf8_error().valid_up_to();
+        anyhow::anyhow!(
+            "Cannot store submitted patch because Git emitted non-UTF-8 bytes at byte offset {offset}"
+        )
+    })
 }
 
 fn rewrite_no_index_patch_paths(patch: &str, path: &str, old_null: bool, new_null: bool) -> String {

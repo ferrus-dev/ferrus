@@ -33,6 +33,14 @@ fn tracked_pathspec_batches_keeps_oversized_single_path() {
 }
 
 #[test]
+fn submitted_patch_rejects_non_utf8_bytes() {
+    let error = submitted_patch_from_utf8(vec![b'a', b'\n', 0xff, b'\n']).unwrap_err();
+
+    assert!(error.to_string().contains("non-UTF-8 bytes"));
+    assert!(error.to_string().contains("byte offset 2"));
+}
+
+#[test]
 fn abandoned_submission_releases_its_tree_pin() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
