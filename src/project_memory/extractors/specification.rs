@@ -49,7 +49,7 @@ fn extract_structure(
     parsed: crate::project_memory::documents::ParsedSpecMemory,
 ) -> Result<MemoryFragment, ()> {
     let title = parsed.structure.title.ok_or(())?;
-    let title_span = parsed.title_span.ok_or(())?;
+    let title_span = parsed.structure.title_span.ok_or(())?;
     let spec_id = entity_id(
         &input.context.project,
         &("specification", &input.source.locator),

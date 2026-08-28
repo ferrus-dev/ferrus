@@ -57,6 +57,7 @@ pub(crate) struct RuntimeCheckDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SpecStructureDocument {
     pub title: Option<String>,
+    pub title_span: Option<SourceSpan>,
     pub milestones: Vec<SpecMilestoneDocument>,
 }
 
@@ -93,7 +94,6 @@ pub(crate) struct OutcomeSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedSpecMemory {
     pub structure: SpecStructureDocument,
-    pub title_span: Option<SourceSpan>,
     pub outcome: Option<SpecOutcomeDocument>,
 }
 
@@ -144,8 +144,11 @@ pub(crate) fn parse_spec_memory(content: &str) -> ParsedSpecMemory {
         .position(|line| line.text.trim_end() == "## Outcome")
         .and_then(|start| parse_outcome(&lines, start, content));
     ParsedSpecMemory {
-        structure: SpecStructureDocument { title, milestones },
-        title_span,
+        structure: SpecStructureDocument {
+            title,
+            title_span,
+            milestones,
+        },
         outcome,
     }
 }
@@ -397,7 +400,6 @@ mod tests {
         let structure = String::from_utf8(structure).unwrap();
         let sanitized_structure = parse_spec_memory(&structure);
         assert_eq!(sanitized_structure.structure, parsed.structure);
-        assert_eq!(sanitized_structure.title_span, parsed.title_span);
         assert!(!structure.contains("Secret task body"));
         assert!(!structure.contains("Depends on: secret"));
         assert!(!structure.contains("Delivered"));

@@ -1357,6 +1357,52 @@ mod tests {
     }
 
     #[test]
+    fn specification_fingerprint_binds_title_evidence_layout() {
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init_git(root.path());
+        let path = "docs/specs/example.md";
+        let initial = "# Example\n\nPrivate body.\n";
+        add_tracked(root.path(), path, initial);
+
+        let source = LocalMemorySource::discover_at(
+            root.path().to_path_buf(),
+            data.path().to_path_buf(),
+            project_ref(),
+            RepoPath::new("docs/specs").unwrap(),
+            MemoryPolicy::default(),
+        )
+        .unwrap();
+        let descriptor = source
+            .manifest
+            .sources
+            .iter()
+            .find(|source| source.category == MemorySourceCategory::SpecificationStructure)
+            .unwrap()
+            .clone();
+        let title_span = parse_spec_memory(initial).structure.title_span.unwrap();
+
+        fs::write(
+            root.path().join(path),
+            "Private prefix.\n# Example\n\nPrivate body.\n",
+        )
+        .unwrap();
+
+        let error = source
+            .content(MemoryContentRequest {
+                project: project_ref(),
+                revision_id: source.manifest.revision_id().unwrap(),
+                source_category: descriptor.category,
+                locator: descriptor.locator,
+                expected_fingerprint: descriptor.fingerprint,
+                evidence: Some(MemoryEvidenceLocator::Span(title_span)),
+                max_bytes: NonZeroU64::new(1024).unwrap(),
+            })
+            .unwrap_err();
+        assert_eq!(error, MemoryQueryError::ContentChanged);
+    }
+
+    #[test]
     fn content_read_deadline_rejects_an_expired_budget() {
         let error = ensure_content_read_deadline(Instant::now(), Duration::ZERO).unwrap_err();
         assert_eq!(
