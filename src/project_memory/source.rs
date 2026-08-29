@@ -845,11 +845,10 @@ fn discover_runtime(
                 continue;
             }
             let payload = serde_json::from_str::<SafeEventPayload>(&payload).ok();
-            let task_id = run_id
-                .as_ref()
-                .and_then(|run_id| run_tasks.get(run_id))
-                .cloned()
-                .or_else(|| payload.and_then(|payload| payload.task_id));
+            let task_id = match run_id.as_ref() {
+                Some(run_id) => run_tasks.get(run_id).cloned(),
+                None => payload.and_then(|payload| payload.task_id),
+            };
             let Some(task_id) = task_id.filter(|task_id| task_ids.contains(task_id)) else {
                 continue;
             };
@@ -1214,8 +1213,14 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO events VALUES (2, ?1, 'check_passed', ?2)",
-                params!["run-2", r#"{"commands":4}"#],
+                "INSERT INTO events VALUES (2, ?1, 'check_failed', ?2)",
+                params!["run-2", r#"{"commands":4,"task_id":"t-1"}"#],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events VALUES (3, NULL, 'task_check_failed', ?1)",
+                params![r#"{"task_id":"t-1"}"#],
             )
             .unwrap();
         let source = LocalMemorySource::discover_at(
@@ -1249,6 +1254,7 @@ mod tests {
             assert!(!value.contains(forbidden));
         }
         assert!(value.contains("event:1"));
+        assert!(value.contains("event:3"));
         assert!(!value.contains("run-2"));
         assert!(!value.contains("event:2"));
         let error = source
