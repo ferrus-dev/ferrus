@@ -8,7 +8,10 @@ use crate::{
     distributed::{
         coordinator::{AdvanceIndexJobRequest, ClaimIndexJobRequest},
         coordinator_sqlite::{CoordinatorLimits, SqliteIndexJobCoordinator},
-        fact_store::{FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome},
+        fact_store::{
+            FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
+            PutFactBatchOutcome,
+        },
         fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
         identity::{
             MemoryManifestId, ObjectId, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
@@ -262,8 +265,12 @@ impl FactBatchStore for DelayedFactStore {
         self.inner.protection()
     }
 
-    fn put(&mut self, batch: &FactBatch) -> Result<PutFactBatchOutcome, Self::Error> {
-        let outcome = self.inner.put(batch)?;
+    fn put(
+        &mut self,
+        batch: &FactBatch,
+        authority: &FactBatchWriteAuthority,
+    ) -> Result<PutFactBatchOutcome, Self::Error> {
+        let outcome = self.inner.put(batch, authority)?;
         self.put_calls = self.put_calls.saturating_add(1);
         if self.delay_put && self.put_calls == 1 {
             std::thread::sleep(self.delay);

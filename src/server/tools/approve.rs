@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use neva::prelude::*;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::info;
@@ -348,7 +350,8 @@ async fn write_integration_error(context: &RuntimeTaskContext, reason: &str) -> 
 
 struct CanonicalApprovalLock {
     path: PathBuf,
-    _file: std::fs::File,
+    owner_path: PathBuf,
+    owner_file: Option<std::fs::File>,
 }
 
 struct CanonicalApprovalLockGuard {
@@ -358,7 +361,37 @@ struct CanonicalApprovalLockGuard {
 impl Drop for CanonicalApprovalLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        unregister_canonical_approval_owner(&self.owner_path);
+        drop(self.owner_file.take());
+        let _ = std::fs::remove_file(&self.owner_path);
     }
+}
+
+static CANONICAL_APPROVAL_OWNERS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn canonical_approval_owners() -> &'static Mutex<HashSet<PathBuf>> {
+    CANONICAL_APPROVAL_OWNERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_canonical_approval_owner(path: &Path) {
+    canonical_approval_owners()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+}
+
+fn unregister_canonical_approval_owner(path: &Path) {
+    canonical_approval_owners()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
+}
+
+fn process_holds_canonical_approval_owner(path: &Path) -> bool {
+    canonical_approval_owners()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
 }
 
 async fn acquire_canonical_approval_lock(
@@ -423,6 +456,10 @@ fn canonical_approval_lock_guard_path(lock_path: &Path) -> PathBuf {
     lock_path.with_file_name(".canonical-approval.lock.guard")
 }
 
+fn canonical_approval_lock_owner_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name(".canonical-approval.lock.owner")
+}
+
 async fn try_create_canonical_approval_lock(
     lock_path: &Path,
     task_id: &str,
@@ -452,10 +489,13 @@ async fn try_create_canonical_approval_lock(
 
     match std::fs::hard_link(&temp_path, lock_path) {
         Ok(()) => {
+            let owner_path = canonical_approval_lock_owner_path(lock_path);
             let owner_file = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(lock_path)
+                .create(true)
+                .truncate(false)
+                .open(&owner_path)
                 .and_then(|file| {
                     file.lock_exclusive()?;
                     Ok(file)
@@ -464,18 +504,21 @@ async fn try_create_canonical_approval_lock(
                 Err(err) => {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     let _ = tokio::fs::remove_file(lock_path).await;
+                    let _ = tokio::fs::remove_file(&owner_path).await;
                     return Err(err).with_context(|| {
                         format!(
-                            "Failed to hold canonical approval lock {}",
-                            lock_path.display()
+                            "Failed to hold canonical approval owner marker {}",
+                            owner_path.display()
                         )
                     });
                 }
             };
+            register_canonical_approval_owner(&owner_path);
             let _ = tokio::fs::remove_file(&temp_path).await;
             Ok(Some(CanonicalApprovalLock {
                 path: lock_path.to_path_buf(),
-                _file: owner_file,
+                owner_path,
+                owner_file: Some(owner_file),
             }))
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -509,18 +552,24 @@ fn canonical_approval_lock_temp_path(lock_path: &Path, task_id: &str) -> PathBuf
 }
 
 async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> {
+    let owner_path = canonical_approval_lock_owner_path(lock_path);
+    if process_holds_canonical_approval_owner(&owner_path) {
+        return Ok(false);
+    }
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(lock_path)
+        .open(&owner_path)
     {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return remove_canonical_approval_lock_files(lock_path, &owner_path).await;
+        }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "Failed to open canonical approval lock {}",
-                    lock_path.display()
+                    "Failed to open canonical approval owner marker {}",
+                    owner_path.display()
                 )
             });
         }
@@ -531,24 +580,39 @@ async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> 
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "Failed to inspect canonical approval lock {}",
-                    lock_path.display()
+                    "Failed to inspect canonical approval owner marker {}",
+                    owner_path.display()
                 )
             });
         }
     }
     drop(file);
 
+    remove_canonical_approval_lock_files(lock_path, &owner_path).await
+}
+
+async fn remove_canonical_approval_lock_files(lock_path: &Path, owner_path: &Path) -> Result<bool> {
     match tokio::fs::remove_file(lock_path).await {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => Err(err).with_context(|| {
             format!(
                 "Failed to remove stale canonical approval lock {}",
                 lock_path.display()
             )
-        }),
+        })?,
     }
+    match tokio::fs::remove_file(owner_path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to remove stale canonical approval owner marker {}",
+                owner_path.display()
+            )
+        })?,
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

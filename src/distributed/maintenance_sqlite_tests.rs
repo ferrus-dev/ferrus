@@ -13,12 +13,12 @@ use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
     coordinator::IndexJobCoordinator,
     coordinator_sqlite::{CoordinatorError, CoordinatorLimits, SqliteIndexJobCoordinator},
-    fact_store::FactBatchStore,
+    fact_store::{FactBatchStore, FactBatchWriteAuthority},
     fact_store_sqlite::{FactStoreError, FactStoreQuota, SqliteFactBatchStore},
     identity::{
         CredentialId, DeletionId, FactShardId, MemoryManifestId, PrincipalId,
         RemoteGraphSnapshotRef, RemoteProjectId, RemoteProjectRef, RemoteRepositoryId,
-        RemoteRepositoryRef, RepositoryManifestId, RequestId, TenantId, TenantObjectRef,
+        RemoteRepositoryRef, RepositoryManifestId, RequestId, TenantId, TenantObjectRef, WorkerId,
     },
     maintenance::{InspectRemoteDeletionRequest, RemoteDeleteRequest, RemoteMaintenanceApi},
     maintenance_sqlite::SqliteRemoteMaintenance,
@@ -45,6 +45,13 @@ use crate::{
 
 const KEY: [u8; 32] = [73; 32];
 const SOURCE: &[u8] = b"same private source bytes";
+
+fn fact_authority() -> FactBatchWriteAuthority {
+    FactBatchWriteAuthority {
+        worker_id: WorkerId::new("maintenance-test-worker").unwrap(),
+        lease_generation: NonZeroU64::new(1).unwrap(),
+    }
+}
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -400,8 +407,12 @@ fn fixture() -> Fixture {
         let mut facts =
             SqliteFactBatchStore::open_uncoordinated_for_test(&fact_path, KEY, fact_quota(), true)
                 .unwrap();
-        facts.put(&batch(&graph_job_a, "a")).unwrap();
-        facts.put(&batch(&graph_job_b, "b")).unwrap();
+        facts
+            .put(&batch(&graph_job_a, "a"), &fact_authority())
+            .unwrap();
+        facts
+            .put(&batch(&graph_job_b, "b"), &fact_authority())
+            .unwrap();
     }
     let maintenance =
         SqliteRemoteMaintenance::open(&control_path, &fact_path, &object_root).unwrap();
@@ -550,7 +561,10 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
     )
     .unwrap();
     assert!(matches!(
-        facts.put(&batch(&fixture.graph_job_a, "after-deletion")),
+        facts.put(
+            &batch(&fixture.graph_job_a, "after-deletion"),
+            &fact_authority(),
+        ),
         Err(FactStoreError::ProjectDeleted)
     ));
 

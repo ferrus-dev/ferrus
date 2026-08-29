@@ -2,6 +2,7 @@
 
 use std::{num::NonZeroU64, path::Path};
 
+use chrono::Utc;
 use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
@@ -12,8 +13,8 @@ use thiserror::Error;
 use super::{
     coordinator_sqlite::COORDINATOR_SCHEMA_VERSION,
     fact_store::{
-        FactBatchProgress, FactBatchStore, FactStoreProtection, PutFactBatchOutcome,
-        progress_from_headers,
+        FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
+        PutFactBatchOutcome, progress_from_headers,
     },
     protocol::{FactBatch, IndexJobKind, IndexJobRef},
 };
@@ -238,7 +239,11 @@ impl FactBatchStore for SqliteFactBatchStore {
         self.protection
     }
 
-    fn put(&mut self, batch: &FactBatch) -> Result<PutFactBatchOutcome, Self::Error> {
+    fn put(
+        &mut self,
+        batch: &FactBatch,
+        authority: &FactBatchWriteAuthority,
+    ) -> Result<PutFactBatchOutcome, Self::Error> {
         if !self.protection.authenticated_transport || !self.protection.encrypted_at_rest {
             return Err(FactStoreError::InsecureProtection);
         }
@@ -285,9 +290,11 @@ impl FactBatchStore for SqliteFactBatchStore {
                     batch.header.job.project.project_id.as_str()
                 ],
             )?;
-            let state = transaction
+            let lease = transaction
                 .query_row(
-                    "SELECT state FROM coordinator.distributed_index_jobs
+                    "SELECT state, lease_worker_id, lease_generation, lease_until_ms,
+                            cancellation_requested
+                     FROM coordinator.distributed_index_jobs
                      WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3 AND kind = ?4",
                     params![
                         batch.header.job.project.tenant_id.as_str(),
@@ -295,10 +302,27 @@ impl FactBatchStore for SqliteFactBatchStore {
                         batch.header.job.job_id.as_str(),
                         job_kind(batch.header.job.kind)
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if state.as_deref() != Some("running") {
+            let expected_generation =
+                i64::try_from(authority.lease_generation.get()).unwrap_or(i64::MAX);
+            if !matches!(
+                lease,
+                Some((state, Some(worker_id), generation, Some(lease_until_ms), 0))
+                    if state == "running"
+                        && worker_id == authority.worker_id.as_str()
+                        && generation == expected_generation
+                        && lease_until_ms > Utc::now().timestamp_millis()
+            ) {
                 return Err(FactStoreError::JobNotWritable);
             }
         }
@@ -479,7 +503,7 @@ mod tests {
         distributed::{
             identity::{
                 FactShardId, IndexJobId, RemoteGraphSnapshotRef, RemoteProjectId, RemoteProjectRef,
-                RemoteRepositoryId, RemoteRepositoryRef, TenantId,
+                RemoteRepositoryId, RemoteRepositoryRef, TenantId, WorkerId,
             },
             protocol::{FactBatchPayload, FactTarget},
         },
@@ -549,6 +573,17 @@ mod tests {
         }
     }
 
+    fn authority() -> FactBatchWriteAuthority {
+        authority_for("worker-a", 1)
+    }
+
+    fn authority_for(worker_id: &str, generation: u64) -> FactBatchWriteAuthority {
+        FactBatchWriteAuthority {
+            worker_id: WorkerId::new(worker_id).unwrap(),
+            lease_generation: NonZeroU64::new(generation).unwrap(),
+        }
+    }
+
     #[test]
     fn batches_are_encrypted_idempotent_and_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -558,8 +593,14 @@ mod tests {
             let mut store =
                 SqliteFactBatchStore::open_uncoordinated_for_test(&path, [23; 32], quota(), true)
                     .unwrap();
-            assert_eq!(store.put(&expected).unwrap(), PutFactBatchOutcome::Stored);
-            assert_eq!(store.put(&expected).unwrap(), PutFactBatchOutcome::Reused);
+            assert_eq!(
+                store.put(&expected, &authority()).unwrap(),
+                PutFactBatchOutcome::Stored
+            );
+            assert_eq!(
+                store.put(&expected, &authority()).unwrap(),
+                PutFactBatchOutcome::Reused
+            );
             let progress = store.progress(&expected.header.job).unwrap();
             assert!(progress.final_batch_seen);
             assert_eq!(progress.batches.len(), 1);
@@ -609,6 +650,10 @@ mod tests {
                      job_id TEXT NOT NULL,
                      kind TEXT NOT NULL,
                      state TEXT NOT NULL,
+                     lease_worker_id TEXT,
+                     lease_generation INTEGER NOT NULL,
+                     lease_until_ms INTEGER,
+                     cancellation_requested INTEGER NOT NULL,
                      PRIMARY KEY (tenant_id, project_id, job_id)
                  );",
             )
@@ -616,12 +661,15 @@ mod tests {
         coordinator
             .execute(
                 "INSERT INTO distributed_index_jobs
-                 (tenant_id, project_id, job_id, kind, state)
-                 VALUES (?1, ?2, ?3, 'repository_graph', 'running')",
+                 (tenant_id, project_id, job_id, kind, state, lease_worker_id,
+                  lease_generation, lease_until_ms, cancellation_requested)
+                 VALUES (?1, ?2, ?3, 'repository_graph', 'running', 'worker-a', 1,
+                         ?4, 0)",
                 params![
                     jobs[0].project.tenant_id.as_str(),
                     jobs[0].project.project_id.as_str(),
-                    jobs[0].job_id.as_str()
+                    jobs[0].job_id.as_str(),
+                    Utc::now().timestamp_millis() + 60_000
                 ],
             )
             .unwrap();
@@ -640,7 +688,7 @@ mod tests {
         .unwrap();
         for (index, terminal_state) in ["complete", "failed", "cancelled"].into_iter().enumerate() {
             assert_eq!(
-                store.put(&batches[index]).unwrap(),
+                store.put(&batches[index], &authority()).unwrap(),
                 PutFactBatchOutcome::Stored
             );
             coordinator
@@ -658,23 +706,87 @@ mod tests {
             coordinator
                 .execute(
                     "INSERT INTO distributed_index_jobs
-                     (tenant_id, project_id, job_id, kind, state)
-                     VALUES (?1, ?2, ?3, 'repository_graph', 'running')",
+                     (tenant_id, project_id, job_id, kind, state, lease_worker_id,
+                      lease_generation, lease_until_ms, cancellation_requested)
+                     VALUES (?1, ?2, ?3, 'repository_graph', 'running', 'worker-a', 1,
+                             ?4, 0)",
                     params![
                         jobs[index + 1].project.tenant_id.as_str(),
                         jobs[index + 1].project.project_id.as_str(),
-                        jobs[index + 1].job_id.as_str()
+                        jobs[index + 1].job_id.as_str(),
+                        Utc::now().timestamp_millis() + 60_000
                     ],
                 )
                 .unwrap();
         }
-        assert_eq!(store.put(&batches[3]).unwrap(), PutFactBatchOutcome::Stored);
+        assert_eq!(
+            store.put(&batches[3], &authority()).unwrap(),
+            PutFactBatchOutcome::Stored
+        );
         for job in &jobs[..3] {
             assert!(store.load_for_ingestion(job).unwrap().is_empty());
         }
         assert_eq!(
             store.load_for_ingestion(&jobs[3]).unwrap(),
             vec![batches[3].clone()]
+        );
+    }
+
+    #[test]
+    fn stale_worker_generation_cannot_write_after_lease_reclaim() {
+        let directory = tempfile::tempdir().unwrap();
+        let fact_path = directory.path().join("facts.db");
+        let coordinator_path = directory.path().join("jobs.db");
+        let job = job("tenant-a");
+        let coordinator = Connection::open(&coordinator_path).unwrap();
+        coordinator
+            .execute_batch(
+                "CREATE TABLE distributed_coordinator_metadata (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL
+                 );
+                 INSERT INTO distributed_coordinator_metadata VALUES (1, 1);
+                 CREATE TABLE distributed_index_jobs (
+                     tenant_id TEXT NOT NULL,
+                     project_id TEXT NOT NULL,
+                     job_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     state TEXT NOT NULL,
+                     lease_worker_id TEXT,
+                     lease_generation INTEGER NOT NULL,
+                     lease_until_ms INTEGER,
+                     cancellation_requested INTEGER NOT NULL,
+                     PRIMARY KEY (tenant_id, project_id, job_id)
+                 );",
+            )
+            .unwrap();
+        coordinator
+            .execute(
+                "INSERT INTO distributed_index_jobs (
+                     tenant_id, project_id, job_id, kind, state, lease_worker_id,
+                     lease_generation, lease_until_ms, cancellation_requested
+                 ) VALUES (?1, ?2, ?3, 'repository_graph', 'running', 'worker-new', 2,
+                           ?4, 0)",
+                params![
+                    job.project.tenant_id.as_str(),
+                    job.project.project_id.as_str(),
+                    job.job_id.as_str(),
+                    Utc::now().timestamp_millis() + 60_000
+                ],
+            )
+            .unwrap();
+        let mut store =
+            SqliteFactBatchStore::open(&fact_path, &coordinator_path, [53; 32], quota(), true)
+                .unwrap();
+        let batch = batch_for_job(job, 0, true);
+
+        assert!(matches!(
+            store.put(&batch, &authority_for("worker-old", 1)),
+            Err(FactStoreError::JobNotWritable)
+        ));
+        assert_eq!(
+            store.put(&batch, &authority_for("worker-new", 2)).unwrap(),
+            PutFactBatchOutcome::Stored
         );
     }
 
@@ -689,10 +801,10 @@ mod tests {
         )
         .unwrap();
         let first = batch("tenant-a", 0, false);
-        store.put(&first).unwrap();
+        store.put(&first, &authority()).unwrap();
         let conflicting_final = batch("tenant-a", 0, true);
         assert!(matches!(
-            store.put(&conflicting_final),
+            store.put(&conflicting_final, &authority()),
             Err(FactStoreError::SequenceConflict)
         ));
         assert!(
@@ -710,9 +822,11 @@ mod tests {
             true,
         )
         .unwrap();
-        completed.put(&batch("tenant-a", 0, true)).unwrap();
+        completed
+            .put(&batch("tenant-a", 0, true), &authority())
+            .unwrap();
         assert!(matches!(
-            completed.put(&batch("tenant-a", 1, false)),
+            completed.put(&batch("tenant-a", 1, false), &authority()),
             Err(FactStoreError::SequenceConflict)
         ));
     }
@@ -739,7 +853,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.put(&batch("tenant-a", 0, true)),
+            store.put(&batch("tenant-a", 0, true), &authority()),
             Err(FactStoreError::ProjectDeleted)
         ));
     }
@@ -755,7 +869,7 @@ mod tests {
         )
         .unwrap();
         let expected = batch("tenant-a", 0, true);
-        store.put(&expected).unwrap();
+        store.put(&expected, &authority()).unwrap();
         store
             .database
             .execute(

@@ -44,7 +44,7 @@ use crate::{
 use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_WORKER_PROTOCOL_VERSION,
     coordinator::{BoundedJobInspection, IndexJobCoordinator},
-    fact_store::{FactBatchProgress, FactBatchStore, PutFactBatchOutcome},
+    fact_store::{FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, PutFactBatchOutcome},
     identity::{
         FactShardId, IndexJobFailureCode, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef,
         RequestId, TenantObjectRef, WorkerId,
@@ -337,6 +337,10 @@ impl StatelessIndexWorker {
         let mut stored_batches = 0u64;
         let mut reused_batches = 0u64;
         let mut output_bytes = 0u64;
+        let write_authority = FactBatchWriteAuthority {
+            worker_id: request.worker_id.clone(),
+            lease_generation: request.lease_generation,
+        };
         let last = payloads.len().saturating_sub(1);
         for (index, payload) in payloads.into_iter().enumerate() {
             self.check_deadline(deadline)?;
@@ -364,7 +368,9 @@ impl StatelessIndexWorker {
             if output_bytes > self.limits.max_output_bytes.get() {
                 return Err(WorkerError::OutputLimitExceeded);
             }
-            let put = facts.put(&batch).map_err(|_| WorkerError::FactStore)?;
+            let put = facts
+                .put(&batch, &write_authority)
+                .map_err(|_| WorkerError::FactStore)?;
             self.check_deadline(deadline)?;
             match put {
                 PutFactBatchOutcome::Stored => stored_batches += 1,

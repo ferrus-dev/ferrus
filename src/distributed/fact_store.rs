@@ -1,9 +1,11 @@
 //! Vendor-neutral persistence boundary for unpublished worker fact batches.
 
+use std::num::NonZeroU64;
+
 use serde::{Deserialize, Serialize};
 
 use super::{
-    identity::{FactBatchId, FactShardId},
+    identity::{FactBatchId, FactShardId, WorkerId},
     protocol::{FactBatch, FactBatchHeader, IndexJobRef},
 };
 
@@ -17,6 +19,12 @@ pub struct FactStoreProtection {
 pub enum PutFactBatchOutcome {
     Stored,
     Reused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactBatchWriteAuthority {
+    pub worker_id: WorkerId,
+    pub lease_generation: NonZeroU64,
 }
 
 /// Privacy-safe durable retry progress. Payload facts are deliberately absent.
@@ -43,7 +51,11 @@ pub trait FactBatchStore {
     type Error;
 
     fn protection(&self) -> FactStoreProtection;
-    fn put(&mut self, batch: &FactBatch) -> Result<PutFactBatchOutcome, Self::Error>;
+    fn put(
+        &mut self,
+        batch: &FactBatch,
+        authority: &FactBatchWriteAuthority,
+    ) -> Result<PutFactBatchOutcome, Self::Error>;
     fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error>;
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error>;
 }
