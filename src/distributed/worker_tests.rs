@@ -1,4 +1,7 @@
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
@@ -269,8 +272,9 @@ impl FactBatchStore for DelayedFactStore {
         &mut self,
         batch: &FactBatch,
         authority: &FactBatchWriteAuthority,
+        deadline: Instant,
     ) -> Result<PutFactBatchOutcome, Self::Error> {
-        let outcome = self.inner.put(batch, authority)?;
+        let outcome = self.inner.put(batch, authority, deadline)?;
         self.put_calls = self.put_calls.saturating_add(1);
         if self.delay_put && self.put_calls == 1 {
             std::thread::sleep(self.delay);

@@ -269,7 +269,7 @@ impl SqliteRemoteQueryApi {
                     .graph
                     .as_ref()
                     .ok_or_else(|| query_invalid(&request.request_id))?;
-                let (units, depth) = graph_neighborhood(
+                let (units, depth, depth_limited) = graph_neighborhood(
                     graph,
                     roots,
                     *direction,
@@ -278,7 +278,7 @@ impl SqliteRemoteQueryApi {
                     started,
                     duration,
                 );
-                let (units, page) = paginate(
+                let (units, mut page) = paginate(
                     units,
                     request.body.page.cursor.as_ref(),
                     &fingerprint,
@@ -287,6 +287,9 @@ impl SqliteRemoteQueryApi {
                     depth,
                     &request.request_id,
                 )?;
+                if depth_limited && page.truncation.is_none() {
+                    page.truncation = Some(RemoteTruncationReason::Depth);
+                }
                 let mut data = RemoteNeighborhoodData {
                     nodes: Vec::new(),
                     edges: Vec::new(),
@@ -309,7 +312,7 @@ impl SqliteRemoteQueryApi {
                 include_snippets,
             } => {
                 validate_context_seeds(&request.request_id, resolved_target, seeds)?;
-                let (units, depth) = context_units(
+                let (units, depth, depth_limited) = context_units(
                     &loaded,
                     seeds,
                     *direction,
@@ -321,7 +324,7 @@ impl SqliteRemoteQueryApi {
                     started,
                     duration,
                 );
-                let (units, page) = paginate(
+                let (units, mut page) = paginate(
                     units,
                     request.body.page.cursor.as_ref(),
                     &fingerprint,
@@ -330,6 +333,9 @@ impl SqliteRemoteQueryApi {
                     depth,
                     &request.request_id,
                 )?;
+                if depth_limited && page.truncation.is_none() {
+                    page.truncation = Some(RemoteTruncationReason::Depth);
+                }
                 let mut data = RemoteContextData {
                     graph_nodes: Vec::new(),
                     graph_edges: Vec::new(),

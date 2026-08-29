@@ -1,13 +1,19 @@
 //! Durable encrypted SQLite adapter for unpublished distributed fact batches.
 
-use std::{num::NonZeroU64, path::Path};
+use std::{
+    num::NonZeroU64,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, Error as SqliteError, ErrorCode, OptionalExtension, TransactionBehavior, params,
+};
 use thiserror::Error;
 
 use super::{
@@ -21,7 +27,22 @@ use super::{
 
 const FACT_STORE_SCHEMA_VERSION: u32 = 1;
 const NONCE_BYTES: usize = 12;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_PROGRESS_OPS: i32 = 100;
 type EncryptedBatchRow = (String, Vec<u8>, Vec<u8>);
+
+fn sqlite_write_timed_out(result: &Result<PutFactBatchOutcome, FactStoreError>) -> bool {
+    matches!(
+        result,
+        Err(FactStoreError::Database(SqliteError::SqliteFailure(failure, _)))
+            if matches!(
+                failure.code,
+                ErrorCode::DatabaseBusy
+                    | ErrorCode::DatabaseLocked
+                    | ErrorCode::OperationInterrupted
+            )
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FactStoreQuota {
@@ -120,7 +141,7 @@ impl SqliteFactBatchStore {
             return Err(FactStoreError::InsecureProtection);
         }
         let database = Connection::open(path)?;
-        database.busy_timeout(std::time::Duration::from_secs(5))?;
+        database.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         initialize_schema(&database)?;
         if let Some(coordinator_path) = coordinator_path {
             database.execute(
@@ -232,18 +253,12 @@ impl SqliteFactBatchStore {
     }
 }
 
-impl FactBatchStore for SqliteFactBatchStore {
-    type Error = FactStoreError;
-
-    fn protection(&self) -> FactStoreProtection {
-        self.protection
-    }
-
-    fn put(
+impl SqliteFactBatchStore {
+    fn put_inner(
         &mut self,
         batch: &FactBatch,
         authority: &FactBatchWriteAuthority,
-    ) -> Result<PutFactBatchOutcome, Self::Error> {
+    ) -> Result<PutFactBatchOutcome, FactStoreError> {
         if !self.protection.authenticated_transport || !self.protection.encrypted_at_rest {
             return Err(FactStoreError::InsecureProtection);
         }
@@ -416,6 +431,42 @@ impl FactBatchStore for SqliteFactBatchStore {
         transaction.commit()?;
         Ok(PutFactBatchOutcome::Stored)
     }
+}
+
+impl FactBatchStore for SqliteFactBatchStore {
+    type Error = FactStoreError;
+
+    fn protection(&self) -> FactStoreProtection {
+        self.protection
+    }
+
+    fn put(
+        &mut self,
+        batch: &FactBatch,
+        authority: &FactBatchWriteAuthority,
+        deadline: Instant,
+    ) -> Result<PutFactBatchOutcome, Self::Error> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        };
+        self.database.busy_timeout(remaining)?;
+        if let Err(error) = self.database.progress_handler(
+            SQLITE_PROGRESS_OPS,
+            Some(move || Instant::now() >= deadline),
+        ) {
+            let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
+            return Err(error.into());
+        }
+        let result = self.put_inner(batch, authority);
+        let timed_out = Instant::now() >= deadline || sqlite_write_timed_out(&result);
+        let _ = self.database.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
+        if timed_out {
+            Ok(PutFactBatchOutcome::DeadlineExceeded)
+        } else {
+            result
+        }
+    }
 
     fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error> {
         let batches = self.load_for_ingestion(job)?;
@@ -584,6 +635,10 @@ mod tests {
         }
     }
 
+    fn write_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     #[test]
     fn batches_are_encrypted_idempotent_and_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -594,11 +649,15 @@ mod tests {
                 SqliteFactBatchStore::open_uncoordinated_for_test(&path, [23; 32], quota(), true)
                     .unwrap();
             assert_eq!(
-                store.put(&expected, &authority()).unwrap(),
+                store
+                    .put(&expected, &authority(), write_deadline())
+                    .unwrap(),
                 PutFactBatchOutcome::Stored
             );
             assert_eq!(
-                store.put(&expected, &authority()).unwrap(),
+                store
+                    .put(&expected, &authority(), write_deadline())
+                    .unwrap(),
                 PutFactBatchOutcome::Reused
             );
             let progress = store.progress(&expected.header.job).unwrap();
@@ -688,7 +747,9 @@ mod tests {
         .unwrap();
         for (index, terminal_state) in ["complete", "failed", "cancelled"].into_iter().enumerate() {
             assert_eq!(
-                store.put(&batches[index], &authority()).unwrap(),
+                store
+                    .put(&batches[index], &authority(), write_deadline())
+                    .unwrap(),
                 PutFactBatchOutcome::Stored
             );
             coordinator
@@ -720,7 +781,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            store.put(&batches[3], &authority()).unwrap(),
+            store
+                .put(&batches[3], &authority(), write_deadline())
+                .unwrap(),
             PutFactBatchOutcome::Stored
         );
         for job in &jobs[..3] {
@@ -781,12 +844,56 @@ mod tests {
         let batch = batch_for_job(job, 0, true);
 
         assert!(matches!(
-            store.put(&batch, &authority_for("worker-old", 1)),
+            store.put(&batch, &authority_for("worker-old", 1), write_deadline()),
             Err(FactStoreError::JobNotWritable)
         ));
         assert_eq!(
-            store.put(&batch, &authority_for("worker-new", 2)).unwrap(),
+            store
+                .put(&batch, &authority_for("worker-new", 2), write_deadline())
+                .unwrap(),
             PutFactBatchOutcome::Stored
+        );
+    }
+
+    #[test]
+    fn fact_batch_writes_stop_at_the_worker_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("facts.db");
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            &database_path,
+            [57; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
+        store
+            .database
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let blocker = Connection::open(database_path).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN EXCLUSIVE;
+                 UPDATE unpublished_fact_batches SET byte_len = byte_len;",
+            )
+            .unwrap();
+        let started = Instant::now();
+        let batch = batch("tenant-a", 0, true);
+
+        let outcome = store
+            .put(&batch, &authority(), started + Duration::from_millis(25))
+            .unwrap();
+
+        assert_eq!(outcome, PutFactBatchOutcome::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            store
+                .load_for_ingestion(&batch.header.job)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -801,10 +908,10 @@ mod tests {
         )
         .unwrap();
         let first = batch("tenant-a", 0, false);
-        store.put(&first, &authority()).unwrap();
+        store.put(&first, &authority(), write_deadline()).unwrap();
         let conflicting_final = batch("tenant-a", 0, true);
         assert!(matches!(
-            store.put(&conflicting_final, &authority()),
+            store.put(&conflicting_final, &authority(), write_deadline()),
             Err(FactStoreError::SequenceConflict)
         ));
         assert!(
@@ -823,10 +930,10 @@ mod tests {
         )
         .unwrap();
         completed
-            .put(&batch("tenant-a", 0, true), &authority())
+            .put(&batch("tenant-a", 0, true), &authority(), write_deadline())
             .unwrap();
         assert!(matches!(
-            completed.put(&batch("tenant-a", 1, false), &authority()),
+            completed.put(&batch("tenant-a", 1, false), &authority(), write_deadline()),
             Err(FactStoreError::SequenceConflict)
         ));
     }
@@ -853,7 +960,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.put(&batch("tenant-a", 0, true), &authority()),
+            store.put(&batch("tenant-a", 0, true), &authority(), write_deadline(),),
             Err(FactStoreError::ProjectDeleted)
         ));
     }
@@ -869,7 +976,9 @@ mod tests {
         )
         .unwrap();
         let expected = batch("tenant-a", 0, true);
-        store.put(&expected, &authority()).unwrap();
+        store
+            .put(&expected, &authority(), write_deadline())
+            .unwrap();
         store
             .database
             .execute(

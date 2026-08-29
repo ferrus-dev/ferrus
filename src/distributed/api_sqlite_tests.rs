@@ -873,6 +873,50 @@ fn context_snippets_are_manifest_scoped_hash_verified_and_bounded() {
 }
 
 #[test]
+fn depth_limited_remote_traversal_reports_depth_truncation() {
+    let fixture = fixture();
+    let authorization = auth(
+        CredentialClass::QueryAgent,
+        AuthorizationScope::Repository(fixture.repository.clone()),
+    );
+    let operations = [
+        RemoteQueryOperation::Neighborhood {
+            roots: vec![fixture.graph_node.clone()],
+            direction: EdgeDirection::Outgoing,
+            edge_kinds: Vec::new(),
+        },
+        RemoteQueryOperation::Context {
+            seeds: vec![RemoteContextSeed::GraphNode(fixture.graph_node.clone())],
+            direction: EdgeDirection::Outgoing,
+            graph_edge_kinds: Vec::new(),
+            memory_relationship_kinds: Vec::new(),
+            include_unresolved: false,
+            include_external: false,
+            include_snippets: false,
+        },
+    ];
+
+    for operation in operations {
+        let mut request = query_request(
+            &fixture,
+            RemoteQueryTarget::Repository(fixture.graph.clone()),
+            operation,
+            10,
+            None,
+        );
+        request.body.budget.max_depth = NonZeroU32::new(1).unwrap();
+
+        let response = fixture.query.query(&authorization, &request).unwrap();
+
+        assert_eq!(response.body.page.explored_depth, 1);
+        assert_eq!(
+            response.body.page.truncation,
+            Some(RemoteTruncationReason::Depth)
+        );
+    }
+}
+
+#[test]
 fn memory_context_returns_only_authorized_sanitized_manifest_content() {
     let fixture = fixture();
     let authorization = auth(
@@ -1041,7 +1085,7 @@ fn memory_context_traversal_honors_relationship_direction() {
         memory: Some(memory),
     };
     let traverse = |seed: &MemoryEntityId, direction| {
-        let (units, _) = context_units(
+        let (units, _, _) = context_units(
             &loaded,
             &[RemoteContextSeed::MemoryEntity(seed.clone())],
             direction,
@@ -1198,7 +1242,7 @@ fn federated_context_rejects_repository_links_for_another_snapshot() {
         graph: Some(graph),
         memory: Some(memory),
     };
-    let (units, _) = context_units(
+    let (units, _, _) = context_units(
         &loaded,
         &[RemoteContextSeed::MemoryEntity(source.id)],
         EdgeDirection::Outgoing,
@@ -1352,7 +1396,7 @@ fn adjacency_and_materialization_observe_an_expired_deadline() {
     let graph = store.graph_snapshot(&fixture.graph).unwrap().unwrap();
     let memory = store.memory_revision(&fixture.memory).unwrap().unwrap();
 
-    let (graph_units, graph_depth) = graph_neighborhood(
+    let (graph_units, graph_depth, graph_depth_limited) = graph_neighborhood(
         &graph,
         &[fixture.graph_node],
         EdgeDirection::Both,
@@ -1363,8 +1407,9 @@ fn adjacency_and_materialization_observe_an_expired_deadline() {
     );
     assert!(graph_units.is_empty());
     assert_eq!(graph_depth, 0);
+    assert!(!graph_depth_limited);
 
-    let (memory_units, memory_depth) = memory_context_units(
+    let (memory_units, memory_depth, memory_depth_limited) = memory_context_units(
         &memory,
         &[RemoteContextSeed::MemoryEntity(
             memory.entities[0].id.clone(),
@@ -1378,6 +1423,7 @@ fn adjacency_and_materialization_observe_an_expired_deadline() {
     );
     assert!(memory_units.is_empty());
     assert_eq!(memory_depth, 0);
+    assert!(!memory_depth_limited);
 }
 
 #[test]

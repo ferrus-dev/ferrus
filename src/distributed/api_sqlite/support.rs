@@ -329,11 +329,11 @@ pub(super) fn graph_neighborhood(
     max_depth: u32,
     started: Instant,
     duration: Duration,
-) -> (Vec<GraphUnit>, u32) {
+) -> (Vec<GraphUnit>, u32, bool) {
     let mut nodes = BTreeMap::new();
     for node in &graph.nodes {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         nodes.insert(node.id.clone(), node);
     }
@@ -342,7 +342,7 @@ pub(super) fn graph_neighborhood(
     let mut frontier = roots.iter().cloned().collect::<BTreeSet<_>>();
     for id in &frontier {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         if nodes.contains_key(id) {
             selected_nodes.insert(id.clone());
@@ -353,7 +353,7 @@ pub(super) fn graph_neighborhood(
         let mut next = BTreeSet::new();
         for edge in &graph.edges {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if !edge_kinds.is_empty() && !edge_kinds.iter().any(|kind| kind == &edge.kind) {
                 continue;
@@ -379,7 +379,7 @@ pub(super) fn graph_neighborhood(
         let mut filtered = BTreeSet::new();
         for id in next {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if !selected_nodes.contains(&id) && nodes.contains_key(&id) {
                 selected_nodes.insert(id.clone());
@@ -389,10 +389,11 @@ pub(super) fn graph_neighborhood(
         frontier = filtered;
         explored += 1;
     }
+    let depth_limited = !frontier.is_empty() && explored >= max_depth;
     let mut units = Vec::with_capacity(selected_nodes.len() + selected_edges.len());
     for id in selected_nodes {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if let Some(node) = nodes.get(&id) {
             units.push(GraphUnit::Node((*node).clone()));
@@ -400,13 +401,13 @@ pub(super) fn graph_neighborhood(
     }
     for edge in &graph.edges {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if selected_edges.contains(&edge.id) {
             units.push(GraphUnit::Edge(edge.clone()));
         }
     }
-    (units, explored)
+    (units, explored, depth_limited)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -421,7 +422,7 @@ pub(super) fn context_units(
     max_depth: u32,
     started: Instant,
     duration: Duration,
-) -> (Vec<ContextUnit>, u32) {
+) -> (Vec<ContextUnit>, u32, bool) {
     if let (Some(graph), Some(memory)) = (&loaded.graph, &loaded.memory) {
         return federated_context_units(
             graph,
@@ -439,22 +440,23 @@ pub(super) fn context_units(
     }
     let mut units = Vec::new();
     let mut explored = 0;
+    let mut depth_limited = false;
     if let Some(graph) = &loaded.graph {
         let roots = graph_seed_ids(graph, seeds, started, duration);
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         let mut nodes = Vec::with_capacity(graph.nodes.len());
         for node in &graph.nodes {
             if started.elapsed() >= duration {
-                return (Vec::new(), 0);
+                return (Vec::new(), 0, false);
             }
             nodes.push(node.clone());
         }
         let mut edges = Vec::new();
         for edge in &graph.edges {
             if started.elapsed() >= duration {
-                return (Vec::new(), 0);
+                return (Vec::new(), 0, false);
             }
             let included = match &edge.target {
                 EdgeTarget::Node(_) => true,
@@ -471,7 +473,7 @@ pub(super) fn context_units(
             edges,
             diagnostics: Vec::new(),
         };
-        let (graph_units, depth) = graph_neighborhood(
+        let (graph_units, depth, graph_depth_limited) = graph_neighborhood(
             &filtered,
             &roots,
             direction,
@@ -481,13 +483,14 @@ pub(super) fn context_units(
             duration,
         );
         explored = explored.max(depth);
+        depth_limited |= graph_depth_limited;
         units.extend(graph_units.into_iter().map(|unit| match unit {
             GraphUnit::Node(node) => ContextUnit::GraphNode(node),
             GraphUnit::Edge(edge) => ContextUnit::GraphEdge(edge),
         }));
     }
     if let Some(memory) = &loaded.memory {
-        let (memory_units, depth) = memory_context_units(
+        let (memory_units, depth, memory_depth_limited) = memory_context_units(
             memory,
             seeds,
             direction,
@@ -498,9 +501,10 @@ pub(super) fn context_units(
             duration,
         );
         explored = explored.max(depth);
+        depth_limited |= memory_depth_limited;
         units.extend(memory_units);
     }
-    (units, explored)
+    (units, explored, depth_limited)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -522,22 +526,22 @@ fn federated_context_units(
     max_depth: u32,
     started: Instant,
     duration: Duration,
-) -> (Vec<ContextUnit>, u32) {
+) -> (Vec<ContextUnit>, u32, bool) {
     let graph_roots = graph_seed_ids(graph, seeds, started, duration);
     if started.elapsed() >= duration {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, false);
     }
     let mut graph_nodes = BTreeMap::new();
     for node in &graph.nodes {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         graph_nodes.insert(node.id.clone(), node);
     }
     let mut memory_entities = BTreeMap::new();
     for entity in &memory.entities {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         memory_entities.insert(entity.id.clone(), entity);
     }
@@ -561,7 +565,7 @@ fn federated_context_units(
         let mut next = BTreeSet::new();
         for edge in &graph.edges {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if !graph_edge_kinds.is_empty()
                 && !graph_edge_kinds.iter().any(|kind| kind == &edge.kind)
@@ -592,7 +596,7 @@ fn federated_context_units(
 
         for relationship in &memory.relationships {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if relationship.provenance.resolution != MemoryResolutionState::Resolved
                 && !include_unresolved
@@ -606,7 +610,7 @@ fn federated_context_units(
             }
             let targets = federated_relationship_targets(graph, relationship, started, duration);
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             let outgoing = frontier.contains(&FederatedNode::Memory(relationship.source.clone()))
                 && matches!(direction, EdgeDirection::Outgoing | EdgeDirection::Both);
@@ -626,7 +630,7 @@ fn federated_context_units(
         let mut filtered = BTreeSet::new();
         for node in next {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             let exists = match &node {
                 FederatedNode::Graph(id) => graph_nodes.contains_key(id),
@@ -640,11 +644,12 @@ fn federated_context_units(
         frontier = filtered;
         explored += 1;
     }
+    let depth_limited = !frontier.is_empty() && explored >= max_depth;
 
     let mut units = Vec::new();
     for node in &selected {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if let FederatedNode::Graph(id) = node
             && let Some(node) = graph_nodes.get(id)
@@ -654,7 +659,7 @@ fn federated_context_units(
     }
     for edge in &graph.edges {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if selected_graph_edges.contains(&edge.id) {
             units.push(ContextUnit::GraphEdge(edge.clone()));
@@ -662,7 +667,7 @@ fn federated_context_units(
     }
     for node in &selected {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if let FederatedNode::Memory(id) = node
             && let Some(entity) = memory_entities.get(id)
@@ -672,13 +677,13 @@ fn federated_context_units(
     }
     for relationship in &memory.relationships {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if selected_memory_relationships.contains(&relationship.id) {
             units.push(ContextUnit::MemoryRelationship(relationship.clone()));
         }
     }
-    (units, explored)
+    (units, explored, depth_limited)
 }
 
 fn federated_relationship_targets(
@@ -809,18 +814,18 @@ pub(super) fn memory_context_units(
     max_depth: u32,
     started: Instant,
     duration: Duration,
-) -> (Vec<ContextUnit>, u32) {
+) -> (Vec<ContextUnit>, u32, bool) {
     let mut entities = BTreeMap::new();
     for entity in &memory.entities {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         entities.insert(entity.id.clone(), entity);
     }
     let mut selected = BTreeSet::new();
     for seed in seeds {
         if started.elapsed() >= duration {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, false);
         }
         if let RemoteContextSeed::MemoryEntity(id) = seed
             && entities.contains_key(id)
@@ -835,7 +840,7 @@ pub(super) fn memory_context_units(
         let mut next = BTreeSet::new();
         for relationship in &memory.relationships {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if relationship.provenance.resolution != MemoryResolutionState::Resolved
                 && !include_unresolved
@@ -866,7 +871,7 @@ pub(super) fn memory_context_units(
         let mut filtered = BTreeSet::new();
         for id in next {
             if started.elapsed() >= duration {
-                return (Vec::new(), explored);
+                return (Vec::new(), explored, false);
             }
             if !selected.contains(&id) && entities.contains_key(&id) {
                 selected.insert(id.clone());
@@ -876,10 +881,11 @@ pub(super) fn memory_context_units(
         frontier = filtered;
         explored += 1;
     }
+    let depth_limited = !frontier.is_empty() && explored >= max_depth;
     let mut units = Vec::with_capacity(selected.len() + relationships.len());
     for id in selected {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if let Some(entity) = entities.get(&id) {
             units.push(ContextUnit::MemoryEntity((*entity).clone()));
@@ -887,13 +893,13 @@ pub(super) fn memory_context_units(
     }
     for relationship in &memory.relationships {
         if started.elapsed() >= duration {
-            return (Vec::new(), explored);
+            return (Vec::new(), explored, false);
         }
         if relationships.contains(&relationship.id) {
             units.push(ContextUnit::MemoryRelationship(relationship.clone()));
         }
     }
-    (units, explored)
+    (units, explored, depth_limited)
 }
 
 pub(super) fn bounded_diagnostics(loaded: &LoadedTarget, max: u32) -> Vec<RemoteQueryDiagnostic> {

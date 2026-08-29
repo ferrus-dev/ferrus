@@ -1,6 +1,6 @@
 //! Vendor-neutral persistence boundary for unpublished worker fact batches.
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,7 @@ pub struct FactStoreProtection {
 pub enum PutFactBatchOutcome {
     Stored,
     Reused,
+    DeadlineExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub trait FactBatchStore {
         &mut self,
         batch: &FactBatch,
         authority: &FactBatchWriteAuthority,
+        deadline: Instant,
     ) -> Result<PutFactBatchOutcome, Self::Error>;
     fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error>;
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error>;

@@ -3,6 +3,7 @@ use std::{
     fs,
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -51,6 +52,10 @@ fn fact_authority() -> FactBatchWriteAuthority {
         worker_id: WorkerId::new("maintenance-test-worker").unwrap(),
         lease_generation: NonZeroU64::new(1).unwrap(),
     }
+}
+
+fn fact_write_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(60)
 }
 
 struct Fixture {
@@ -408,10 +413,18 @@ fn fixture() -> Fixture {
             SqliteFactBatchStore::open_uncoordinated_for_test(&fact_path, KEY, fact_quota(), true)
                 .unwrap();
         facts
-            .put(&batch(&graph_job_a, "a"), &fact_authority())
+            .put(
+                &batch(&graph_job_a, "a"),
+                &fact_authority(),
+                fact_write_deadline(),
+            )
             .unwrap();
         facts
-            .put(&batch(&graph_job_b, "b"), &fact_authority())
+            .put(
+                &batch(&graph_job_b, "b"),
+                &fact_authority(),
+                fact_write_deadline(),
+            )
             .unwrap();
     }
     let maintenance =
@@ -564,6 +577,7 @@ fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
         facts.put(
             &batch(&fixture.graph_job_a, "after-deletion"),
             &fact_authority(),
+            fact_write_deadline(),
         ),
         Err(FactStoreError::ProjectDeleted)
     ));

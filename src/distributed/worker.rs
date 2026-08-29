@@ -341,6 +341,10 @@ impl StatelessIndexWorker {
             worker_id: request.worker_id.clone(),
             lease_generation: request.lease_generation,
         };
+        let write_deadline = deadline
+            .started
+            .checked_add(Duration::from_millis(deadline.limit_ms))
+            .ok_or(WorkerError::DeadlineExceeded)?;
         let last = payloads.len().saturating_sub(1);
         for (index, payload) in payloads.into_iter().enumerate() {
             self.check_deadline(deadline)?;
@@ -369,12 +373,15 @@ impl StatelessIndexWorker {
                 return Err(WorkerError::OutputLimitExceeded);
             }
             let put = facts
-                .put(&batch, &write_authority)
+                .put(&batch, &write_authority, write_deadline)
                 .map_err(|_| WorkerError::FactStore)?;
             self.check_deadline(deadline)?;
             match put {
                 PutFactBatchOutcome::Stored => stored_batches += 1,
                 PutFactBatchOutcome::Reused => reused_batches += 1,
+                PutFactBatchOutcome::DeadlineExceeded => {
+                    return Err(WorkerError::DeadlineExceeded);
+                }
             }
         }
         let progress = facts
