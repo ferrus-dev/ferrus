@@ -186,6 +186,14 @@ impl crate::distributed::object_store::TenantObjectStore for BoundedReadTracker<
         unreachable!("workers never write source objects")
     }
 
+    fn put_verified_batch(
+        &mut self,
+        _project: &RemoteProjectRef,
+        _objects: &[crate::distributed::object_store::VerifiedObject<'_>],
+    ) -> Result<Vec<crate::distributed::object_store::PutObjectResult>, Self::Error> {
+        unreachable!("workers never write source objects")
+    }
+
     fn read_verified(
         &self,
         _object: &crate::distributed::identity::TenantObjectRef,

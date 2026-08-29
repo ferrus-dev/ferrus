@@ -34,10 +34,10 @@ pub const REMOTE_REPOSITORY_SOURCE_POLICY_VERSION: u32 = 1;
 use super::{
     DISTRIBUTED_SOURCE_MANIFEST_VERSION,
     identity::{
-        MemoryManifestId, MemoryManifestRef, RemoteProjectRef, RemoteRepositoryRef,
+        MemoryManifestId, MemoryManifestRef, ObjectId, RemoteProjectRef, RemoteRepositoryRef,
         RepositoryManifestId, RepositoryManifestRef, TenantObjectRef,
     },
-    object_store::{ObjectStoreProtection, TenantObjectStore},
+    object_store::{ObjectStoreProtection, TenantObjectStore, VerifiedObject},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,12 +328,11 @@ where
 
     let mut summary = diagnostic_summary(local);
     let mut files = Vec::with_capacity(local.files.len());
+    let mut staged_objects = Vec::with_capacity(local.files.len().saturating_add(1));
     for file in &local.files {
         let content = source.read_verified(file).map_err(PackagingError::Source)?;
         verify_descriptor(file, &content.bytes)?;
-        let stored = store
-            .put_verified(&repository.project, &file.content_identity, &content.bytes)
-            .map_err(PackagingError::Store)?;
+        let object = tenant_object_ref(&repository.project, &file.content_identity)?;
         account_put(&mut summary, file.byte_len);
         files.push(RepositorySourceObject {
             path: file.path.clone(),
@@ -341,8 +340,9 @@ where
             byte_len: file.byte_len,
             file_mode: file.file_mode,
             file_role: repository_file_role(&file.path),
-            object: stored.object,
+            object,
         });
+        staged_objects.push((file.content_identity.clone(), content.bytes));
     }
     if !source.revalidate().map_err(PackagingError::Source)? {
         return Err(PackagingError::ContentIdentityMismatch);
@@ -364,22 +364,30 @@ where
         return Err(PackagingError::ByteLimitExceeded);
     }
     let manifest_digest = sha256(&manifest_bytes);
-    let manifest_object = store
-        .put_verified(&repository.project, &manifest_digest, &manifest_bytes)
-        .map_err(PackagingError::Store)?
-        .object;
+    let manifest_object = tenant_object_ref(&repository.project, &manifest_digest)?;
     let reference = RepositoryManifestRef {
         repository,
         repository_identity: local.revision.repository.clone(),
         manifest_id: RepositoryManifestId::new(manifest_digest.value())
             .map_err(|_| PackagingError::InvalidManifest)?,
-        manifest_digest,
+        manifest_digest: manifest_digest.clone(),
         source_policy_digest: policy.source_policy_digest,
         expected_snapshot_id,
         manifest_object,
     };
     let manifest = RepositorySourceManifest { reference, body };
     manifest.validate()?;
+    staged_objects.push((manifest_digest, manifest_bytes));
+    let batch = staged_objects
+        .iter()
+        .map(|(content_identity, content)| VerifiedObject {
+            content_identity,
+            content,
+        })
+        .collect::<Vec<_>>();
+    store
+        .put_verified_batch(&manifest.reference.repository.project, &batch)
+        .map_err(PackagingError::Store)?;
     Ok(manifest)
 }
 
@@ -418,6 +426,7 @@ where
 
     let mut summary = PackagingSummary::default();
     let mut sources = Vec::with_capacity(local.sources.len());
+    let mut staged_objects = Vec::with_capacity(local.sources.len().saturating_add(1));
     for descriptor in &local.sources {
         let source_policy = policy
             .category(descriptor.category)
@@ -435,9 +444,7 @@ where
             return Err(PackagingError::ByteLimitExceeded);
         }
         let content_identity = sha256(&sanitized);
-        let stored = store
-            .put_verified(&project, &content_identity, &sanitized)
-            .map_err(PackagingError::Store)?;
+        let object = tenant_object_ref(&project, &content_identity)?;
         account_put(&mut summary, sanitized_len);
         sources.push(MemorySourceObject {
             category: descriptor.category,
@@ -446,8 +453,9 @@ where
             sanitized_byte_len: sanitized_len,
             sensitivity: source_policy.sensitivity,
             content_access: source_policy.content_access,
-            object: stored.object,
+            object,
         });
+        staged_objects.push((content_identity, sanitized));
     }
     source.revalidate(&local).map_err(PackagingError::Source)?;
 
@@ -475,16 +483,13 @@ where
         return Err(PackagingError::ByteLimitExceeded);
     }
     let manifest_digest = sha256(&manifest_bytes);
-    let manifest_object = store
-        .put_verified(&project, &manifest_digest, &manifest_bytes)
-        .map_err(PackagingError::Store)?
-        .object;
+    let manifest_object = tenant_object_ref(&project, &manifest_digest)?;
     let reference = MemoryManifestRef {
         project,
         project_identity: body.project_identity.clone(),
         manifest_id: MemoryManifestId::new(manifest_digest.value())
             .map_err(|_| PackagingError::InvalidManifest)?,
-        manifest_digest,
+        manifest_digest: manifest_digest.clone(),
         memory_policy_digest: local.policy_digest,
         expected_revision_id,
         manifest_object,
@@ -492,7 +497,30 @@ where
     };
     let manifest = MemorySourceManifest { reference, body };
     manifest.validate()?;
+    staged_objects.push((manifest_digest, manifest_bytes));
+    let batch = staged_objects
+        .iter()
+        .map(|(content_identity, content)| VerifiedObject {
+            content_identity,
+            content,
+        })
+        .collect::<Vec<_>>();
+    store
+        .put_verified_batch(&manifest.reference.project, &batch)
+        .map_err(PackagingError::Store)?;
     Ok(manifest)
+}
+
+fn tenant_object_ref<S, E>(
+    project: &RemoteProjectRef,
+    content_identity: &Digest,
+) -> Result<TenantObjectRef, PackagingError<S, E>> {
+    Ok(TenantObjectRef {
+        project: project.clone(),
+        object_id: ObjectId::new(content_identity.value())
+            .map_err(|_| PackagingError::InvalidManifest)?,
+        content_identity: content_identity.clone(),
+    })
 }
 
 fn require_protection<S, E>(protection: ObjectStoreProtection) -> Result<(), PackagingError<S, E>> {
@@ -650,7 +678,7 @@ mod tests {
             identity::{
                 ObjectId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId, TenantId,
             },
-            object_store::{EncryptedFilesystemObjectStore, ObjectStoreQuota},
+            object_store::{EncryptedFilesystemObjectStore, ObjectStoreError, ObjectStoreQuota},
         },
         project_memory::{
             domain::{
@@ -976,6 +1004,60 @@ mod tests {
         assert!(matches!(
             forged.validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(),
             Err(PackagingError::InvalidManifest)
+        ));
+    }
+
+    #[test]
+    fn failed_memory_packaging_does_not_persist_staged_source_objects() {
+        let content = b"# Example\n\n- [x] #5.0 Done\n\nID: rg5.0\n".to_vec();
+        let parsed = parse_spec_memory(std::str::from_utf8(&content).unwrap());
+        let policy = MemoryPolicy::default();
+        let descriptor = AuthorizedSourceDescriptor {
+            project: local_project(),
+            category: MemorySourceCategory::SpecificationStructure,
+            locator: MemorySourceLocator::TrackedFile {
+                path: RepoPath::new("docs/specs/example.md").unwrap(),
+            },
+            fingerprint: memory_canonical_digest(&parsed.structure),
+            byte_len: content.len() as u64,
+        };
+        let sanitized =
+            sanitize_memory_source::<anyhow::Error, ObjectStoreError>(&descriptor, &content)
+                .unwrap();
+        let content_identity = sha256(&sanitized);
+        let mut manifest = AuthorizedSourceManifest {
+            project: local_project(),
+            policy_digest: policy.digest(),
+            source_set_digest: sha256(b"placeholder"),
+            extractor_set_digest: sha256(b"extractors"),
+            sources: vec![descriptor],
+        };
+        manifest.source_set_digest = manifest.computed_source_set_digest().unwrap();
+        let source = FakeMemorySource { manifest, content };
+        let object_dir = tempfile::tempdir().unwrap();
+        let mut object_store = store(object_dir.path());
+        let project = remote_project("tenant-a");
+        let result = package_memory_source(
+            &source,
+            project.clone(),
+            &policy,
+            PackagingLimits {
+                max_objects: NonZeroU64::new(100).unwrap(),
+                max_total_bytes: NonZeroU64::new(sanitized.len() as u64).unwrap(),
+                max_diagnostics: NonZeroU64::new(100).unwrap(),
+            },
+            &mut object_store,
+        );
+
+        assert!(matches!(result, Err(PackagingError::ByteLimitExceeded)));
+        let object = TenantObjectRef {
+            project,
+            object_id: ObjectId::new(content_identity.value()).unwrap(),
+            content_identity,
+        };
+        assert!(matches!(
+            object_store.read_verified(&object),
+            Err(ObjectStoreError::ObjectUnavailable)
         ));
     }
 

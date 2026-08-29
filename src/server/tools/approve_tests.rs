@@ -89,6 +89,30 @@ async fn canonical_approval_lock_replaces_dead_owner() {
 }
 
 #[tokio::test]
+async fn canonical_approval_lock_replaces_reused_live_pid_without_inode_lock() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    tokio::fs::write(
+        &lock_path,
+        format!("pid={}\ntask_id=t-old\n", std::process::id()),
+    )
+    .await
+    .unwrap();
+
+    let lock = tokio::time::timeout(
+        Duration::from_secs(2),
+        acquire_canonical_approval_lock_at(&lock_path, "t-007"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+    assert!(contents.contains("task_id=t-007"));
+    drop(lock);
+}
+
+#[tokio::test]
 async fn canonical_approval_lock_replaces_malformed_owner() {
     let dir = TempDir::new().unwrap();
     let lock_path = dir.path().join("canonical-approval.lock");

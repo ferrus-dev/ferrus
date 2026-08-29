@@ -348,6 +348,7 @@ async fn write_integration_error(context: &RuntimeTaskContext, reason: &str) -> 
 
 struct CanonicalApprovalLock {
     path: PathBuf,
+    _file: std::fs::File,
 }
 
 struct CanonicalApprovalLockGuard {
@@ -451,9 +452,30 @@ async fn try_create_canonical_approval_lock(
 
     match std::fs::hard_link(&temp_path, lock_path) {
         Ok(()) => {
+            let owner_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .and_then(|file| {
+                    file.lock_exclusive()?;
+                    Ok(file)
+                }) {
+                Ok(file) => file,
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let _ = tokio::fs::remove_file(lock_path).await;
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to hold canonical approval lock {}",
+                            lock_path.display()
+                        )
+                    });
+                }
+            };
             let _ = tokio::fs::remove_file(&temp_path).await;
             Ok(Some(CanonicalApprovalLock {
                 path: lock_path.to_path_buf(),
+                _file: owner_file,
             }))
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -487,36 +509,35 @@ fn canonical_approval_lock_temp_path(lock_path: &Path, task_id: &str) -> PathBuf
 }
 
 async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> {
-    let contents = match tokio::fs::read_to_string(lock_path).await {
-        Ok(contents) => contents,
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "Failed to read canonical approval lock {}",
+                    "Failed to open canonical approval lock {}",
                     lock_path.display()
                 )
             });
         }
     };
-
-    let Some(pid) = canonical_approval_lock_pid(&contents) else {
-        match tokio::fs::remove_file(lock_path).await {
-            Ok(()) => return Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to remove malformed canonical approval lock {}",
-                        lock_path.display()
-                    )
-                });
-            }
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect canonical approval lock {}",
+                    lock_path.display()
+                )
+            });
         }
-    };
-    if crate::platform::pid_is_alive(pid) {
-        return Ok(false);
     }
+    drop(file);
 
     match tokio::fs::remove_file(lock_path).await {
         Ok(()) => Ok(true),
@@ -530,6 +551,7 @@ async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> 
     }
 }
 
+#[cfg(test)]
 fn canonical_approval_lock_pid(contents: &str) -> Option<u32> {
     contents.lines().find_map(|line| {
         line.strip_prefix("pid=")

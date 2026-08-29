@@ -1,6 +1,7 @@
 //! Tenant-scoped immutable source-object storage.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     num::NonZeroU64,
@@ -99,6 +100,12 @@ pub struct PutObjectResult {
     pub outcome: PutObjectOutcome,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedObject<'a> {
+    pub content_identity: &'a Digest,
+    pub content: &'a [u8],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundedObjectRead {
     Content(Vec<u8>),
@@ -116,6 +123,13 @@ pub trait TenantObjectStore {
         content_identity: &Digest,
         content: &[u8],
     ) -> Result<PutObjectResult, Self::Error>;
+    /// Persists a complete package atomically. Either every unique object is
+    /// available after this call or none of the newly stored objects are.
+    fn put_verified_batch(
+        &mut self,
+        project: &RemoteProjectRef,
+        objects: &[VerifiedObject<'_>],
+    ) -> Result<Vec<PutObjectResult>, Self::Error>;
     fn read_verified(&self, object: &TenantObjectRef) -> Result<Vec<u8>, Self::Error>;
     fn read_verified_bounded(
         &self,
@@ -497,6 +511,164 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         })
     }
 
+    fn put_verified_batch(
+        &mut self,
+        project: &RemoteProjectRef,
+        objects: &[VerifiedObject<'_>],
+    ) -> Result<Vec<PutObjectResult>, Self::Error> {
+        if !self.protection.authenticated_transport || !self.protection.encrypted_at_rest {
+            return Err(ObjectStoreError::InsecureProtection);
+        }
+
+        struct StagedObject<'a> {
+            object: TenantObjectRef,
+            content: &'a [u8],
+            byte_len: u64,
+            path: PathBuf,
+        }
+
+        let mut staged = Vec::<StagedObject<'_>>::new();
+        let mut requested = Vec::with_capacity(objects.len());
+        for input in objects {
+            verify_digest(input.content_identity, input.content)?;
+            let byte_len = u64::try_from(input.content.len()).unwrap_or(u64::MAX);
+            if byte_len > self.quota.max_object_bytes.get() {
+                return Err(ObjectStoreError::ObjectQuotaExceeded);
+            }
+            let object = TenantObjectRef {
+                project: project.clone(),
+                object_id: ObjectId::new(input.content_identity.value())
+                    .map_err(|_| ObjectStoreError::ContentIdentityMismatch)?,
+                content_identity: input.content_identity.clone(),
+            };
+            requested.push(object.clone());
+            if let Some(existing) = staged
+                .iter()
+                .find(|existing| existing.object.object_id == object.object_id)
+            {
+                if existing.object.content_identity != object.content_identity
+                    || existing.content != input.content
+                {
+                    return Err(ObjectStoreError::IntegrityFailure);
+                }
+                continue;
+            }
+            staged.push(StagedObject {
+                path: self.object_path(&object),
+                object,
+                content: input.content,
+                byte_len,
+            });
+        }
+
+        let transaction = self
+            .database
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if project_has_deletion_tombstone(&transaction, project)? {
+            return Err(ObjectStoreError::ProjectDeleted);
+        }
+
+        let mut outcomes = BTreeMap::new();
+        let mut pending = Vec::new();
+        for (index, item) in staged.iter().enumerate() {
+            let existing = transaction
+                .query_row(
+                    "SELECT byte_len FROM source_objects
+                     WHERE tenant_id = ?1 AND project_id = ?2 AND object_id = ?3",
+                    params![
+                        project.tenant_id.as_str(),
+                        project.project_id.as_str(),
+                        item.object.object_id.as_str()
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(stored_len) = existing {
+                if stored_len < 0 || stored_len as u64 != item.byte_len {
+                    return Err(ObjectStoreError::IntegrityFailure);
+                }
+                if Self::decrypt_file(&self.key, &item.object, &item.path)? != item.content {
+                    return Err(ObjectStoreError::IntegrityFailure);
+                }
+                outcomes.insert(
+                    item.object.object_id.as_str().to_string(),
+                    PutObjectOutcome::Reused,
+                );
+            } else {
+                pending.push(index);
+            }
+        }
+
+        let (stored_objects, stored_bytes): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM source_objects
+             WHERE tenant_id = ?1 AND project_id = ?2",
+            params![project.tenant_id.as_str(), project.project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let stored_objects =
+            u64::try_from(stored_objects).map_err(|_| ObjectStoreError::IntegrityFailure)?;
+        let stored_bytes =
+            u64::try_from(stored_bytes).map_err(|_| ObjectStoreError::IntegrityFailure)?;
+        let pending_objects = u64::try_from(pending.len()).unwrap_or(u64::MAX);
+        let pending_bytes = pending.iter().try_fold(0u64, |total, index| {
+            total.checked_add(staged[*index].byte_len)
+        });
+        let Some(pending_bytes) = pending_bytes else {
+            return Err(ObjectStoreError::ProjectByteQuotaExceeded);
+        };
+        if stored_objects.saturating_add(pending_objects) > self.quota.max_objects_per_project.get()
+        {
+            return Err(ObjectStoreError::ProjectObjectQuotaExceeded);
+        }
+        if stored_bytes.saturating_add(pending_bytes) > self.quota.max_bytes_per_project.get() {
+            return Err(ObjectStoreError::ProjectByteQuotaExceeded);
+        }
+
+        let mut created_paths = Vec::new();
+        let result = (|| {
+            for index in pending {
+                let item = &staged[index];
+                let path_existed = item.path.exists();
+                Self::write_encrypted(&self.key, &item.object, &item.path, item.content)?;
+                if !path_existed {
+                    created_paths.push(item.path.clone());
+                }
+                transaction.execute(
+                    "INSERT INTO source_objects (
+                        tenant_id, project_id, object_id, digest_algorithm, digest_value, byte_len
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        project.tenant_id.as_str(),
+                        project.project_id.as_str(),
+                        item.object.object_id.as_str(),
+                        item.object.content_identity.algorithm(),
+                        item.object.content_identity.value(),
+                        i64::try_from(item.byte_len)
+                            .map_err(|_| ObjectStoreError::ObjectQuotaExceeded)?
+                    ],
+                )?;
+                outcomes.insert(
+                    item.object.object_id.as_str().to_string(),
+                    PutObjectOutcome::Stored,
+                );
+            }
+            transaction.commit()?;
+            Ok(requested
+                .into_iter()
+                .map(|object| PutObjectResult {
+                    outcome: outcomes[object.object_id.as_str()],
+                    object,
+                })
+                .collect())
+        })();
+        if result.is_err() {
+            for path in created_paths {
+                let _ = fs::remove_file(path);
+            }
+        }
+        result
+    }
+
     fn read_verified(&self, object: &TenantObjectRef) -> Result<Vec<u8>, Self::Error> {
         if !self.contains(object)? {
             return Err(ObjectStoreError::ObjectUnavailable);
@@ -717,6 +889,50 @@ mod tests {
                 .windows(content.len())
                 .any(|window| window == content)
         );
+    }
+
+    #[test]
+    fn verified_batch_rejects_quota_without_persisting_a_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = EncryptedFilesystemObjectStore::open(
+            directory.path(),
+            [7; 32],
+            ObjectStoreQuota {
+                max_objects_per_project: NonZeroU64::new(1).unwrap(),
+                max_bytes_per_project: NonZeroU64::new(1024).unwrap(),
+                max_object_bytes: NonZeroU64::new(512).unwrap(),
+            },
+            true,
+        )
+        .unwrap();
+        let first = b"first package object";
+        let second = b"second package object";
+        let first_digest = digest(first);
+        let second_digest = digest(second);
+
+        let result = store.put_verified_batch(
+            &project("tenant-a"),
+            &[
+                VerifiedObject {
+                    content_identity: &first_digest,
+                    content: first,
+                },
+                VerifiedObject {
+                    content_identity: &second_digest,
+                    content: second,
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(ObjectStoreError::ProjectObjectQuotaExceeded)
+        ));
+        let stored: i64 = store
+            .database
+            .query_row("SELECT COUNT(*) FROM source_objects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 0);
     }
 
     #[test]
