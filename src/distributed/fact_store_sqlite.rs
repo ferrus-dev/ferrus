@@ -297,17 +297,39 @@ impl SqliteFactBatchStore {
         &mut self,
         batch: &FactBatch,
         authority: &FactBatchWriteAuthority,
+        deadline: Instant,
     ) -> Result<PutFactBatchOutcome, FactStoreError> {
         if !self.protection.authenticated_transport || !self.protection.encrypted_at_rest {
             return Err(FactStoreError::InsecureProtection);
         }
-        batch.validate().map_err(|_| FactStoreError::InvalidBatch)?;
-        let encoded = serde_json::to_vec(batch).map_err(|_| FactStoreError::Serialization)?;
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
+        let validation = batch.validate();
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
+        validation.map_err(|_| FactStoreError::InvalidBatch)?;
+        let encoded = serde_json::to_vec(batch);
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
+        let encoded = encoded.map_err(|_| FactStoreError::Serialization)?;
         let byte_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
         if byte_len > self.quota.max_batch_bytes.get() {
             return Err(FactStoreError::BatchQuotaExceeded);
         }
-        let (nonce, ciphertext) = Self::encrypt(&self.key, batch, &encoded)?;
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
+        let encrypted = Self::encrypt(&self.key, batch, &encoded);
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
+        let (nonce, ciphertext) = encrypted?;
+        if Instant::now() >= deadline {
+            return Ok(PutFactBatchOutcome::DeadlineExceeded);
+        }
 
         let transaction = self
             .database
@@ -496,7 +518,7 @@ impl FactBatchStore for SqliteFactBatchStore {
             let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
             return Err(error.into());
         }
-        let result = self.put_inner(batch, authority);
+        let result = self.put_inner(batch, authority, deadline);
         let timed_out = Instant::now() >= deadline || sqlite_timed_out(&result);
         let _ = self.database.progress_handler(0, None::<fn() -> bool>);
         let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
@@ -952,6 +974,32 @@ mod tests {
         assert_eq!(outcome, PutFactBatchOutcome::DeadlineExceeded);
         assert!(started.elapsed() < Duration::from_secs(1));
         blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            store
+                .load_for_ingestion(&batch.header.job)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pre_sqlite_batch_processing_stops_at_the_worker_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            directory.path().join("facts.db"),
+            [58; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
+        let mut batch = batch("tenant-a", 0, true);
+        batch.header.protocol_version = 0;
+
+        let outcome = store
+            .put_inner(&batch, &authority(), Instant::now())
+            .unwrap();
+
+        assert_eq!(outcome, PutFactBatchOutcome::DeadlineExceeded);
         assert!(
             store
                 .load_for_ingestion(&batch.header.job)
