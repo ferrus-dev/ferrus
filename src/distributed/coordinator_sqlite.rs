@@ -526,6 +526,10 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = load_record(&transaction, &request.job)?.ok_or(CoordinatorError::NotFound)?;
+        if record.state == IndexJobState::Cancelled {
+            transaction.commit()?;
+            return Ok(record);
+        }
         if request
             .expected_state
             .is_some_and(|expected| expected != record.state)

@@ -17,6 +17,7 @@ use crate::repository_graph::{
         ContextData, ContextRequest, ContextResponse, ContextSeed, ContextSelectionKind,
         ContextSelectionReason, ContextSnippet, EdgeDirection, PageRequest, QueryError,
         QueryErrorCode, QueryScope, SearchRequest, SearchResponse, StatusRequest, StatusResponse,
+        TruncationReason,
     },
 };
 
@@ -48,6 +49,42 @@ const CURSOR_VERSION: u32 = 1;
 
 fn candidate_cap_truncated(desired: usize, backend_has_more: bool) -> bool {
     desired == MAX_FEDERATION_CANDIDATES && backend_has_more
+}
+
+fn repository_truncation_reason(reason: TruncationReason) -> MemoryTruncationReason {
+    match reason {
+        TruncationReason::Results => MemoryTruncationReason::Results,
+        TruncationReason::Bytes => MemoryTruncationReason::Bytes,
+        TruncationReason::Depth => MemoryTruncationReason::Depth,
+        TruncationReason::Duration => MemoryTruncationReason::Duration,
+        TruncationReason::Capability => MemoryTruncationReason::Capability,
+    }
+}
+
+fn truncation_priority(reason: MemoryTruncationReason) -> u8 {
+    match reason {
+        MemoryTruncationReason::Duration => 5,
+        MemoryTruncationReason::Bytes => 4,
+        MemoryTruncationReason::Results => 3,
+        MemoryTruncationReason::Depth => 2,
+        MemoryTruncationReason::Capability => 1,
+    }
+}
+
+fn stronger_truncation(
+    left: Option<MemoryTruncationReason>,
+    right: Option<MemoryTruncationReason>,
+) -> Option<MemoryTruncationReason> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            Some(if truncation_priority(left) >= truncation_priority(right) {
+                left
+            } else {
+                right
+            })
+        }
+        (left, right) => left.or(right),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -850,12 +887,38 @@ where
         let mut candidates = items.into_iter().skip(offset).peekable();
         let mut returned = Vec::new();
         let mut returned_bytes = 0_u64;
+        let backend_has_more = repository_responses
+            .iter()
+            .any(|(response, _)| response.page.next_cursor.is_some())
+            || memory_responses
+                .iter()
+                .any(|(response, _)| response.page.next_cursor.is_some());
+        let candidate_cap_truncated = candidate_cap_truncated(desired, backend_has_more);
+        let domain_truncation = repository_responses
+            .iter()
+            .filter_map(|(response, _)| {
+                response
+                    .page
+                    .truncation
+                    .as_ref()
+                    .map(|truncation| repository_truncation_reason(truncation.reason))
+            })
+            .chain(memory_responses.iter().filter_map(|(response, _)| {
+                response
+                    .page
+                    .truncation
+                    .as_ref()
+                    .map(|truncation| truncation.reason)
+            }))
+            .fold(None, |current, reason| {
+                stronger_truncation(current, Some(reason))
+            });
         let mut reason = if link_duration_exceeded {
             Some(MemoryTruncationReason::Duration)
-        } else if link_results_truncated {
+        } else if link_results_truncated || candidate_cap_truncated {
             Some(MemoryTruncationReason::Results)
         } else {
-            None
+            domain_truncation
         };
         for item in candidates.by_ref() {
             if returned.len() >= budget.max_results {

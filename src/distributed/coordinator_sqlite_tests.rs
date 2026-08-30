@@ -364,19 +364,16 @@ fn cancellation_revokes_the_lease_and_prevents_publication() {
         .claim(&claim_request("tenant-a", "worker-a"), now())
         .unwrap()
         .unwrap();
-    let cancelled = coordinator
-        .cancel(
-            &CancelIndexJobRequest {
-                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                request_id: RequestId::new("cancel").unwrap(),
-                job: leased.job.clone(),
-                expected_state: Some(IndexJobState::Leased),
-            },
-            now(),
-        )
-        .unwrap();
+    let request = CancelIndexJobRequest {
+        protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+        request_id: RequestId::new("cancel").unwrap(),
+        job: leased.job.clone(),
+        expected_state: Some(IndexJobState::Leased),
+    };
+    let cancelled = coordinator.cancel(&request, now()).unwrap();
     assert_eq!(cancelled.state, IndexJobState::Cancelled);
     assert!(cancelled.cancellation_requested);
+    assert_eq!(coordinator.cancel(&request, now()).unwrap(), cancelled);
     assert!(matches!(
         coordinator.start(&advance(&leased), now()),
         Err(CoordinatorError::LeaseLost)

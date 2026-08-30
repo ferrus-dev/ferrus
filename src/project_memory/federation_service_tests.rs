@@ -243,7 +243,7 @@ fn cursor_is_bound_to_both_domain_revisions() {
 }
 
 #[test]
-fn search_candidate_cap_is_reported_as_result_truncation() {
+fn federation_candidate_cap_is_reported_as_result_truncation() {
     assert!(candidate_cap_truncated(MAX_FEDERATION_CANDIDATES, true));
     assert!(!candidate_cap_truncated(MAX_FEDERATION_CANDIDATES, false));
     assert!(!candidate_cap_truncated(
@@ -471,6 +471,14 @@ fn combined_context_charges_cross_domain_links_against_depth() {
             .iter()
             .any(|reason| reason.kind == ContextSelectionKind::ExactSeed)
     }));
+    assert_eq!(
+        response
+            .page
+            .truncation
+            .as_ref()
+            .map(|truncation| truncation.reason),
+        Some(MemoryTruncationReason::Depth)
+    );
 
     let paged = service.context(request(1)).unwrap();
     assert_eq!(
