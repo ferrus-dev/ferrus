@@ -23,6 +23,12 @@ pub enum PutFactBatchOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactBatchProgressOutcome {
+    Available(FactBatchProgress),
+    DeadlineExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactBatchWriteAuthority {
     pub worker_id: WorkerId,
     pub lease_generation: NonZeroU64,
@@ -58,7 +64,11 @@ pub trait FactBatchStore {
         authority: &FactBatchWriteAuthority,
         deadline: Instant,
     ) -> Result<PutFactBatchOutcome, Self::Error>;
-    fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error>;
+    fn progress(
+        &self,
+        job: &IndexJobRef,
+        deadline: Instant,
+    ) -> Result<FactBatchProgressOutcome, Self::Error>;
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error>;
 }
 

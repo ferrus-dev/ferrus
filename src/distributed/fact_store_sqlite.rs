@@ -19,7 +19,7 @@ use thiserror::Error;
 use super::{
     coordinator_sqlite::COORDINATOR_SCHEMA_VERSION,
     fact_store::{
-        FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
+        FactBatchProgressOutcome, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
         PutFactBatchOutcome, progress_from_headers,
     },
     protocol::{FactBatch, IndexJobKind, IndexJobRef},
@@ -31,7 +31,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_PROGRESS_OPS: i32 = 100;
 type EncryptedBatchRow = (String, Vec<u8>, Vec<u8>);
 
-fn sqlite_write_timed_out(result: &Result<PutFactBatchOutcome, FactStoreError>) -> bool {
+fn sqlite_timed_out<T>(result: &Result<T, FactStoreError>) -> bool {
     matches!(
         result,
         Err(FactStoreError::Database(SqliteError::SqliteFailure(failure, _)))
@@ -251,6 +251,45 @@ impl SqliteFactBatchStore {
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    fn progress_inner(
+        &self,
+        job: &IndexJobRef,
+        deadline: Instant,
+    ) -> Result<FactBatchProgressOutcome, FactStoreError> {
+        let mut statement = self.database.prepare(
+            "SELECT batch_id, nonce, ciphertext FROM unpublished_fact_batches
+             WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3 AND job_kind = ?4
+             ORDER BY shard_id, sequence",
+        )?;
+        let mut rows = statement.query(params![
+            job.project.tenant_id.as_str(),
+            job.project.project_id.as_str(),
+            job.job_id.as_str(),
+            job_kind(job.kind)
+        ])?;
+        let mut headers = Vec::new();
+        while let Some(row) = rows.next()? {
+            if Instant::now() >= deadline {
+                return Ok(FactBatchProgressOutcome::DeadlineExceeded);
+            }
+            let batch_id = row.get::<_, String>(0)?;
+            let nonce = row.get::<_, Vec<u8>>(1)?;
+            let ciphertext = row.get::<_, Vec<u8>>(2)?;
+            if Instant::now() >= deadline {
+                return Ok(FactBatchProgressOutcome::DeadlineExceeded);
+            }
+            let batch = self.decrypt(job, &batch_id, &nonce, &ciphertext)?;
+            if Instant::now() >= deadline {
+                return Ok(FactBatchProgressOutcome::DeadlineExceeded);
+            }
+            headers.push(batch.header);
+        }
+        Ok(FactBatchProgressOutcome::Available(progress_from_headers(
+            job.clone(),
+            headers,
+        )))
+    }
 }
 
 impl SqliteFactBatchStore {
@@ -458,7 +497,7 @@ impl FactBatchStore for SqliteFactBatchStore {
             return Err(error.into());
         }
         let result = self.put_inner(batch, authority);
-        let timed_out = Instant::now() >= deadline || sqlite_write_timed_out(&result);
+        let timed_out = Instant::now() >= deadline || sqlite_timed_out(&result);
         let _ = self.database.progress_handler(0, None::<fn() -> bool>);
         let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
         if timed_out {
@@ -468,12 +507,31 @@ impl FactBatchStore for SqliteFactBatchStore {
         }
     }
 
-    fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error> {
-        let batches = self.load_for_ingestion(job)?;
-        Ok(progress_from_headers(
-            job.clone(),
-            batches.into_iter().map(|batch| batch.header),
-        ))
+    fn progress(
+        &self,
+        job: &IndexJobRef,
+        deadline: Instant,
+    ) -> Result<FactBatchProgressOutcome, Self::Error> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(FactBatchProgressOutcome::DeadlineExceeded);
+        };
+        self.database.busy_timeout(remaining)?;
+        if let Err(error) = self.database.progress_handler(
+            SQLITE_PROGRESS_OPS,
+            Some(move || Instant::now() >= deadline),
+        ) {
+            let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
+            return Err(error.into());
+        }
+        let result = self.progress_inner(job, deadline);
+        let timed_out = Instant::now() >= deadline || sqlite_timed_out(&result);
+        let _ = self.database.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.database.busy_timeout(SQLITE_BUSY_TIMEOUT);
+        if timed_out {
+            Ok(FactBatchProgressOutcome::DeadlineExceeded)
+        } else {
+            result
+        }
     }
 
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error> {
@@ -660,7 +718,12 @@ mod tests {
                     .unwrap(),
                 PutFactBatchOutcome::Reused
             );
-            let progress = store.progress(&expected.header.job).unwrap();
+            let FactBatchProgressOutcome::Available(progress) = store
+                .progress(&expected.header.job, write_deadline())
+                .unwrap()
+            else {
+                panic!("progress read should complete before its deadline");
+            };
             assert!(progress.final_batch_seen);
             assert_eq!(progress.batches.len(), 1);
         }
@@ -895,6 +958,50 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn fact_batch_progress_stops_at_the_worker_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("facts.db");
+        let mut store = SqliteFactBatchStore::open_uncoordinated_for_test(
+            &database_path,
+            [59; 32],
+            quota(),
+            true,
+        )
+        .unwrap();
+        let batch = batch("tenant-a", 0, true);
+        store.put(&batch, &authority(), write_deadline()).unwrap();
+        store
+            .database
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let blocker = Connection::open(&database_path).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN EXCLUSIVE;
+                 UPDATE unpublished_fact_batches SET byte_len = byte_len;",
+            )
+            .unwrap();
+        let started = Instant::now();
+
+        let outcome = store
+            .progress(&batch.header.job, started + Duration::from_millis(25))
+            .unwrap();
+
+        assert_eq!(outcome, FactBatchProgressOutcome::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(matches!(
+            store
+                .progress(&batch.header.job, write_deadline())
+                .unwrap(),
+            FactBatchProgressOutcome::Available(progress)
+                if progress.final_batch_seen && progress.batches.len() == 1
+        ));
     }
 
     #[test]

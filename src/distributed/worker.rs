@@ -44,7 +44,10 @@ use crate::{
 use super::{
     DISTRIBUTED_CONTROL_PROTOCOL_VERSION, DISTRIBUTED_WORKER_PROTOCOL_VERSION,
     coordinator::{BoundedJobInspection, IndexJobCoordinator},
-    fact_store::{FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, PutFactBatchOutcome},
+    fact_store::{
+        FactBatchProgress, FactBatchProgressOutcome, FactBatchStore, FactBatchWriteAuthority,
+        PutFactBatchOutcome,
+    },
     identity::{
         FactShardId, IndexJobFailureCode, RemoteGraphSnapshotRef, RemoteMemoryRevisionRef,
         RequestId, TenantObjectRef, WorkerId,
@@ -384,10 +387,15 @@ impl StatelessIndexWorker {
                 }
             }
         }
-        let progress = facts
-            .progress(&request.job.job)
-            .map_err(|_| WorkerError::FactStore)?;
-        self.check_deadline(deadline)?;
+        let progress = match facts
+            .progress(&request.job.job, write_deadline)
+            .map_err(|_| WorkerError::FactStore)?
+        {
+            FactBatchProgressOutcome::Available(progress) => progress,
+            FactBatchProgressOutcome::DeadlineExceeded => {
+                return Err(WorkerError::DeadlineExceeded);
+            }
+        };
         if !progress_is_complete(&progress) {
             return Err(WorkerError::FactStore);
         }

@@ -12,7 +12,7 @@ use crate::{
         coordinator::{AdvanceIndexJobRequest, ClaimIndexJobRequest},
         coordinator_sqlite::{CoordinatorLimits, SqliteIndexJobCoordinator},
         fact_store::{
-            FactBatchProgress, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
+            FactBatchProgressOutcome, FactBatchStore, FactBatchWriteAuthority, FactStoreProtection,
             PutFactBatchOutcome,
         },
         fact_store_sqlite::{FactStoreQuota, SqliteFactBatchStore},
@@ -282,14 +282,17 @@ impl FactBatchStore for DelayedFactStore {
         Ok(outcome)
     }
 
-    fn progress(&self, job: &IndexJobRef) -> Result<FactBatchProgress, Self::Error> {
-        let progress = self.inner.progress(job)?;
+    fn progress(
+        &self,
+        job: &IndexJobRef,
+        deadline: Instant,
+    ) -> Result<FactBatchProgressOutcome, Self::Error> {
         let calls = self.progress_calls.get().saturating_add(1);
         self.progress_calls.set(calls);
         if self.delay_progress && calls == 1 {
             std::thread::sleep(self.delay);
         }
-        Ok(progress)
+        self.inner.progress(job, deadline)
     }
 
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error> {
