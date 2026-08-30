@@ -116,6 +116,13 @@ impl IndexInputRef {
         }
     }
 
+    fn repository_origin_snapshots(&self) -> &[RemoteGraphSnapshotRef] {
+        match self {
+            Self::Repository(_) => &[],
+            Self::Memory(manifest) => &manifest.repository_origin_snapshots,
+        }
+    }
+
     fn repository_identity(&self) -> Option<&crate::repository_graph::domain::RepositoryRef> {
         match self {
             Self::Repository(manifest) => Some(&manifest.repository_identity),
@@ -166,6 +173,7 @@ struct IdempotencyMaterial<'a> {
     policy_digest: &'a Digest,
     expected_target_identity: &'a str,
     repository_snapshot: Option<&'a RemoteGraphSnapshotRef>,
+    repository_origin_snapshots: &'a [RemoteGraphSnapshotRef],
     repository_identity: Option<&'a crate::repository_graph::domain::RepositoryRef>,
     project_identity: Option<&'a crate::project_memory::domain::ProjectRef>,
     semantics: &'a IndexSemantics,
@@ -222,6 +230,7 @@ fn idempotency_key(
             policy_digest: input.policy_digest(),
             expected_target_identity: input.expected_target_identity(),
             repository_snapshot: input.repository_snapshot(),
+            repository_origin_snapshots: input.repository_origin_snapshots(),
             repository_identity: input.repository_identity(),
             project_identity: input.project_identity(),
             semantics,

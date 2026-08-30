@@ -326,6 +326,7 @@ fn memory_manifest(objects: &mut EncryptedFilesystemObjectStore) -> MemorySource
             expected_revision_id,
             manifest_object,
             repository_snapshot: None,
+            repository_origin_snapshots: Vec::new(),
         },
         body,
     };

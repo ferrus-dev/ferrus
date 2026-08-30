@@ -20,7 +20,10 @@ use crate::{
             MemoryRevision,
         },
         extractors::{built_in_extractor_set_digest, built_in_extractors},
-        links::{SnapshotLinkResolutionError, resolve_repository_links_for_snapshot},
+        links::{
+            RepositoryLinkSnapshot, RepositoryLinkSnapshotSet, SnapshotLinkResolutionError,
+            resolve_repository_links_for_snapshot,
+        },
         ports::{MemoryExtractionContext, MemoryExtractionInput},
     },
     repository_graph::{
@@ -198,6 +201,12 @@ struct RepositoryExtractorSelection {
     resolver_enabled: bool,
 }
 
+#[derive(Clone, Copy)]
+struct MemoryRepositorySnapshots<'a> {
+    current: Option<&'a StoredRemoteGraphSnapshot>,
+    origins: &'a [StoredRemoteGraphSnapshot],
+}
+
 impl StatelessIndexWorker {
     pub fn new(limits: WorkerLimits) -> Self {
         Self { limits }
@@ -215,19 +224,20 @@ impl StatelessIndexWorker {
         O: TenantObjectStore,
         F: FactBatchStore,
     {
-        self.execute_with_repository_snapshot(request, coordinator, objects, facts, None)
+        self.execute_with_repository_snapshots(request, coordinator, objects, facts, None, &[])
     }
 
-    /// Execute a job with its optional immutable repository-link input. A
-    /// memory job that pins a repository snapshot fails closed unless the
-    /// caller supplies the exact stored snapshot selected by the job.
-    pub fn execute_with_repository_snapshot<C, O, F>(
+    /// Execute a memory job with the exact current and task/run origin graph
+    /// snapshots named by its immutable job input. A pinned job fails closed
+    /// unless the caller supplies the complete selected snapshot set.
+    pub fn execute_with_repository_snapshots<C, O, F>(
         &self,
         request: &ExecuteIndexJobRequest,
         coordinator: &C,
         objects: &O,
         facts: &mut F,
         repository_snapshot: Option<&StoredRemoteGraphSnapshot>,
+        repository_origin_snapshots: &[StoredRemoteGraphSnapshot],
     ) -> Result<WorkerExecutionOutcome, WorkerError>
     where
         C: IndexJobCoordinator,
@@ -306,7 +316,10 @@ impl StatelessIndexWorker {
                     coordinator,
                     objects,
                     &manifest,
-                    repository_snapshot,
+                    MemoryRepositorySnapshots {
+                        current: repository_snapshot,
+                        origins: repository_origin_snapshots,
+                    },
                     deadline,
                 )?;
                 (
@@ -715,7 +728,7 @@ impl StatelessIndexWorker {
         coordinator: &C,
         objects: &O,
         remote: &MemorySourceManifest,
-        repository_snapshot: Option<&StoredRemoteGraphSnapshot>,
+        repository_snapshots: MemoryRepositorySnapshots<'_>,
         deadline: WorkerDeadline,
     ) -> Result<MemoryExtractionOutput, WorkerError>
     where
@@ -848,18 +861,46 @@ impl StatelessIndexWorker {
             }
         }
         self.check_deadline(deadline)?;
+        let mut supplied_origin_refs = repository_snapshots
+            .origins
+            .iter()
+            .map(|snapshot| snapshot.record.snapshot.clone())
+            .collect::<Vec<_>>();
+        supplied_origin_refs.sort();
+        if supplied_origin_refs != remote.reference.repository_origin_snapshots {
+            return Err(WorkerError::InvalidInput);
+        }
         let repository_links = match (
             remote.reference.repository_snapshot.as_ref(),
-            repository_snapshot,
+            repository_snapshots.current,
         ) {
             (None, None) => None,
             (Some(expected), Some(snapshot)) if &snapshot.record.snapshot == expected => {
+                if repository_snapshots.origins.iter().any(|origin| {
+                    origin.record.snapshot.repository != expected.repository
+                        || origin.record.repository_identity != snapshot.record.repository_identity
+                }) {
+                    return Err(WorkerError::InvalidInput);
+                }
+                let origin_snapshots = repository_snapshots
+                    .origins
+                    .iter()
+                    .map(|origin| RepositoryLinkSnapshot {
+                        snapshot_id: &origin.record.snapshot.snapshot_id,
+                        nodes: &origin.nodes,
+                    })
+                    .collect::<Vec<_>>();
                 let commit = resolve_repository_links_for_snapshot(
                     &revision,
                     &entities.values().cloned().collect::<Vec<_>>(),
-                    &snapshot.record.repository_identity,
-                    &expected.snapshot_id,
-                    &snapshot.nodes,
+                    RepositoryLinkSnapshotSet {
+                        repository: &snapshot.record.repository_identity,
+                        current: RepositoryLinkSnapshot {
+                            snapshot_id: &expected.snapshot_id,
+                            nodes: &snapshot.nodes,
+                        },
+                        origins: &origin_snapshots,
+                    },
                     request.job.created_at,
                     || self.check_deadline(deadline).is_err(),
                 )

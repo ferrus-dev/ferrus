@@ -144,6 +144,7 @@ fn memory_input(tenant: &str) -> IndexInputRef {
             content_identity: digest("11"),
         },
         repository_snapshot: None,
+        repository_origin_snapshots: Vec::new(),
     })
 }
 
@@ -197,6 +198,33 @@ fn idempotency_is_deterministic_kind_specific_and_tenant_scoped() {
     assert_ne!(first.idempotency_key, memory.idempotency_key);
     assert_ne!(first.idempotency_key, changed_target.idempotency_key);
     assert!(first.validate().is_ok());
+}
+
+#[test]
+fn memory_origin_snapshots_are_part_of_job_idempotency() {
+    let mut first_input = memory_input("tenant-a");
+    let IndexInputRef::Memory(first_manifest) = &mut first_input else {
+        unreachable!("memory input helper always returns a memory manifest");
+    };
+    first_manifest.repository_snapshot = Some(RemoteGraphSnapshotRef {
+        repository: repository("tenant-a"),
+        snapshot_id: SnapshotId::new("current").unwrap(),
+    });
+    first_manifest.repository_origin_snapshots = vec![RemoteGraphSnapshotRef {
+        repository: repository("tenant-a"),
+        snapshot_id: SnapshotId::new("baseline-a").unwrap(),
+    }];
+    let mut second_input = first_input.clone();
+    let IndexInputRef::Memory(second_manifest) = &mut second_input else {
+        unreachable!("memory input helper always returns a memory manifest");
+    };
+    second_manifest.repository_origin_snapshots[0].snapshot_id =
+        SnapshotId::new("baseline-b").unwrap();
+
+    let first = IndexJobSpec::new(IndexJobKind::ProjectMemory, first_input, semantics()).unwrap();
+    let second = IndexJobSpec::new(IndexJobKind::ProjectMemory, second_input, semantics()).unwrap();
+
+    assert_ne!(first.idempotency_key, second.idempotency_key);
 }
 
 #[test]

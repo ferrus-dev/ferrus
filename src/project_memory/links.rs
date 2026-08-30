@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::repository_graph::{
     domain::{
-        GraphNode, NodeId, PublishedViewName, RepoPath, RepositoryId, RepositoryNamespace,
+        Digest, GraphNode, NodeId, PublishedViewName, RepoPath, RepositoryId, RepositoryNamespace,
         RepositoryRef, SemanticKey, SnapshotId,
     },
     sqlite::{OpenQuerySidecarResult, SIDECAR_FILE_NAME, Sidecar, open_for_query_at},
@@ -19,8 +19,8 @@ use super::{
     diagnostics::{MemoryDiagnostic, MemoryDiagnosticCode, MemoryDiagnosticSeverity},
     domain::{
         MemoryBuildId, MemoryConfidence, MemoryEntity, MemoryEntityData, MemoryEntityId,
-        MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance, MemoryRelationship,
-        MemoryRelationshipId, MemoryRelationshipKind, MemoryRelationshipTarget,
+        MemoryEvidenceLocator, MemoryExtractorIdentity, MemoryIndexTimestamps, MemoryProvenance,
+        MemoryRelationship, MemoryRelationshipId, MemoryRelationshipKind, MemoryRelationshipTarget,
         MemoryRepositoryLinkCommit, MemoryRepositoryLinkSet, MemoryRepositoryLinkSetId,
         MemoryResolutionState, MemoryRevision, MemorySourceLocator, ProjectRef,
     },
@@ -45,19 +45,33 @@ pub(crate) enum SnapshotLinkResolutionError {
     DeadlineExceeded,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RepositoryLinkSnapshot<'a> {
+    pub snapshot_id: &'a SnapshotId,
+    pub nodes: &'a [GraphNode],
+}
+
+pub(crate) struct RepositoryLinkSnapshotSet<'a> {
+    pub repository: &'a RepositoryRef,
+    pub current: RepositoryLinkSnapshot<'a>,
+    pub origins: &'a [RepositoryLinkSnapshot<'a>],
+}
+
 /// Resolve the portable subset of repository evidence against one immutable
 /// graph snapshot. Remote workers use this pure boundary without opening a
 /// repository, sidecar, process, or network connection.
 pub(crate) fn resolve_repository_links_for_snapshot(
     revision: &MemoryRevision,
     entities: &[MemoryEntity],
-    repository: &RepositoryRef,
-    snapshot_id: &SnapshotId,
-    nodes: &[GraphNode],
+    snapshots: RepositoryLinkSnapshotSet<'_>,
     indexed_at: DateTime<Utc>,
     mut deadline_expired: impl FnMut() -> bool,
 ) -> std::result::Result<MemoryRepositoryLinkCommit, SnapshotLinkResolutionError> {
     check_snapshot_link_deadline(&mut deadline_expired)?;
+    let repository = snapshots.repository;
+    let snapshot_id = snapshots.current.snapshot_id;
+    let nodes = snapshots.current.nodes;
+    let origin_snapshots = snapshots.origins;
 
     let link_set_id = MemoryRepositoryLinkSetId::new(format!(
         "memory-links:{}",
@@ -67,7 +81,19 @@ pub(crate) fn resolve_repository_links_for_snapshot(
             &revision.id,
             repository,
             &Some(snapshot_id),
-            Vec::<(SnapshotId, bool)>::new(),
+            entities
+                .iter()
+                .flat_map(repository_origin_snapshots)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|origin| {
+                    let available = origin == *snapshot_id
+                        || origin_snapshots
+                            .iter()
+                            .any(|snapshot| snapshot.snapshot_id == &origin);
+                    (origin, available)
+                })
+                .collect::<Vec<_>>(),
             resolver_identity(),
         ))
         .value()
@@ -82,6 +108,33 @@ pub(crate) fn resolve_repository_links_for_snapshot(
         resolver: resolver_identity(),
     };
 
+    let mut origin_files = BTreeMap::new();
+    origin_files.insert(
+        snapshot_id.clone(),
+        snapshot_files_from_nodes(snapshot_id, nodes, &mut deadline_expired)?,
+    );
+    for snapshot in origin_snapshots {
+        check_snapshot_link_deadline(&mut deadline_expired)?;
+        let files =
+            snapshot_files_from_nodes(snapshot.snapshot_id, snapshot.nodes, &mut deadline_expired)?;
+        if origin_files
+            .insert(snapshot.snapshot_id.clone(), files)
+            .is_some()
+        {
+            return Err(SnapshotLinkResolutionError::InvalidSnapshot);
+        }
+    }
+
+    let milestones = entities
+        .iter()
+        .filter_map(|entity| match &entity.data {
+            MemoryEntityData::Milestone { milestone_id, .. } => {
+                Some((milestone_id.clone(), entity.id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut diagnostics = Vec::new();
     let mut candidates = BTreeMap::new();
     for entity in entities {
         check_snapshot_link_deadline(&mut deadline_expired)?;
@@ -121,6 +174,84 @@ pub(crate) fn resolve_repository_links_for_snapshot(
                 );
             }
         }
+        match &entity.data {
+            MemoryEntityData::TaskReference {
+                task_id,
+                milestone_id,
+                baseline_snapshot_id,
+                repository_snapshot_id,
+                ..
+            } => {
+                let changed = portable_origin_changed_paths(
+                    baseline_snapshot_id.as_ref(),
+                    repository_snapshot_id.as_ref(),
+                    &origin_files,
+                );
+                if baseline_snapshot_id.is_some()
+                    && repository_snapshot_id.is_some()
+                    && changed.is_none()
+                {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &revision.completed_by,
+                        &revision.id,
+                        diagnostic_code("link.taskorigin.unavailable"),
+                        Some(entity.id.clone()),
+                        None,
+                    );
+                }
+                for changed in changed.unwrap_or_default() {
+                    insert_candidate(
+                        &mut candidates,
+                        revision,
+                        entity.id.clone(),
+                        MemoryRelationshipKind::Touches,
+                        ExplicitRepositoryReference::Path(changed.path.clone()),
+                        Some(changed.origin_snapshot_id.clone()),
+                        entity.provenance.clone(),
+                    );
+                    if let Some(milestone_entity) =
+                        milestone_id.as_ref().and_then(|id| milestones.get(id))
+                    {
+                        let mut provenance = entity.provenance.clone();
+                        provenance.evidence = MemoryEvidenceLocator::Record(task_id.clone());
+                        insert_candidate(
+                            &mut candidates,
+                            revision,
+                            milestone_entity.clone(),
+                            MemoryRelationshipKind::Touches,
+                            ExplicitRepositoryReference::Path(changed.path),
+                            Some(changed.origin_snapshot_id),
+                            provenance,
+                        );
+                    }
+                }
+            }
+            MemoryEntityData::RunReference {
+                baseline_snapshot_id,
+                repository_snapshot_id,
+                ..
+            } => {
+                for changed in portable_origin_changed_paths(
+                    baseline_snapshot_id.as_ref(),
+                    repository_snapshot_id.as_ref(),
+                    &origin_files,
+                )
+                .unwrap_or_default()
+                {
+                    insert_candidate(
+                        &mut candidates,
+                        revision,
+                        entity.id.clone(),
+                        MemoryRelationshipKind::Touches,
+                        ExplicitRepositoryReference::Path(changed.path),
+                        Some(changed.origin_snapshot_id),
+                        entity.provenance.clone(),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     let mut paths = BTreeSet::new();
@@ -141,7 +272,6 @@ pub(crate) fn resolve_repository_links_for_snapshot(
         }
     }
 
-    let mut diagnostics = Vec::new();
     if candidates.len() > MAX_REPOSITORY_LINKS {
         push_diagnostic(
             &mut diagnostics,
@@ -243,6 +373,69 @@ fn check_snapshot_link_deadline(
     } else {
         Ok(())
     }
+}
+
+fn snapshot_files_from_nodes(
+    snapshot_id: &SnapshotId,
+    nodes: &[GraphNode],
+    deadline_expired: &mut impl FnMut() -> bool,
+) -> std::result::Result<BTreeMap<RepoPath, Digest>, SnapshotLinkResolutionError> {
+    let mut files = BTreeMap::new();
+    for node in nodes {
+        check_snapshot_link_deadline(deadline_expired)?;
+        if node.snapshot_id != *snapshot_id {
+            return Err(SnapshotLinkResolutionError::InvalidSnapshot);
+        }
+        let Some(evidence) = &node.provenance.evidence else {
+            continue;
+        };
+        if files
+            .insert(evidence.path.clone(), evidence.content_identity.clone())
+            .is_some_and(|existing| existing != evidence.content_identity)
+        {
+            return Err(SnapshotLinkResolutionError::InvalidSnapshot);
+        }
+        if files.len() > MAX_ORIGIN_FILES {
+            return Err(SnapshotLinkResolutionError::InvalidSnapshot);
+        }
+    }
+    Ok(files)
+}
+
+fn portable_origin_changed_paths(
+    baseline: Option<&SnapshotId>,
+    view: Option<&SnapshotId>,
+    snapshots: &BTreeMap<SnapshotId, BTreeMap<RepoPath, Digest>>,
+) -> Option<Vec<ChangedPath>> {
+    let (Some(baseline), Some(view)) = (baseline, view) else {
+        return None;
+    };
+    let (Some(baseline_files), Some(view_files)) = (snapshots.get(baseline), snapshots.get(view))
+    else {
+        return None;
+    };
+    let paths = baseline_files
+        .keys()
+        .chain(view_files.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Some(
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let baseline_identity = baseline_files.get(&path);
+                let view_identity = view_files.get(&path);
+                (baseline_identity != view_identity).then(|| ChangedPath {
+                    origin_snapshot_id: if view_identity.is_some() {
+                        view.clone()
+                    } else {
+                        baseline.clone()
+                    },
+                    path,
+                })
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1074,9 +1267,14 @@ mod tests {
         let result = resolve_repository_links_for_snapshot(
             &revision,
             &[],
-            &repository,
-            &snapshot_id,
-            &[node],
+            RepositoryLinkSnapshotSet {
+                repository: &repository,
+                current: RepositoryLinkSnapshot {
+                    snapshot_id: &snapshot_id,
+                    nodes: &[node],
+                },
+                origins: &[],
+            },
             Utc::now(),
             || {
                 checks.set(checks.get() + 1);

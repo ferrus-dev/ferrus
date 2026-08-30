@@ -199,6 +199,7 @@ fn submit_memory_job(
         expected_revision_id: MemoryRevisionId::new(format!("memory-{suffix}")).unwrap(),
         manifest_object: object.clone(),
         repository_snapshot: None,
+        repository_origin_snapshots: Vec::new(),
     });
     let job = IndexJobSpec::new(
         IndexJobKind::ProjectMemory,

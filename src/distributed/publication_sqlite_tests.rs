@@ -120,6 +120,7 @@ fn input(kind: IndexJobKind, tenant: &str, unique: &str, target: &str) -> IndexI
                 expected_revision_id: MemoryRevisionId::new(target).unwrap(),
                 manifest_object: object,
                 repository_snapshot: None,
+                repository_origin_snapshots: Vec::new(),
             })
         }
     }

@@ -33,7 +33,9 @@ use crate::{
         },
     },
     project_memory::{
-        documents::parse_spec_memory,
+        documents::{
+            RuntimeRunDocument, RuntimeSourceDocument, RuntimeTaskDocument, parse_spec_memory,
+        },
         domain::{
             AuthorizedSourceDescriptor, MemoryRelationshipTarget, MemorySourceCategory,
             MemorySourceLocator, ProjectId, ProjectNamespace, ProjectRef,
@@ -883,7 +885,7 @@ fn repository_worker_applies_one_diagnostic_budget_to_the_whole_job() {
 
 struct FakeMemorySource {
     manifest: AuthorizedSourceManifest,
-    content: Vec<u8>,
+    contents: BTreeMap<MemorySourceCategory, Vec<u8>>,
 }
 
 impl MemorySource for FakeMemorySource {
@@ -899,7 +901,11 @@ impl MemorySource for FakeMemorySource {
     ) -> Result<MemorySourceContent, Self::Error> {
         anyhow::ensure!(self.manifest.sources.contains(source));
         Ok(MemorySourceContent {
-            bytes: self.content.clone(),
+            bytes: self
+                .contents
+                .get(&source.category)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing fake memory source content"))?,
         })
     }
 
@@ -933,7 +939,7 @@ fn memory_worker_extracts_only_sanitized_manifest_objects() {
     local_manifest.source_set_digest = local_manifest.computed_source_set_digest().unwrap();
     let source = FakeMemorySource {
         manifest: local_manifest,
-        content,
+        contents: BTreeMap::from([(MemorySourceCategory::SpecificationStructure, content)]),
     };
     let storage_dir = tempfile::tempdir().unwrap();
     let mut objects = object_store(&storage_dir.path().join("objects"));
@@ -1112,6 +1118,27 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
     let content = b"# Example\n\n## Outcome\n\nDelivered.\n\n### Decisions\n\nUse `path:src/lib.rs` and `symbol:important-type`.\n".to_vec();
     let parsed = parse_spec_memory(std::str::from_utf8(&content).unwrap());
     let policy = MemoryPolicy::default();
+    let baseline_snapshot_id = SnapshotId::new("baseline-snapshot").unwrap();
+    let current_snapshot_id = SnapshotId::new("graph-snapshot").unwrap();
+    let runtime = RuntimeSourceDocument {
+        tasks: vec![RuntimeTaskDocument {
+            id: "task-1".to_string(),
+            milestone_id: None,
+            status: "complete".to_string(),
+            baseline_snapshot_id: Some(baseline_snapshot_id.clone()),
+            repository_snapshot_id: Some(current_snapshot_id.clone()),
+        }],
+        runs: vec![RuntimeRunDocument {
+            id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            status: "completed".to_string(),
+            check_ids: Vec::new(),
+            baseline_snapshot_id: Some(baseline_snapshot_id.clone()),
+            repository_snapshot_id: Some(current_snapshot_id.clone()),
+        }],
+        checks: Vec::new(),
+    };
+    let runtime_content = serde_json::to_vec(&runtime).unwrap();
     let descriptor = AuthorizedSourceDescriptor {
         project: local_project(),
         category: MemorySourceCategory::ApprovedOutcome,
@@ -1121,17 +1148,29 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         fingerprint: memory_digest(parsed.outcome.as_ref().unwrap()),
         byte_len: content.len() as u64,
     };
+    let runtime_descriptor = AuthorizedSourceDescriptor {
+        project: local_project(),
+        category: MemorySourceCategory::RuntimeProvenance,
+        locator: MemorySourceLocator::RuntimeRecords {
+            record_type: crate::project_memory::domain::MemoryStatusToken::new("terminal").unwrap(),
+        },
+        fingerprint: memory_digest(&runtime_content),
+        byte_len: runtime_content.len() as u64,
+    };
     let mut local_manifest = AuthorizedSourceManifest {
         project: local_project(),
         policy_digest: policy.digest(),
         source_set_digest: Digest::new("sha256", "11").unwrap(),
         extractor_set_digest: built_in_extractor_set_digest(),
-        sources: vec![descriptor],
+        sources: vec![descriptor, runtime_descriptor],
     };
     local_manifest.source_set_digest = local_manifest.computed_source_set_digest().unwrap();
     let source = FakeMemorySource {
         manifest: local_manifest,
-        content,
+        contents: BTreeMap::from([
+            (MemorySourceCategory::ApprovedOutcome, content),
+            (MemorySourceCategory::RuntimeProvenance, runtime_content),
+        ]),
     };
     let storage_dir = tempfile::tempdir().unwrap();
     let mut objects = object_store(&storage_dir.path().join("objects"));
@@ -1145,9 +1184,14 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
     .unwrap();
     let graph_ref = RemoteGraphSnapshotRef {
         repository: remote_repository(),
-        snapshot_id: SnapshotId::new("graph-snapshot").unwrap(),
+        snapshot_id: current_snapshot_id.clone(),
+    };
+    let baseline_ref = RemoteGraphSnapshotRef {
+        repository: remote_repository(),
+        snapshot_id: baseline_snapshot_id.clone(),
     };
     manifest.reference.repository_snapshot = Some(graph_ref.clone());
+    manifest.reference.repository_origin_snapshots = vec![baseline_ref.clone()];
     let graph = StoredRemoteGraphSnapshot {
         record: RemoteGraphSnapshotRecord {
             snapshot: graph_ref.clone(),
@@ -1191,6 +1235,19 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         edges: Vec::new(),
         diagnostics: Vec::new(),
     };
+    let mut baseline_graph = graph.clone();
+    baseline_graph.record.snapshot = baseline_ref;
+    baseline_graph.record.job.job_id =
+        crate::distributed::identity::IndexJobId::new("baseline-graph-job").unwrap();
+    baseline_graph.record.build_id = BuildId::new("baseline-graph-build").unwrap();
+    baseline_graph.nodes[0].snapshot_id = baseline_snapshot_id;
+    baseline_graph.nodes[0].id = NodeId::new("baseline-node").unwrap();
+    baseline_graph.nodes[0]
+        .provenance
+        .evidence
+        .as_mut()
+        .unwrap()
+        .content_identity = Digest::new("sha256", "43").unwrap();
     let mut jobs = coordinator(&storage_dir.path().join("jobs.db"));
     let running = running_job(
         &mut jobs,
@@ -1203,10 +1260,30 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         },
     );
     let request = execution_request(running);
+    let mut missing_origin_facts =
+        fact_store(&storage_dir.path().join("missing-origin-linked-facts.db"));
+    assert_eq!(
+        StatelessIndexWorker::new(worker_limits()).execute_with_repository_snapshots(
+            &request,
+            &jobs,
+            &objects,
+            &mut missing_origin_facts,
+            Some(&graph),
+            &[],
+        ),
+        Err(WorkerError::InvalidInput)
+    );
     let mut facts = fact_store(&storage_dir.path().join("linked-facts.db"));
 
     StatelessIndexWorker::new(worker_limits())
-        .execute_with_repository_snapshot(&request, &jobs, &objects, &mut facts, Some(&graph))
+        .execute_with_repository_snapshots(
+            &request,
+            &jobs,
+            &objects,
+            &mut facts,
+            Some(&graph),
+            &[baseline_graph],
+        )
         .unwrap();
 
     let batches = facts.load_for_ingestion(&request.job.job).unwrap();
@@ -1244,4 +1321,24 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         } if snapshot_id == &graph_ref.snapshot_id && node_id.as_str() == "important-node"
             && semantic_key.as_ref().is_some_and(|key| key.as_str() == "important-type")
     )));
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| {
+                relationship.kind == crate::project_memory::domain::MemoryRelationshipKind::Touches
+                    && relationship.provenance.source_category
+                        == MemorySourceCategory::RuntimeProvenance
+                    && matches!(
+                        &relationship.target,
+                        MemoryRelationshipTarget::RepositoryPath {
+                            path,
+                            snapshot_id: Some(snapshot_id),
+                            ..
+                        } if path.as_str() == "src/lib.rs"
+                            && snapshot_id == &current_snapshot_id
+                    )
+            })
+            .count(),
+        2
+    );
 }

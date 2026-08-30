@@ -166,10 +166,29 @@ pub struct MemoryManifestRef {
     /// revision identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_snapshot: Option<RemoteGraphSnapshotRef>,
+    /// Immutable task/run origin snapshots used only to derive changed-path
+    /// repository evidence. They are excluded from the semantic memory
+    /// revision identity but included in the distributed job identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_origin_snapshots: Vec<RemoteGraphSnapshotRef>,
 }
 
 impl MemoryManifestRef {
     pub fn validate(&self) -> Result<(), RemoteIdentityError> {
+        let origins_are_canonical = self
+            .repository_origin_snapshots
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+        let origins_match_repository = self.repository_snapshot.as_ref().map_or_else(
+            || self.repository_origin_snapshots.is_empty(),
+            |current| {
+                self.repository_origin_snapshots.iter().all(|snapshot| {
+                    snapshot.repository.project == self.project
+                        && current.repository == snapshot.repository
+                        && current != snapshot
+                })
+            },
+        );
         if self.manifest_object.project != self.project
             || self.manifest_object.content_identity != self.manifest_digest
             || self.manifest_object.object_id.as_str() != self.manifest_digest.value()
@@ -177,6 +196,8 @@ impl MemoryManifestRef {
                 .repository_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.repository.project != self.project)
+            || !origins_are_canonical
+            || !origins_match_repository
         {
             return Err(RemoteIdentityError::ManifestObjectMismatch);
         }

@@ -227,6 +227,11 @@ impl MemorySourceManifest {
                                 && source.content_access == policy.content_access
                         })
             })
+            || !self
+                .body
+                .sources
+                .windows(2)
+                .all(|pair| memory_source_identity(&pair[0]) < memory_source_identity(&pair[1]))
             || self.body.summary.included_objects != self.body.sources.len() as u64
             || self.body.summary.total_bytes
                 != self.body.sources.iter().fold(0u64, |total, source| {
@@ -457,6 +462,7 @@ where
         });
         staged_objects.push((content_identity, sanitized));
     }
+    sources.sort_by_cached_key(memory_source_identity);
     source.revalidate(&local).map_err(PackagingError::Source)?;
 
     let expected_revision_id = local
@@ -494,6 +500,7 @@ where
         expected_revision_id,
         manifest_object,
         repository_snapshot: None,
+        repository_origin_snapshots: Vec::new(),
     };
     let manifest = MemorySourceManifest { reference, body };
     manifest.validate()?;
@@ -509,6 +516,11 @@ where
         .put_verified_batch(&manifest.reference.project, &batch)
         .map_err(PackagingError::Store)?;
     Ok(manifest)
+}
+
+fn memory_source_identity(source: &MemorySourceObject) -> Vec<u8> {
+    serde_json::to_vec(&(source.category, &source.locator, &source.source_fingerprint))
+        .expect("memory source identities are serializable")
 }
 
 fn tenant_object_ref<S, E>(
@@ -1005,6 +1017,71 @@ mod tests {
             forged.validate::<anyhow::Error, crate::distributed::object_store::ObjectStoreError>(),
             Err(PackagingError::InvalidManifest)
         ));
+    }
+
+    #[test]
+    fn memory_packaging_canonicalizes_source_discovery_order() {
+        let content =
+            b"# Example\n\n- [x] #5.0 Done\n\nID: rg5.0\n\n## Outcome\n\nApproved.\n".to_vec();
+        let parsed = parse_spec_memory(std::str::from_utf8(&content).unwrap());
+        let policy = MemoryPolicy::default();
+        let descriptor = |category, fingerprint| AuthorizedSourceDescriptor {
+            project: local_project(),
+            category,
+            locator: MemorySourceLocator::TrackedFile {
+                path: RepoPath::new("docs/specs/example.md").unwrap(),
+            },
+            fingerprint,
+            byte_len: content.len() as u64,
+        };
+        let structure = descriptor(
+            MemorySourceCategory::SpecificationStructure,
+            memory_canonical_digest(&parsed.structure),
+        );
+        let outcome = descriptor(
+            MemorySourceCategory::ApprovedOutcome,
+            memory_canonical_digest(parsed.outcome.as_ref().unwrap()),
+        );
+        let source = |sources| {
+            let mut manifest = AuthorizedSourceManifest {
+                project: local_project(),
+                policy_digest: policy.digest(),
+                source_set_digest: sha256(b"placeholder"),
+                extractor_set_digest: sha256(b"extractors"),
+                sources,
+            };
+            manifest.source_set_digest = manifest.computed_source_set_digest().unwrap();
+            FakeMemorySource {
+                manifest,
+                content: content.clone(),
+            }
+        };
+        let object_dir = tempfile::tempdir().unwrap();
+        let mut object_store = store(object_dir.path());
+
+        let first = package_memory_source(
+            &source(vec![structure.clone(), outcome.clone()]),
+            remote_project("tenant-a"),
+            &policy,
+            limits(),
+            &mut object_store,
+        )
+        .unwrap();
+        let reordered = package_memory_source(
+            &source(vec![outcome, structure]),
+            remote_project("tenant-a"),
+            &policy,
+            limits(),
+            &mut object_store,
+        )
+        .unwrap();
+
+        assert_eq!(first, reordered);
+        assert!(
+            first.body.sources.windows(2).all(|pair| {
+                memory_source_identity(&pair[0]) < memory_source_identity(&pair[1])
+            })
+        );
     }
 
     #[test]
