@@ -131,7 +131,7 @@ deletable.
 
 ## Milestones
 
-- [ ] #5.0 Define distributed identities, protocols, consistency, tenancy, and threat model
+- [x] #5.0 Define distributed identities, protocols, consistency, tenancy, and threat model
 
 ID: rg5.0
 Depends on: none
@@ -139,7 +139,11 @@ Depends on: none
 Specify versioned control/query/fact contracts, tenant and repository identity, idempotency, job state machine,
 publication consistency, authorization matrix, data classification, retention, deletion, and worker threat model.
 
-- [ ] #5.1 Implement privacy-filtered repository and memory packaging and source storage
+Implemented by the vendor-neutral contracts under `src/distributed/` and the normative consistency, tenancy,
+data-lifecycle, and threat-model decisions in `docs/distributed-indexing-architecture.md`. This milestone adds no
+remote backend, network dependency, cloud SDK, or change to the local SQLite execution path.
+
+- [x] #5.1 Implement privacy-filtered repository and memory packaging and source storage
 
 ID: rg5.1
 Depends on: rg5.0
@@ -147,7 +151,12 @@ Depends on: rg5.0
 Package repository and authorized memory sources as separate manifests after local policy enforcement, upload them
 to tenant-scoped immutable object storage, and verify manifests, encryption, quotas, and idempotent reuse.
 
-- [ ] #5.2 Implement durable idempotent index-job coordination
+Implemented by `src/distributed/source.rs` and `src/distributed/object_store.rs`. Repository packaging accepts only
+locally filtered canonical manifests, project-memory packaging uploads only sanitized Phase 4 categories, and both
+store their immutable manifest body and content objects under tenant/project scope. The durable prototype adapter
+uses authenticated encryption at rest, digest verification, atomic object writes, quotas, and idempotent reuse.
+
+- [x] #5.2 Implement durable idempotent index-job coordination
 
 ID: rg5.2
 Depends on: rg5.0
@@ -155,7 +164,12 @@ Depends on: rg5.0
 Add build submission, idempotency, durable states, leases, heartbeats, bounded attempts, retry, cancellation,
 reclaim, and privacy-safe job inspection through a vendor-neutral coordinator interface.
 
-- [ ] #5.3 Implement stateless graph and memory extraction workers and fact batches
+Implemented by the `IndexJobCoordinator` port in `src/distributed/coordinator.rs` and its separately versioned
+SQLite prototype adapter in `src/distributed/coordinator_sqlite.rs`. Concurrent duplicate submissions converge,
+claims and transitions require renewable generation leases, retry and reclaim respect bounded attempts,
+cancellation revokes publication authority, and inspection exposes typed metadata without free-form diagnostics.
+
+- [x] #5.3 Implement stateless graph and memory extraction workers and fact batches
 
 ID: rg5.3
 Depends on: rg5.1, rg5.2
@@ -164,7 +178,14 @@ Run existing graph and memory extractors in isolated resource-bounded workers, c
 manifest kind, emit idempotent versioned fact batches, persist retry progress, and prohibit repository code
 execution and unrestricted egress.
 
-- [ ] #5.4 Implement remote graph and memory storage with independent publication
+Implemented by the secure-only sandbox and stateless extraction adapter in `src/distributed/worker.rs`, the
+unpublished `FactBatchStore` port, and the encrypted durable SQLite prototype in
+`src/distributed/fact_store_sqlite.rs`. Workers revalidate live lease authority, read only scoped immutable
+objects, reuse the shipped graph and memory extractors, enforce hard input/parser/fact/diagnostic/time/output
+budgets, and deterministically reuse fact batches across retries. The deployment adapter remains responsible for
+applying the declared OS or container CPU, memory, filesystem, credential, and allowlisted-egress controls.
+
+- [x] #5.4 Implement remote graph and memory storage with independent publication
 
 ID: rg5.4
 Depends on: rg5.3
@@ -172,7 +193,15 @@ Depends on: rg5.3
 Ingest graph and memory fact batches into tenant-scoped remote storage, keep partial builds invisible, publish graph
 snapshots and memory revisions through independent compare-and-set pointers, and compose explicit federated refs.
 
-- [ ] #5.5 Expose authenticated control and snapshot-pinned query APIs
+Implemented by the vendor-neutral `RemotePublicationStore` port in
+`src/distributed/publication.rs` and the durable SQLite prototype in
+`src/distributed/publication_sqlite.rs`. The prototype validates a complete fact stream and exact live publication
+lease, stores tenant-scoped immutable graph and memory facts with authenticated encryption, and atomically combines
+immutable ingestion, one domain-specific CAS pointer update, and durable job completion. Graph and memory pointers
+advance independently, stale publishers retain at most an unreferenced immutable result, and federated selection
+returns an explicit pair without introducing another mutable pointer.
+
+- [x] #5.5 Expose authenticated control and snapshot-pinned query APIs
 
 ID: rg5.5
 Depends on: rg5.0, rg5.4
@@ -180,13 +209,39 @@ Depends on: rg5.0, rg5.4
 Provide least-privilege build control and bounded graph/memory query services, query-only agent credentials,
 authorization-before-disclosure, explicit protocol versions, and local behavior that remains opt-in and offline.
 
-- [ ] #5.6 Validate recovery, deletion, observability, tenant isolation, and adapter parity
+Implemented by the vendor-neutral control and query contracts in `src/distributed/api.rs` and the in-process
+SQLite service adapter in `src/distributed/api_sqlite.rs`. The server-owned authorization context is not part of
+the request body, every operation is authorized before validation or storage lookup, and query-agent credentials
+cannot submit, inspect, cancel, or publish builds. Query budgets are clamped independently by the service, SQLite
+reads are deadline-interruptible, pagination cursors bind the immutable target and effective query shape, and
+oversized first results fail terminally instead of reissuing a non-advancing cursor. A `latest` selector is resolved
+once to an immutable graph snapshot, memory revision, or explicit federated pair and that target is returned in the
+response. Opt-in snippets are read only through the completed build's immutable source manifest and are verified
+against the manifest descriptor and encrypted object digest before disclosure. The prototype remains
+transport-neutral: a future HTTP or RPC adapter must authenticate the caller and construct `AuthorizationContext`;
+RG5.5 does not start a listener, initialize a cloud client, or change the local Ferrus path.
+
+- [x] #5.6 Validate recovery, deletion, observability, tenant isolation, and adapter parity
 
 ID: rg5.6
 Depends on: rg5.2, rg5.4, rg5.5
 
 Exercise duplication, worker loss, lease expiry, cancellation, timeouts, publication races, network partitions,
 tenant attacks, retention/deletion, privacy-safe telemetry, and the shared local/remote contract suite.
+
+Implemented by the versioned maintenance contracts in `src/distributed/maintenance.rs`, the resumable SQLite
+deletion and audit adapter in `src/distributed/maintenance_sqlite.rs`, and the cross-store and cross-adapter tests in
+`src/distributed/maintenance_sqlite_tests.rs` and `src/distributed/api_sqlite.rs`. Full project deletion removes
+tenant-scoped source objects, unpublished batches, graph snapshots, memory revisions, publication pointers, jobs,
+caches when present, and prior audit records without touching identical content in another tenant. Progress is
+durable between stores, retries converge on the same deletion identity, and completion or failure emits only
+bounded IDs, enum codes, counters, and timestamps. Repository deletion removes repository-owned graph, job, and
+batch state while preserving project memory and shared project-scoped objects; repository source-object deletion
+fails closed until a complete ownership/refcount index exists. The shared query behavior contract exercises local
+and remote SQLite graph and memory adapters for deterministic versioned results, immutable target pinning, and
+provenance. Focused failure coverage now includes duplicate delivery, lease loss/reclaim, cancellation, parser and
+query deadlines, publication races, content-store outage, interrupted cross-store deletion, and foreign-tenant
+probes, while compile-time boundaries keep distributed failure paths out of local Ferrus runtime state.
 
 ## Acceptance Criteria
 

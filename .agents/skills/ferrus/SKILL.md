@@ -79,6 +79,10 @@ ferrus tasks list                               # inspect SQLite task runtime ro
 ferrus runs list                                # inspect SQLite run attempts
 ferrus events list                              # inspect SQLite runtime events
 ferrus migrate                                  # import legacy project state into SQLite
+ferrus graph memory index [--full] [--json]     # build derived curated project memory
+ferrus graph memory status [--json]             # inspect memory revision and freshness
+ferrus graph search <query> --domain <scope>    # search repository, memory, or all
+ferrus graph context <seed> --domain <scope>    # assemble bounded scoped context
 ```
 
 Set `RUST_LOG=ferrus=debug` (or `info`/`warn`) for verbose logs to stderr.
@@ -156,6 +160,15 @@ exact path/symbol discovery, then request a small bounded context packet. Ask fo
 needed; snippets are hash-verified against the returned snapshot. Graph use is optional, and a missing relationship
 means only "not known by this index," not proof that the relationship does not exist. These tools never build or
 mutate the index and graph output is not injected into task or review prompts.
+
+### Project memory and federated retrieval
+
+Both roles can also use `project_memory_status`, `project_context_search`, and `project_context`
+without a task lease. These tools are read-only and require an explicit `repository`, `memory`, or
+`all` domain, so an existing repository lookup is never broadened silently. Check memory status
+before memory retrieval. Combined context preserves the exact repository snapshot, memory revision,
+independent freshness, and evidence-backed cross-domain links. The tools do not build indexes,
+author outcomes, change policy, or mutate task/run/archive state.
 
 ## MCP resources
 

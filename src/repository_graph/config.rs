@@ -56,6 +56,18 @@ struct FerrusConfigDocument {
     repository_graph: RepositoryGraphConfig,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FerrusQueryLimitsDocument {
+    #[serde(default)]
+    repository_graph: RepositoryGraphQueryLimitsDocument,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RepositoryGraphQueryLimitsDocument {
+    #[serde(default)]
+    query_limits: QueryLimitsConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceConfig {
@@ -167,6 +179,17 @@ impl Default for QueryLimitsConfig {
             max_duration_ms: 2_000,
             max_diagnostics: 50,
         }
+    }
+}
+
+impl QueryLimitsConfig {
+    /// Parses only the shared query limits from a complete `ferrus.toml` document.
+    ///
+    /// Memory-only operations use this lenient boundary so unsupported graph-only
+    /// settings cannot disable the independently usable memory sidecar.
+    pub fn from_ferrus_toml(contents: &str) -> Result<Self, toml::de::Error> {
+        let document: FerrusQueryLimitsDocument = toml::from_str(contents)?;
+        Ok(document.repository_graph.query_limits)
     }
 }
 

@@ -34,30 +34,39 @@ pub const INPUT_SCHEMA: &str = r#"{
 }"#;
 
 #[derive(Debug, Deserialize)]
-struct ArchiveSpecInput {
+pub struct ArchiveSpecInput {
     spec_path: String,
     outcome: String,
 }
 
-pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
-    let input = parse_input(input).map_err(tool_err)?;
+pub async fn handler(input: Json<ArchiveSpecInput>) -> Result<String, Error> {
+    let input = validate_input(input.into_inner()).map_err(tool_err)?;
     run(input.spec_path, input.outcome).await.map_err(tool_err)
 }
 
 async fn run(spec_path: String, outcome: String) -> Result<String> {
     let result = project::archive_completed_spec(&spec_path, &outcome).await?;
-    Ok(format!(
-        "Spec archived. Archive: {}. Tasks archived: {}. Runs archived: {}.",
-        result.archive_dir, result.archived_tasks, result.archived_runs
-    ))
+    Ok(complete_after_archive(
+        result,
+        crate::project_memory_runtime::refresh_after_archive_best_effort(),
+    )
+    .await)
 }
 
-fn parse_input(input: serde_json::Value) -> Result<ArchiveSpecInput> {
-    let input: ArchiveSpecInput = serde_json::from_value(input).map_err(|err| {
-        anyhow::anyhow!(
-            "Cannot archive spec: expected input object with spec_path and outcome ({err})."
-        )
-    })?;
+async fn complete_after_archive(
+    result: project::SpecArchiveResult,
+    refresh: impl std::future::Future<
+        Output = crate::project_memory_runtime::ArchiveMemoryRefreshOutcome,
+    >,
+) -> String {
+    let _ = refresh.await;
+    format!(
+        "Spec archived. Archive: {}. Tasks archived: {}. Runs archived: {}.",
+        result.archive_dir, result.archived_tasks, result.archived_runs
+    )
+}
+
+fn validate_input(input: ArchiveSpecInput) -> Result<ArchiveSpecInput> {
     if input.spec_path.trim().is_empty() {
         anyhow::bail!("Cannot archive spec: spec_path is required.");
     }
@@ -70,15 +79,15 @@ fn parse_input(input: serde_json::Value) -> Result<ArchiveSpecInput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
 
     #[test]
-    fn parses_archive_spec_input() {
-        let input = parse_input(serde_json::json!({
-            "spec_path": "docs/specs/example.md",
-            "outcome": "## Outcome\n\nDone."
-        }))
+    fn validates_archive_spec_input() {
+        let input = validate_input(ArchiveSpecInput {
+            spec_path: "docs/specs/example.md".to_string(),
+            outcome: "## Outcome\n\nDone.".to_string(),
+        })
         .unwrap();
         assert_eq!(input.spec_path, "docs/specs/example.md");
         assert!(input.outcome.contains("Done."));
@@ -98,10 +107,28 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
-        let input = parse_input(input).unwrap();
+        let (input,): (Json<ArchiveSpecInput>,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
+        let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.spec_path, "docs/specs/example.md");
         assert!(input.outcome.contains("Done."));
+    }
+
+    #[tokio::test]
+    async fn completed_archive_is_not_failed_by_memory_refresh_failure() {
+        let message = complete_after_archive(
+            project::SpecArchiveResult {
+                archive_dir: "archive/specs/example".to_string(),
+                archived_tasks: 2,
+                archived_runs: 3,
+            },
+            async { crate::project_memory_runtime::ArchiveMemoryRefreshOutcome::Failed },
+        )
+        .await;
+        assert_eq!(
+            message,
+            "Spec archived. Archive: archive/specs/example. Tasks archived: 2. Runs archived: 3."
+        );
     }
 }

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "approved-outcome-explains-current-code",
+      "search_query": "bounded retrieval",
+      "expected_memory_text": "Implemented `path:src/lib.rs` with bounded retrieval.",
+      "expected_repository_path": "src/lib.rs",
+      "baseline_raw_artifact_reads": 3,
+      "forbidden_raw_markers": [
+        "private executor reasoning",
+        "private review discussion",
+        "private patch payload"
+      ]
+    }
+  ]
+}

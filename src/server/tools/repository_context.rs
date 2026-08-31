@@ -318,7 +318,7 @@ fn serialize_invalid_request(error: &anyhow::Error) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
 
     fn local_context() -> LocalGraphContext {
@@ -377,7 +377,8 @@ mod tests {
             )])),
             meta: None,
         };
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
+        let (input,): (serde_json::Value,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
         let input = parse_input(input).unwrap();
         assert!(input.include_snippets);
         assert_eq!(input.seeds.len(), 1);

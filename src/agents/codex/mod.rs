@@ -431,6 +431,9 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "repository_graph_status",
             "repository_search",
             "repository_context",
+            "project_memory_status",
+            "project_context_search",
+            "project_context",
         ],
         ROLE_SUPERVISOR => &[
             "enqueue_task",
@@ -448,6 +451,9 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
             "repository_graph_status",
             "repository_search",
             "repository_context",
+            "project_memory_status",
+            "project_context_search",
+            "project_context",
         ],
         _ => &[],
     }
@@ -799,6 +805,13 @@ args = []
             tools["repository_context"]["approval_mode"].as_str(),
             Some("approve")
         );
+        for tool in [
+            "project_memory_status",
+            "project_context_search",
+            "project_context",
+        ] {
+            assert_eq!(tools[tool]["approval_mode"].as_str(), Some("approve"));
+        }
         assert!(!tools.contains_key("approve"));
     }
 
@@ -818,14 +831,21 @@ args = []
             tools["repository_context"]["approval_mode"].as_str(),
             Some("approve")
         );
+        for tool in [
+            "project_memory_status",
+            "project_context_search",
+            "project_context",
+        ] {
+            assert_eq!(tools[tool]["approval_mode"].as_str(), Some("approve"));
+        }
         assert!(!tools.contains_key("create_task"));
         assert!(!tools.contains_key("submit"));
     }
 
     #[test]
     fn codex_tool_approval_sets_match_role_needs() {
-        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 13);
-        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 15);
+        assert!(auto_approved_tools(ROLE_EXECUTOR).len() <= 16);
+        assert!(auto_approved_tools(ROLE_SUPERVISOR).len() <= 18);
     }
 
     #[test]

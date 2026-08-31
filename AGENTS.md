@@ -63,8 +63,10 @@ ferrus events list
 ferrus migrate
 ferrus graph index [--full] [--json]
 ferrus graph status [--json]
-ferrus graph search <query> [--kind <kind>] [--path <path>] [--limit <n>] [--json]
-ferrus graph context (--node <id> | --symbol <key> | --path <path>) [--depth <n>] [--json]
+ferrus graph memory index [--full] [--json]
+ferrus graph memory status [--json]
+ferrus graph search <query> [--domain repository|memory|all] [--kind <kind>] [--path <path>] [--limit <n>] [--json]
+ferrus graph context (--node <id> | --symbol <key> | --path <path> | --memory-entity <id> | --milestone <id> | --task <id> | --run <id>) [--domain repository|memory|all] [--depth <n>] [--json]
 ```
 
 ## Source Layout
@@ -75,8 +77,11 @@ src/
   cli/                        # clap entry and command implementations
   config/mod.rs               # ferrus.toml deserialization and updates
   config/claude.rs            # Claude MCP isolation config helpers
+  distributed/                # vendor-neutral remote identity, protocol, and security contracts
+  project_memory/             # project-memory contracts and local ingestion backend
   repository_graph/           # backend-neutral graph contracts and local backend
   repository_graph_runtime.rs # project-local graph CLI/MCP adapter
+  project_memory_runtime.rs   # project-local memory/federation CLI/MCP adapter
   templates.rs                # embedded Markdown templates
   specs.rs                    # spec discovery and milestone resolution
   agent_id.rs                 # stable agent IDs and MCP server names
@@ -99,6 +104,21 @@ src/
 `RuntimeTaskContext` from `ferrus.db`, update task and run rows transactionally, and write only
 scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`.
 
+**Distributed data-plane boundary**: `src/distributed/` defines optional vendor-neutral remote
+identity, protocol, consistency, authorization, retention, deletion, and worker-isolation
+contracts. Local graph, memory, HQ, task, and run paths must not depend on these types or initialize
+network or cloud clients. Every remote adapter operation is opt-in, explicitly tenant/project
+scoped, authorized before lookup, version checked, and snapshot or revision pinned. Graph and
+memory jobs and compare-and-set publication pointers remain independent.
+
+Remote packaging runs only after local repository and memory policy enforcement. Store source and
+manifest objects under explicit tenant/project scope with authenticated encryption, quotas, digest
+verification, and no cross-tenant reuse. The Phase 5 prototype accepts clean canonical repository
+snapshots only; task overlays and dirty worktrees remain local. Distributed coordinator persistence
+must use its own versioned database, never orchestration or local graph/memory sidecars. Job effects
+are at-least-once and therefore require semantic idempotency keys, renewable generation leases,
+bounded attempts, typed failure codes, cancellation guards, and transactional reclaim.
+
 **Repository graph boundary**: the optional repository graph is derived machine-local state
 in `repo-graph.db`, separate from orchestration state in `ferrus.db`. Keep backend-neutral
 identities, requests, responses, and ports under `src/repository_graph/`. Keep project-local
@@ -106,12 +126,80 @@ path, config, sidecar, freshness, and verified-content adaptation in
 `src/repository_graph_runtime.rs`. Core config loading must remain lenient toward graph
 settings; graph operations validate `[repository_graph]` strictly only when invoked.
 
+**Project memory boundary**: project memory is independently revisioned derived state in
+`project-memory.db`. Its default sources are tracked specification structure, approved Outcome
+content, sanitized archive manifest metadata, and read-only terminal task/run/check provenance.
+Never import raw task, submission, review, patch, log, question, answer, consultation, or
+integration-error bodies through the default adapters. Memory indexing must not mutate
+`ferrus.db`, specifications, archives, or repository graph publications.
+
+Keep repository cross-links in immutable link sets addressed by both memory revision and
+repository snapshot; do not make repository state an implicit input to `memory_revision_id`.
+Resolve only tracked/archive paths, explicit `path:` or `symbol:` references, and authorized
+task snapshot origins. Retain prior exact targets as stale after refactors, keep never-matched
+or ambiguous references unresolved, and never promote similarity-only links to authoritative.
+
+**Distributed workers**: remote extraction consumes only validated tenant-scoped immutable
+manifest and object references. Keep the worker stateless and free of repository filesystem,
+process execution, and unrestricted network APIs. Reuse shipped deterministic graph and memory
+extractors under server-side input, parser, duration, fact, diagnostic, batch, and output caps.
+Check the durable worker ID and lease generation before source reads and every fact-batch write.
+Persist partial output only through the encrypted unpublished fact-batch port; repeated attempts
+must produce the same sequence and batch identities, and ordinary queries must never see partial
+batches. OS or container adapters must enforce the secure-only sandbox declaration, including
+CPU, memory, ephemeral filesystem, short-lived credentials, and allowlisted egress.
+
+Remote memory jobs may resolve explicit repository evidence only against an immutable graph
+snapshot pinned in the job input. Keep the resulting repository link set independently identified
+and stored; the selected graph snapshot must not become an input to `memory_revision_id`.
+Federated reads may use only the link set matching their exact memory revision and graph snapshot
+pair.
+
+**Distributed publication**: keep immutable remote graph/memory records and publication ports
+vendor-neutral. The SQLite prototype shares the exact coordinator control-plane database so one
+transaction can revalidate job kind and scope, cancellation, worker lease generation, complete
+fact coverage, immutable insertion, pointer CAS, and job completion. Store graph and memory facts
+under separate tenant/project namespaces with authenticated encryption and hard quotas. Compare
+the expected pointer before a same-target no-op, never let a stale publisher replace the winner,
+and update only one domain pointer per publication. Compose federated refs from the two immutable
+targets without adding a third mutable pointer. Unpublished batches and unreferenced immutable
+losers are not ordinary query results.
+
+**Distributed APIs**: keep build control and snapshot query contracts transport-neutral. A network
+adapter must authenticate first and construct the server-owned `AuthorizationContext`; request
+bodies must never select their own credential class or permissions. Authorize scope and operation
+before protocol validation or any job, pointer, snapshot, revision, manifest, or object lookup.
+Query-agent credentials are read-only. Resolve mutable view selectors once, return the immutable
+target, and bind pagination cursors to that target plus the effective query shape and depth. Clamp
+all client budgets with independent service limits, interrupt storage scans at the effective
+deadline, and return a terminal error when one result cannot fit. Source snippets require separate
+verified-content authority and must match the completed job's immutable manifest descriptor before
+the encrypted object store is read. Do not initialize a remote transport from local Ferrus paths.
+
+**Distributed maintenance**: authorize deletion before validation or lookup, key retries by exact
+target and retention coverage, and persist bounded progress between independent stores. Full project
+deletion must remove uploaded objects, unpublished batches, published graph and memory data and
+pointers, jobs, caches, and prior audits without affecting an identical object in another tenant.
+Write a new completion audit only after the covered purge; audit records may contain only canonical
+IDs, enum codes, counters, and timestamps. Repository deletion must preserve project memory and
+shared project-scoped source objects. Fail repository `uploaded_source` coverage closed until a
+complete ownership/refcount index makes it safe. Keep every step idempotent so failed cross-store
+deletion can resume without inventing stronger atomicity than the adapter provides.
+
 **Repository retrieval tools**: `repository_graph_status`, `repository_search`, and
 `repository_context` are read-only, role-visible tools registered in `server/mod.rs`. They
 require no task lease and must not mutate tasks, runs, events, or either database. Do not
 inject graph output into task or review prompts. Structural responses omit source bodies;
 requested snippets must pass the snapshot-aware, hash-verified content boundary. Treat a
 missing relationship as unknown, not absent.
+
+**Project context tools**: `project_memory_status`, `project_context_search`, and
+`project_context` are read-only and role-visible. Federated requests must supply an explicit
+`repository`, `memory`, or `all` domain. They must not build either sidecar, author outcomes,
+change source policy, or mutate orchestration state. Report repository snapshot and memory
+revision freshness independently; cross domains only through evidence-backed links for those
+exact revisions. Spec archive is the only approved Outcome authoring workflow. Refresh memory
+best-effort after archive commit, and never turn refresh failure into archive failure.
 
 **Task graph overlays**: managed Executor worktrees query a task-owned publication composed
 from the pinned baseline and the last successful changed-file overlay refresh. `/check` and

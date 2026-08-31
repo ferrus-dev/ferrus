@@ -24,6 +24,9 @@ heartbeat_interval_secs = 30 # how often agents should call /heartbeat
 [repository_graph]
 enabled = true
 
+[repository_graph.telemetry]
+enabled = true
+
 [hq.supervisor]
 agent = "claude-code"
 model = ""

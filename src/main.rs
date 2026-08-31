@@ -7,6 +7,7 @@ mod hq;
 mod legacy_state;
 mod platform;
 mod project;
+mod project_memory_runtime;
 mod repository_graph_runtime;
 mod runtime_status;
 mod runtime_table;
@@ -16,7 +17,8 @@ mod state;
 mod templates;
 mod update_check;
 
-use ferrus::repository_graph;
+use clap::Parser;
+use ferrus::{project_memory, repository_graph};
 
 #[cfg(test)]
 mod test_support {
@@ -45,8 +47,6 @@ mod test_support {
         );
     }
 }
-
-use clap::Parser;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

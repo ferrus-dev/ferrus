@@ -36,15 +36,15 @@ pub const INPUT_SCHEMA: &str = r#"{
     "required": ["input"]
 }"#;
 
-pub async fn handler(input: serde_json::Value) -> Result<String, Error> {
-    let input = parse_input(input).map_err(tool_err)?;
+pub async fn handler(input: Json<EnqueueTaskInput>) -> Result<String, Error> {
+    let input = validate_input(input.into_inner()).map_err(tool_err)?;
     run(input.description, input.spec_path, input.milestone_id)
         .await
         .map_err(tool_err)
 }
 
 #[derive(Debug, Deserialize)]
-struct EnqueueTaskInput {
+pub struct EnqueueTaskInput {
     description: String,
     spec_path: Option<String>,
     milestone_id: Option<String>,
@@ -110,12 +110,7 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn parse_input(input: serde_json::Value) -> Result<EnqueueTaskInput> {
-    let input: EnqueueTaskInput = serde_json::from_value(input).map_err(|err| {
-        anyhow::anyhow!(
-            "Cannot enqueue task: expected input object with description, optional spec_path, and optional milestone_id ({err})."
-        )
-    })?;
+fn validate_input(input: EnqueueTaskInput) -> Result<EnqueueTaskInput> {
     if input.description.trim().is_empty() {
         anyhow::bail!("Cannot enqueue task: description is required.");
     }
@@ -126,11 +121,22 @@ fn parse_input(input: serde_json::Value) -> Result<EnqueueTaskInput> {
 mod tests {
     use super::*;
     use crate::project::LocalProjectRef;
-    use neva::types::CallToolRequestParams;
+    use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    async fn setup() -> (TempDir, std::path::PathBuf) {
+    struct TestWorkspace {
+        _dir: TempDir,
+        previous: std::path::PathBuf,
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    async fn setup() -> TestWorkspace {
         let dir = TempDir::new().unwrap();
         let previous = std::env::current_dir().unwrap();
         let data_dir = dir.path().join(".ferrus/projects/test-project");
@@ -144,11 +150,10 @@ mod tests {
         let local_ref = toml::to_string_pretty(&local_ref).unwrap();
         std::fs::write(dir.path().join(".ferrus/project.toml"), local_ref).unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        (dir, previous)
-    }
-
-    fn teardown(previous: std::path::PathBuf) {
-        std::env::set_current_dir(previous).unwrap();
+        TestWorkspace {
+            _dir: dir,
+            previous,
+        }
     }
 
     #[test]
@@ -174,12 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_reads_wrapped_request_object() {
-        let input = parse_input(serde_json::json!({
-            "description": "Build task",
-            "spec_path": "docs/specs/spec.md",
-            "milestone_id": "m1.0",
-        }))
+    fn validates_extracted_request_object() {
+        let input = validate_input(EnqueueTaskInput {
+            description: "Build task".to_string(),
+            spec_path: Some("docs/specs/spec.md".to_string()),
+            milestone_id: Some("m1.0".to_string()),
+        })
         .unwrap();
 
         assert_eq!(input.description, "Build task");
@@ -202,8 +207,9 @@ mod tests {
             meta: None,
         };
 
-        let (input,): (serde_json::Value,) = params.try_into().unwrap();
-        let input = parse_input(input).unwrap();
+        let (input,): (Json<EnqueueTaskInput>,) =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"])).unwrap();
+        let input = validate_input(input.into_inner()).unwrap();
 
         assert_eq!(input.description, "Build task");
         assert_eq!(input.spec_path.as_deref(), Some("docs/specs/spec.md"));
@@ -211,16 +217,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_rejects_bare_string() {
-        let err = parse_input(serde_json::json!("m1.0")).unwrap_err();
+    fn neva_json_extractor_rejects_bare_string() {
+        let params = CallToolRequestParams {
+            name: "enqueue_task".to_string(),
+            args: Some(HashMap::from([(
+                "input".to_string(),
+                serde_json::json!("m1.0"),
+            )])),
+            meta: None,
+        };
+        let result: std::result::Result<(Json<EnqueueTaskInput>,), Error> =
+            FromHandlerArgs::from_args(params, &ArgNames::new(["input"]));
+        let err = result.unwrap_err();
 
-        assert!(err.to_string().contains("expected input object"));
+        assert!(err.to_string().contains("invalid type: string"));
     }
 
     #[tokio::test]
     async fn enqueue_task_writes_pending_artifact_without_state_json() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         let response = run(
             "Build queued task".to_string(),
@@ -245,14 +261,12 @@ mod tests {
         assert_eq!(tasks[0].status, "pending");
         assert_eq!(tasks[0].spec_path.as_deref(), Some("docs/specs/spec.md"));
         assert_eq!(tasks[0].milestone_id.as_deref(), Some("m1.0"));
-
-        teardown(previous);
     }
 
     #[tokio::test]
     async fn enqueue_task_rejects_duplicate_non_terminal_origin() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         run(
             "First task".to_string(),
@@ -270,14 +284,12 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("already has task t-001"));
-
-        teardown(previous);
     }
 
     #[tokio::test]
     async fn concurrent_enqueue_allows_only_one_task_per_origin() {
         let _guard = crate::test_support::cwd_lock().lock().unwrap();
-        let (_dir, previous) = setup().await;
+        let _workspace = setup().await;
 
         let first = run(
             "First task".to_string(),
@@ -293,11 +305,12 @@ mod tests {
 
         assert_ne!(first.is_ok(), second.is_ok());
         let error = first.err().or_else(|| second.err()).unwrap();
-        assert!(error.to_string().contains("already has task"));
+        assert!(
+            error.to_string().contains("already has task"),
+            "unexpected concurrent enqueue error: {error:#}"
+        );
         let tasks = project::list_tasks().await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
-
-        teardown(previous);
     }
 }

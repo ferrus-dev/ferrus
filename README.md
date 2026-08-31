@@ -1,6 +1,6 @@
 # ferrus
 
-[![Ferrus version](https://img.shields.io/badge/ferrus-0.3.1--alpha.1-orange)](https://crates.io/crates/ferrus)
+[![Ferrus version](https://img.shields.io/badge/ferrus-0.4.0--alpha.1-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
 [![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
@@ -27,12 +27,11 @@ Ferrus works with existing coding agents:
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
-- **goose** (experimental) -- MCP-native and convenient for local models. Ferrus attaches its role-scoped MCP server at launch via goose's `--with-extension`, so no config file is written; set the model provider (e.g. a local LM Studio/Ollama provider) with `goose configure`. Honors the per-task worktree, so the executor role is usable. Headless runs are bounded by loop guards (`--max-turns`, `--max-tool-repetitions`) so a weak local model that thrashes on compile errors fails cleanly instead of looping forever -- raise the turn budget by exporting `GOOSE_MAX_TURNS` before launching Ferrus. Tool-calling reliability depends heavily on the local model.
-- **opencode** (experimental) -- convenient for running local models. Warning: The executor layer is currently **unstable**: opencode identifies a project by its git root-commit and binds it to a single working directory in its own global store, so it does not stay confined to the isolated per-task worktree HQ provisions and may operate on the canonical checkout instead. Use opencode for the **supervisor/reviewer** role for now; treat the executor role as not yet supported.
+- **goose** (experimental)
+- **opencode** (experimental; Supervisor and Reviewer only)
 
 Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
-
-Internally, agent support is normalized through `src/agents/`: `mod.rs` defines the shared Supervisor/Executor contracts and MCP config entry shape, while `claude/`, `codex/`, `qwen/`, `opencode/`, and `goose/` adapt each CLI's launch flags, model overrides, headless prompt transport, and local permission/config conventions.
+See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limitations and configuration details.
 
 >  **Status**: ferrus is currently in alpha and not ready for production.
 
@@ -92,316 +91,48 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 
 ---
 
-## HQ
+## Core workflow
 
-`ferrus` with no arguments opens an interactive shell:
+`ferrus` opens HQ. The main path is deliberately small:
 
-| Command | Description |
-|---|---|
-| `/plan` | Free-form planning session with the supervisor (no task created) |
-| `/task` | Define a task from the selected milestone, then run the executor->review loop automatically |
-| `/task --manual` | Define a free-form task without selected milestone context |
-| `/spec` | Draft, approve, and save a feature specification; offers to archive a completed selected spec first |
-| `/archive-spec` | Summarize completed selected spec work into `## Outcome` and archive linked task/run artifacts |
-| `/milestones` | Select the current spec and milestone |
-| `/reset-spec` | Clear the selected spec and milestone |
-| `/check` | Run configured checks from HQ when the current workflow permits; does not mutate task state |
-| `/check --force` | Run configured checks from HQ regardless of task status; does not mutate task state |
-| `/supervisor` | Open an interactive supervisor session (no initial prompt) |
-| `/executor` | Open an interactive executor session (no initial prompt) |
-| `/resume` | Manually resume the executor headlessly; also recovers Consultation by relaunching both supervisor and executor |
-| `/review` | Manually spawn supervisor in review mode (escape hatch when automatic spawning failed) |
-| `/status` | Show task state, agent list, and session log paths |
-| `/tasks` | List SQLite task runtime rows |
-| `/runs [--limit N]` | List SQLite run attempts |
-| `/events [--limit N] [--run <id>]` | List SQLite runtime events |
-| `/attach <name>` | Show log path for a running headless agent |
-| `/stop` | Stop all running agent sessions (prompts for confirmation) |
-| `/reset` | Force-reset resettable tasks and clear their scoped artifacts (prompts for confirmation) |
-| `/init [--agents-path]` | Initialize ferrus in the current directory |
-| `/register [--supervisor <agent>] [--executor <agent>]` | Register Claude Code or Codex configs from HQ |
-| `/model <supervisor|executor> <model>` | Update the supervisor or executor model override |
-| `/model <supervisor|executor> --clear` | Clear the supervisor or executor model override |
-| `/help` | List all HQ commands |
-| `/quit` | Exit HQ |
-
-> **Quit HQ:** Press **Ctrl+C** twice within 2 seconds to exit. The first press shows a yellow "Press Ctrl+C again to exit" prompt in the status line; the second confirms and exits. The prompt clears automatically after 2 seconds if you change your mind.
-
-> **TUI features:** Type `/` to see autocomplete suggestions; press **Tab** / **Shift+Tab** to navigate and **Enter** to accept. A status line at the bottom of the terminal shows the current task state and retry/cycle counters in real time.
-
-### How the loop works
-
-```
-ferrus> /task
-  +- supervisor spawns -> you describe the task -> supervisor calls enqueue_task
-       +- executor spawns (headless) -> implements -> check -> submit
-            +- reviewer spawns (headless) -> reads submission -> approve or reject
-                 +- approved -> Complete
-                 +- rejected -> executor re-spawns with feedback
+```text
+/task -> Supervisor defines work -> Executor implements and checks -> Reviewer approves or rejects
 ```
 
-Agents are **stateless between runs**. Ferrus resolves each run to a SQLite task row and scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`; each spawn exits when its job is done.
-
----
-
-## State machine
-
-```
-pending
- +-> executing      <- /wait_for_task claim
-       +-> addressing <- /reject -> work loop
-       +-> consultation <- /consult
-       |     +-> (restore paused status) <- /wait_for_consult
-       +-> awaiting_human <- /ask_human
-       |     +-> (restore paused status) <- /wait_for_answer
-       +-> reviewing <- /submit final gate pass
-       |     +-> addressing <- /reject
-       |     +-> complete <- /approve
-       +-> failed <- retry, review-cycle, or executor-dispatch limit
-```
-
-Any active Executor work state (Executing, Addressing) can pause to `Consultation` via `/consult`. HQ spawns the configured Supervisor in consultation mode, and the executor immediately calls `/wait_for_consult` to block until the Supervisor answers via `/respond_consult`.
-
-Any active state, including `Consultation`, can pause to `AwaitingHuman` via `/ask_human`. The agent immediately calls `/wait_for_answer` to block until the human responds. The human types their answer in the HQ terminal (raw text, no slash prefix). `/wait_for_answer` restores the previous state and returns the answer.
-
-- Each task advances independently; `max_parallel_tasks` controls concurrent executors.
-- HQ `/reset` force-resets resettable tasks and clears their scoped artifacts. MCP `/reset` is only valid for a failed task.
-
----
-
-## CLI reference
-
-### `ferrus init [--agents-path <path>]`
-
-Scaffolds ferrus in the current project (default `--agents-path .agents`):
-
-- Creates `ferrus.toml` with default limits and an empty check command list
-- Creates `.ferrus/` templates, task/run artifact directories, `agents.json`, and `logs/`
-- Registers the project in `~/.ferrus/projects/<project-id>/`
-- Writes `.ferrus/project.toml` with the project id and local data directory
-- Creates `~/.ferrus/projects/<project-id>/project.toml` with project metadata
-- Creates `~/.ferrus/projects/<project-id>/ferrus.db` with `tasks`, `runs`, and `events` tables
-- Creates `docs/specs/` for approved feature specifications
-- Creates skill files agents load to understand their role:
-  - `<agents-path>/skills/ferrus/SKILL.md` -- general overview
-  - `<agents-path>/skills/ferrus-supervisor/SKILL.md` + `ROLE.md`
-  - `<agents-path>/skills/ferrus-executor/SKILL.md` + `ROLE.md`
-- Adds `.ferrus/` to `.gitignore`
-
-### `ferrus serve [--role supervisor|executor] [--agent-name <name>] [--agent-index <n>]`
-
-Starts the agent coordination server on stdio. Agents load this as an MCP server. `--agent-name` and `--agent-index` are embedded in the `claimed_by` field (e.g. `"executor:codex:1"`). Pass `--role` to expose only the tools for that role:
-
-| `--role` | Tools exposed |
-|---|---|
-| `supervisor` | Definition sessions: `enqueue_task`, `create_spec`, `archive_spec`; task sessions: `wait_for_review`, `review_pending`, `approve`, `reject`, `wait_for_consultation`, `respond_consult`, `ask_human`, `wait_for_answer`, `heartbeat` |
-| `executor` | `wait_for_task`, `check`, `consult`, `submit`, `wait_for_consult`, `ask_human`, `wait_for_answer`, `status`, `reset`, `heartbeat` |
-| *(omitted)* | All tools |
-
-All three server modes also expose the optional read-only repository retrieval tools
-`repository_graph_status`, `repository_search`, and `repository_context`. They do not require a task lease and never
-build an index or mutate task/run state.
-
-The unfiltered server additionally exposes compatibility tools such as `create_task` and `answer`. The `status` tool includes scoped SQLite task context when called by a running agent with a resolved runtime identity.
-
-### `ferrus register [--supervisor <agent>] [--supervisor-model <model>] [--executor <agent>] [--executor-model <model>]`
-
-Writes agent config files so they automatically load `ferrus serve` as a tool server, and adds only the selected agents' local files to `.gitignore`. At least one of `--supervisor` or `--executor` is required; each model flag requires the matching role flag. Supported agents:
-
-| Agent | Config written |
-|---|---|
-| `claude-code` | `.claude/mcp-supervisor.json` or `.claude/mcp-executor.json` + `.claude/settings.local.json` permissions |
-| `codex` | `.codex/config.toml` |
-| `qwen-code` | `.qwen/settings.json` |
-| `opencode` | `opencode.json` |
-| `goose` | none -- the Ferrus MCP server is attached at launch via `--with-extension` |
-
-### `ferrus doctor`
-
-Checks that `.ferrus/project.toml`, global project metadata, task/run artifacts, and the `ferrus.db` schema agree with the current workspace. It also reports interrupted runs and expired leases that can be fixed with `ferrus recover`.
-
-### `ferrus graph`
-
-The optional local repository graph indexes generic files/documents, Cargo metadata, and Rust syntax without
-running repository code. Enable it explicitly in `ferrus.toml`:
-
-```toml
-[repository_graph]
-enabled = true
-```
-
-Indexing is never part of `ferrus init`; run it when wanted:
-
-```sh
-ferrus graph index [--full] [--json]
-ferrus graph status [--json]
-ferrus graph search RuntimeTaskContext --kind struct --path src [--limit 20] [--json]
-ferrus graph show --node <node-id> [--json]
-ferrus graph show --symbol <semantic-key> [--json]
-ferrus graph show --path src/project.rs [--json]
-ferrus graph context (--node <node-id> | --symbol <semantic-key> | --path <path>) [--depth 2] [--max-results 50] [--json]
-ferrus graph neighbors <node-id> --direction both --depth 2 --limit 50 [--kind contains] [--json]
-```
-
-`index` reuses unchanged per-file fragments by default; `--full` bypasses that cache. Completed snapshots are
-immutable and published atomically, so a failed or stale build leaves the previous graph queryable. `status` is
-read-only and reports absent or incompatible storage without creating it.
-
-Every query reports the snapshot ID, freshness against the current source manifest, diagnostic counts,
-repository-relative evidence spans, provenance, and any truncation. CLI limits are requests: configured
-`[repository_graph.query_limits]` remain hard service caps. The derived sidecar is machine-local beside
-`ferrus.db`; it stores structural facts and content identities, not source bodies.
-
-Managed Executor worktrees use a task-owned graph view pinned to the dispatch baseline. `/check` and the final
-submit gate refresh its changed-file overlay best-effort: unchanged fragments are reused, changed and added files
-replace or extend the view, and deleted paths hide baseline facts. Task-view responses include both the baseline
-snapshot, overlay revision, and mutable/frozen lifecycle; a graph refresh failure never changes task lifecycle
-state. Submit freezes the successfully materialized view with an immutable Git tree in the same runtime
-transaction as the Reviewing handoff. Reviewers and recovery sessions therefore reopen the exact submitted graph
-and hash-verified snippets after the Executor worktree disappears; rejection preserves that run history while the
-task resumes a mutable successor view.
-
-Runtime identity selects the view explicitly: taskless/manual sessions use canonical, Executors use their mutable
-task overlay, Consultants use the attached task view and Executor workspace, and Reviewers use the frozen view on
-their review run. An invalid task binding or unavailable submitted freeze is reported instead of silently falling
-back to canonical context.
-
-Approval compares the actual canonical source manifest before and after patch application, integration checks,
-spec updates, and any rollback. A changed post-operation manifest is durably marked stale with its source revision
-and manifest identity. A clean rollback records no proposed integration; partial mutations remain stale and are
-refreshed from the files actually left in canonical. Best-effort incremental indexing starts only after the
-canonical approval lock is released, and its success or failure never changes the task approval outcome. A manual
-`ferrus graph index` clears the same durable invalidation after publishing its verified snapshot.
-
-Canonical and task refreshes are coordinated by expiring SQLite leases scoped to the exact published view, so
-concurrent tasks cannot publish into one another's namespace and duplicate refreshes are suppressed across Ferrus
-processes. Ordinary maintenance keeps every snapshot referenced by a non-terminal task/run (including frozen
-review views) plus all published canonical snapshots. Completed-task publications and unreferenced snapshots age
-out under `[repository_graph.retention]`; deleting a managed worktree never deletes a retained immutable baseline.
-Interrupted builds never expose partial facts: `ferrus recover` marks only unfinished attempts failed, reclaims
-expired graph refresh leases, and garbage-collects safe candidates without changing task lifecycle state.
-
-Supervisor and Executor agents can inspect the same published graph through `repository_graph_status`, find exact
-paths or symbols with `repository_search`, and assemble bounded deterministic evidence with `repository_context`.
-Source snippets are opt-in and hash-verified against the indexed snapshot. Graph output is not automatically
-injected into task or review prompts, and a missing relationship means only that the current index does not know it.
-
-The normative retrieval behavior is documented in
-[`docs/repository-graph-retrieval.md`](docs/repository-graph-retrieval.md). Local Criterion methodology and dogfood
-results live in [`docs/repository-graph-benchmarks.md`](docs/repository-graph-benchmarks.md); the reproducible
-26-case navigation evaluation and current automation decision are in
-[`docs/repository-graph-evaluations.md`](docs/repository-graph-evaluations.md).
-
-### `ferrus projects list`
-
-Lists projects registered under `~/.ferrus/projects`, including project id, name, database presence, last opened timestamp, workspace path, and data directory.
-
-### `ferrus recover`
-
-Runs the same runtime recovery that HQ performs on startup: dead running rows are marked `interrupted`, expired task leases without a live run are released, and recorded human answers are reconciled. It also recovers unfinished repository-graph builds, expired view-refresh leases, and safe retention candidates when the optional sidecar is available; graph recovery failure is reported but does not undo runtime recovery.
-
-Use `ferrus recover --dry-run` to print the pending recovery counters without changing runtime state.
-Use `ferrus recover --worktrees` to also remove orphaned managed task worktrees that no active task or active run still owns. Combine it with `--dry-run` to preview the orphan count without removing anything.
-
-### `ferrus tasks list`
-
-Prints task runtime rows from `ferrus.db`, including task status, active claim owner, lease expiry, and artifact path.
-
-### `ferrus runs list [--limit N]`
-
-Prints recent run attempts from `ferrus.db`, including role, agent, status, PID, timestamps, and workspace path.
-
-### `ferrus events list [--limit N] [--run <id>]`
-
-Prints recent runtime events from `ferrus.db`. Use `--run <id>` or `--run-id <id>` to filter to one run attempt.
-
-### `ferrus migrate` / `ferrus upgrade`
-
-Registers an existing pre-registry project in `~/.ferrus/projects/<project-id>/`, initializes the SQLite database, creates `.ferrus/tasks/` and `.ferrus/runs/`, and imports non-empty legacy task, review, submission, human-question, and consultation artifacts into the scoped layout.
-
----
-
-## `ferrus.toml`
-
-```toml
-[checks]
-commands = [
-    "cargo clippy -- -D warnings",
-    "cargo fmt --check",
-    "cargo test",
-]
-
-[limits]
-max_check_retries = 20   # consecutive check failures before state -> Failed
-max_review_cycles = 3    # reject->fix cycles before state -> Failed
-max_feedback_lines = 30  # trailing lines per failing command shown in /check and /submit output
-wait_timeout_secs = 60   # max duration of one wait_* tool call before it returns timeout so the agent can poll again
-max_parallel_tasks = 1   # maximum number of concurrent executor sessions
-max_executor_dispatches = 6 # headless executor sessions per work phase before state -> Failed; 0 disables
-
-[lease]
-ttl_secs = 90                  # how long a claimed lease is valid without renewal
-heartbeat_interval_secs = 30   # how often agents should call heartbeat
-
-[spec]
-directory = "docs/specs"       # where /create_spec writes approved specs
-
-[hq.supervisor]
-agent = "claude-code"  # agent for supervisor/reviewer role: claude-code | codex | qwen-code | goose | opencode
-model = ""             # optional override; empty = agent default
-
-[hq.executor]
-agent = "codex"        # agent for executor role: claude-code | codex | qwen-code | goose (experimental); opencode executor is experimental/unstable -- see Supported agents
-model = ""             # optional override; empty = agent default
-```
-
-Check commands run in the active task workspace. Full output is written to `.ferrus/logs/check_<attempt>_<scope>_<ts>.txt`, where the task/run scope prevents parallel checks from overwriting each other. `/check` and `/submit` return a short failure summary inline.
-
----
-
-## Runtime files
-
-Ferrus now separates human-readable project artifacts from machine-local runtime state:
-
-| Path | Contents |
-|---|---|
-| `.ferrus/` | Project-local templates, task/run artifacts, agent registry, and logs |
-| `~/.ferrus/projects/<project-id>/` | Machine-local project metadata, SQLite runtime database, and global logs |
-
-SQLite is the runtime source of truth. `ferrus.db` stores task status, claims and leases, run ownership, lifecycle events, retry counters, paused interaction metadata, and selected-spec state. Markdown files are scoped task intent and run artifacts, not a mirrored state machine. On HQ startup Ferrus marks dead active runs as `interrupted`, preserves leases backed by live runs, releases other expired leases, and resumes recoverable task flows.
-
-### `.ferrus/`
-
-| File | Contents |
-|---|---|
-| `project.toml` | Local pointer to `~/.ferrus/projects/<project-id>/` |
-| `agents.json` | Runtime registry for agent sessions, statuses, PIDs, and log ownership |
-| `TASK.md` | Task drafting template |
-| `CONSULT_TEMPLATE.md` | Read-only consultation request template |
-| `SPEC_TEMPLATE.md` | Read-only feature specification template |
-| `tasks/<task-id>.md` | Numbered task intent artifact |
-| `runs/<task-id>/SUBMISSION.md` | Executor submission notes |
-| `runs/<task-id>/REVIEW.md` | Supervisor review or rejection notes |
-| `runs/<task-id>/QUESTION.md` | Pending human question |
-| `runs/<task-id>/ANSWER.md` | Human answer |
-| `runs/<task-id>/CONSULT_REQUEST.md` | Executor consultation request |
-| `runs/<task-id>/CONSULT_RESPONSE.md` | Supervisor consultation response |
-| `runs/<task-id>/PATCH.diff` | Patch produced from an isolated executor workspace |
-| `runs/<task-id>/INTEGRATION_ERROR.md` | Recoverable patch or integration-check failure context |
-| `logs/` | Scoped check output and PTY session logs per agent |
-
-`.ferrus/` is gitignored by `ferrus init`.
-
-### `~/.ferrus/projects/<project-id>/`
-
-| File | Contents |
-|---|---|
-| `project.toml` | Project id, name, workspace path, `.ferrus` path, git metadata, timestamps, schema version |
-| `ferrus.db` | SQLite source of truth for tasks, runs, events, leases, counters, and project runtime state |
-| `archive/specs/<spec-slug>-<closed-at>/` | Machine-local archives for completed spec task/run artifacts, with `manifest.toml`, copied `spec.md`, `tasks/`, and `runs/` |
-| `logs/` | Reserved for machine-local logs that should not be committed |
-
----
+Tasks advance independently through SQLite-backed states. Executor work happens in isolated worktrees, checks run
+before submission, and rejected work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
+provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
+
+The full HQ command list, state transitions, CLI reference, configuration example, graph commands, and runtime file
+layout are in [docs/cli-and-runtime.md](docs/cli-and-runtime.md).
+
+## Repository intelligence
+
+Ferrus has two optional, independently revisioned local indexes:
+
+- the repository graph for deterministic structural navigation and snapshot-aware snippets;
+- project memory for approved outcomes, specification history, and bounded provenance.
+
+Both use separate machine-local SQLite sidecars. They are read-only from agent retrieval tools, never replace
+`ferrus.db`, and never become implicit prompt context. Task worktrees receive pinned graph baselines plus mutable
+overlays; review uses a frozen submitted view. The same contracts also define a vendor-neutral path to distributed
+storage and workers.
+
+Start with [repository graph architecture](docs/repository-graph-architecture.md),
+[project memory architecture](docs/project-memory-architecture.md), and
+[distributed indexing architecture](docs/distributed-indexing-architecture.md).
+
+## Documentation
+
+- [CLI, HQ, configuration, and runtime reference](docs/cli-and-runtime.md)
+- [Roadmap and milestones](docs/milestones.md)
+- [Repository graph retrieval](docs/repository-graph-retrieval.md)
+- [Repository graph benchmarks](docs/repository-graph-benchmarks.md)
+- [Repository graph evaluation](docs/repository-graph-evaluations.md)
+- [Project memory operations](docs/project-memory.md)
+- [Project memory evaluation](docs/project-memory-evaluations.md)
+- [Semantic retrieval and embeddings](docs/semantic-retrieval.md)
+- [Feature specifications](docs/specs/)
 
 ## Dogfooding
 

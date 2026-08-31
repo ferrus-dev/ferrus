@@ -470,14 +470,6 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     tokio::fs::create_dir_all(log_dir)
         .await
         .context("Failed to create .ferrus/logs")?;
-    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let log_path = log_dir.join(format!("{}_{ts}.log", request.role));
-
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("Failed to open log file {}", log_path.display()))?;
     let run_id = crate::project::allocate_run_id(request.role, request.name);
     request.env.push((ENV_RUN_ID, run_id.clone()));
     let task_id = request
@@ -486,6 +478,14 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .find_map(|(key, value)| (*key == ENV_TASK_ID).then_some(value.trim()))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+    let log_path = headless_log_path(log_dir, request.role, task_id.as_deref(), &run_id, &ts);
+
+    let log_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to create log file {}", log_path.display()))?;
     if let Some(workspace) = request.workspace.as_ref() {
         request.env.push((
             ENV_PROJECT_ROOT,
@@ -672,6 +672,41 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     })
 }
 
+fn headless_log_path(
+    log_dir: &std::path::Path,
+    role: &str,
+    task_id: Option<&str>,
+    run_id: &str,
+    timestamp: &str,
+) -> PathBuf {
+    let scope = task_id.unwrap_or("session");
+    log_dir.join(format!(
+        "{}_{}_{}_{}.log",
+        sanitize_log_component(role),
+        sanitize_log_component(scope),
+        sanitize_log_component(timestamp),
+        sanitize_log_component(run_id),
+    ))
+}
+
+fn sanitize_log_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn stream_prompt_to_stdin(child: &mut std::process::Child, prompt: &str) -> Result<()> {
     use std::io::Write as _;
 
@@ -816,12 +851,81 @@ fn parse_mcp_tool_status(line: &str) -> Option<(String, ToolCallStatus)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn background_pty_log_path_contains_role() {
-        let role = "executor";
-        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
-        let log_path = format!(".ferrus/logs/{}_{}.log", role, ts);
-        assert!(log_path.contains(role));
+    fn headless_log_path_includes_role_task_timestamp_and_run() {
+        let path = headless_log_path(
+            std::path::Path::new(".ferrus/logs"),
+            "executor",
+            Some("t-042"),
+            "r-1234-abcd",
+            "20260814T120000",
+        );
+
+        assert_eq!(
+            path,
+            std::path::Path::new(".ferrus/logs/executor_t-042_20260814T120000_r-1234-abcd.log")
+        );
+    }
+
+    #[test]
+    fn headless_log_paths_do_not_collide_for_parallel_tasks() {
+        let log_dir = std::path::Path::new(".ferrus/logs");
+        let first = headless_log_path(
+            log_dir,
+            "executor",
+            Some("t-001"),
+            "r-1234-first",
+            "20260814T120000",
+        );
+        let second = headless_log_path(
+            log_dir,
+            "executor",
+            Some("t-002"),
+            "r-1234-second",
+            "20260814T120000",
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn headless_log_paths_do_not_collide_for_repeated_task_dispatches() {
+        let log_dir = std::path::Path::new(".ferrus/logs");
+        let first = headless_log_path(
+            log_dir,
+            "executor",
+            Some("t-001"),
+            "r-1234-first",
+            "20260814T120000",
+        );
+        let second = headless_log_path(
+            log_dir,
+            "executor",
+            Some("t-001"),
+            "r-1234-second",
+            "20260814T120000",
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn headless_log_path_uses_sanitized_session_scope_without_task() {
+        let path = headless_log_path(
+            std::path::Path::new(".ferrus/logs"),
+            "review/supervisor",
+            None,
+            "run:id",
+            "2026-08-14T12:00:00",
+        );
+
+        assert_eq!(
+            path,
+            std::path::Path::new(
+                ".ferrus/logs/review_supervisor_session_2026-08-14T12_00_00_run_id.log"
+            )
+        );
     }
 
     #[test]

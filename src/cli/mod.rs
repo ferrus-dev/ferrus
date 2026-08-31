@@ -143,7 +143,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::commands::graph::{Direction, GraphCommand};
+    use crate::cli::commands::graph::{Direction, GraphCommand, GraphDomain, MemoryCommand};
 
     #[test]
     fn graph_search_surface_parses_scriptable_filters() {
@@ -165,6 +165,7 @@ mod tests {
             command:
                 GraphCommand::Search {
                     query,
+                    domain,
                     kinds,
                     path,
                     limit,
@@ -175,10 +176,40 @@ mod tests {
             panic!("graph search did not parse");
         };
         assert_eq!(query, "RuntimeTaskContext");
+        assert!(matches!(domain, GraphDomain::Repository));
         assert_eq!(kinds, ["struct"]);
         assert_eq!(path.as_deref(), Some("src"));
         assert_eq!(limit, Some(20));
         assert!(json);
+    }
+
+    #[test]
+    fn graph_memory_and_explicit_domain_surfaces_parse() {
+        let memory = Cli::try_parse_from(["ferrus", "graph", "memory", "index", "--full"]).unwrap();
+        assert!(matches!(
+            memory.command,
+            Some(Commands::Graph {
+                command: GraphCommand::Memory {
+                    command: MemoryCommand::Index {
+                        full: true,
+                        json: false
+                    }
+                }
+            })
+        ));
+
+        let search =
+            Cli::try_parse_from(["ferrus", "graph", "search", "decision", "--domain", "all"])
+                .unwrap();
+        assert!(matches!(
+            search.command,
+            Some(Commands::Graph {
+                command: GraphCommand::Search {
+                    domain: GraphDomain::All,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

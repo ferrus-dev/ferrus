@@ -122,7 +122,7 @@ repository snapshot identity and a memory revision identity with separate freshn
 
 ## Milestones
 
-- [ ] #4.0 Define project memory, provenance, privacy, and federation contracts
+- [x] #4.0 Define project memory, provenance, privacy, and federation contracts
 
 ID: rg4.0
 Depends on: none
@@ -130,7 +130,12 @@ Depends on: none
 Specify memory entities and relationships, independent revision identity, authorized source categories, privacy
 defaults, link evidence, store/query interfaces, freshness, and federation semantics.
 
-- [ ] #4.1 Implement deterministic specification and outcome ingestion
+Normative contract: [Project Memory and Federation Contracts](../project-memory-architecture.md).
+
+Implemented in `src/project_memory/` as backend-neutral domain, policy, diagnostics, store/query ports, bounded
+wire DTOs, and explicit repository/memory federation targets. Storage and ingestion remain in later milestones.
+
+- [x] #4.1 Implement deterministic specification and outcome ingestion
 
 ID: rg4.1
 Depends on: rg4.0
@@ -138,7 +143,10 @@ Depends on: rg4.0
 Parse tracked specs, stable milestones, completion state, and approved `## Outcome` sections into revisioned memory
 records with incremental reuse, deletion/tombstone handling, and atomic publication.
 
-- [ ] #4.2 Add archive manifest and runtime provenance adapters
+Implemented by the tracked-spec source, deterministic specification extractor, incremental fragment cache, and
+atomic `project-memory.db` revision publication in `src/project_memory/`.
+
+- [x] #4.2 Add archive manifest and runtime provenance adapters
 
 ID: rg4.2
 Depends on: rg4.0
@@ -146,7 +154,10 @@ Depends on: rg4.0
 Read project-scoped machine-local archive manifests and the minimum authorized task/run/status/check metadata
 needed for citations without importing raw artifact bodies.
 
-- [ ] #4.3 Build evidence-backed links between memory and repository context
+Implemented by registered-project discovery plus sanitized archive and read-only `ferrus.db` adapters. Runtime
+payloads are reduced to task, run, milestone, status, and check-event identities before extraction.
+
+- [x] #4.3 Build evidence-backed links between memory and repository context
 
 ID: rg4.3
 Depends on: rg4.1, rg4.2
@@ -154,7 +165,12 @@ Depends on: rg4.1, rg4.2
 Resolve explicit paths, semantic keys, task/milestone origins, archive records, and authorized changed-path
 evidence against repository snapshots while preserving stale and unresolved links honestly.
 
-- [ ] #4.4 Implement bounded federated search and context assembly
+Implemented as independently revisioned repository link sets in `project-memory.db`. The local resolver accepts
+tracked/archive paths, explicit `` `path:...` `` and `` `symbol:...` `` references, and changed paths derived from
+authorized baseline/submitted graph snapshot identities. Exact matches target immutable snapshots; missing prior
+matches remain stale, while never-resolved or ambiguous references remain unresolved with bounded diagnostics.
+
+- [x] #4.4 Implement bounded federated search and context assembly
 
 ID: rg4.4
 Depends on: rg4.3
@@ -162,7 +178,13 @@ Depends on: rg4.3
 Add repository-only, memory-only, and combined search/context scopes, deterministic ranking and deduplication,
 independent freshness, evidence-preserving cross-link expansion, and hard query budgets.
 
-- [ ] #4.5 Expose memory lifecycle and federation through CLI and read-only MCP
+Implemented by the read-only SQLite memory query backend and backend-neutral federated context service in
+`src/project_memory/`. Queries clamp caller budgets to service limits, bind cursors to exact request and revision
+identities, interrupt SQLite work at the duration deadline, and verify optional snippets through `MemoryContent`.
+Combined context crosses domains only through the exact repository link set for the selected memory revision and
+repository snapshot, preserves the link records as evidence, and reports freshness for both domains independently.
+
+- [x] #4.5 Expose memory lifecycle and federation through CLI and read-only MCP
 
 ID: rg4.5
 Depends on: rg4.4
@@ -171,13 +193,21 @@ Add the specified memory lifecycle CLI, domain-scoped search/context options, `p
 `project_context_search`, and `project_context` tools, archive/outcome invalidation hooks, guidance, and
 privacy-safe metrics without creating another memory-authoring workflow.
 
-- [ ] #4.6 Validate privacy defaults, freshness, lifecycle, and retrieval usefulness
+Implemented with explicit local memory index/status commands, backward-compatible CLI domain
+routing, three role-visible read-only MCP tools, verified memory snippets, privacy-safe retrieval
+metrics, and a post-commit best-effort archive refresh that cannot change archive lifecycle state.
+
+- [x] #4.6 Validate privacy defaults, freshness, lifecycle, and retrieval usefulness
 
 ID: rg4.6
 Depends on: rg4.5
 
 Add deterministic fixtures, deletion and stale-link tests, archive lifecycle coverage, sensitive-source tests,
 federated retrieval evals, retention diagnostics, and user documentation.
+
+Completed with cross-build determinism and incompatible-sidecar tests, expanded sensitive-artifact
+exclusion coverage, stale archive freshness and best-effort lifecycle checks, read-only retention
+statistics, an offline federated usefulness corpus, and user-facing operations and evaluation guides.
 
 ## Acceptance Criteria
 
