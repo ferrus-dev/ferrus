@@ -25,7 +25,7 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
             if let Some(baseline_tree) =
                 read_executor_workspace_baseline_tree(&baseline_path).await?
             {
-                copy_canonical_agent_config_files(&project_root, &workspace_dir).await?;
+                copy_canonical_ignored_agent_config_files(&project_root, &workspace_dir).await?;
                 crate::project::pin_executor_baseline_tree(&project_root, task_id, &baseline_tree)
                     .await?;
                 return Ok(ExecutorWorkspace {
@@ -486,18 +486,60 @@ async fn copy_canonical_agent_config_files(
     project_root: &Path,
     workspace_dir: &Path,
 ) -> Result<()> {
-    for relative in [
-        ".ferrus/project.toml",
-        ".claude/mcp-supervisor.json",
-        ".claude/mcp-executor.json",
-        ".claude/settings.local.json",
-        ".codex/config.toml",
-        ".qwen/settings.json",
-        "opencode.json",
-    ] {
+    for relative in AGENT_CONFIG_PATHS {
         copy_canonical_file_if_present(project_root, workspace_dir, Path::new(relative)).await?;
     }
     Ok(())
+}
+
+const AGENT_CONFIG_PATHS: &[&str] = &[
+    ".ferrus/project.toml",
+    ".claude/mcp-supervisor.json",
+    ".claude/mcp-executor.json",
+    ".claude/settings.local.json",
+    ".codex/config.toml",
+    ".qwen/settings.json",
+    "opencode.json",
+];
+
+async fn copy_canonical_ignored_agent_config_files(
+    project_root: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    for relative in AGENT_CONFIG_PATHS {
+        let relative = Path::new(relative);
+        if git_path_is_ignored(project_root, relative).await? {
+            copy_canonical_file_if_present(project_root, workspace_dir, relative).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn git_path_is_ignored(project_root: &Path, relative: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["check-ignore", "--quiet", "--"])
+        .arg(relative)
+        .output()
+        .await
+        .with_context(|| format!("Failed to inspect Git policy for {}", relative.display()))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "Failed to inspect Git policy for {}: {}",
+        relative.display(),
+        if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            stderr
+        }
+    )
 }
 
 async fn copy_canonical_file_if_present(

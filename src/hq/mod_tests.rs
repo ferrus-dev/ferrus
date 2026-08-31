@@ -182,8 +182,12 @@ async fn executor_workspace_includes_uncommitted_canonical_changes() {
         .unwrap();
     tokio::fs::write(".gitignore", ".ferrus/\n").await.unwrap();
     tokio::fs::write("tracked.txt", "base\n").await.unwrap();
+    tokio::fs::create_dir_all(".codex").await.unwrap();
+    tokio::fs::write(".codex/config.toml", "model = \"baseline\"\n")
+        .await
+        .unwrap();
     std::process::Command::new("git")
-        .args(["add", ".gitignore", "tracked.txt"])
+        .args(["add", ".gitignore", "tracked.txt", ".codex/config.toml"])
         .status()
         .unwrap();
     let commit_status = std::process::Command::new("git")
@@ -272,6 +276,36 @@ async fn executor_workspace_includes_uncommitted_canonical_changes() {
         String::from_utf8_lossy(&baseline_ref.stdout).trim(),
         baseline_tree
     );
+
+    tokio::fs::write(".codex/config.toml", "model = \"canonical-update\"\n")
+        .await
+        .unwrap();
+    let resumed_workspace = prepare_executor_workspace("t-001").await.unwrap();
+    assert_eq!(
+        resumed_workspace.baseline_tree.as_deref(),
+        Some(baseline_tree)
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(resumed_workspace.workspace_dir.join(".codex/config.toml"))
+            .await
+            .unwrap(),
+        "model = \"baseline\"\n"
+    );
+    let config_patch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&resumed_workspace.workspace_dir)
+        .args([
+            "diff",
+            "--binary",
+            baseline_tree,
+            "--",
+            ".codex/config.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(config_patch.status.success());
+    assert!(config_patch.stdout.is_empty());
+
     assert!(
         std::process::Command::new("git")
             .args(["gc", "--prune=now"])
@@ -536,8 +570,20 @@ async fn executor_workspace_starts_from_unborn_git_project() {
             .success()
     );
 
+    tokio::fs::write(
+        ".codex/config.toml",
+        "[mcp_servers.ferrus-executor]\ncommand = \"ferrus-updated\"\n",
+    )
+    .await
+    .unwrap();
     let resumed_workspace = prepare_executor_workspace("t-unborn").await.unwrap();
     assert_eq!(resumed_workspace.baseline_tree, baseline_tree);
+    assert_eq!(
+        tokio::fs::read_to_string(resumed_workspace.workspace_dir.join(".codex/config.toml"))
+            .await
+            .unwrap(),
+        "[mcp_servers.ferrus-executor]\ncommand = \"ferrus-updated\"\n"
+    );
     let restored_ref = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-unborn"])
         .output()
