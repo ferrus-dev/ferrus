@@ -175,6 +175,10 @@ impl SqliteIndexJobCoordinator {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(replayed) = load_advance_receipt(&transaction, request, expected, next)? {
+            transaction.commit()?;
+            return Ok(replayed);
+        }
         let record = load_record(&transaction, &request.job)?.ok_or(CoordinatorError::NotFound)?;
         require_live_lease(&record, &request.worker_id, request.lease_generation, now)?;
         if record.cancellation_requested || record.state == IndexJobState::Cancelled {
@@ -214,6 +218,7 @@ impl SqliteIndexJobCoordinator {
             return Err(CoordinatorError::Conflict);
         }
         let updated = load_record(&transaction, &request.job)?.ok_or(CoordinatorError::NotFound)?;
+        insert_advance_receipt(&transaction, request, expected, next, &updated)?;
         transaction.commit()?;
         Ok(updated)
     }
@@ -655,6 +660,70 @@ fn require_live_lease(
     Ok(())
 }
 
+fn load_advance_receipt(
+    connection: &Connection,
+    request: &AdvanceIndexJobRequest,
+    expected: IndexJobState,
+    next: IndexJobState,
+) -> Result<Option<IndexJobRecord>, CoordinatorError> {
+    let encoded = connection
+        .query_row(
+            "SELECT outcome_json
+             FROM distributed_index_job_advance_receipts
+             WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3
+               AND expected_state = ?4 AND next_state = ?5
+               AND worker_id = ?6 AND lease_generation = ?7",
+            params![
+                request.job.project.tenant_id.as_str(),
+                request.job.project.project_id.as_str(),
+                request.job.job_id.as_str(),
+                state_token(expected),
+                state_token(next),
+                request.worker_id.as_str(),
+                i64_from_u64(request.lease_generation.get())?,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    encoded
+        .map(|encoded| {
+            let record = serde_json::from_slice::<IndexJobRecord>(&encoded)
+                .map_err(|_| CoordinatorError::Serialization)?;
+            if record.job != request.job || record.state != next || record.validate().is_err() {
+                return Err(CoordinatorError::Serialization);
+            }
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn insert_advance_receipt(
+    transaction: &Transaction<'_>,
+    request: &AdvanceIndexJobRequest,
+    expected: IndexJobState,
+    next: IndexJobState,
+    outcome: &IndexJobRecord,
+) -> Result<(), CoordinatorError> {
+    let encoded = serde_json::to_vec(outcome).map_err(|_| CoordinatorError::Serialization)?;
+    transaction.execute(
+        "INSERT INTO distributed_index_job_advance_receipts (
+             tenant_id, project_id, job_id, expected_state, next_state,
+             worker_id, lease_generation, outcome_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            request.job.project.tenant_id.as_str(),
+            request.job.project.project_id.as_str(),
+            request.job.job_id.as_str(),
+            state_token(expected),
+            state_token(next),
+            request.worker_id.as_str(),
+            i64_from_u64(request.lease_generation.get())?,
+            encoded,
+        ],
+    )?;
+    Ok(())
+}
+
 fn load_record(
     connection: &Connection,
     job: &IndexJobRef,
@@ -749,6 +818,7 @@ fn row_to_record(
 fn initialize_schema(connection: &Connection) -> Result<(), CoordinatorError> {
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS distributed_coordinator_metadata (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              schema_version INTEGER NOT NULL
@@ -811,7 +881,24 @@ fn initialize_schema(connection: &Connection) -> Result<(), CoordinatorError> {
              UNIQUE (tenant_id, project_id, kind, idempotency_algorithm, idempotency_value)
          );
          CREATE INDEX IF NOT EXISTS distributed_index_jobs_claim
-             ON distributed_index_jobs (tenant_id, project_id, kind, state, created_at_ms);",
+             ON distributed_index_jobs (tenant_id, project_id, kind, state, created_at_ms);
+         CREATE TABLE IF NOT EXISTS distributed_index_job_advance_receipts (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             expected_state TEXT NOT NULL,
+             next_state TEXT NOT NULL,
+             worker_id TEXT NOT NULL,
+             lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+             outcome_json BLOB NOT NULL,
+             PRIMARY KEY (
+                 tenant_id, project_id, job_id, expected_state, next_state,
+                 worker_id, lease_generation
+             ),
+             FOREIGN KEY (tenant_id, project_id, job_id)
+                 REFERENCES distributed_index_jobs (tenant_id, project_id, job_id)
+                 ON DELETE CASCADE
+         );",
     )?;
     Ok(())
 }

@@ -259,6 +259,53 @@ fn lease_heartbeat_and_state_transitions_are_generation_guarded() {
 }
 
 #[test]
+fn state_advance_retries_replay_semantic_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("jobs.db");
+    let (complete_request, complete) = {
+        let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(3)).unwrap();
+        coordinator
+            .submit(&submit_request("tenant-a"), now())
+            .unwrap();
+        let leased = coordinator
+            .claim(&claim_request("tenant-a", "worker-a"), now())
+            .unwrap()
+            .unwrap();
+
+        let start_request = advance(&leased);
+        let running = coordinator.start(&start_request, now()).unwrap();
+        let mut start_retry = start_request;
+        start_retry.request_id = RequestId::new("start-retry").unwrap();
+        assert_eq!(coordinator.start(&start_retry, now()).unwrap(), running);
+
+        let publication_request = advance(&running);
+        let publishing = coordinator
+            .begin_publication(&publication_request, now())
+            .unwrap();
+        let mut publication_retry = publication_request;
+        publication_retry.request_id = RequestId::new("publication-retry").unwrap();
+        assert_eq!(
+            coordinator
+                .begin_publication(&publication_retry, now())
+                .unwrap(),
+            publishing
+        );
+
+        let complete_request = advance(&publishing);
+        let complete = coordinator.complete(&complete_request, now()).unwrap();
+        (complete_request, complete)
+    };
+
+    let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(3)).unwrap();
+    let mut complete_retry = complete_request;
+    complete_retry.request_id = RequestId::new("complete-retry").unwrap();
+    assert_eq!(
+        coordinator.complete(&complete_retry, now()).unwrap(),
+        complete
+    );
+}
+
+#[test]
 fn expired_leases_requeue_then_stop_at_the_attempt_limit() {
     let directory = tempfile::tempdir().unwrap();
     let mut coordinator =
