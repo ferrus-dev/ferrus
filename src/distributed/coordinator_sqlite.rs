@@ -486,6 +486,10 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(replayed) = load_failure_receipt(&transaction, request)? {
+            transaction.commit()?;
+            return Ok(replayed);
+        }
         let record = load_record(&transaction, &request.job)?.ok_or(CoordinatorError::NotFound)?;
         require_live_lease(&record, &request.worker_id, request.lease_generation, now)?;
         if record.cancellation_requested || record.state == IndexJobState::Cancelled {
@@ -515,6 +519,7 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
             ],
         )?;
         let updated = load_record(&transaction, &request.job)?.ok_or(CoordinatorError::NotFound)?;
+        insert_failure_receipt(&transaction, request, &updated)?;
         transaction.commit()?;
         Ok(updated)
     }
@@ -724,6 +729,70 @@ fn insert_advance_receipt(
     Ok(())
 }
 
+fn load_failure_receipt(
+    connection: &Connection,
+    request: &FailIndexJobRequest,
+) -> Result<Option<IndexJobRecord>, CoordinatorError> {
+    let encoded = connection
+        .query_row(
+            "SELECT outcome_json
+             FROM distributed_index_job_failure_receipts
+             WHERE tenant_id = ?1 AND project_id = ?2 AND job_id = ?3
+               AND worker_id = ?4 AND lease_generation = ?5
+               AND failure_code = ?6 AND retryable = ?7",
+            params![
+                request.job.project.tenant_id.as_str(),
+                request.job.project.project_id.as_str(),
+                request.job.job_id.as_str(),
+                request.worker_id.as_str(),
+                i64_from_u64(request.lease_generation.get())?,
+                request.failure_code.as_str(),
+                request.retryable,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    encoded
+        .map(|encoded| {
+            let record = serde_json::from_slice::<IndexJobRecord>(&encoded)
+                .map_err(|_| CoordinatorError::Serialization)?;
+            if record.job != request.job
+                || !matches!(record.state, IndexJobState::Queued | IndexJobState::Failed)
+                || record.failure_code.as_ref() != Some(&request.failure_code)
+                || record.validate().is_err()
+            {
+                return Err(CoordinatorError::Serialization);
+            }
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn insert_failure_receipt(
+    transaction: &Transaction<'_>,
+    request: &FailIndexJobRequest,
+    outcome: &IndexJobRecord,
+) -> Result<(), CoordinatorError> {
+    let encoded = serde_json::to_vec(outcome).map_err(|_| CoordinatorError::Serialization)?;
+    transaction.execute(
+        "INSERT INTO distributed_index_job_failure_receipts (
+             tenant_id, project_id, job_id, worker_id, lease_generation,
+             failure_code, retryable, outcome_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            request.job.project.tenant_id.as_str(),
+            request.job.project.project_id.as_str(),
+            request.job.job_id.as_str(),
+            request.worker_id.as_str(),
+            i64_from_u64(request.lease_generation.get())?,
+            request.failure_code.as_str(),
+            request.retryable,
+            encoded,
+        ],
+    )?;
+    Ok(())
+}
+
 fn load_record(
     connection: &Connection,
     job: &IndexJobRef,
@@ -894,6 +963,23 @@ fn initialize_schema(connection: &Connection) -> Result<(), CoordinatorError> {
              PRIMARY KEY (
                  tenant_id, project_id, job_id, expected_state, next_state,
                  worker_id, lease_generation
+             ),
+             FOREIGN KEY (tenant_id, project_id, job_id)
+                 REFERENCES distributed_index_jobs (tenant_id, project_id, job_id)
+                 ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS distributed_index_job_failure_receipts (
+             tenant_id TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             worker_id TEXT NOT NULL,
+             lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+             failure_code TEXT NOT NULL,
+             retryable INTEGER NOT NULL,
+             outcome_json BLOB NOT NULL,
+             PRIMARY KEY (
+                 tenant_id, project_id, job_id, worker_id, lease_generation,
+                 failure_code, retryable
              ),
              FOREIGN KEY (tenant_id, project_id, job_id)
                  REFERENCES distributed_index_jobs (tenant_id, project_id, job_id)

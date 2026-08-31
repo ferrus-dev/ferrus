@@ -430,8 +430,8 @@ fn cancellation_revokes_the_lease_and_prevents_publication() {
 #[test]
 fn retryable_worker_failure_requeues_with_a_bounded_code() {
     let directory = tempfile::tempdir().unwrap();
-    let mut coordinator =
-        SqliteIndexJobCoordinator::open(directory.path().join("jobs.db"), limits(2)).unwrap();
+    let path = directory.path().join("jobs.db");
+    let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(2)).unwrap();
     coordinator
         .submit(&submit_request("tenant-a"), now())
         .unwrap();
@@ -441,24 +441,26 @@ fn retryable_worker_failure_requeues_with_a_bounded_code() {
         .unwrap();
     let running = coordinator.start(&advance(&leased), now()).unwrap();
     let lease = running.lease.as_ref().unwrap();
-    let requeued = coordinator
-        .fail(
-            &FailIndexJobRequest {
-                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                request_id: RequestId::new("retry").unwrap(),
-                job: running.job.clone(),
-                worker_id: lease.worker_id.clone(),
-                lease_generation: lease.generation,
-                failure_code: IndexJobFailureCode::new("object.timeout").unwrap(),
-                retryable: true,
-            },
-            now(),
-        )
-        .unwrap();
+    let retryable_request = FailIndexJobRequest {
+        protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+        request_id: RequestId::new("retry").unwrap(),
+        job: running.job.clone(),
+        worker_id: lease.worker_id.clone(),
+        lease_generation: lease.generation,
+        failure_code: IndexJobFailureCode::new("object.timeout").unwrap(),
+        retryable: true,
+    };
+    let requeued = coordinator.fail(&retryable_request, now()).unwrap();
     assert_eq!(requeued.state, IndexJobState::Queued);
     assert_eq!(
         requeued.failure_code.as_ref().unwrap().as_str(),
         "object.timeout"
+    );
+    let mut retryable_replay = retryable_request;
+    retryable_replay.request_id = RequestId::new("retry-replay").unwrap();
+    assert_eq!(
+        coordinator.fail(&retryable_replay, now()).unwrap(),
+        requeued
     );
     let second = coordinator
         .claim(&claim_request("tenant-a", "worker-b"), now())
@@ -466,6 +468,25 @@ fn retryable_worker_failure_requeues_with_a_bounded_code() {
         .unwrap();
     assert_eq!(second.attempt.get(), 2);
     assert!(second.failure_code.is_none());
+    let running = coordinator.start(&advance(&second), now()).unwrap();
+    let lease = running.lease.as_ref().unwrap();
+    let terminal_request = FailIndexJobRequest {
+        protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
+        request_id: RequestId::new("terminal").unwrap(),
+        job: running.job.clone(),
+        worker_id: lease.worker_id.clone(),
+        lease_generation: lease.generation,
+        failure_code: IndexJobFailureCode::new("extractor.failed").unwrap(),
+        retryable: false,
+    };
+    let failed = coordinator.fail(&terminal_request, now()).unwrap();
+    assert_eq!(failed.state, IndexJobState::Failed);
+    drop(coordinator);
+
+    let mut coordinator = SqliteIndexJobCoordinator::open(&path, limits(2)).unwrap();
+    let mut terminal_replay = terminal_request;
+    terminal_replay.request_id = RequestId::new("terminal-replay").unwrap();
+    assert_eq!(coordinator.fail(&terminal_replay, now()).unwrap(), failed);
 }
 
 #[test]
