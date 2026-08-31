@@ -22,6 +22,7 @@ use crate::{
     repository_graph::domain::{
         Confidence, ExtractorId, ExtractorIdentity, FactProvenance, GraphValue, RepoPath,
         RepositoryId, RepositoryNamespace, RepositoryRef, ResolutionState, SemanticKey,
+        SourceEvidence,
     },
 };
 
@@ -243,11 +244,25 @@ fn graph_batch(job: &IndexJobRef, snapshot: &str, secret: &str) -> FactBatch {
     graph_batch_with_final(job, snapshot, secret, true)
 }
 
+fn graph_batch_with_path(job: &IndexJobRef, snapshot: &str, secret: &str, path: &str) -> FactBatch {
+    graph_batch_with_options(job, snapshot, secret, true, Some(path))
+}
+
 fn graph_batch_with_final(
     job: &IndexJobRef,
     snapshot: &str,
     secret: &str,
     final_batch: bool,
+) -> FactBatch {
+    graph_batch_with_options(job, snapshot, secret, final_batch, None)
+}
+
+fn graph_batch_with_options(
+    job: &IndexJobRef,
+    snapshot: &str,
+    secret: &str,
+    final_batch: bool,
+    path: Option<&str>,
 ) -> FactBatch {
     let snapshot_id = SnapshotId::new(snapshot).unwrap();
     let node = GraphNode {
@@ -261,7 +276,11 @@ fn graph_batch_with_final(
                 version: "1".to_string(),
                 contract_version: 1,
             },
-            evidence: None,
+            evidence: path.map(|path| SourceEvidence {
+                path: RepoPath::new(path).unwrap(),
+                content_identity: digest("55"),
+                span: None,
+            }),
             resolution: ResolutionState::Resolved,
             confidence: Confidence::Exact,
         },
@@ -437,7 +456,11 @@ fn memory_publication_checks_authority_before_loading_repository_links() {
             },
             project_identity: local_project(),
             build_id: MemoryBuildId::new("build-memory-authority-first").unwrap(),
-            repository_links: Some(Box::new(RemoteMemoryLinkSetTarget { graph, link_set })),
+            repository_links: Some(Box::new(RemoteMemoryLinkSetTarget {
+                graph,
+                origin_graphs: Vec::new(),
+                link_set,
+            })),
         },
         FactShardId::new("memory-all").unwrap(),
         0,
@@ -464,15 +487,42 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("control.db");
     let mut coordinator = coordinator(&path);
+    let origin_job = publishing_job(
+        &mut coordinator,
+        IndexJobKind::RepositoryGraph,
+        "a0",
+        "snapshot-origin",
+    );
+    let origin_request = graph_request(&origin_job, "snapshot-origin", None);
+    let origin_batch = graph_batch_with_path(
+        &origin_job.job,
+        "snapshot-origin",
+        "deleted repository node",
+        "src/deleted.rs",
+    );
+    let mut store = store(&path);
+    let origin_version = match store
+        .publish_graph(&origin_request, &[origin_batch], Utc::now())
+        .unwrap()
+    {
+        GraphPublicationOutcome::Published { view, .. } => GraphPublicationVersion {
+            snapshot_id: view.snapshot_id,
+            generation: view.generation,
+        },
+        GraphPublicationOutcome::Superseded { .. } => panic!("first graph must publish"),
+    };
+    let origin_graph = RemoteGraphSnapshotRef {
+        repository: repository("tenant-a"),
+        snapshot_id: SnapshotId::new("snapshot-origin").unwrap(),
+    };
     let graph_job = publishing_job(
         &mut coordinator,
         IndexJobKind::RepositoryGraph,
         "aa",
         "snapshot-linked",
     );
-    let graph_request = graph_request(&graph_job, "snapshot-linked", None);
+    let graph_request = graph_request(&graph_job, "snapshot-linked", Some(origin_version));
     let graph_batch = graph_batch(&graph_job.job, "snapshot-linked", "linked repository node");
-    let mut store = store(&path);
     store
         .publish_graph(&graph_request, &[graph_batch], Utc::now())
         .unwrap();
@@ -491,6 +541,7 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
         unreachable!();
     };
     manifest.repository_snapshot = Some(graph.clone());
+    manifest.repository_origin_snapshots = vec![origin_graph.clone()];
     let memory_job = publishing_job_with_input(
         &mut coordinator,
         IndexJobKind::ProjectMemory,
@@ -540,14 +591,29 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
         memory_revision_id: revision_id.clone(),
         id: MemoryRelationshipId::new("linked-relationship").unwrap(),
         kind: MemoryRelationshipKind::Touches,
-        source: entity_id,
+        source: entity_id.clone(),
         target: MemoryRelationshipTarget::RepositoryNode {
             repository: local_repository(),
             snapshot_id: graph.snapshot_id.clone(),
             node_id: NodeId::new("node-snapshot-linked").unwrap(),
             semantic_key: Some(SemanticKey::new("symbol-snapshot-linked").unwrap()),
         },
-        provenance,
+        provenance: provenance.clone(),
+    };
+    let mut stale_provenance = provenance;
+    stale_provenance.resolution = MemoryResolutionState::Stale;
+    let stale_relationship = MemoryRelationship {
+        project: local_project(),
+        memory_revision_id: revision_id.clone(),
+        id: MemoryRelationshipId::new("stale-relationship").unwrap(),
+        kind: MemoryRelationshipKind::Touches,
+        source: entity_id,
+        target: MemoryRelationshipTarget::RepositoryPath {
+            repository: local_repository(),
+            path: RepoPath::new("src/deleted.rs").unwrap(),
+            snapshot_id: Some(origin_graph.snapshot_id.clone()),
+        },
+        provenance: stale_provenance,
     };
     let batch = FactBatch::new(
         memory_job.job.clone(),
@@ -560,6 +626,7 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
             build_id: MemoryBuildId::new("build-memory-linked").unwrap(),
             repository_links: Some(Box::new(RemoteMemoryLinkSetTarget {
                 graph: graph.clone(),
+                origin_graphs: vec![origin_graph.clone()],
                 link_set,
             })),
         },
@@ -569,7 +636,7 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
         true,
         FactBatchPayload::ProjectMemory {
             entities: vec![entity],
-            relationships: vec![relationship.clone()],
+            relationships: vec![relationship.clone(), stale_relationship.clone()],
             diagnostics: Vec::new(),
         },
     )
@@ -587,7 +654,8 @@ fn memory_publication_keeps_repository_links_in_an_exact_federated_link_set() {
     assert!(memory.relationships.is_empty());
     let federated = FederatedViewRef::new(graph, memory_ref).unwrap();
     let links = store.memory_repository_links(&federated).unwrap().unwrap();
-    assert_eq!(links.relationships, vec![relationship]);
+    assert_eq!(links.target.origin_graphs, vec![origin_graph]);
+    assert_eq!(links.relationships, vec![relationship, stale_relationship]);
 }
 
 #[test]

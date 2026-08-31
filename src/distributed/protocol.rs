@@ -12,7 +12,7 @@ use crate::{
         diagnostics::MemoryDiagnostic,
         domain::{
             MemoryBuildId, MemoryEntity, MemoryRelationship, MemoryRepositoryLinkSet,
-            MemoryRevisionId, MemoryViewName,
+            MemoryResolutionState, MemoryRevisionId, MemoryViewName,
         },
     },
     repository_graph::domain::{
@@ -425,6 +425,10 @@ pub enum FactTarget {
 #[serde(deny_unknown_fields)]
 pub struct RemoteMemoryLinkSetTarget {
     pub graph: RemoteGraphSnapshotRef,
+    /// Additional immutable snapshots that may retain exact stale evidence.
+    /// They are canonical job inputs, not mutable federated view pointers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_graphs: Vec<RemoteGraphSnapshotRef>,
     pub link_set: MemoryRepositoryLinkSet,
 }
 
@@ -618,6 +622,10 @@ fn validate_fact_targets(
                     && links.link_set.memory_revision_id == revision.revision_id
                     && links.link_set.repository_snapshot_id.as_ref()
                         == Some(&links.graph.snapshot_id)
+                    && links.origin_graphs.windows(2).all(|pair| pair[0] < pair[1])
+                    && links.origin_graphs.iter().all(|origin| {
+                        origin.repository == links.graph.repository && origin != &links.graph
+                    })
             });
             link_target_is_valid
                 && entities.iter().all(|entity| {
@@ -667,8 +675,22 @@ fn memory_relationship_matches_link_target(
         _ => return true,
     };
     target.is_some_and(|target| {
-        repository == &target.link_set.repository
-            && snapshot_id.is_none_or(|snapshot| snapshot == &target.graph.snapshot_id)
+        if repository != &target.link_set.repository {
+            return false;
+        }
+        match snapshot_id {
+            None => relationship.provenance.resolution == MemoryResolutionState::Unresolved,
+            Some(snapshot) if snapshot == &target.graph.snapshot_id => {
+                relationship.provenance.resolution == MemoryResolutionState::Resolved
+            }
+            Some(snapshot) => {
+                relationship.provenance.resolution == MemoryResolutionState::Stale
+                    && target
+                        .origin_graphs
+                        .iter()
+                        .any(|origin| &origin.snapshot_id == snapshot)
+            }
+        }
     })
 }
 

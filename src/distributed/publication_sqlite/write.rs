@@ -363,8 +363,22 @@ fn repository_relationship_matches(
         } => (repository, snapshot_id.as_ref()),
         _ => return false,
     };
-    repository == &target.link_set.repository
-        && snapshot.is_none_or(|snapshot| snapshot == &target.graph.snapshot_id)
+    if repository != &target.link_set.repository {
+        return false;
+    }
+    match snapshot {
+        None => relationship.provenance.resolution == MemoryResolutionState::Unresolved,
+        Some(snapshot) if snapshot == &target.graph.snapshot_id => {
+            relationship.provenance.resolution == MemoryResolutionState::Resolved
+        }
+        Some(snapshot) => {
+            relationship.provenance.resolution == MemoryResolutionState::Stale
+                && target
+                    .origin_graphs
+                    .iter()
+                    .any(|origin| &origin.snapshot_id == snapshot)
+        }
+    }
 }
 
 pub(super) fn validate_batch_stream(
@@ -959,8 +973,7 @@ pub(super) fn insert_memory_repository_links(
     )?
     .ok_or(RemoteStoreError::IntegrityFailure)?
     .job_id;
-    let encoded =
-        serde_json::to_vec(&target.link_set).map_err(|_| RemoteStoreError::Serialization)?;
+    let encoded = serde_json::to_vec(target).map_err(|_| RemoteStoreError::Serialization)?;
     let existing = transaction
         .query_row(
             "SELECT link_set_id, link_set_json
@@ -978,7 +991,8 @@ pub(super) fn insert_memory_repository_links(
         )
         .optional()?;
     if let Some((link_set_id, link_set_json)) = existing {
-        if link_set_id != target.link_set.id.as_str() || link_set_json != encoded {
+        let stored_target = decode_memory_link_target(&link_set_json, &target.graph)?;
+        if link_set_id != target.link_set.id.as_str() || stored_target != *target {
             return Err(RemoteStoreError::ImmutableConflict);
         }
         return Ok(());

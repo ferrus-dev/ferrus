@@ -37,8 +37,8 @@ use crate::{
             RuntimeRunDocument, RuntimeSourceDocument, RuntimeTaskDocument, parse_spec_memory,
         },
         domain::{
-            AuthorizedSourceDescriptor, MemoryRelationshipTarget, MemorySourceCategory,
-            MemorySourceLocator, ProjectId, ProjectNamespace, ProjectRef,
+            AuthorizedSourceDescriptor, MemoryRelationshipTarget, MemoryResolutionState,
+            MemorySourceCategory, MemorySourceLocator, ProjectId, ProjectNamespace, ProjectRef,
         },
         extractors::canonical_digest as memory_digest,
         policy::MemoryPolicy,
@@ -1236,11 +1236,11 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         diagnostics: Vec::new(),
     };
     let mut baseline_graph = graph.clone();
-    baseline_graph.record.snapshot = baseline_ref;
+    baseline_graph.record.snapshot = baseline_ref.clone();
     baseline_graph.record.job.job_id =
         crate::distributed::identity::IndexJobId::new("baseline-graph-job").unwrap();
     baseline_graph.record.build_id = BuildId::new("baseline-graph-build").unwrap();
-    baseline_graph.nodes[0].snapshot_id = baseline_snapshot_id;
+    baseline_graph.nodes[0].snapshot_id = baseline_snapshot_id.clone();
     baseline_graph.nodes[0].id = NodeId::new("baseline-node").unwrap();
     baseline_graph.nodes[0]
         .provenance
@@ -1248,6 +1248,19 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
         .as_mut()
         .unwrap()
         .content_identity = Digest::new("sha256", "43").unwrap();
+    let mut deleted_node = baseline_graph.nodes[0].clone();
+    deleted_node.id = NodeId::new("deleted-node").unwrap();
+    deleted_node.semantic_key = None;
+    deleted_node.provenance.evidence.as_mut().unwrap().path =
+        RepoPath::new("src/deleted.rs").unwrap();
+    deleted_node
+        .provenance
+        .evidence
+        .as_mut()
+        .unwrap()
+        .content_identity = Digest::new("sha256", "45").unwrap();
+    baseline_graph.nodes.push(deleted_node);
+    baseline_graph.record.counts.primary = 2;
     let mut jobs = coordinator(&storage_dir.path().join("jobs.db"));
     let running = running_job(
         &mut jobs,
@@ -1294,6 +1307,7 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
                 repository_links: Some(target),
                 ..
             } if target.graph == graph_ref
+                && target.origin_graphs == vec![baseline_ref.clone()]
                 && target.link_set.repository_snapshot_id.as_ref() == Some(&graph_ref.snapshot_id)
         )
     }));
@@ -1336,6 +1350,27 @@ fn memory_worker_emits_a_snapshot_pinned_repository_link_set() {
                             ..
                         } if path.as_str() == "src/lib.rs"
                             && snapshot_id == &current_snapshot_id
+                    )
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| {
+                relationship.kind == crate::project_memory::domain::MemoryRelationshipKind::Touches
+                    && relationship.provenance.source_category
+                        == MemorySourceCategory::RuntimeProvenance
+                    && relationship.provenance.resolution == MemoryResolutionState::Stale
+                    && matches!(
+                        &relationship.target,
+                        MemoryRelationshipTarget::RepositoryPath {
+                            path,
+                            snapshot_id: Some(snapshot_id),
+                            ..
+                        } if path.as_str() == "src/deleted.rs"
+                            && snapshot_id == &baseline_snapshot_id
                     )
             })
             .count(),

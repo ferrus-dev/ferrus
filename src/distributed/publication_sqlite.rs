@@ -27,7 +27,7 @@ use crate::{
     },
     repository_graph::domain::{
         BuildId, Digest, EdgeId, EdgeTarget, GraphDiagnostic, GraphEdge, GraphNode, NodeId,
-        PublishedViewName, SnapshotId,
+        PublishedViewName, RepoPath, SemanticKey, SnapshotId,
     },
 };
 
@@ -404,11 +404,7 @@ impl SqliteRemotePublicationStore {
         let Some((link_set_id, job_id, link_set_json)) = row else {
             return Ok(None);
         };
-        let link_set = decode(&link_set_json)?;
-        let target = RemoteMemoryLinkSetTarget {
-            graph: view.graph.clone(),
-            link_set,
-        };
+        let target = decode_memory_link_target(&link_set_json, &view.graph)?;
         if target.link_set.memory_revision_id != view.memory.revision_id
             || target.link_set.repository_snapshot_id.as_ref() != Some(&view.graph.snapshot_id)
         {
@@ -615,6 +611,10 @@ impl SqliteRemotePublicationStore {
                         && manifest.expected_revision_id == request.revision_id
                         && manifest.repository_snapshot.as_ref()
                             == prepared_links.as_ref().map(|(links, _)| &links.target.graph)
+                        && manifest.repository_origin_snapshots
+                            == prepared_links
+                                .as_ref()
+                                .map_or(&[][..], |(links, _)| links.target.origin_graphs.as_slice())
             )
         {
             return Err(RemoteStoreError::InvalidInput);
@@ -628,7 +628,20 @@ impl SqliteRemotePublicationStore {
                 true,
             )?
             .ok_or(RemoteStoreError::InvalidInput)?;
-            validate_repository_links_against_graph(links, &graph)?;
+            let mut origins = Vec::with_capacity(links.target.origin_graphs.len());
+            for origin in &links.target.origin_graphs {
+                origins.push(
+                    load_graph_snapshot_from_connection(
+                        &transaction,
+                        &self.key,
+                        origin,
+                        None,
+                        true,
+                    )?
+                    .ok_or(RemoteStoreError::InvalidInput)?,
+                );
+            }
+            validate_repository_links_against_graph(links, &graph, &origins)?;
         }
         let reused_revision =
             insert_memory_revision(&transaction, &prepared.record, &encrypted, self.limits)?;
@@ -701,6 +714,23 @@ impl SqliteRemotePublicationStore {
     }
 }
 
+fn decode_memory_link_target(
+    encoded: &[u8],
+    graph: &RemoteGraphSnapshotRef,
+) -> Result<RemoteMemoryLinkSetTarget, RemoteStoreError> {
+    if let Ok(target) = serde_json::from_slice::<RemoteMemoryLinkSetTarget>(encoded) {
+        return (target.graph == *graph)
+            .then_some(target)
+            .ok_or(RemoteStoreError::IntegrityFailure);
+    }
+    let link_set = decode(encoded)?;
+    Ok(RemoteMemoryLinkSetTarget {
+        graph: graph.clone(),
+        origin_graphs: Vec::new(),
+        link_set,
+    })
+}
+
 fn load_graph_snapshot_from_connection(
     connection: &Connection,
     key: &LessSafeKey,
@@ -761,27 +791,21 @@ fn load_graph_snapshot_from_connection(
 fn validate_repository_links_against_graph(
     links: &PreparedMemoryRepositoryLinks,
     graph: &StoredRemoteGraphSnapshot,
+    origins: &[StoredRemoteGraphSnapshot],
 ) -> Result<(), RemoteStoreError> {
     if links.target.graph != graph.record.snapshot
         || links.target.link_set.repository != graph.record.repository_identity
+        || origins.len() != links.target.origin_graphs.len()
+        || origins
+            .iter()
+            .zip(&links.target.origin_graphs)
+            .any(|(stored, expected)| {
+                stored.record.snapshot != *expected
+                    || stored.record.repository_identity != graph.record.repository_identity
+            })
     {
         return Err(RemoteStoreError::InvalidInput);
     }
-    let nodes = graph
-        .nodes
-        .iter()
-        .map(|node| (&node.id, node.semantic_key.as_ref()))
-        .collect::<BTreeMap<_, _>>();
-    let paths = graph
-        .nodes
-        .iter()
-        .filter_map(|node| {
-            node.provenance
-                .evidence
-                .as_ref()
-                .map(|evidence| &evidence.path)
-        })
-        .collect::<BTreeSet<_>>();
     let valid = links.relationships.iter().all(|relationship| {
         match (&relationship.target, relationship.provenance.resolution) {
             (
@@ -795,11 +819,24 @@ fn validate_repository_links_against_graph(
             ) => {
                 repository == &graph.record.repository_identity
                     && snapshot_id == &graph.record.snapshot.snapshot_id
-                    && nodes.get(node_id).is_some_and(|stored| {
-                        semantic_key
-                            .as_ref()
-                            .is_none_or(|semantic_key| *stored == Some(semantic_key))
-                    })
+                    && repository_node_matches(graph, node_id, semantic_key.as_ref())
+            }
+            (
+                MemoryRelationshipTarget::RepositoryNode {
+                    repository,
+                    snapshot_id,
+                    node_id,
+                    semantic_key,
+                },
+                MemoryResolutionState::Stale,
+            ) => {
+                repository == &graph.record.repository_identity
+                    && origins
+                        .iter()
+                        .find(|origin| origin.record.snapshot.snapshot_id == *snapshot_id)
+                        .is_some_and(|origin| {
+                            repository_node_matches(origin, node_id, semantic_key.as_ref())
+                        })
             }
             (
                 MemoryRelationshipTarget::RepositoryPath {
@@ -811,7 +848,21 @@ fn validate_repository_links_against_graph(
             ) => {
                 repository == &graph.record.repository_identity
                     && snapshot_id == &graph.record.snapshot.snapshot_id
-                    && paths.contains(path)
+                    && repository_path_matches(graph, path)
+            }
+            (
+                MemoryRelationshipTarget::RepositoryPath {
+                    repository,
+                    path,
+                    snapshot_id: Some(snapshot_id),
+                },
+                MemoryResolutionState::Stale,
+            ) => {
+                repository == &graph.record.repository_identity
+                    && origins
+                        .iter()
+                        .find(|origin| origin.record.snapshot.snapshot_id == *snapshot_id)
+                        .is_some_and(|origin| repository_path_matches(origin, path))
             }
             (
                 MemoryRelationshipTarget::RepositoryPath {
@@ -830,6 +881,27 @@ fn validate_repository_links_against_graph(
         }
     });
     valid.then_some(()).ok_or(RemoteStoreError::InvalidInput)
+}
+
+fn repository_node_matches(
+    graph: &StoredRemoteGraphSnapshot,
+    node_id: &NodeId,
+    semantic_key: Option<&SemanticKey>,
+) -> bool {
+    graph.nodes.iter().any(|node| {
+        &node.id == node_id
+            && semantic_key
+                .is_none_or(|semantic_key| node.semantic_key.as_ref() == Some(semantic_key))
+    })
+}
+
+fn repository_path_matches(graph: &StoredRemoteGraphSnapshot, path: &RepoPath) -> bool {
+    graph.nodes.iter().any(|node| {
+        node.provenance
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| &evidence.path == path)
+    })
 }
 
 impl RemotePublicationStore for SqliteRemotePublicationStore {

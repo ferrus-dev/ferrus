@@ -933,6 +933,7 @@ impl StatelessIndexWorker {
                 diagnostics.extend(commit.diagnostics);
                 Some(Box::new(RemoteMemoryLinkSetTarget {
                     graph: expected.clone(),
+                    origin_graphs: remote.reference.repository_origin_snapshots.clone(),
                     link_set: commit.link_set,
                 }))
             }

@@ -294,6 +294,26 @@ pub(crate) fn resolve_repository_links_for_snapshot(
                 },
                 MemoryResolutionState::Resolved,
             ),
+            ExplicitRepositoryReference::Path(path)
+                if candidate.origin_snapshot_id.as_ref().is_some_and(|origin| {
+                    origin_files
+                        .get(origin)
+                        .is_some_and(|files| files.contains_key(path))
+                }) =>
+            {
+                let origin = candidate
+                    .origin_snapshot_id
+                    .as_ref()
+                    .expect("matched origin path has a snapshot");
+                (
+                    MemoryRelationshipTarget::RepositoryPath {
+                        repository: repository.clone(),
+                        path: path.clone(),
+                        snapshot_id: Some(origin.clone()),
+                    },
+                    MemoryResolutionState::Stale,
+                )
+            }
             ExplicitRepositoryReference::Path(path) => (
                 MemoryRelationshipTarget::RepositoryPath {
                     repository: repository.clone(),
