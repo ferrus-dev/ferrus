@@ -483,16 +483,46 @@ async fn merge_trees(
     ours: &str,
     theirs: &str,
 ) -> Result<String> {
+    // Older Git versions require commit operands for merge-tree --write-tree.
+    // Give both sides the explicit baseline as their common parent.
+    let baseline_commit = commit_tree(project_root, baseline, None, "baseline").await?;
+    let ours_commit = commit_tree(project_root, ours, Some(&baseline_commit), "canonical").await?;
+    let theirs_commit =
+        commit_tree(project_root, theirs, Some(&baseline_commit), "submitted").await?;
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["merge-tree", "--write-tree", "--messages", "--merge-base"])
-        .arg(baseline)
-        .arg(ours)
-        .arg(theirs)
+        .args(["merge-tree", "--write-tree", "--messages"])
+        .arg(ours_commit)
+        .arg(theirs_commit)
         .output()
         .await?;
     git_stdout(output, "three-way merge approved task")
+}
+
+async fn commit_tree(
+    project_root: &Path,
+    tree: &str,
+    parent: Option<&str>,
+    role: &str,
+) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(project_root)
+        .env("GIT_AUTHOR_NAME", "Ferrus")
+        .env("GIT_AUTHOR_EMAIL", "ferrus@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Ferrus")
+        .env("GIT_COMMITTER_EMAIL", "ferrus@example.invalid")
+        .args(["commit-tree", tree]);
+    if let Some(parent) = parent {
+        command.args(["-p", parent]);
+    }
+    let output = command
+        .args(["-m", &format!("Ferrus temporary {role} tree")])
+        .output()
+        .await?;
+    git_stdout(output, &format!("wrap {role} tree in a temporary commit"))
 }
 
 async fn materialize_tree(
