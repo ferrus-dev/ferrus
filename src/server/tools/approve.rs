@@ -399,6 +399,7 @@ async fn integrate_patch_three_way(
         _ => submitted_tree_from_patch(context, project_root, &baseline).await?,
     };
     let merged = merge_trees(project_root, &baseline, &snapshot.tree, &submitted).await?;
+    reject_gitlink_changes(project_root, &snapshot.tree, &merged).await?;
     if let Err(error) = materialize_tree(project_root, &snapshot.tree, &merged).await {
         if let Err(restore_error) = snapshot.restore(project_root).await {
             anyhow::bail!(
@@ -498,6 +499,46 @@ async fn merge_trees(
         .output()
         .await?;
     git_stdout(output, "three-way merge approved task")
+}
+
+async fn reject_gitlink_changes(
+    project_root: &Path,
+    current_tree: &str,
+    target_tree: &str,
+) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--raw",
+            "-r",
+            "-z",
+            "--no-renames",
+        ])
+        .arg(current_tree)
+        .arg(target_tree)
+        .output()
+        .await?;
+    git_success(&output, "inspect approved tree for submodule changes")?;
+    if output
+        .stdout
+        .split(|byte| *byte == 0)
+        .any(raw_diff_entry_changes_gitlink)
+    {
+        anyhow::bail!(
+            "Approved submissions that change submodules are not supported because their gitlinks cannot be materialized safely"
+        );
+    }
+    Ok(())
+}
+
+fn raw_diff_entry_changes_gitlink(entry: &[u8]) -> bool {
+    let mut fields = entry.split(|byte| byte.is_ascii_whitespace());
+    let old_mode = fields.next();
+    let new_mode = fields.next();
+    old_mode == Some(&b":160000"[..]) || new_mode == Some(&b"160000"[..])
 }
 
 async fn commit_tree(

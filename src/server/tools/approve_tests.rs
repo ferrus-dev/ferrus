@@ -433,6 +433,106 @@ async fn approve_three_way_merges_disjoint_hunks_from_a_pinned_baseline() {
 }
 
 #[tokio::test]
+async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (dir, previous) = setup().await;
+    if !git(dir.path(), ["init"]).success() {
+        teardown(previous);
+        return;
+    }
+    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
+    assert!(git(dir.path(), ["add", "file.txt"]).success());
+    assert!(
+        git(
+            dir.path(),
+            [
+                "-c",
+                "user.email=ferrus@example.invalid",
+                "-c",
+                "user.name=Ferrus",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        )
+        .success()
+    );
+    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+    crate::project::pin_executor_baseline_tree(dir.path(), "t-007", &baseline_tree)
+        .await
+        .unwrap();
+
+    let gitlink_target = git_output(dir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let cache_info = format!("160000,{gitlink_target},dependency");
+    assert!(
+        git(
+            dir.path(),
+            ["update-index", "--add", "--cacheinfo", &cache_info],
+        )
+        .success()
+    );
+    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
+    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
+    assert!(!patch.trim().is_empty());
+    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
+    let submitted_tree =
+        crate::repository_graph::source::parse_git_tree_digest(&submitted_tree).unwrap();
+    crate::repository_graph::source::pin_submitted_tree(dir.path(), "t-007", &submitted_tree)
+        .unwrap();
+
+    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
+        .await
+        .unwrap();
+    crate::project::record_task_status(
+        "t-007",
+        ".ferrus/tasks/t-007.md",
+        crate::project::TaskStatus::Reviewing,
+    )
+    .await
+    .unwrap();
+    let frozen_view = crate::project::RepositoryViewReference::materialized(
+        crate::repository_graph::domain::SnapshotId::new("baseline-snapshot").unwrap(),
+        None,
+        crate::repository_graph::domain::SnapshotId::new("submitted-snapshot").unwrap(),
+        crate::project::RepositoryViewStatus::Available,
+    )
+    .unwrap()
+    .frozen(submitted_tree)
+    .unwrap();
+    crate::project::record_task_repository_view("t-007", &frozen_view)
+        .await
+        .unwrap();
+    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+        .await
+        .unwrap();
+
+    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+    assert!(error.contains("change submodules are not supported"));
+    assert!(!dir.path().join("dependency").exists());
+    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
+    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+        .await
+        .unwrap();
+    assert!(integration_error.contains("change submodules are not supported"));
+    let task = crate::project::list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "t-007")
+        .unwrap();
+    assert_eq!(task.status, "reviewing");
+
+    teardown(previous);
+}
+
+#[tokio::test]
 async fn approve_from_executor_worktree_updates_and_checks_canonical_workspace() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let (dir, previous) = setup().await;
