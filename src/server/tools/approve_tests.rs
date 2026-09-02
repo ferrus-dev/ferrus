@@ -422,7 +422,10 @@ async fn approve_three_way_merges_disjoint_hunks_from_a_pinned_baseline() {
     run("supervisor:codex:7").await.unwrap();
 
     assert_eq!(
-        tokio::fs::read_to_string("file.txt").await.unwrap(),
+        tokio::fs::read_to_string("file.txt")
+            .await
+            .unwrap()
+            .replace("\r\n", "\n"),
         "canonical change\nsecond\nthird\nfourth\nfifth\ntask change\n"
     );
 
@@ -655,7 +658,7 @@ async fn approve_rolls_back_patch_when_post_apply_checks_fail() {
     let (dir, previous) = setup().await;
     tokio::fs::write(
         "ferrus.toml",
-        "[repository_graph]\nenabled = true\n\n[checks]\ncommands = [\"printf mutated > file.txt; printf generated > generated.txt; git add file.txt generated.txt; exit 1\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+        "[repository_graph]\nenabled = true\n\n[checks]\ncommands = [\"git show HEAD:file.txt > generated.txt\", \"git add file.txt generated.txt\", \"git grep -q base -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
     )
     .await
     .unwrap();
@@ -724,7 +727,7 @@ async fn approve_rolls_back_patch_when_post_apply_checks_fail() {
         .await
         .unwrap();
     assert!(integration_error.contains("configured checks failed"));
-    assert!(integration_error.contains("printf mutated > file.txt"));
+    assert!(integration_error.contains("git grep -q base -- file.txt"));
     let tasks = crate::project::list_tasks().await.unwrap();
     let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
     assert_eq!(task.status, "reviewing");

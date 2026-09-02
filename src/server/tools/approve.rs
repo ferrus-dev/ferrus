@@ -360,18 +360,12 @@ async fn apply_approved_patch(
 
     let snapshot = CanonicalWorkspaceSnapshot::capture(project_root).await?;
     if let Err(error) = integrate_patch_three_way(context, project_root, &snapshot).await {
-        let restore_error = snapshot.restore(project_root).await.err();
         let detail = bounded_git_detail(&error.to_string());
         let reason = format!(
-            "Cannot approve task {} because its submitted changes could not be merged into {}: {}{}",
+            "Cannot approve task {} because its submitted changes could not be merged into {}: {}",
             context.task_id,
             project_root.display(),
-            detail,
-            restore_error
-                .map(|error| format!(
-                    "\n\nAdditionally failed to restore the pre-integration canonical workspace: {error}"
-                ))
-                .unwrap_or_default()
+            detail
         );
         write_integration_error(context, &reason).await?;
         project::record_task_integration_failed_best_effort(
@@ -405,7 +399,15 @@ async fn integrate_patch_three_way(
         _ => submitted_tree_from_patch(context, project_root, &baseline).await?,
     };
     let merged = merge_trees(project_root, &baseline, &snapshot.tree, &submitted).await?;
-    materialize_tree(project_root, &snapshot.tree, &merged).await
+    if let Err(error) = materialize_tree(project_root, &snapshot.tree, &merged).await {
+        if let Err(restore_error) = snapshot.restore(project_root).await {
+            anyhow::bail!(
+                "{error}\n\nAdditionally failed to restore the pre-integration canonical workspace: {restore_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn task_baseline_tree(
