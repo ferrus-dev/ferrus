@@ -1008,6 +1008,7 @@ async fn approve_rollback_preserves_files_ignored_before_integration() {
         teardown(previous);
         return;
     }
+    assert!(git(dir.path(), ["config", "core.autocrlf", "false"]).success());
     tokio::fs::write(
         "ferrus.toml",
         "[checks]\ncommands = [\"git grep -q secret.txt -- .gitignore\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
