@@ -65,6 +65,7 @@ const COMMANDS: &[(&str, &str)] = &[
 
 pub enum UiMessage {
     Info(String),
+    Table(Vec<String>),
     Success(String),
     Tip(String),
     Muted(String),
@@ -179,6 +180,10 @@ struct TranscriptLine {
 #[derive(Clone, Copy)]
 enum TranscriptKind {
     Info,
+    TableTop,
+    TableHeader,
+    TableRow,
+    TableBottom,
     Success,
     Tip,
     Muted,
@@ -601,6 +606,12 @@ fn handle_message(
         UiMessage::Info(text) => {
             let lines = split_transcript(&text, TranscriptKind::Info);
             app.messages.extend(lines.iter().cloned());
+            if !app.suspended {
+                redraw_dashboard(stdout, app, ui)?;
+            }
+        }
+        UiMessage::Table(rows) => {
+            app.messages.extend(table_transcript(&rows));
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }

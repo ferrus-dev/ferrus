@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct StyledSegment {
     pub(super) text: String,
     pub(super) color: Color,
-    bold: bool,
+    pub(super) bold: bool,
     pub(super) link: Option<String>,
 }
 
@@ -547,11 +547,38 @@ pub(super) fn recent_transcript_blocks(
         }
 
         let take = block.len().min(remaining - gap_before_newer_block);
-        selected.push(block.into_iter().take(take).collect::<Vec<_>>());
+        selected.push(take_transcript_block(block, take));
         remaining -= gap_before_newer_block + take;
     }
     selected.reverse();
     selected
+}
+
+pub(super) fn take_transcript_block(
+    mut block: Vec<TranscriptLine>,
+    take: usize,
+) -> Vec<TranscriptLine> {
+    if block.len() <= take {
+        return block;
+    }
+
+    let is_table = matches!(
+        block.first().map(|line| line.kind),
+        Some(TranscriptKind::TableTop)
+    ) && matches!(
+        block.last().map(|line| line.kind),
+        Some(TranscriptKind::TableBottom)
+    );
+    if is_table && take >= 2 {
+        let bottom = block
+            .pop()
+            .expect("table block should have a bottom border");
+        let mut visible = block.into_iter().take(take - 1).collect::<Vec<_>>();
+        visible.push(bottom);
+        return visible;
+    }
+
+    block.into_iter().take(take).collect()
 }
 
 pub(super) fn runtime_task_activity_lines(

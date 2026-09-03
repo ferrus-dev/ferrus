@@ -126,11 +126,16 @@ pub fn event_lines(events: &[EventRecord], run_filter: Option<&str>) -> Vec<Stri
 }
 
 fn compact(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let mut shortened: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        shortened.push_str("...");
+    if value.chars().count() <= max_chars {
+        return value.to_string();
     }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut shortened = value.chars().take(max_chars - 3).collect::<String>();
+    shortened.push_str("...");
     shortened
 }
 
@@ -167,8 +172,30 @@ mod tests {
 
         assert!(lines[0].contains("Spec"));
         assert!(lines[0].contains("Milestone"));
-        assert!(lines[1].contains("docs/specs/sp"));
+        assert!(lines[1].contains("docs/specs/..."));
         assert!(lines[1].contains("m1.0"));
+    }
+
+    #[test]
+    fn task_lines_keep_columns_aligned_after_compacted_spec() {
+        let tasks = vec![TaskRecord {
+            id: "t-001".to_string(),
+            path: ".ferrus/tasks/t-001.md".to_string(),
+            spec_path: Some("docs/specs/a-very-long-spec-name.md".to_string()),
+            milestone_id: Some("m1.0".to_string()),
+            status: "complete".to_string(),
+            paused_status: None,
+            claimed_by: None,
+            lease_until: None,
+            last_heartbeat: None,
+            check_retries: 0,
+            review_cycles: 0,
+            failure_reason: None,
+        }];
+
+        let lines = task_lines(&tasks);
+
+        assert_eq!(lines[0].find("Milestone"), lines[1].find("m1.0"));
     }
 
     #[test]
@@ -213,6 +240,34 @@ mod tests {
         assert!(lines[1].contains("r-123"));
         assert!(lines[1].contains("executor"));
         assert!(lines[1].contains("42"));
+    }
+
+    #[test]
+    fn run_lines_keep_columns_aligned_after_compacted_agent() {
+        let runs = vec![RunRecord {
+            id: "r-123".to_string(),
+            task_id: "t-001".to_string(),
+            role: "executor".to_string(),
+            agent: "executor:a-very-long-agent-name".to_string(),
+            status: "completed".to_string(),
+            started_at: "2026-05-17T10:00:00Z".to_string(),
+            updated_at: "2026-05-17T10:01:00Z".to_string(),
+            pid: None,
+            workspace_path: "/tmp/ferrus".to_string(),
+        }];
+
+        let lines = run_lines(&runs);
+
+        assert_eq!(lines[0].find("Status"), lines[1].find("completed"));
+    }
+
+    #[test]
+    fn compact_keeps_ellipsis_within_the_requested_width() {
+        assert_eq!(compact("abcdefgh", 6), "abc...");
+        assert_eq!(compact("abcdefgh", 3), "...");
+        assert_eq!(compact("abcdefgh", 2), "..");
+        assert_eq!(compact("abcdefgh", 0), "");
+        assert_eq!(compact("abc", 3), "abc");
     }
 
     #[test]

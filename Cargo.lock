@@ -581,7 +581,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferrus"
-version = "0.4.0-alpha.2"
+version = "0.4.0-alpha.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -969,9 +969,9 @@ dependencies = [
 
 [[package]]
 name = "neva"
-version = "0.5.2"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a193dbe30828e326fa3c871137d1209da395c0303ffe3bf06bce67e8faa1cc9"
+checksum = "01dc6efd7d547724860ba419a19d5e6ade81204f7f997cf4a721cb91c4e20417"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -994,14 +994,14 @@ dependencies = [
 
 [[package]]
 name = "neva_macros"
-version = "0.5.2"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7da175fc026f05e0d48ead4d53cbbf0544a896cdac051855316dcd30ea69e5ab"
+checksum = "1f8104e43d9f71bd3e1af203cbaec42d7d8cf9da40b8fb0ff01bfaeb8cf112fb"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
- "syn 3.0.3",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1349,7 +1349,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 3.0.3",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1391,7 +1391,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1402,7 +1402,7 @@ checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1557,9 +1557,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.3"
+version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1882,9 +1882,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -1912,9 +1912,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volga-di"
-version = "0.9.6"
+version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecfee2c5c6172647ee547c85306bb1b6447368f31e40df8a5ab0b1a834c32ea0"
+checksum = "8350199ab0f6b04576b74611e85af4adc80ac991a975e89dc093778a3bc76292"
 dependencies = [
  "http",
 ]

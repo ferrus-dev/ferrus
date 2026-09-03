@@ -315,18 +315,16 @@ async fn dispatch_with_human_question_target(
         }
         ShellCommand::Tasks => {
             let tasks = crate::project::list_tasks().await?;
-            ctx.display
-                .info_block(crate::runtime_table::task_lines(&tasks));
+            ctx.display.table(crate::runtime_table::task_lines(&tasks));
         }
         ShellCommand::Run { limit } => ctx.run_batch_plan(limit).await?,
         ShellCommand::Runs { limit } => {
             let runs = crate::project::list_runs(limit).await?;
-            ctx.display
-                .info_block(crate::runtime_table::run_lines(&runs));
+            ctx.display.table(crate::runtime_table::run_lines(&runs));
         }
         ShellCommand::Events { limit, run_id } => {
             let events = crate::project::list_events(limit, run_id.clone()).await?;
-            ctx.display.info_block(crate::runtime_table::event_lines(
+            ctx.display.table(crate::runtime_table::event_lines(
                 &events,
                 run_id.as_deref(),
             ));

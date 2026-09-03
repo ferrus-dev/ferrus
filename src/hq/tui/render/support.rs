@@ -243,10 +243,70 @@ pub(in crate::hq::tui) fn transcript_activity_line(
     line: &TranscriptLine,
     width: usize,
 ) -> StyledLine {
+    if matches!(
+        line.kind,
+        TranscriptKind::TableTop
+            | TranscriptKind::TableHeader
+            | TranscriptKind::TableRow
+            | TranscriptKind::TableBottom
+    ) {
+        return table_activity_line(line, width);
+    }
+
     let text = format!("  {}", activity_text(line));
     let color = transcript_color(line.kind);
     log_path_line(&text, color, width)
         .unwrap_or_else(|| StyledLine::plain(truncate_to_width(&text, width), color))
+}
+
+pub(in crate::hq::tui) fn table_activity_line(line: &TranscriptLine, width: usize) -> StyledLine {
+    const TABLE_INSET: usize = 2;
+    const CELL_PADDING: usize = 1;
+
+    let block_width = width.saturating_sub(TABLE_INSET * 2);
+    if block_width < 2 {
+        return StyledLine::plain(truncate_to_width(&line.text, width), Color::Grey);
+    }
+
+    let inset = " ".repeat(TABLE_INSET.min(width));
+    match line.kind {
+        TranscriptKind::TableTop => StyledLine::plain(
+            format!("{inset}╭{}╮", "─".repeat(block_width.saturating_sub(2))),
+            Color::DarkGrey,
+        ),
+        TranscriptKind::TableBottom => StyledLine::plain(
+            format!("{inset}╰{}╯", "─".repeat(block_width.saturating_sub(2))),
+            Color::DarkGrey,
+        ),
+        TranscriptKind::TableHeader | TranscriptKind::TableRow => {
+            let content_width = block_width.saturating_sub(CELL_PADDING * 2 + 2);
+            let content = pad_or_truncate(&line.text, content_width);
+            let is_header = matches!(line.kind, TranscriptKind::TableHeader);
+            StyledLine {
+                segments: vec![
+                    StyledSegment {
+                        text: format!("{inset}│{}", " ".repeat(CELL_PADDING)),
+                        color: Color::DarkGrey,
+                        bold: false,
+                        link: None,
+                    },
+                    StyledSegment {
+                        text: content,
+                        color: if is_header { orange() } else { Color::Grey },
+                        bold: is_header,
+                        link: None,
+                    },
+                    StyledSegment {
+                        text: format!("{}│", " ".repeat(CELL_PADDING)),
+                        color: Color::DarkGrey,
+                        bold: false,
+                        link: None,
+                    },
+                ],
+            }
+        }
+        _ => StyledLine::plain(truncate_to_width(&line.text, width), Color::Grey),
+    }
 }
 
 pub(in crate::hq::tui) fn log_path_line(
@@ -327,6 +387,9 @@ pub(in crate::hq::tui) fn percent_encode_uri_path(value: &str) -> String {
 pub(in crate::hq::tui) fn transcript_color(kind: TranscriptKind) -> Color {
     match kind {
         TranscriptKind::Info => Color::Grey,
+        TranscriptKind::TableTop | TranscriptKind::TableBottom => Color::DarkGrey,
+        TranscriptKind::TableHeader => orange(),
+        TranscriptKind::TableRow => Color::Grey,
         TranscriptKind::Success => Color::Green,
         TranscriptKind::Tip => Color::Yellow,
         TranscriptKind::Muted => Color::DarkGrey,
