@@ -1,6 +1,6 @@
 # ferrus
 
-[![Ferrus version](https://img.shields.io/badge/ferrus-0.4.0--alpha.1-orange)](https://crates.io/crates/ferrus)
+[![Ferrus version](https://img.shields.io/badge/ferrus-0.4.0--alpha.2-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
 [![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
@@ -69,12 +69,12 @@ Install:
 ```sh
 cargo install ferrus
 # or on Linux/macOS:
-curl -fsSL https://github.com/ferrus-dev/ferrus/releases/latest/download/install.sh | sh
+curl -fsSL https://ferrus.dev/cli/install.sh | sh
 ```
 
 ```powershell
 # or on Windows:
-iwr https://github.com/ferrus-dev/ferrus/releases/latest/download/install.ps1 -useb | iex
+iwr https://ferrus.dev/cli/install.ps1 -useb | iex
 ```
 
 Run:
