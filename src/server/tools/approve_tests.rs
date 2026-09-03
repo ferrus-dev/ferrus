@@ -48,6 +48,45 @@ async fn setup() -> (TempDir, std::path::PathBuf) {
     (dir, previous)
 }
 
+async fn prepare_frozen_review(
+    root: &std::path::Path,
+    baseline_tree: &str,
+    submitted_tree: &str,
+    patch: &str,
+) {
+    crate::project::pin_executor_baseline_tree(root, "t-007", baseline_tree)
+        .await
+        .unwrap();
+    let submitted_tree =
+        crate::repository_graph::source::parse_git_tree_digest(submitted_tree).unwrap();
+    crate::repository_graph::source::pin_submitted_tree(root, "t-007", &submitted_tree).unwrap();
+    store::write_patch_for_run_dir(".ferrus/runs/t-007", patch)
+        .await
+        .unwrap();
+    crate::project::record_task_status(
+        "t-007",
+        ".ferrus/tasks/t-007.md",
+        crate::project::TaskStatus::Reviewing,
+    )
+    .await
+    .unwrap();
+    let frozen_view = crate::project::RepositoryViewReference::materialized(
+        crate::repository_graph::domain::SnapshotId::new("baseline-snapshot").unwrap(),
+        None,
+        crate::repository_graph::domain::SnapshotId::new("submitted-snapshot").unwrap(),
+        crate::project::RepositoryViewStatus::Available,
+    )
+    .unwrap()
+    .frozen(submitted_tree)
+    .unwrap();
+    crate::project::record_task_repository_view("t-007", &frozen_view)
+        .await
+        .unwrap();
+    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+        .await
+        .unwrap();
+}
+
 fn teardown(previous: std::path::PathBuf) {
     std::env::set_current_dir(previous).unwrap();
 }
@@ -462,9 +501,6 @@ async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
     let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
         .trim()
         .to_string();
-    crate::project::pin_executor_baseline_tree(dir.path(), "t-007", &baseline_tree)
-        .await
-        .unwrap();
 
     let gitlink_target = git_output(dir.path(), ["rev-parse", "HEAD"])
         .trim()
@@ -481,36 +517,7 @@ async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
     let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
     assert!(!patch.trim().is_empty());
     assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
-    let submitted_tree =
-        crate::repository_graph::source::parse_git_tree_digest(&submitted_tree).unwrap();
-    crate::repository_graph::source::pin_submitted_tree(dir.path(), "t-007", &submitted_tree)
-        .unwrap();
-
-    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
-        .await
-        .unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    let frozen_view = crate::project::RepositoryViewReference::materialized(
-        crate::repository_graph::domain::SnapshotId::new("baseline-snapshot").unwrap(),
-        None,
-        crate::repository_graph::domain::SnapshotId::new("submitted-snapshot").unwrap(),
-        crate::project::RepositoryViewStatus::Available,
-    )
-    .unwrap()
-    .frozen(submitted_tree)
-    .unwrap();
-    crate::project::record_task_repository_view("t-007", &frozen_view)
-        .await
-        .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
+    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
 
     let error = run("supervisor:codex:7").await.unwrap_err().to_string();
 
@@ -521,6 +528,152 @@ async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
         .await
         .unwrap();
     assert!(integration_error.contains("change submodules are not supported"));
+    let task = crate::project::list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "t-007")
+        .unwrap();
+    assert_eq!(task.status, "reviewing");
+
+    teardown(previous);
+}
+
+#[tokio::test]
+async fn approve_preserves_ignored_file_that_conflicts_with_submitted_addition() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (dir, previous) = setup().await;
+    if !git(dir.path(), ["init"]).success() {
+        teardown(previous);
+        return;
+    }
+    tokio::fs::write(".gitignore", "ignored.txt\n")
+        .await
+        .unwrap();
+    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
+    assert!(git(dir.path(), ["add", ".gitignore", "file.txt"]).success());
+    assert!(
+        git(
+            dir.path(),
+            [
+                "-c",
+                "user.email=ferrus@example.invalid",
+                "-c",
+                "user.name=Ferrus",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        )
+        .success()
+    );
+    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+
+    tokio::fs::write("ignored.txt", "submitted\n")
+        .await
+        .unwrap();
+    assert!(git(dir.path(), ["add", "-f", "ignored.txt"]).success());
+    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
+    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
+    assert!(!patch.trim().is_empty());
+    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
+    tokio::fs::write("ignored.txt", "canonical local content\n")
+        .await
+        .unwrap();
+    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
+
+    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+    assert!(error.contains("ignored local content"), "{error}");
+    assert_eq!(
+        tokio::fs::read_to_string("ignored.txt").await.unwrap(),
+        "canonical local content\n"
+    );
+    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
+    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+        .await
+        .unwrap();
+    assert!(integration_error.contains("ignored local content"));
+    let task = crate::project::list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "t-007")
+        .unwrap();
+    assert_eq!(task.status, "reviewing");
+
+    teardown(previous);
+}
+
+#[tokio::test]
+async fn approve_rejects_changes_outside_canonical_sparse_checkout() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (dir, previous) = setup().await;
+    if !git(dir.path(), ["init"]).success() {
+        teardown(previous);
+        return;
+    }
+    tokio::fs::create_dir_all("included").await.unwrap();
+    tokio::fs::create_dir_all("skipped").await.unwrap();
+    tokio::fs::write("included/file.txt", "included\n")
+        .await
+        .unwrap();
+    tokio::fs::write("skipped/file.txt", "baseline\n")
+        .await
+        .unwrap();
+    assert!(git(dir.path(), ["add", "included", "skipped"]).success());
+    assert!(
+        git(
+            dir.path(),
+            [
+                "-c",
+                "user.email=ferrus@example.invalid",
+                "-c",
+                "user.name=Ferrus",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        )
+        .success()
+    );
+    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+
+    tokio::fs::write("skipped/file.txt", "submitted\n")
+        .await
+        .unwrap();
+    assert!(git(dir.path(), ["add", "skipped/file.txt"]).success());
+    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
+    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
+    assert!(!patch.trim().is_empty());
+    assert!(git(dir.path(), ["reset", "--hard", "HEAD"]).success());
+    assert!(
+        git(dir.path(), ["sparse-checkout", "set", "included"]).success(),
+        "Git must support sparse-checkout check-rules for this test"
+    );
+    assert!(!dir.path().join("skipped/file.txt").exists());
+    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
+
+    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+    assert!(
+        error.contains("outside the canonical sparse checkout"),
+        "{error}"
+    );
+    assert!(!dir.path().join("skipped/file.txt").exists());
+    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
+    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+        .await
+        .unwrap();
+    assert!(integration_error.contains("outside the canonical sparse checkout"));
     let task = crate::project::list_tasks()
         .await
         .unwrap()

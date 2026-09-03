@@ -4,10 +4,11 @@ use neva::prelude::*;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::info;
 
@@ -358,36 +359,46 @@ async fn apply_approved_patch(
         return Ok(None);
     }
 
-    let snapshot = CanonicalWorkspaceSnapshot::capture(project_root).await?;
-    if let Err(error) = integrate_patch_three_way(context, project_root, &snapshot).await {
-        let detail = bounded_git_detail(&error.to_string());
-        let reason = format!(
-            "Cannot approve task {} because its submitted changes could not be merged into {}: {}",
-            context.task_id,
-            project_root.display(),
-            detail
-        );
-        write_integration_error(context, &reason).await?;
-        project::record_task_integration_failed_best_effort(
-            &context.task_id,
-            context.run_id.as_deref(),
-            &reason,
-        )
-        .await;
-        anyhow::bail!(
-            "{reason}\n\nIntegration error was saved to {}/INTEGRATION_ERROR.md. \
-             Reject this review with the conflict details so an Executor can address it.",
-            context.run_dir
-        );
+    let integration = async {
+        let (baseline, submitted) = task_submission_trees(context, project_root).await?;
+        let submitted_changes = tree_changes(project_root, &baseline, &submitted).await?;
+        reject_sparse_checkout_exclusions(project_root, &submitted_changes).await?;
+        let snapshot = CanonicalWorkspaceSnapshot::capture(project_root).await?;
+        integrate_patch_three_way(project_root, &snapshot, &baseline, &submitted).await?;
+        Ok::<_, anyhow::Error>(snapshot)
     }
+    .await;
+    let snapshot = match integration {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let detail = bounded_git_detail(&error.to_string());
+            let reason = format!(
+                "Cannot approve task {} because its submitted changes could not be merged into {}: {}",
+                context.task_id,
+                project_root.display(),
+                detail
+            );
+            write_integration_error(context, &reason).await?;
+            project::record_task_integration_failed_best_effort(
+                &context.task_id,
+                context.run_id.as_deref(),
+                &reason,
+            )
+            .await;
+            anyhow::bail!(
+                "{reason}\n\nIntegration error was saved to {}/INTEGRATION_ERROR.md. \
+             Reject this review with the conflict details so an Executor can address it.",
+                context.run_dir
+            );
+        }
+    };
     Ok(Some(snapshot))
 }
 
-async fn integrate_patch_three_way(
+async fn task_submission_trees(
     context: &RuntimeTaskContext,
     project_root: &Path,
-    snapshot: &CanonicalWorkspaceSnapshot,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let frozen_submitted = context.repository_view.lifecycle
         == crate::repository_graph::domain::TaskViewLifecycle::FrozenSubmitted;
     let baseline = task_baseline_tree(project_root, &context.task_id, frozen_submitted).await?;
@@ -398,8 +409,17 @@ async fn integrate_patch_three_way(
         }
         _ => submitted_tree_from_patch(context, project_root, &baseline).await?,
     };
-    let merged = merge_trees(project_root, &baseline, &snapshot.tree, &submitted).await?;
-    reject_gitlink_changes(project_root, &snapshot.tree, &merged).await?;
+    Ok((baseline, submitted))
+}
+
+async fn integrate_patch_three_way(
+    project_root: &Path,
+    snapshot: &CanonicalWorkspaceSnapshot,
+    baseline: &str,
+    submitted: &str,
+) -> Result<()> {
+    let merged = merge_trees(project_root, baseline, &snapshot.tree, submitted).await?;
+    validate_tree_materialization(project_root, &snapshot.tree, &merged).await?;
     if let Err(error) = materialize_tree(project_root, &snapshot.tree, &merged).await {
         if let Err(restore_error) = snapshot.restore(project_root).await {
             anyhow::bail!(
@@ -501,11 +521,33 @@ async fn merge_trees(
     git_stdout(output, "three-way merge approved task")
 }
 
-async fn reject_gitlink_changes(
+#[derive(Debug)]
+struct TreeChange {
+    path: Vec<u8>,
+    is_addition: bool,
+    changes_gitlink: bool,
+}
+
+async fn validate_tree_materialization(
     project_root: &Path,
     current_tree: &str,
     target_tree: &str,
 ) -> Result<()> {
+    let changes = tree_changes(project_root, current_tree, target_tree).await?;
+    if changes.iter().any(|change| change.changes_gitlink) {
+        anyhow::bail!(
+            "Approved submissions that change submodules are not supported because their gitlinks cannot be materialized safely"
+        );
+    }
+    reject_ignored_path_collisions(project_root, &changes).await?;
+    reject_sparse_checkout_exclusions(project_root, &changes).await
+}
+
+async fn tree_changes(
+    project_root: &Path,
+    current_tree: &str,
+    target_tree: &str,
+) -> Result<Vec<TreeChange>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -521,24 +563,161 @@ async fn reject_gitlink_changes(
         .arg(target_tree)
         .output()
         .await?;
-    git_success(&output, "inspect approved tree for submodule changes")?;
-    if output
+    git_success(&output, "inspect paths changed by the approved tree")?;
+    parse_raw_tree_changes(&output.stdout)
+}
+
+fn parse_raw_tree_changes(raw: &[u8]) -> Result<Vec<TreeChange>> {
+    let mut records = raw.split(|byte| *byte == 0);
+    let mut changes = Vec::new();
+    while let Some(metadata) = records.next() {
+        if metadata.is_empty() {
+            continue;
+        }
+        let path = records
+            .next()
+            .context("Git returned a malformed raw tree diff without a path")?;
+        let mut fields = metadata.split(|byte| byte.is_ascii_whitespace());
+        let old_mode = fields
+            .next()
+            .and_then(|mode| mode.strip_prefix(b":"))
+            .context("Git returned a malformed raw tree diff without an old mode")?;
+        let new_mode = fields
+            .next()
+            .context("Git returned a malformed raw tree diff without a new mode")?;
+        changes.push(TreeChange {
+            path: path.to_vec(),
+            is_addition: old_mode == b"000000" && new_mode != b"000000",
+            changes_gitlink: old_mode == b"160000" || new_mode == b"160000",
+        });
+    }
+    Ok(changes)
+}
+
+async fn reject_ignored_path_collisions(project_root: &Path, changes: &[TreeChange]) -> Result<()> {
+    let additions: Vec<&[u8]> = changes
+        .iter()
+        .filter(|change| change.is_addition)
+        .map(|change| change.path.as_slice())
+        .collect();
+    if additions.is_empty() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])
+        .output()
+        .await?;
+    git_success(
+        &output,
+        "inspect ignored canonical paths before integration",
+    )?;
+    let collision = output
         .stdout
         .split(|byte| *byte == 0)
-        .any(raw_diff_entry_changes_gitlink)
-    {
+        .filter(|path| !path.is_empty())
+        .any(|ignored| {
+            let ignored = ignored.strip_suffix(b"/").unwrap_or(ignored);
+            additions
+                .iter()
+                .any(|addition| paths_overlap(ignored, addition))
+        });
+    if collision {
         anyhow::bail!(
-            "Approved submissions that change submodules are not supported because their gitlinks cannot be materialized safely"
+            "Canonical workspace contains ignored local content at a path changed by the approved submission"
         );
     }
     Ok(())
 }
 
-fn raw_diff_entry_changes_gitlink(entry: &[u8]) -> bool {
-    let mut fields = entry.split(|byte| byte.is_ascii_whitespace());
-    let old_mode = fields.next();
-    let new_mode = fields.next();
-    old_mode == Some(&b":160000"[..]) || new_mode == Some(&b"160000"[..])
+fn paths_overlap(left: &[u8], right: &[u8]) -> bool {
+    left == right || path_is_parent(left, right) || path_is_parent(right, left)
+}
+
+fn path_is_parent(parent: &[u8], child: &[u8]) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|remainder| remainder.starts_with(b"/"))
+}
+
+async fn reject_sparse_checkout_exclusions(
+    project_root: &Path,
+    changes: &[TreeChange],
+) -> Result<()> {
+    if changes.is_empty() || !sparse_checkout_enabled(project_root).await? {
+        return Ok(());
+    }
+    let paths: HashSet<&[u8]> = changes
+        .iter()
+        .map(|change| change.path.as_slice())
+        .collect();
+    let input = nul_terminated_paths(paths.iter().copied());
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(project_root)
+        .args(["sparse-checkout", "check-rules", "-z"]);
+    let output = command_output_with_stdin(&mut command, &input).await?;
+    git_success(&output, "check approved paths against the sparse checkout")?;
+    let included: HashSet<&[u8]> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    if paths.iter().any(|path| !included.contains(path)) {
+        anyhow::bail!("Approved submission changes paths outside the canonical sparse checkout");
+    }
+    Ok(())
+}
+
+async fn sparse_checkout_enabled(project_root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["config", "--bool", "--get", "core.sparseCheckout"])
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(output.stdout.starts_with(b"true"));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    git_success(&output, "inspect canonical sparse checkout configuration")?;
+    Ok(false)
+}
+
+fn nul_terminated_paths<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path);
+        input.push(0);
+    }
+    input
+}
+
+async fn command_output_with_stdin(command: &mut Command, input: &[u8]) -> Result<Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Failed to open Git stdin for canonical integration preflight")?;
+    stdin.write_all(input).await?;
+    drop(stdin);
+    Ok(child.wait_with_output().await?)
 }
 
 async fn commit_tree(
