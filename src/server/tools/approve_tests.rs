@@ -1001,6 +1001,91 @@ async fn approve_rolls_back_patch_when_post_apply_checks_fail() {
 }
 
 #[tokio::test]
+async fn approve_rollback_preserves_files_ignored_before_integration() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (dir, previous) = setup().await;
+    if !git(dir.path(), ["init"]).success() {
+        teardown(previous);
+        return;
+    }
+    tokio::fs::write(
+        "ferrus.toml",
+        "[checks]\ncommands = [\"git grep -q secret.txt -- .gitignore\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(".gitignore", "secret.txt\n")
+        .await
+        .unwrap();
+    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
+    assert!(git(dir.path(), ["add", "ferrus.toml", ".gitignore", "file.txt"]).success());
+    assert!(
+        git(
+            dir.path(),
+            [
+                "-c",
+                "user.email=ferrus@example.invalid",
+                "-c",
+                "user.name=Ferrus",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        )
+        .success()
+    );
+    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+
+    tokio::fs::write(".gitignore", "").await.unwrap();
+    assert!(git(dir.path(), ["add", ".gitignore"]).success());
+    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
+    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
+    assert!(!patch.trim().is_empty());
+    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
+    tokio::fs::write(".gitignore", "secret.txt\n")
+        .await
+        .unwrap();
+    let ignored_contents = b"canonical ignored bytes\0\xff";
+    tokio::fs::write("secret.txt", ignored_contents)
+        .await
+        .unwrap();
+    let worktree_before =
+        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
+    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
+
+    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+    assert!(error.contains("configured checks failed"), "{error}");
+    assert!(error.contains("rolled back"), "{error}");
+    assert_eq!(
+        tokio::fs::read("secret.txt").await.unwrap(),
+        ignored_contents
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(".gitignore").await.unwrap(),
+        "secret.txt\n"
+    );
+    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
+    assert_eq!(
+        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap(),
+        worktree_before
+    );
+    let task = crate::project::list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "t-007")
+        .unwrap();
+    assert_eq!(task.status, "reviewing");
+
+    teardown(previous);
+}
+
+#[tokio::test]
 async fn failed_integration_marks_actual_partial_canonical_manifest_stale() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let (dir, previous) = setup().await;

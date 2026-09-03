@@ -229,25 +229,25 @@ async fn observe_canonical_source(project_root: &Path) -> CanonicalSourceObserva
 struct CanonicalWorkspaceSnapshot {
     tree: String,
     index: CanonicalIndexSnapshot,
+    ignored_paths: Vec<Vec<u8>>,
 }
 
 impl CanonicalWorkspaceSnapshot {
     async fn capture(project_root: &Path) -> Result<Self> {
         let index = CanonicalIndexSnapshot::capture(project_root).await?;
-        let project_root = project_root.to_path_buf();
-        let tree = tokio::task::spawn_blocking(move || {
-            crate::repository_graph::source::capture_worktree_tree(project_root)
-        })
-        .await??;
+        let ignored_paths = ignored_untracked_paths(project_root).await?;
+        let tree = capture_canonical_worktree_tree(project_root).await?;
         Ok(Self {
-            tree: tree.value().to_string(),
+            tree,
             index,
+            ignored_paths,
         })
     }
 
     async fn restore(&self, project_root: &Path) -> Result<()> {
-        let current = Self::capture(project_root).await?;
-        let worktree_result = materialize_tree(project_root, &current.tree, &self.tree)
+        let current = capture_canonical_worktree_tree(project_root).await?;
+        let current = tree_without_paths(project_root, &current, &self.ignored_paths).await?;
+        let worktree_result = materialize_tree(project_root, &current, &self.tree)
             .await
             .context("Failed to restore the pre-integration canonical worktree");
         let index_result = self.index.restore().await;
@@ -263,6 +263,40 @@ impl CanonicalWorkspaceSnapshot {
     async fn restore_index(&self) -> Result<()> {
         self.index.restore().await
     }
+}
+
+async fn capture_canonical_worktree_tree(project_root: &Path) -> Result<String> {
+    let project_root = project_root.to_path_buf();
+    let tree = tokio::task::spawn_blocking(move || {
+        crate::repository_graph::source::capture_worktree_tree(project_root)
+    })
+    .await??;
+    Ok(tree.value().to_string())
+}
+
+async fn ignored_untracked_paths(project_root: &Path) -> Result<Vec<Vec<u8>>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        .await?;
+    git_success(
+        &output,
+        "capture ignored canonical paths before integration",
+    )?;
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 #[derive(Debug)]
@@ -753,6 +787,39 @@ async fn materialize_tree(
     let index = TemporaryIntegrationIndex::new();
     read_tree(project_root, index.path(), current_tree, false).await?;
     read_tree(project_root, index.path(), target_tree, true).await
+}
+
+async fn tree_without_paths(
+    project_root: &Path,
+    tree: &str,
+    excluded_paths: &[Vec<u8>],
+) -> Result<String> {
+    if excluded_paths.is_empty() {
+        return Ok(tree.to_string());
+    }
+
+    let index = TemporaryIntegrationIndex::new();
+    read_tree(project_root, index.path(), tree, false).await?;
+    let input = nul_terminated_paths(excluded_paths.iter().map(Vec::as_slice));
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(project_root)
+        .env("GIT_INDEX_FILE", index.path())
+        .args(["update-index", "--force-remove", "-z", "--stdin"]);
+    let output = command_output_with_stdin(&mut command, &input).await?;
+    git_success(
+        &output,
+        "exclude pre-integration ignored paths from rollback",
+    )?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .env("GIT_INDEX_FILE", index.path())
+        .arg("write-tree")
+        .output()
+        .await?;
+    git_stdout(output, "write rollback tree without ignored paths")
 }
 
 static TEMPORARY_INTEGRATION_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
