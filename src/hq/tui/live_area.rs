@@ -342,7 +342,7 @@ pub(super) fn table_transcript(rows: &[String]) -> Vec<TranscriptLine> {
         continuation: false,
     });
     lines.extend(rows.iter().enumerate().map(|(idx, row)| TranscriptLine {
-        text: row.clone(),
+        text: sanitize_table_row(row),
         kind: if idx == 0 {
             TranscriptKind::TableHeader
         } else {
@@ -356,6 +356,12 @@ pub(super) fn table_transcript(rows: &[String]) -> Vec<TranscriptLine> {
         continuation: true,
     });
     lines
+}
+
+fn sanitize_table_row(row: &str) -> String {
+    row.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 #[allow(dead_code)]

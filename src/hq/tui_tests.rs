@@ -413,6 +413,20 @@ fn truncated_table_keeps_both_borders_and_header() {
 }
 
 #[test]
+fn table_transcript_replaces_control_characters_without_adding_rows() {
+    let table = table_transcript(&["ID\nStatus".into(), "t-001\r\npending\t\u{1b}[31m".into()]);
+
+    assert_eq!(table.len(), 4);
+    assert_eq!(table[1].text, "ID Status");
+    assert_eq!(table[2].text, "t-001  pending  [31m");
+    assert!(
+        table[1..=2]
+            .iter()
+            .all(|line| !line.text.chars().any(char::is_control))
+    );
+}
+
+#[test]
 fn success_activity_gets_leading_dot() {
     let line = TranscriptLine {
         text: "Task t-001 completed.".into(),
