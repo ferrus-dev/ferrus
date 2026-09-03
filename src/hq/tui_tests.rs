@@ -353,6 +353,66 @@ fn command_output_renders_in_unframed_activity_area() {
 }
 
 #[test]
+fn table_output_renders_with_frame_and_orange_header() {
+    let mut app = App::new();
+    app.messages.extend(table_transcript(&[
+        "ID            Status".into(),
+        "t-001         pending".into(),
+    ]));
+
+    let rows = dashboard_lines(&app, 80, 40);
+    let rendered = rows
+        .iter()
+        .map(|row| {
+            row.line
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let header_row = rendered
+        .iter()
+        .position(|line| line.starts_with("  │ ID"))
+        .expect("table header should be rendered");
+    let top = header_row - 1;
+
+    assert!(rendered[top].starts_with("  ╭"));
+    assert!(rendered[top + 2].starts_with("  │ t-001"));
+    assert!(rendered[top + 3].starts_with("  ╰"));
+    assert!(
+        rendered[top..=top + 3]
+            .iter()
+            .all(|line| display_width(line) == 78)
+    );
+
+    let header = &rows[top + 1].line;
+    let header_content = header
+        .segments
+        .iter()
+        .find(|segment| segment.text.contains("ID"))
+        .expect("table header content should be styled separately");
+    assert_eq!(header_content.color, orange());
+    assert!(header_content.bold);
+}
+
+#[test]
+fn truncated_table_keeps_both_borders_and_header() {
+    let table = table_transcript(&[
+        "ID  Status".into(),
+        "1   pending".into(),
+        "2   complete".into(),
+    ]);
+
+    let blocks = recent_transcript_blocks(&table, 3);
+
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(blocks[0][0].kind, TranscriptKind::TableTop));
+    assert!(matches!(blocks[0][1].kind, TranscriptKind::TableHeader));
+    assert!(matches!(blocks[0][2].kind, TranscriptKind::TableBottom));
+}
+
+#[test]
 fn success_activity_gets_leading_dot() {
     let line = TranscriptLine {
         text: "Task t-001 completed.".into(),

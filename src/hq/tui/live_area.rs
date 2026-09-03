@@ -330,6 +330,34 @@ pub(super) fn split_transcript(text: &str, kind: TranscriptKind) -> Vec<Transcri
     lines
 }
 
+pub(super) fn table_transcript(rows: &[String]) -> Vec<TranscriptLine> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    lines.push(TranscriptLine {
+        text: String::new(),
+        kind: TranscriptKind::TableTop,
+        continuation: false,
+    });
+    lines.extend(rows.iter().enumerate().map(|(idx, row)| TranscriptLine {
+        text: row.clone(),
+        kind: if idx == 0 {
+            TranscriptKind::TableHeader
+        } else {
+            TranscriptKind::TableRow
+        },
+        continuation: true,
+    }));
+    lines.push(TranscriptLine {
+        text: String::new(),
+        kind: TranscriptKind::TableBottom,
+        continuation: true,
+    });
+    lines
+}
+
 #[allow(dead_code)]
 pub(super) fn terminal_width() -> u16 {
     size().map(|(w, _)| w).unwrap_or(80)

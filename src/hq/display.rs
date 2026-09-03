@@ -26,6 +26,17 @@ impl Display {
         }
     }
 
+    pub fn table(&self, lines: impl IntoIterator<Item = String>) {
+        let lines = lines.into_iter().collect::<Vec<_>>();
+        match lines.len() {
+            0 => {}
+            1 => self.info(lines.into_iter().next().unwrap_or_default()),
+            _ => {
+                let _ = self.0.send(UiMessage::Table(lines));
+            }
+        }
+    }
+
     pub fn tip(&self, msg: impl Into<String>) {
         let _ = self.0.send(UiMessage::Tip(msg.into()));
     }
@@ -157,6 +168,38 @@ mod tests {
         let msg = rx.try_recv().expect("message should be sent");
         match msg {
             UiMessage::Info(text) => assert_eq!(text, "first\nsecond"),
+            _ => panic!("expected info message"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn table_sends_structured_rows() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
+
+        display.table(vec!["ID  Status".to_string(), "1   pending".to_string()]);
+
+        let msg = rx.try_recv().expect("message should be sent");
+        match msg {
+            UiMessage::Table(lines) => {
+                assert_eq!(lines, vec!["ID  Status", "1   pending"]);
+            }
+            _ => panic!("expected table message"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn single_table_message_stays_plain() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display = Display(tx);
+
+        display.table(vec!["No tasks recorded in ferrus.db.".to_string()]);
+
+        let msg = rx.try_recv().expect("message should be sent");
+        match msg {
+            UiMessage::Info(text) => assert_eq!(text, "No tasks recorded in ferrus.db."),
             _ => panic!("expected info message"),
         }
         assert!(rx.try_recv().is_err());
