@@ -14,24 +14,26 @@ Running `ferrus` without arguments opens the interactive HQ shell.
 | `/task --manual` | Define a free-form task without selected milestone context. |
 | `/spec` | Draft, approve, and save a feature specification. |
 | `/archive-spec` | Add an approved Outcome and archive completed spec artifacts. |
-| `/milestones` | Select the current specification and milestone. |
-| `/reset-spec` | Clear the selected specification and milestone. |
+| `/milestones` | Select the current specification; optionally start its next ready milestone. |
+| `/reset-spec` | Clear the selected specification. |
 | `/check` | Run configured checks without changing task state. |
-| `/check --force` | Run checks regardless of task status. |
+| `/check --force` | Compatibility form of `/check`; both ignore task status. |
 | `/supervisor` | Open an interactive Supervisor session. |
 | `/executor` | Open an interactive Executor session. |
 | `/resume` | Resume the Executor or a paused consultation. |
 | `/review` | Manually start review if automatic spawning failed. |
 | `/status` | Show task state, agents, counters, and session logs. |
 | `/tasks` | List task rows. |
+| `/run [--limit N]` | Plan and queue a batch from ready milestones in the selected spec. |
 | `/runs [--limit N]` | List recent run attempts. |
 | `/events [--limit N] [--run ID]` | List runtime events. |
 | `/attach NAME` | Show the log path for a running headless agent. |
 | `/stop` | Stop running agent sessions after confirmation. |
-| `/reset` | Force-reset a resettable task and clear scoped artifacts. |
+| `/reset` | Stop sessions, mark all resettable tasks Reset, and clear their scoped artifacts after confirmation. |
 | `/init [--agents-path PATH]` | Initialize Ferrus in the current directory. |
 | `/register ...` | Register agent configuration from HQ. |
-| `/model ROLE MODEL` | Set or clear a role-specific model override. |
+| `/model ROLE MODEL` | Set a role-specific model override. |
+| `/model ROLE --clear` | Clear the role-specific model override. |
 | `/help` | List HQ commands. |
 | `/quit` | Exit HQ. |
 
@@ -57,12 +59,15 @@ Agents are stateless between runs. SQLite owns runtime state; scoped Markdown fi
 ### `ferrus init [--agents-path PATH]`
 
 Initializes a project, creates the local templates and artifact directories, registers machine-local project
-metadata, creates `ferrus.db`, and installs Ferrus role skills under the selected agents path.
+metadata, creates `ferrus.db`, and installs Ferrus role skills under the selected agents path. Existing skill files are preserved.
 
 ### `ferrus serve [--role supervisor|executor] [--agent-name NAME] [--agent-index N]`
 
 Starts the stdio MCP server used by agent adapters. A role limits lifecycle tools to those required by that role.
-All modes expose the optional read-only repository graph and project memory retrieval tools when configured.
+Taskless Supervisors expose task/spec creation, while task-scoped sessions hide those tools and expose heartbeat.
+HQ archive mode exposes `archive_spec` and hides review/consultation tools. Only unfiltered servers expose
+compatibility `create_task` and `answer`. Retrieval tools are registered in every role, even when an index is
+unavailable; they report its status without building it.
 
 ### `ferrus register ...`
 
@@ -186,8 +191,11 @@ agent = "codex"
 model = ""
 ```
 
-Checks run in the active task workspace. Full output is written to scoped files under `.ferrus/logs/`; tool
-responses contain only bounded failure summaries. A dispatch limit of zero disables that guard.
+Executor MCP checks run in the task workspace and write full logs under `.ferrus/logs/`, returning bounded
+failure summaries. HQ `/check` runs in HQ's working directory without task-state or retry changes.
+A dispatch limit of zero disables that guard; a fresh rejection resets its counter. `max_parallel_tasks`
+controls Executor concurrency, while `/run --limit N` caps the planned batch. Non-Git projects use the
+canonical directory and permit only one Executor.
 
 ## Runtime files
 
@@ -202,6 +210,10 @@ Ferrus deliberately separates repository-local artifacts from machine-local runt
 | `.ferrus/logs/` | Scoped check and PTY logs. |
 | `~/.ferrus/projects/<project-id>/project.toml` | Machine-local project metadata. |
 | `~/.ferrus/projects/<project-id>/ferrus.db` | Runtime source of truth. |
+| `~/.ferrus/projects/<project-id>/repo-graph.db` | Optional derived repository graph. |
+| `~/.ferrus/projects/<project-id>/project-memory.db` | Optional derived project memory. |
+| `~/.ferrus/projects/<project-id>/worktrees/<task-id>/` | Managed Executor Git worktrees. |
+| `.ferrus/hq.log` | HQ tracing output. |
 | `~/.ferrus/projects/<project-id>/archive/` | Archived completed specification artifacts. |
 
 At startup, Ferrus reconciles dead runs and expired leases using the database. Markdown files are not a mirrored

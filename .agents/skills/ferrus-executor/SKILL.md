@@ -44,6 +44,7 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 ## Useful Ferrus tools
 
 - `/wait_for_task`
+- `/heartbeat` (while owning the task lease)
 - `/check`
 - `/consult`
 - `/wait_for_consult`

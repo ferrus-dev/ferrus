@@ -1,4 +1,4 @@
-//! Reset a failed task through its runtime context and clear scoped artifacts.
+//! Mark a failed task Reset through its runtime context while preserving scoped artifacts.
 
 use anyhow::Result;
 use neva::prelude::*;

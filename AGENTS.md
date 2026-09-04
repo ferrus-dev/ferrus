@@ -28,7 +28,7 @@ their plain-ASCII equivalents instead:
 - Use `->` or `<-` instead of a Unicode arrow.
 - Use `...` (three periods) instead of a single ellipsis character.
 
-Use em dashes sparingly.
+Keep punctuation plain ASCII.
 
 Intentional Unicode test fixtures and terminal UI glyph tables are exceptions when the
 characters themselves are the behavior under test or part of the rendered interface.
@@ -57,12 +57,15 @@ ferrus serve [--role supervisor|executor] [--agent-name <name>] [--agent-index <
 ferrus register --supervisor <agent> --executor <agent>
 ferrus doctor
 ferrus recover [--dry-run] [--worktrees]
+ferrus projects list
 ferrus tasks list
-ferrus runs list
-ferrus events list
+ferrus runs list [--limit N]
+ferrus events list [--limit N] [--run ID]
 ferrus migrate
 ferrus graph index [--full] [--json]
 ferrus graph status [--json]
+ferrus graph show (--node <id> | --symbol <key> | --path <path>) [--json]
+ferrus graph neighbors <node-id> [--direction incoming|outgoing|both] [--depth N] [--limit N] [--json]
 ferrus graph memory index [--full] [--json]
 ferrus graph memory status [--json]
 ferrus graph search <query> [--domain repository|memory|all] [--kind <kind>] [--path <path>] [--limit <n>] [--json]
@@ -82,7 +85,11 @@ src/
   repository_graph/           # backend-neutral graph contracts and local backend
   repository_graph_runtime.rs # project-local graph CLI/MCP adapter
   project_memory_runtime.rs   # project-local memory/federation CLI/MCP adapter
-  templates.rs                # embedded Markdown templates
+  project.rs                  # runtime types and project API facade
+  project/                    # SQLite schema, tasks, claims, runs, registry, and graph bindings
+  runtime_status.rs           # shared task lifecycle states
+  runtime_table.rs            # CLI/HQ runtime table formatting
+  templates.rs                # embedded artifact templates (agent skills are in cli/commands/init.rs)
   specs.rs                    # spec discovery and milestone resolution
   agent_id.rs                 # stable agent IDs and MCP server names
   legacy_state.rs             # legacy STATE.json import shape
@@ -228,22 +235,25 @@ view before collecting completed-task publications, unreferenced snapshots, orph
 or old failed builds. Recovery may mark only unfinished graph builds failed and must not
 mutate orchestration lifecycle state.
 
-**Per-task state machine**: each SQLite task row follows this lifecycle. With `--limit 1`, it
-is effectively the original single-task flow, only DB-backed:
+**Per-task state machine**: each SQLite task follows this lifecycle. Executor concurrency
+is controlled by `limits.max_parallel_tasks`; `/run --limit N` caps queued milestones.
 
 ```text
-pending
-  -> executing          <- /wait_for_task claim
-       -> addressing    <- /reject; then return to the work loop
-       -> consultation  <- /consult
-          -> previous state after /wait_for_consult
-       -> awaiting_human <- /ask_human
-          -> previous state after /wait_for_answer
-       -> reviewing     <- /submit final gate pass
-          -> addressing <- /reject
-          -> complete   <- /approve
-       -> failed        <- retry, review-cycle, or executor-dispatch limit
+pending -> executing                         /wait_for_task
+executing or addressing -> reviewing         /submit (checks pass)
+reviewing -> addressing                      /reject
+reviewing -> complete                        /approve
+executing or addressing -> consultation      /consult
+consultation -> previous work state          /wait_for_consult
+active work or review -> awaiting_human      /ask_human
+awaiting_human -> previous state             /wait_for_answer
+working or reviewing -> failed               retry, review-cycle, or dispatch limit
+failed -> reset                              MCP /reset
 ```
+
+`/reject` returns work to `addressing` only while the review-cycle budget permits it.
+HQ `/reset` also resets pending and active tasks after confirmation; `reset` is terminal,
+not a requeue. MCP `/reset` preserves task artifacts, while HQ `/reset` clears scoped artifacts.
 
 **Executor dispatch guard**: HQ respawns a headless Executor that exits without submitting.
 `limits.max_executor_dispatches` (default 6) bounds respawns per work phase through the
@@ -263,7 +273,8 @@ Claim, renew, and release through `project` helpers so ownership, TTL, and event
 consistent.
 
 **File locking**: task claiming and heartbeat renewal are SQLite operations. Do not add
-`.ferrus/STATE.lock` or file-lock based coordination.
+`.ferrus/STATE.lock` or file locks for task leases. Canonical approval uses a separate
+machine-local file lock to serialize Git integration and rollback; graph refreshes use sidecar leases.
 
 **Spec selection**: `project_runtime_state` stores the selected spec. Task rows store
 `spec_path` and `milestone_id`; milestone display text is resolved from spec Markdown by
@@ -281,11 +292,12 @@ Claude Code role-scoped MCP configuration is stored in `.claude/mcp-supervisor.j
 `.claude/mcp-executor.json`; permissions are stored in `.claude/settings.local.json`.
 
 **HQ checks**: HQ `/check` runs configured commands directly and does not mutate task state.
-Task retry accounting belongs to Executor MCP `/check`.
+Task retry accounting belongs to Executor MCP `/check`. HQ `--force` is retained for compatibility
+and does not change check behavior.
 
 **HQ reset versus MCP reset**: HQ `/reset` force-resets resettable tasks after confirmation,
 clears scoped task, answer, and consultation files, and preserves selected spec and milestone.
-MCP `/reset` is valid only from Failed.
+MCP `/reset` is valid only from Failed, marks the row Reset, and preserves artifacts. Neither reset requeues work.
 
 <!-- ferrus-executor-instructions -->
 ## Ferrus Executor

@@ -47,13 +47,13 @@ pub enum ShellCommand {
         #[arg(long = "run-id", alias = "run", value_name = "RUN_ID")]
         run_id: Option<String>,
     },
-    /// Run the Ferrus /check gate deterministically from HQ.
+    /// Run configured checks from HQ without changing task state.
     Check {
-        /// Run checks directly from HQ without requiring Executing or Addressing state.
+        /// Compatibility flag; HQ checks already run without task-state requirements.
         #[arg(long)]
         force: bool,
     },
-    /// Reset all task files and set state to Idle (prompts for confirmation if state is Executing or Reviewing).
+    /// Stop sessions, mark resettable tasks Reset, and clear scoped artifacts after confirmation.
     Reset,
     /// Stop all running executor and supervisor/reviewer sessions (prompts for confirmation).
     Stop,
