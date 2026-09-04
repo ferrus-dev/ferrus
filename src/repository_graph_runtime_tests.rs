@@ -1,3 +1,5 @@
+//! Local graph runtime tests for task views, submission freezes, freshness, and verified snippets.
+
 use super::*;
 
 struct CurrentDirGuard {

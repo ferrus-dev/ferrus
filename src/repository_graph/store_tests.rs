@@ -1,3 +1,5 @@
+//! Graph store tests for immutable snapshots, publication visibility, and compare-and-set ordering.
+
 use super::*;
 use crate::repository_graph::sqlite::{OpenSidecarResult, open_for_build_at};
 

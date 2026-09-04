@@ -1,3 +1,5 @@
+//! Adapt read-only graph queries and verified snippets to local sidecar availability.
+
 use super::*;
 
 pub(super) fn search_response_at(

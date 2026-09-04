@@ -1,3 +1,5 @@
+//! HQ specification selection, milestone planning, task drafting, and archive sessions.
+
 use super::super::*;
 
 impl HqContext {

@@ -1,3 +1,5 @@
+//! CLI indexing and retrieval for repository graphs, project memory, and combined context.
+
 use std::{
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::{AtomicU64, Ordering},

@@ -1,3 +1,5 @@
+//! Read and initialize Claude's role-scoped MCP isolation setting.
+
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, value};
 

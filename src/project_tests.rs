@@ -1,3 +1,5 @@
+//! Shared runtime test fixtures and suites for project registration, tasks, runs, and graph bindings.
+
 use super::*;
 use tempfile::TempDir;
 

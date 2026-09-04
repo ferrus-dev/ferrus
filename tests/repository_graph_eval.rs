@@ -1,3 +1,5 @@
+//! Integration gates for graph retrieval quality, determinism, and navigation usefulness.
+
 #[path = "support/repository_graph_eval.rs"]
 mod evaluation;
 

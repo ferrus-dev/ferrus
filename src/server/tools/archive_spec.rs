@@ -1,3 +1,5 @@
+//! Archive a completed specification with approved Outcome content, then refresh memory best-effort.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde::Deserialize;
@@ -78,6 +80,8 @@ fn validate_input(input: ArchiveSpecInput) -> Result<ArchiveSpecInput> {
 
 #[cfg(test)]
 mod tests {
+    //! Archive input extraction and best-effort memory refresh after successful archival.
+
     use super::*;
     use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;

@@ -1,3 +1,5 @@
+//! Parse HQ slash commands and model-selection arguments.
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -126,6 +128,8 @@ pub fn parse_command(input: &str) -> Result<ShellCommand> {
 
 #[cfg(test)]
 mod tests {
+    //! Slash-command parsing, aliases, limits, and invalid arguments.
+
     use super::*;
 
     #[test]

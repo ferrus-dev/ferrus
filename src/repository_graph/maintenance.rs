@@ -469,6 +469,8 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Refresh lease ownership, interrupted-build recovery, and protected snapshot retention.
+
     use super::*;
     use crate::repository_graph::{
         domain::{RepositoryId, RepositoryNamespace},

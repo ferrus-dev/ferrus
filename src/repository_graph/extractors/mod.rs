@@ -80,6 +80,8 @@ fn framed_digest(parts: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Stable fact IDs, digest framing, and built-in extractor registration.
+
     use super::*;
 
     #[test]

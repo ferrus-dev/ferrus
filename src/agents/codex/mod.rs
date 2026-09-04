@@ -461,6 +461,8 @@ fn auto_approved_tools(role: &str) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
+    //! Codex command construction, model settings, and MCP isolation across platforms.
+
     use super::*;
     #[cfg(not(windows))]
     use crate::agents::tests::assert_program_and_args;

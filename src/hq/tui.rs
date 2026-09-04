@@ -1,3 +1,5 @@
+//! Terminal event loop, input state, and message handling for the HQ dashboard.
+
 use std::{
     env, fs,
     io::{self, Stdout, Write},

@@ -1,3 +1,5 @@
+//! Persist command history and derive compact working-directory and branch labels.
+
 use super::*;
 
 pub(super) fn history_path() -> PathBuf {

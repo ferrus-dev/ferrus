@@ -1,3 +1,5 @@
+//! Compose and redraw the HQ dashboard, activity feed, and prompt area.
+
 use super::*;
 
 #[derive(Clone)]

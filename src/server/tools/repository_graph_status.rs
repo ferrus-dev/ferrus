@@ -1,3 +1,5 @@
+//! Expose read-only graph availability and freshness for the calling agent's view.
+
 use anyhow::Result;
 use neva::prelude::*;
 use std::time::Instant;

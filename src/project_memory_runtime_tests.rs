@@ -1,3 +1,5 @@
+//! Local memory runtime tests for read-only retrieval, indexing, and independent freshness.
+
 use super::*;
 
 struct CurrentDirGuard(std::path::PathBuf);

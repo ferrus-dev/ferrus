@@ -1,3 +1,5 @@
+//! List recorded runtime events, optionally filtered by run.
+
 use anyhow::Result;
 use clap::Subcommand;
 

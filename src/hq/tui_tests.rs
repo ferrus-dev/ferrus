@@ -1,3 +1,5 @@
+//! Terminal UI tests for completion, layout, activity rendering, and input handling.
+
 use super::*;
 
 #[test]

@@ -1,3 +1,5 @@
+//! Discover non-Git repository files through confined directory traversal and source policy.
+
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},

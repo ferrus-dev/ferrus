@@ -1,3 +1,5 @@
+//! Validate and save approved specification content under a unique file name.
+
 use anyhow::{Context, Result};
 use neva::prelude::*;
 use std::io::ErrorKind;
@@ -152,6 +154,8 @@ fn ensure_trailing_newline(mut markdown: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Specification naming, unique paths, and SQLite selection updates.
+
     use super::*;
     use tempfile::TempDir;
 

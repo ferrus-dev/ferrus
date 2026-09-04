@@ -1,3 +1,5 @@
+//! Load scoped publication records and encrypted facts, and initialize their SQLite schema.
+
 use super::*;
 
 pub(super) fn load_graph_view(

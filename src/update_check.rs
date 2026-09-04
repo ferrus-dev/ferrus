@@ -1,3 +1,5 @@
+//! Check the crates.io sparse index for newer releases using a bounded request and local cache.
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -175,6 +177,8 @@ fn cache_file_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    //! Sparse-index paths, release selection, and cache expiration.
+
     use super::{
         UpdateCache, build_message, cache_is_stale, newest_non_yanked_version, sparse_index_path,
     };

@@ -145,6 +145,8 @@ fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Qwen launch arguments, model overrides, and role-specific MCP entries.
+
     use super::*;
     use crate::agents::tests::assert_program_and_args;
 

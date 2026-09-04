@@ -1,3 +1,5 @@
+//! Build role prompts, launch agent processes, and manage headless session logs and shutdown.
+
 use crate::agent_id::{ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR};
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent};
 use crate::platform::{self, ShutdownSignal};
@@ -850,6 +852,8 @@ fn parse_mcp_tool_status(line: &str) -> Option<(String, ToolCallStatus)> {
 
 #[cfg(test)]
 mod tests {
+    //! Session log isolation and mode-specific agent prompts.
+
     use super::*;
 
     #[test]

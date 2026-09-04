@@ -1,3 +1,5 @@
+//! Unix process groups, parent monitoring, shell execution, and terminal input modes.
+
 use std::io::Stdout;
 use std::process::Command as StdCommand;
 
@@ -131,6 +133,8 @@ pub(crate) fn leave_tui(stdout: &mut Stdout) {
 
 #[cfg(test)]
 mod tests {
+    //! Unix shell selection and the no-op process attachment guard.
+
     use super::*;
     use std::process::Command;
 

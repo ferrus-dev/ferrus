@@ -1,3 +1,5 @@
+//! MCP tool modules and shared task-context and lease-ownership guards.
+
 pub mod answer;
 pub mod approve;
 pub mod archive_spec;
@@ -80,6 +82,8 @@ pub(super) async fn require_runtime_task_context(
 
 #[cfg(test)]
 mod tests {
+    //! Shared schemas, lease guards, and read-only retrieval invariants.
+
     use super::*;
     use tempfile::TempDir;
 

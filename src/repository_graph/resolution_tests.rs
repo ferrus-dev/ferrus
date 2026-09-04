@@ -1,3 +1,5 @@
+//! Cross-file resolution tests for Cargo and Rust evidence, ambiguity, and bounded work.
+
 use sha2::{Digest as _, Sha256};
 
 use super::*;

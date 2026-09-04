@@ -1,3 +1,5 @@
+//! Maintenance tests for scoped deletion, resumable purges, retention coverage, and audits.
+
 use std::{
     collections::BTreeSet,
     fs,

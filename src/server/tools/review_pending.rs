@@ -1,3 +1,5 @@
+//! Claim or validate a reviewing task and read its scoped submission and integration feedback.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::info;
@@ -96,6 +98,8 @@ async fn read_review_context(
 
 #[cfg(test)]
 mod tests {
+    //! Review context includes scoped patches and integration failures.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

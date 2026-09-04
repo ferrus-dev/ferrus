@@ -1,3 +1,5 @@
+//! Read and atomically replace the project-local agent session registry.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +95,8 @@ pub async fn write_agents(registry: &AgentsRegistry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Agent registry persistence, lookup, and defaults when absent.
+
     use super::*;
     use tempfile::TempDir;
 

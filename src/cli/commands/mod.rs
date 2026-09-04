@@ -1,3 +1,5 @@
+//! Implementations of the Ferrus command-line subcommands.
+
 pub mod doctor;
 pub mod events;
 pub mod graph;

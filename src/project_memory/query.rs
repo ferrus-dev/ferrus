@@ -347,6 +347,8 @@ pub enum MemoryQueryError {
 
 #[cfg(test)]
 mod tests {
+    //! Nonzero query budgets and verified snippet source fingerprints.
+
     use super::*;
 
     #[test]

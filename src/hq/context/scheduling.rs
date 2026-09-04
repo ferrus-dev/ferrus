@@ -1,3 +1,5 @@
+//! Schedule Executors, Reviewers, and Consultants within available slots and live task ownership.
+
 use super::super::*;
 
 impl HqContext {

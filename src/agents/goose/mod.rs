@@ -292,6 +292,8 @@ fn goose_config_value_from_line(line: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Goose role-scoped extensions, headless limits, and model overrides.
+
     use super::*;
 
     fn args_of(command: &Command) -> Vec<String> {

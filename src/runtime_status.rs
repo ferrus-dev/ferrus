@@ -1,3 +1,5 @@
+//! Task lifecycle states, wire names, and shared predicates for ownership and scheduling.
+
 use anyhow::Result;
 use std::{fmt, str::FromStr};
 
@@ -83,6 +85,8 @@ impl FromStr for TaskStatus {
 
 #[cfg(test)]
 mod tests {
+    //! Terminal-state and reset eligibility predicates.
+
     use super::TaskStatus;
 
     #[test]

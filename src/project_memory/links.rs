@@ -796,6 +796,8 @@ impl LocalRepositoryLinkResolver {
         Ok(candidates)
     }
 
+    // Historical exact matches remain stale evidence after a refactor. Never-matched
+    // or ambiguous references stay unresolved; similarity cannot choose a new target.
     fn resolve_candidate(
         &self,
         revision: &MemoryRevision,
@@ -1220,6 +1222,8 @@ fn link_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    //! Explicit evidence parsing and deadline enforcement during link resolution.
+
     use std::cell::Cell;
 
     use super::*;

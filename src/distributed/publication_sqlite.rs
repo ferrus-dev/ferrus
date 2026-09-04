@@ -507,6 +507,8 @@ impl SqliteRemotePublicationStore {
         let reused_snapshot =
             insert_graph_snapshot(&transaction, &prepared.record, &encrypted, self.limits)?;
         let actual = load_graph_view(&transaction, &request.repository, &request.view_name)?;
+        // Compare before the same-target shortcut: a stale publisher must still
+        // lose even when another worker published identical content.
         let expected_matches = graph_expected_matches(request.expected.as_ref(), actual.as_ref());
         let outcome = if !expected_matches {
             GraphPublicationOutcome::Superseded { current: actual }

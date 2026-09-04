@@ -1,3 +1,5 @@
+//! Extract Cargo dependency facts and normalize manifest-relative paths and workspace patterns.
+
 use super::*;
 
 pub(super) fn extract_dependency_groups(

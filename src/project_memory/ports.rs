@@ -253,6 +253,8 @@ pub trait MemoryEventSink {
 
 #[cfg(test)]
 mod tests {
+    //! Debug output redacts source content passed to extractors.
+
     use super::*;
 
     #[test]

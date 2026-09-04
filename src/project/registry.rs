@@ -1,3 +1,5 @@
+//! Project registration, artifact reservation, spec archival, and runtime inspection.
+
 use super::*;
 
 pub async fn ensure_global_dir() -> Result<PathBuf> {

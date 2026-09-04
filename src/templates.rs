@@ -1,3 +1,5 @@
+//! Embedded task, specification, consultation, and agent guidance templates used during initialization.
+
 pub const SPEC_TEMPLATE: &str = r#"# <Feature Name> Specification
 
 ## Summary

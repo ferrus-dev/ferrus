@@ -1,3 +1,5 @@
+//! Run configured review checks and persist full logs with bounded feedback for the agent.
+
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -142,6 +144,8 @@ fn last_n_lines(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Bounded feedback selects the requested number of trailing log lines.
+
     use super::*;
 
     #[test]

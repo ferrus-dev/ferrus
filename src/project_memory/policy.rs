@@ -107,6 +107,8 @@ impl MemoryPolicy {
 
 #[cfg(test)]
 mod tests {
+    //! Curated default sources and deterministic policy identity.
+
     use super::*;
 
     #[test]

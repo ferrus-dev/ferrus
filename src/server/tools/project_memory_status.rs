@@ -1,3 +1,5 @@
+//! Expose read-only memory availability and freshness for the calling agent's project context.
+
 use std::time::Instant;
 
 use anyhow::Result;

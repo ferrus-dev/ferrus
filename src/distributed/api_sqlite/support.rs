@@ -1,3 +1,5 @@
+//! Shared authorization, bounded context assembly, cursor validation, and remote error mapping.
+
 use super::*;
 
 pub(super) struct LoadedTarget {

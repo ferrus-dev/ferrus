@@ -1,3 +1,5 @@
+//! Poll a scoped human answer, restore the paused task state, and return the answer to its owner.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde_json::json;
@@ -112,6 +114,8 @@ async fn read_answer(context: &RuntimeTaskContext) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Human-answer ownership, lease renewal, and paused-state restoration.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

@@ -1,3 +1,5 @@
+//! Poll and claim ready Executor work, returning task intent and any rejection feedback.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde_json::json;
@@ -133,6 +135,8 @@ fn state_name_for_task_status(status: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    //! Executor polling claims ready SQLite work and returns scoped context.
+
     use super::*;
     use tempfile::TempDir;
 

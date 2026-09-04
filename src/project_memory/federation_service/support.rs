@@ -1,3 +1,5 @@
+//! Route domain seeds, match evidence links, and fit federated responses to caller budgets.
+
 use super::*;
 
 pub(super) fn repository_only_seeds(

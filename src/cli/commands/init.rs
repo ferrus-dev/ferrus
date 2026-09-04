@@ -1,3 +1,5 @@
+//! Scaffold project configuration, artifact templates, skills, and agent registration.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 

@@ -1,3 +1,5 @@
+//! Protocol tests for versioning, semantic idempotency, scoped identities, and state transitions.
+
 use super::*;
 use crate::distributed::identity::{
     MemoryManifestId, ObjectId, RemoteProjectId, RemoteRepositoryId, RepositoryManifestId,

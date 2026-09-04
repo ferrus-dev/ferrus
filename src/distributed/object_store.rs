@@ -842,6 +842,8 @@ fn verify_digest_until(
 
 #[cfg(test)]
 mod tests {
+    //! Encrypted object integrity, quota enforcement, and idempotent storage.
+
     use super::*;
     use crate::distributed::identity::{RemoteProjectId, TenantId};
 

@@ -1,3 +1,5 @@
+//! Shared source tests for exclusion patterns, confined reads, and verified snapshot content.
+
 use super::*;
 use crate::repository_graph::domain::{
     RepositoryId, RepositoryNamespace, SourcePosition, SourceSpan,

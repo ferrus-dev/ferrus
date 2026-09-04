@@ -1,3 +1,5 @@
+//! Command-line arguments and dispatch between project commands, MCP serving, and HQ.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -142,6 +144,8 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
+    //! CLI parsing for graph domains, filters, context seeds, and budgets.
+
     use super::*;
     use crate::cli::commands::graph::{Direction, GraphCommand, GraphDomain, MemoryCommand};
 

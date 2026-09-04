@@ -682,6 +682,8 @@ fn sha256(content: &[u8]) -> Digest {
 
 #[cfg(test)]
 mod tests {
+    //! Privacy-filtered packaging and immutable manifest validation.
+
     use std::num::NonZeroU64;
 
     use super::*;

@@ -1,3 +1,5 @@
+//! Extract specification structure and approved Outcome sections into memory entities and links.
+
 use crate::project_memory::{
     documents::{OutcomeSectionKind, parse_spec_memory},
     domain::{

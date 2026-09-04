@@ -1,3 +1,5 @@
+//! Coordinator tests for durable retries, lease generations, cancellation, and tenant isolation.
+
 use super::*;
 use crate::{
     distributed::{

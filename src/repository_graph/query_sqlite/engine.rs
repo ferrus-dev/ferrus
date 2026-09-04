@@ -1,3 +1,5 @@
+//! Resolve graph scopes and execute bounded SQLite scans and context traversal.
+
 use super::*;
 
 impl<'a> SqliteGraphQuery<'a> {

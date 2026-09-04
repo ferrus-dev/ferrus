@@ -1,3 +1,5 @@
+//! Pause Executor work and write a scoped consultation request for the Supervisor.
+
 use anyhow::Result;
 use tracing::info;
 
@@ -107,6 +109,8 @@ fn validate_consult_request(question: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Consultation request validation and scoped task transitions.
+
     use super::*;
     use tempfile::TempDir;
 

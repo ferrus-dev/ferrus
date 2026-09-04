@@ -1,3 +1,5 @@
+//! Runtime tests for run tracking, lease recovery, and orphaned worktree cleanup.
+
 use super::*;
 
 #[tokio::test]

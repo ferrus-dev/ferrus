@@ -349,6 +349,8 @@ pub trait RemoteSnapshotQueryApi {
 
 #[cfg(test)]
 mod tests {
+    //! Remote request validation and independent server budget clamps.
+
     use super::*;
 
     fn nonzero(value: u64) -> NonZeroU64 {

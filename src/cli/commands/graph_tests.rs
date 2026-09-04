@@ -1,3 +1,5 @@
+//! Regression tests for CLI graph identity, freshness, evidence paths, and domain filters.
+
 use super::*;
 
 #[test]

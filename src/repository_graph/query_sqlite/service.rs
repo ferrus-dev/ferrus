@@ -1,3 +1,5 @@
+//! Implement GraphQuery with service limits, snapshot-bound pagination, and freshness reporting.
+
 use super::*;
 
 impl GraphQuery for SqliteGraphQuery<'_> {

@@ -1,3 +1,5 @@
+//! Memory sidecar tests for immutable revisions, publication, migration, and stored facts.
+
 use super::*;
 
 #[test]

@@ -1,3 +1,5 @@
+//! HQ session operations connecting agent launch, task recovery, checks, and UI feedback.
+
 use super::*;
 
 mod interaction;

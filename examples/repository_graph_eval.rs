@@ -1,3 +1,5 @@
+//! Run the repository retrieval evaluation corpus and optionally write its report.
+
 #[path = "../tests/support/repository_graph_eval.rs"]
 mod repository_graph_eval;
 

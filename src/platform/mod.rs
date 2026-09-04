@@ -1,3 +1,5 @@
+//! OS-specific process lifecycle, shell, and terminal operations behind a shared interface.
+
 use anyhow::Result;
 use std::io::Stdout;
 use std::process::Command as StdCommand;

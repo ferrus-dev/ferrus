@@ -1,3 +1,5 @@
+//! Renew the calling agent's task lease and return a structured ownership result.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde_json::json;
@@ -74,6 +76,8 @@ async fn run(agent_id: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Lease renewal resolves task ownership from SQLite context.
+
     use super::*;
     use tempfile::TempDir;
 

@@ -1,3 +1,5 @@
+//! HQ tests for scheduling, worktree isolation, recovery, and paused-session resumption.
+
 use super::*;
 
 fn task_record(id: &str, status: crate::project::TaskStatus) -> TaskRecord {

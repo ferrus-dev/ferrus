@@ -194,6 +194,8 @@ pub struct FederatedContextResponse {
 
 #[cfg(test)]
 mod tests {
+    //! Federated target selectors cannot contradict their domain.
+
     use super::*;
 
     #[test]

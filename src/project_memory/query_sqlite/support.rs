@@ -1,3 +1,5 @@
+//! Memory query matching, freshness, cursor fingerprints, and bounded response serialization.
+
 use super::*;
 
 pub(super) fn matching_seed_entities(

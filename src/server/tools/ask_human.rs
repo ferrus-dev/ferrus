@@ -1,3 +1,5 @@
+//! Pause a task with its requester identity and scoped question for human input.
+
 use anyhow::Result;
 use tracing::info;
 
@@ -133,6 +135,8 @@ fn is_supervisor(agent_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Requester ownership, scoped questions, and paused task state.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

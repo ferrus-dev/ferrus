@@ -1,3 +1,5 @@
+//! Filesystem discovery tests for path confinement, source exclusions, and resource limits.
+
 use std::collections::BTreeSet;
 
 use super::*;

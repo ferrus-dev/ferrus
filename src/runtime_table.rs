@@ -1,3 +1,5 @@
+//! Format project, task, run, and event records for CLI and HQ tables.
+
 use crate::project::{EventRecord, ProjectListEntry, RunRecord, TaskRecord};
 
 pub fn project_lines(projects: &[ProjectListEntry]) -> Vec<String> {
@@ -141,6 +143,8 @@ fn compact(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Runtime table fields, empty states, and column alignment.
+
     use super::*;
 
     #[test]

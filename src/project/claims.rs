@@ -1,3 +1,5 @@
+//! Transactional task claims, lease renewal, and agent-scoped runtime context resolution.
+
 use super::*;
 
 pub async fn claim_task(
@@ -60,6 +62,8 @@ pub async fn claim_review_task_by_id(
         .await
 }
 
+// Hold an immediate transaction across selection and lease assignment so two
+// callers cannot both acquire the same unclaimed or expired task.
 async fn claim_task_by_id_with_statuses(
     task_id: &str,
     agent_id: &str,
@@ -138,6 +142,8 @@ pub async fn claim_next_review_task(agent_id: &str, ttl_secs: u64) -> Result<Rea
     claim_next_task_with_statuses(agent_id, ttl_secs, &[TaskStatus::Reviewing], false).await
 }
 
+// Queue scans need the same write reservation as claims by ID; a read followed
+// by a separate update would allow competing callers to select the same task.
 async fn claim_next_task_with_statuses(
     agent_id: &str,
     ttl_secs: u64,
@@ -153,6 +159,7 @@ async fn claim_next_task_with_statuses(
         let now = Utc::now();
         let mut candidates = task_candidates_by_status(&transaction, &statuses)?;
 
+        // Repeated polls must return the caller's current lease before taking new work.
         for candidate in &mut candidates {
             let lease_until = parse_lease_until(candidate.lease_until.as_deref());
             let lease_active = lease_until

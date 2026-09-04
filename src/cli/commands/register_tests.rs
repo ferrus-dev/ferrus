@@ -1,3 +1,5 @@
+//! Regression tests for agent registration, role isolation, and legacy configuration migration.
+
 use super::*;
 
 struct CurrentDirGuard {

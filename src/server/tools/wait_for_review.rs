@@ -1,3 +1,5 @@
+//! Poll and claim a reviewing task for the Supervisor, returning scoped review context.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde_json::json;
@@ -128,6 +130,8 @@ fn run_dir_for_task(task_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Review polling claims the intended SQLite task.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

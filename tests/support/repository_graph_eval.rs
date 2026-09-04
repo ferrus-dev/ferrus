@@ -1,3 +1,5 @@
+//! Shared evaluation corpus, query measurements, and usefulness gates for repository retrieval.
+
 use std::{
     collections::{BTreeSet, HashSet},
     num::{NonZeroU32, NonZeroU64},

@@ -1,3 +1,5 @@
+//! Resolve Cargo dependencies and Rust cross-file relationships from extracted evidence.
+
 use super::*;
 
 pub(super) fn resolve_cargo_dependencies(

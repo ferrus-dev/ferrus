@@ -1,3 +1,5 @@
+//! Resolve MCP resources to agent-scoped runtime state and task/run artifacts.
+
 use neva::prelude::*;
 
 use crate::{
@@ -332,6 +334,8 @@ fn valid_task_id(task_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Resource routing preserves task/run scope and read-only runtime access.
+
     use super::*;
     use neva::types::ResourceContents;
     use tempfile::TempDir;

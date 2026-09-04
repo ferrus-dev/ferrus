@@ -1,3 +1,5 @@
+//! Resolve project-local paths and read, write, or clear task/run-scoped artifacts.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -298,6 +300,8 @@ fn run_file(run_dir: &str, filename: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    //! Scoped artifact paths, isolated check logs, and template preservation.
+
     use super::*;
     use tempfile::TempDir;
 

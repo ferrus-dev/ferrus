@@ -1,3 +1,5 @@
+//! Maintain canonical graph publications, recovery, retention, and task baseline pinning.
+
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,3 +1,5 @@
+//! Publication tests for immutable facts, pointer CAS, lease authority, and domain isolation.
+
 use super::*;
 use crate::{
     distributed::{

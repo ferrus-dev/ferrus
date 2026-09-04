@@ -1,3 +1,5 @@
+//! Persist the Supervisor's response for the Executor waiting on a consultation.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::info;
@@ -81,6 +83,8 @@ async fn write_consult_response(context: &RuntimeTaskContext, response: &str) ->
 
 #[cfg(test)]
 mod tests {
+    //! Responses stay attached to the intended consultation run.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

@@ -1,3 +1,5 @@
+//! Interactive HQ command dispatch and coordination of agent sessions with runtime tasks.
+
 pub mod agent_manager;
 mod commands;
 mod display;

@@ -1,3 +1,5 @@
+//! Persist task/run graph references and canonical invalidation state in the runtime database.
+
 use super::*;
 
 pub async fn task_repository_view(task_id: &str) -> Result<Option<RepositoryViewReference>> {

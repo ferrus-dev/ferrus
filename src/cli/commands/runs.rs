@@ -1,3 +1,5 @@
+//! List runtime run attempts with an optional result limit.
+
 use anyhow::Result;
 use clap::Subcommand;
 

@@ -1,3 +1,5 @@
+//! List projects registered in the machine-local Ferrus registry.
+
 use anyhow::Result;
 use clap::Subcommand;
 

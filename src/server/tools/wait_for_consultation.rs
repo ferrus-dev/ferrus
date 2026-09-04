@@ -1,3 +1,5 @@
+//! Attach a Supervisor run to an available consultation and return its request context.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde_json::json;
@@ -83,6 +85,8 @@ fn runtime_task_id() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Supervisor attachment preserves the Executor's task lease.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

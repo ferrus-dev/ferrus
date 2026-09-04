@@ -1,3 +1,5 @@
+//! Prepare isolated Executor worktrees and persist the baseline used to isolate task changes.
+
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,8 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
             if let Some(baseline_tree) =
                 read_executor_workspace_baseline_tree(&baseline_path).await?
             {
+                // Tracked config changes after the baseline would become task changes.
+                // Only ignored agent configs can be refreshed safely on reuse.
                 copy_canonical_ignored_agent_config_files(&project_root, &workspace_dir).await?;
                 crate::project::pin_executor_baseline_tree(&project_root, task_id, &baseline_tree)
                     .await?;
@@ -85,6 +89,8 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
     }
     let setup = async {
         seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
+        // Include the user's existing changes in the baseline so submission
+        // attributes only subsequent Executor changes to this task.
         let baseline_tree = capture_executor_workspace_baseline_tree(&workspace_dir).await?;
         persist_executor_workspace_baseline(
             &project_root,
@@ -581,6 +587,8 @@ async fn git_has_head(path: &Path) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
+    //! Symlink-safe copying of untracked files and agent configuration.
+
     use super::*;
 
     #[tokio::test]
