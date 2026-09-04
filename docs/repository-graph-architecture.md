@@ -239,6 +239,16 @@ Availability, build execution, publication, and freshness are orthogonal and mus
 - `failed`: an attempt stopped with diagnostics;
 - `superseded`: a complete attempt lost publication compare-and-set to a newer view.
 
+Incremental indexing can reuse a completed snapshot without loading cached fragments or rerunning resolution.
+This requires matching snapshot identity, persisted index metrics and fact counts, and identical source warnings
+in both the original fact-producing build and the latest diagnostic set. Analyzer diagnostics or changed source
+warnings use the normal indexing path. `--full` always bypasses both snapshot and fragment reuse.
+
+Reuse still revalidates source before completion and before publication, rechecks eligibility transactionally,
+and uses the normal publication compare-and-set. It records a new build attempt and its diagnostics while
+preserving the existing snapshot and publication generation on a no-op. Fragment timestamps are unchanged because
+no fragments were read; retained snapshot file references continue to protect those fragments from collection.
+
 ### Freshness
 
 - `fresh`: the current effective source manifest, graph model, semantic config, and extractor set match the pinned
