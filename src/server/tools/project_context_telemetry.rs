@@ -1,3 +1,5 @@
+//! Emit bounded project-context metrics without logging retrieved text or request bodies.
+
 use std::time::Instant;
 
 use serde::Serialize;
@@ -153,6 +155,8 @@ fn emit(metric: Metric<'_>) {
 
 #[cfg(test)]
 mod tests {
+    //! Telemetry payloads cannot carry query text, paths, or source bodies.
+
     use super::*;
 
     #[test]

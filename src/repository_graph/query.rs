@@ -458,6 +458,8 @@ pub struct ContentResponse {
 
 #[cfg(test)]
 mod tests {
+    //! Explicit query scopes, bounded content requests, and structural context responses.
+
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::*;

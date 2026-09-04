@@ -1,3 +1,5 @@
+//! Repository graph source policy and resource limits, validated when graph operations are used.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -440,6 +442,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Canonical configuration digests, ordered source rules, and limit validation.
+
     use super::*;
 
     #[test]

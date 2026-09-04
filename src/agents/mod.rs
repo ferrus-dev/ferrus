@@ -539,6 +539,8 @@ fn add_json_allow_permission(root: &mut Value, permission: &str, path: &Path) ->
 
 #[cfg(test)]
 mod tests {
+    //! Agent selection errors, model normalization, and display configuration.
+
     use super::*;
 
     pub(crate) fn assert_program_and_args(command: Command, program: &str, args: &[&str]) {

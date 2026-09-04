@@ -1,3 +1,5 @@
+//! Runtime tests for claims, task transitions, retry limits, and human/consultation pauses.
+
 use super::*;
 
 #[tokio::test]

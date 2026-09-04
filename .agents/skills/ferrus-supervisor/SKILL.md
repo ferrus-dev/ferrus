@@ -40,15 +40,21 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 ## Useful Ferrus tools
 
-- `/create_task`
+- `/enqueue_task` (task-definition sessions)
 - `/create_spec`
-- `/archive_spec`
+- `/archive_spec` (HQ archive sessions)
 - `/wait_for_review`
 - `/review_pending`
 - `/approve`
 - `/reject`
+- `/wait_for_consultation`
 - `/respond_consult`
 - `/ask_human`
+- `/wait_for_answer`
+- `/heartbeat` (task-scoped sessions, while owning the task lease)
+
+`/create_task` is a compatibility tool on unfiltered servers, not role-scoped Supervisor sessions.
+Use only tools exposed by the current mode; a Consultant attaches without taking the Executor's lease.
 
 ## Useful Ferrus resources
 

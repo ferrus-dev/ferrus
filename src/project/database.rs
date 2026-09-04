@@ -1,3 +1,5 @@
+//! Runtime database opening, versioned schema migration, and shared row/transaction helpers.
+
 use super::*;
 
 pub(super) async fn initialize_database(path: &Path) -> Result<()> {

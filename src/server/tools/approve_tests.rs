@@ -1,3 +1,5 @@
+//! Approval tests for canonical integration, rollback, workspace preservation, and lock ownership.
+
 use super::*;
 use crate::state::store;
 use tempfile::TempDir;

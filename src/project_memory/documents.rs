@@ -371,6 +371,8 @@ fn section_kind(title: &str) -> Option<OutcomeSectionKind> {
 
 #[cfg(test)]
 mod tests {
+    //! Curated Outcome parsing and redaction of unauthorized specification content.
+
     use super::*;
 
     #[test]

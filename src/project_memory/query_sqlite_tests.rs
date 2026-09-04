@@ -1,3 +1,5 @@
+//! Memory query tests for search, context, cursor validation, and bounded responses.
+
 use std::{cell::Cell, fs, path::Path, process::Command};
 
 use tempfile::TempDir;

@@ -1,3 +1,5 @@
+//! Validate repository context requests and retrieve the caller's scoped graph view.
+
 use std::{
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
@@ -317,6 +319,8 @@ fn serialize_invalid_request(error: &anyhow::Error) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Context schema validation, wrapped input, seeds, and budget preservation.
+
     use super::*;
     use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;

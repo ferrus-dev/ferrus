@@ -1,3 +1,5 @@
+//! Apply hard exclusions and configured include/exclude patterns before source ingestion.
+
 use super::*;
 
 #[derive(Debug, Clone)]

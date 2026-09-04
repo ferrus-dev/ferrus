@@ -99,8 +99,9 @@ On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads th
 /task -> Supervisor defines work -> Executor implements and checks -> Reviewer approves or rejects
 ```
 
-Tasks advance independently through SQLite-backed states. Executor work happens in isolated worktrees, checks run
-before submission, and rejected work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
+Tasks advance independently through SQLite-backed states. Git projects use isolated Executor worktrees;
+non-Git projects run in the project directory with one Executor. Checks run before submission, and rejected
+work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
 provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
 
 The full HQ command list, state transitions, CLI reference, configuration example, graph commands, and runtime file

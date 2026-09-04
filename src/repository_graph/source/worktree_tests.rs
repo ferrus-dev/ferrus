@@ -1,3 +1,5 @@
+//! Worktree source tests for baseline overlays, immutable trees, and verified content.
+
 use super::*;
 use crate::repository_graph::{
     config::RepositoryGraphConfig,

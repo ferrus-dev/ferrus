@@ -1,3 +1,5 @@
+//! Parse Cargo manifests with bounded input and deadlines, including the parser worker protocol.
+
 use super::*;
 
 #[derive(Debug, Serialize, Deserialize)]

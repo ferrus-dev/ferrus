@@ -1,3 +1,5 @@
+//! Criterion benchmarks for repository graph indexing, queries, and incremental updates.
+
 use std::{hint::black_box, path::Path, time::Duration};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group};

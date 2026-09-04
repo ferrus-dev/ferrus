@@ -1,3 +1,6 @@
+//! Integrate reviewed work into the canonical workspace, check it, and roll back on failure.
+//! Completion follows successful integration; graph refresh observes the resulting source state.
+
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use neva::prelude::*;
@@ -48,6 +51,8 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
+    // Observe both manifests while integration is serialized, then release the
+    // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
@@ -173,6 +178,8 @@ impl CanonicalIntegrationObserver {
         project_root: &Path,
         integration_succeeded: bool,
     ) -> bool {
+        // Measure the actual post-rollback tree: a failed integration may leave
+        // partial changes, while a clean rollback must not invalidate the graph.
         let after = observe_canonical_source(project_root).await;
         if matches!(
             (&self.before, &after),
@@ -1055,6 +1062,8 @@ async fn acquire_canonical_approval_lock_at(
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
+    // Serialize creation and stale-lock removal on a stable guard file so
+    // competing recoveries cannot unlink a newly acquired approval lock.
     let _guard = acquire_canonical_approval_lock_guard(lock_path)?;
     loop {
         match try_create_canonical_approval_lock(lock_path, task_id).await {
@@ -1128,6 +1137,7 @@ async fn try_create_canonical_approval_lock(
     }
     drop(file);
 
+    // Publish a complete marker without replacing an existing owner's path.
     match std::fs::hard_link(&temp_path, lock_path) {
         Ok(()) => {
             let owner_path = canonical_approval_lock_owner_path(lock_path);
@@ -1192,6 +1202,7 @@ fn canonical_approval_lock_temp_path(lock_path: &Path, task_id: &str) -> PathBuf
     ))
 }
 
+// The held owner-file lock is authoritative; marker PIDs can be reused after a crash.
 async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> {
     let owner_path = canonical_approval_lock_owner_path(lock_path);
     if process_holds_canonical_approval_owner(&owner_path) {

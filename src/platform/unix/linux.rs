@@ -1,3 +1,5 @@
+//! Linux process naming and parent-death signals for MCP and headless agents.
+
 pub(super) fn set_serve_process_name() {
     unsafe {
         let name = b"ferrus-mcp\0";

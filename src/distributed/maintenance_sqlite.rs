@@ -215,6 +215,8 @@ impl SqliteRemoteMaintenance {
             DeletionTarget::Repository(repository) => self.repository_jobs(repository)?,
         };
 
+        // Each store commits independently. Persist progress after each purge so
+        // retries can resume without assuming a transaction across databases.
         if deletion.coverage.contains(&RetentionClass::UploadedSource) {
             let DeletionTarget::Project(project) = &deletion.target else {
                 return Err(MaintenanceStoreError::Conflict);

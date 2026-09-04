@@ -196,6 +196,8 @@ fn count(connection: &Connection, sql: &str) -> rusqlite::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    //! Read-only health inspection of absent, malformed, and active sidecars.
+
     use super::*;
     use crate::repository_graph::{
         domain::{

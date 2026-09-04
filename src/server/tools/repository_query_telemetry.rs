@@ -1,3 +1,5 @@
+//! Emit repository retrieval counters and timings without source bodies or query text.
+
 use std::time::Instant;
 
 use serde::Serialize;
@@ -211,6 +213,8 @@ fn emit(context: &LocalGraphContext, metric: RepositoryQueryMetric<'_>) {
 
 #[cfg(test)]
 mod tests {
+    //! Telemetry payloads cannot carry query text, paths, or source bodies.
+
     use super::*;
 
     #[test]

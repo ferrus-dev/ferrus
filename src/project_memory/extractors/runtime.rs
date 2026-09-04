@@ -1,3 +1,5 @@
+//! Extract terminal task, run, and check provenance from sanitized runtime documents.
+
 use std::collections::BTreeMap;
 
 use crate::project_memory::{

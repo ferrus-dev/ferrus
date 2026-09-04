@@ -1,3 +1,5 @@
+//! Validated memory identities, entities, provenance, immutable revisions, and publication values.
+
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -666,6 +668,8 @@ pub struct MemoryBuildMetrics {
 
 #[cfg(test)]
 mod tests {
+    //! Bounded memory values, portable evidence, and deterministic revision identities.
+
     use super::*;
 
     #[test]

@@ -1,3 +1,5 @@
+//! Poll runtime state and selected spec metadata to refresh the HQ dashboard.
+
 use std::time::SystemTime;
 
 use tokio::sync::watch;
@@ -150,6 +152,8 @@ pub fn format_elapsed(duration: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Elapsed-time formatting at second, minute, and hour boundaries.
+
     use std::time::Duration;
 
     use super::format_elapsed;

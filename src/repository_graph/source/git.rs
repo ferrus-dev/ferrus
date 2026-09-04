@@ -1,3 +1,5 @@
+//! Discover tracked and nonignored untracked Git paths and revalidate content under source policy.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -533,6 +535,8 @@ pub(super) fn trim_ascii(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    //! Git discovery policy, path normalization, and worktree revalidation.
+
     use super::*;
     use crate::repository_graph::{
         config::RepositoryGraphConfig,

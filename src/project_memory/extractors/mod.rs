@@ -68,6 +68,8 @@ pub(crate) fn canonical_digest(value: &impl Serialize) -> Digest {
 
 #[cfg(test)]
 mod tests {
+    //! Stable and unique built-in memory extractor registration.
+
     use super::*;
 
     #[test]

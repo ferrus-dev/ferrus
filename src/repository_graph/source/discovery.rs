@@ -1,3 +1,5 @@
+//! Build bounded source manifests, normalize discovered paths, and hash verified content.
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

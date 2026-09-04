@@ -1,3 +1,5 @@
+//! Ferrus executable entry point: initialize logging and dispatch CLI or interactive HQ.
+
 mod agent_id;
 mod agents;
 mod checks;
@@ -22,6 +24,8 @@ use ferrus::{project_memory, repository_graph};
 
 #[cfg(test)]
 mod test_support {
+    //! Serialize tests that change cwd and assert that runtime paths never recreate STATE.json.
+
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     pub(crate) struct RecoveringMutex(Mutex<()>);

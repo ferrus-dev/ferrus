@@ -1,3 +1,5 @@
+//! Extract memory entities from sanitized archive manifests rather than archived artifact bodies.
+
 use crate::project_memory::{
     documents::ArchiveSourceDocument,
     domain::{

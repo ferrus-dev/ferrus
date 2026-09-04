@@ -1,3 +1,5 @@
+//! Mark a failed task Reset through its runtime context while preserving scoped artifacts.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::info;
@@ -57,6 +59,8 @@ async fn reset_runtime_task(context: &RuntimeTaskContext) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Only failed SQLite tasks may be reset through MCP.
+
     use super::*;
     use tempfile::TempDir;
 

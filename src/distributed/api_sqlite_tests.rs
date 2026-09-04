@@ -1,3 +1,5 @@
+//! Remote API tests for authorization ordering, pinned queries, budgets, and verified content.
+
 use std::num::{NonZeroU32, NonZeroU64};
 
 use super::*;

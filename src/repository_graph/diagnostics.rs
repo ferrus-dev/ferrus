@@ -66,6 +66,8 @@ impl EventSink for TracingEventSink {
 
 #[cfg(test)]
 mod tests {
+    //! Lifecycle event payloads carry only bounded metadata.
+
     use super::*;
     use crate::repository_graph::domain::{BuildId, RepositoryId, RepositoryNamespace, SnapshotId};
 

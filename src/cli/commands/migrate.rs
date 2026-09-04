@@ -1,3 +1,5 @@
+//! Import legacy project state into the machine-local SQLite runtime.
+
 use anyhow::Result;
 
 use super::register;

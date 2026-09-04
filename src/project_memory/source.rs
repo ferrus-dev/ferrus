@@ -1020,6 +1020,8 @@ pub(crate) fn record_approved_outcome_for_test(data: &Path, spec_path: &str, spe
 
 #[cfg(test)]
 mod tests {
+    //! Archive proof, authorized source discovery, and privacy boundaries.
+
     use super::*;
     use std::num::NonZeroU64;
 

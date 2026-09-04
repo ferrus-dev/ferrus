@@ -1,3 +1,5 @@
+//! Run configured checks in order and capture each command's exit status and output.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -73,6 +75,8 @@ async fn run_command(cmd: &str, cwd: Option<&Path>) -> Result<CommandResult> {
 
 #[cfg(test)]
 mod tests {
+    //! Check ordering, aggregate failure reporting, and empty-command behavior.
+
     use super::*;
 
     #[cfg(unix)]

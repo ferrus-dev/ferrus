@@ -1,3 +1,5 @@
+//! Runtime tests for schema migration, graph references, and frozen submission state.
+
 use super::*;
 
 #[test]

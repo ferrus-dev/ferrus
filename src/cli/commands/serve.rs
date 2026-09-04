@@ -1,3 +1,5 @@
+//! Launch the stdio MCP server with the requested agent identity and role.
+
 use anyhow::Result;
 
 use crate::server::Role;

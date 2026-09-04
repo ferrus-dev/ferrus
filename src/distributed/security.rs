@@ -574,6 +574,8 @@ pub struct AuditRecord {
 
 #[cfg(test)]
 mod tests {
+    //! Authorization scopes, retention coverage, and secure worker declarations.
+
     use super::*;
     use crate::distributed::identity::{RemoteProjectId, RemoteRepositoryId};
 

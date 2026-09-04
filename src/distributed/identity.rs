@@ -237,6 +237,8 @@ impl FederatedViewRef {
 
 #[cfg(test)]
 mod tests {
+    //! Canonical remote IDs and tenant/project separation.
+
     use super::*;
 
     fn digest(value: &str) -> Digest {

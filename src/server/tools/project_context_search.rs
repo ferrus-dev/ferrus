@@ -1,3 +1,5 @@
+//! Search selected repository/memory domains with validated filters and bounded results.
+
 use std::time::Instant;
 
 use anyhow::Result;

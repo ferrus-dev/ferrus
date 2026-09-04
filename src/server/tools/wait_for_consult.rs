@@ -1,3 +1,5 @@
+//! Poll the scoped Supervisor response and restore the Executor's pre-consultation state.
+
 use anyhow::Result;
 use neva::prelude::*;
 use std::time::{Duration, Instant};
@@ -75,6 +77,8 @@ async fn read_consult_response(context: &RuntimeTaskContext) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Scoped consultation responses restore the Executor's prior state.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

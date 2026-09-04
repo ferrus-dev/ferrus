@@ -629,6 +629,8 @@ fn job_kind(kind: IndexJobKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    //! Encrypted batch persistence, quotas, authority checks, and idempotent writes.
+
     use super::*;
     use crate::{
         distributed::{

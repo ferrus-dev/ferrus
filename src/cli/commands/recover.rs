@@ -1,3 +1,5 @@
+//! Preview or apply runtime recovery, graph maintenance, and orphaned worktree cleanup.
+
 use anyhow::Result;
 
 use crate::project;

@@ -1,3 +1,5 @@
+//! Validate search filters and budgets before querying the caller's repository view.
+
 use std::{
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
@@ -240,6 +242,8 @@ fn requested_budget(
 
 #[cfg(test)]
 mod tests {
+    //! Search schema validation, wrapped input, filters, cursors, and budgets.
+
     use super::*;
     use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};
     use std::collections::HashMap;

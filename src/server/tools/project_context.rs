@@ -1,3 +1,5 @@
+//! Validate explicit domain seeds and retrieve bounded project context with optional content.
+
 use std::time::Instant;
 
 use anyhow::Result;
@@ -217,6 +219,8 @@ fn validate_seed_domains(domain: ContextDomain, seeds: &[FederatedContextSeed]) 
 
 #[cfg(test)]
 mod tests {
+    //! Domain and snippet settings gate memory source discovery and seed acceptance.
+
     use super::*;
 
     #[test]

@@ -1,3 +1,5 @@
+//! Wire the stdio MCP server and expose tools, resources, and prompts by role and task scope.
+
 use anyhow::Result;
 use neva::App;
 use neva::types::ToolSchema;
@@ -332,6 +334,8 @@ fn supervisor_task_scope_from_agent_id(agent_id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    //! Role, task, and archive scopes expose only their intended MCP tools.
+
     use super::*;
 
     #[test]

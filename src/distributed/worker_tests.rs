@@ -1,3 +1,5 @@
+//! Worker tests for immutable input, extraction limits, lease checks, and retry-safe batches.
+
 use std::{
     cell::Cell,
     time::{Duration, Instant},

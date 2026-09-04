@@ -1,3 +1,5 @@
+//! Cargo extractor tests for targets, dependencies, parser limits, and portable paths.
+
 use super::*;
 use crate::repository_graph::{
     domain::{

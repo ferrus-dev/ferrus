@@ -1,3 +1,5 @@
+//! Terminal setup and shared dashboard formatting, width, color, and link helpers.
+
 use super::*;
 
 pub(in crate::hq::tui) fn enter_tui() -> Result<()> {

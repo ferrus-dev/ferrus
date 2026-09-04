@@ -1,3 +1,5 @@
+//! Launch interactive agent sessions and deliver human answers to paused task owners.
+
 use super::super::*;
 
 impl HqContext {

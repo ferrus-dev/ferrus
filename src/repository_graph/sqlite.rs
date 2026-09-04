@@ -547,6 +547,8 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Sidecar schema migration and read-only query opening.
+
     use super::*;
 
     fn create_sidecar_at_version(path: &Path, schema_version: u32) {

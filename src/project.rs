@@ -1,3 +1,6 @@
+//! Machine-local project registry and SQLite orchestration state.
+//! Task, run, lease, and event helpers own runtime transitions; scoped files hold artifacts.
+
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},

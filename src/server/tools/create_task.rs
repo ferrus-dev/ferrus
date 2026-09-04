@@ -1,3 +1,5 @@
+//! Compatibility task-creation handler backed by queued SQLite tasks and scoped intent files.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::info;
@@ -56,6 +58,8 @@ async fn run(description: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Concurrent task creation reserves distinct artifacts and preserves templates.
+
     use super::*;
     use tempfile::TempDir;
 

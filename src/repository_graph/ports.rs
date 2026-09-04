@@ -391,6 +391,8 @@ pub trait EventSink {
 
 #[cfg(test)]
 mod tests {
+    //! Debug output redacts verified extraction input.
+
     use super::*;
     use crate::repository_graph::domain::{BuildId, RepositoryId, RepositoryNamespace, SnapshotId};
 

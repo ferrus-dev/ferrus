@@ -1,3 +1,5 @@
+//! Runtime tests for legacy migration and completed specification archival.
+
 use super::*;
 
 #[tokio::test]

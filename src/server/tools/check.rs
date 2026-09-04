@@ -1,3 +1,5 @@
+//! Run Executor checks, account for retry limits, and refresh the task graph overlay best-effort.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::{info, warn};
@@ -143,6 +145,8 @@ async fn run(agent_id: Option<&str>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Successful checks clear retry metadata through SQLite task context.
+
     use super::*;
     use tempfile::TempDir;
 

@@ -1,3 +1,5 @@
+//! Graph cursor fingerprints, SQLite row decoding, and query error/serialization helpers.
+
 use super::*;
 
 #[derive(Serialize, Deserialize)]

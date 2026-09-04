@@ -1,3 +1,5 @@
+//! Decode legacy STATE.json data and map its states for SQLite migration.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -76,6 +78,8 @@ pub fn task_status_for_legacy_state(state: &LegacyTaskState) -> TaskStatus {
 
 #[cfg(test)]
 mod tests {
+    //! Preservation of legacy pause metadata and retry counters during decoding.
+
     use super::*;
 
     #[test]

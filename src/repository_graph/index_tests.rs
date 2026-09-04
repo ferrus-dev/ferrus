@@ -1,3 +1,5 @@
+//! Graph indexing tests for incremental reuse, source changes, and publication consistency.
+
 use std::{
     cell::Cell,
     fs,

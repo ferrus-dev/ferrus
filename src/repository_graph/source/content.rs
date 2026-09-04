@@ -1,3 +1,5 @@
+//! Serve source snippets only after verifying content against the requested snapshot manifest.
+
 use super::*;
 
 pub struct LocalSnapshotContent {
@@ -215,6 +217,8 @@ impl SnapshotContent for LocalSnapshotContent {
     }
 }
 
+// Callers verify the entire blob first; slicing before verification would leave
+// a snippet detached from the snapshot's whole-file content identity.
 fn content_response_for_bytes(
     request: &ContentRequest,
     repository: &RepositoryRef,

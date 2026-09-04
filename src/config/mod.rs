@@ -1,3 +1,5 @@
+//! Load ferrus.toml defaults and update HQ agent settings while preserving TOML layout.
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -83,6 +85,8 @@ pub struct HqConfig {
     pub executor: HqAgentConfig,
 }
 
+// Optional graph/memory settings are validated by their own entry points.
+// Keeping this shape lenient lets ordinary orchestration run if those settings are invalid.
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     checks: ChecksConfig,
@@ -370,6 +374,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    //! Configuration defaults, legacy HQ formats, and lenient optional settings.
+
     use super::*;
 
     #[test]

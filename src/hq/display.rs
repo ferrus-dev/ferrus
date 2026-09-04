@@ -1,3 +1,5 @@
+//! Translate HQ output into terminal messages and formatted tables.
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::state::agents::{AgentStatus, AgentsRegistry};
@@ -148,6 +150,8 @@ fn agent_status_label<'a>(agents: &'a AgentsRegistry, role: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    //! Structured UI messages and compact agent-status rendering.
+
     use tokio::sync::mpsc;
 
     use crate::{

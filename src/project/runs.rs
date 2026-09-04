@@ -1,3 +1,5 @@
+//! Record agent runs and events, recover interrupted work, and retain task baseline refs.
+
 use super::*;
 
 pub async fn record_runtime_event(

@@ -1,3 +1,5 @@
+//! Validate task intent and optional milestone origin, then enqueue a scoped runtime task.
+
 use anyhow::Result;
 use neva::prelude::*;
 use serde::Deserialize;
@@ -119,6 +121,8 @@ fn validate_input(input: EnqueueTaskInput) -> Result<EnqueueTaskInput> {
 
 #[cfg(test)]
 mod tests {
+    //! Wrapped MCP input, task validation, and enqueue origin handling.
+
     use super::*;
     use crate::project::LocalProjectRef;
     use neva::types::{ArgNames, CallToolRequestParams, FromHandlerArgs};

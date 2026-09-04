@@ -1,3 +1,5 @@
+//! Record review feedback and return a task to Addressing, subject to the review-cycle limit.
+
 use anyhow::Result;
 use neva::prelude::*;
 use tracing::{info, warn};
@@ -112,6 +114,8 @@ async fn write_review(context: &RuntimeTaskContext, notes: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Scoped review feedback, retry resets, and rejection state transitions.
+
     use super::*;
     use tempfile::TempDir;
 

@@ -1,3 +1,5 @@
+//! Validate and encrypt publication facts; enforce lease authority, receipts, and pointer updates.
+
 use super::*;
 
 pub(super) fn prepare_graph(

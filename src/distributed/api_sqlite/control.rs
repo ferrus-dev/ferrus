@@ -1,3 +1,5 @@
+//! Authorize remote build operations before validating requests or accessing coordinator state.
+
 use super::*;
 
 pub struct SqliteRemoteControlApi {

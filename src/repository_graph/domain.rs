@@ -1,3 +1,5 @@
+//! Validated graph identities, source manifests, facts, snapshots, and publication values.
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -606,6 +608,8 @@ impl QueryBudget {
 
 #[cfg(test)]
 mod tests {
+    //! Portable paths, canonical digests, nonzero budgets, and graph identities.
+
     use super::*;
 
     #[test]

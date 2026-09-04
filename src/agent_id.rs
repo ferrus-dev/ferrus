@@ -1,3 +1,5 @@
+//! Stable agent IDs, role-scoped MCP server names, and inherited runtime environment keys.
+
 pub const ROLE_SUPERVISOR: &str = "supervisor";
 pub const ROLE_EXECUTOR: &str = "executor";
 pub const DEFAULT_AGENT_INDEX: u32 = 1;
@@ -24,6 +26,8 @@ pub fn legacy_mcp_server_name(role: &str, index: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Agent ID and MCP server naming conventions.
+
     use super::*;
 
     #[test]

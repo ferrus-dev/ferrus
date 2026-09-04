@@ -170,6 +170,8 @@ fn validate_interactive_launch(role: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! OpenCode launch arguments, model overrides, and role configuration checks.
+
     use super::*;
     use crate::agents::tests::assert_program_and_args;
 

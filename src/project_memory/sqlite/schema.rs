@@ -1,3 +1,5 @@
+//! Initialize and migrate the memory sidecar schema and encode revision/publication rows.
+
 use super::*;
 
 pub(super) fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryStoreError> {

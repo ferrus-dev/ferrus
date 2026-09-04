@@ -136,6 +136,8 @@ impl MemoryEventSink for TracingMemoryEventSink {
 
 #[cfg(test)]
 mod tests {
+    //! Diagnostic and lifecycle payloads exclude free-form text.
+
     use super::*;
     use crate::project_memory::domain::{ProjectId, ProjectNamespace};
 

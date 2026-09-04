@@ -1,3 +1,5 @@
+//! Report the calling agent's task state, retry counters, and runtime context.
+
 use anyhow::Result;
 use neva::prelude::*;
 
@@ -125,6 +127,8 @@ async fn sqlite_status_lines() -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    //! Status uses agent-scoped SQLite context and handles taskless callers.
+
     use super::*;
     use tempfile::TempDir;
 

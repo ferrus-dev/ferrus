@@ -1,3 +1,5 @@
+//! Memory indexing tests for source policy, revision identity, and publication behavior.
+
 use std::{fs, path::Path, process::Command};
 
 use rusqlite::{Connection, params};

@@ -1,3 +1,5 @@
+//! Editable prompt state, command completion, and interactive selection behavior.
+
 use super::*;
 
 impl App {

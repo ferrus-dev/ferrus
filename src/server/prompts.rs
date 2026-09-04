@@ -1,3 +1,5 @@
+//! Assemble Executor and Reviewer prompts from their SQLite context and scoped artifacts.
+
 use neva::prelude::*;
 
 use crate::{project::RuntimeTaskContext, state::store};
@@ -128,6 +130,8 @@ fn state_section(title: &str, context: Option<&RuntimeTaskContext>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    //! Prompts resolve agent-scoped task artifacts through SQLite context.
+
     use super::*;
     use neva::types::Content;
     use tempfile::TempDir;

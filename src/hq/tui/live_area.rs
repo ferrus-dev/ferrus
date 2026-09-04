@@ -1,3 +1,5 @@
+//! Render transient status, selection, and completion rows below the transcript.
+
 use super::*;
 
 pub(super) fn print_status_line(

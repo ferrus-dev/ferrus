@@ -1,3 +1,5 @@
+//! Windows process monitoring, kill-on-close jobs, shell execution, and console modes.
+
 use std::{
     io::{Stdout, Write},
     process::Command as StdCommand,
@@ -250,6 +252,8 @@ fn create_kill_on_close_job() -> Result<HANDLE> {
 
 #[cfg(test)]
 mod tests {
+    //! Windows shell selection and process-liveness checks.
+
     use super::*;
     use std::process::Command;
 

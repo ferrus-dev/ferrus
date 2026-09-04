@@ -611,6 +611,8 @@ fn saturating_i64(value: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    //! Deterministic repository/file facts, hierarchy, and conventional-file classification.
+
     use super::*;
     use crate::repository_graph::{
         domain::{

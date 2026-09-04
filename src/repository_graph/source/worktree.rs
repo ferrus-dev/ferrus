@@ -1,3 +1,5 @@
+//! Compose pinned Git baselines with task worktree changes and capture immutable source trees.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,

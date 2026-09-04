@@ -1,3 +1,5 @@
+//! Write role-scoped agent MCP configuration and migrate legacy registration entries.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 

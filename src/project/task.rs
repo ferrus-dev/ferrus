@@ -1,3 +1,5 @@
+//! Persist task transitions, retry counters, human/consultation pauses, and project selection.
+
 use super::*;
 
 pub async fn list_events(limit: usize, run_id: Option<String>) -> Result<Vec<EventRecord>> {

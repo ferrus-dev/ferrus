@@ -1,3 +1,5 @@
+//! Rust extractor tests for symbols, imports, relationships, and bounded parsing.
+
 use std::collections::BTreeSet;
 
 use super::*;

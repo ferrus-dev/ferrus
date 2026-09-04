@@ -175,6 +175,8 @@ impl SqliteIndexJobCoordinator {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A committed transition may have cleared the lease already. Replay its
+        // receipt before checking current authority so a lost response is retryable.
         if let Some(replayed) = load_advance_receipt(&transaction, request, expected, next)? {
             transaction.commit()?;
             return Ok(replayed);
@@ -486,6 +488,8 @@ impl IndexJobCoordinator for SqliteIndexJobCoordinator {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Failure clears the lease; an identical retry must return the saved
+        // outcome without changing the state of a later worker attempt.
         if let Some(replayed) = load_failure_receipt(&transaction, request)? {
             transaction.commit()?;
             return Ok(replayed);
@@ -665,6 +669,8 @@ fn require_live_lease(
     Ok(())
 }
 
+// Receipt identity describes the operation and lease generation, not request_id:
+// transports may assign a new request ID when retrying the same operation.
 fn load_advance_receipt(
     connection: &Connection,
     request: &AdvanceIndexJobRequest,

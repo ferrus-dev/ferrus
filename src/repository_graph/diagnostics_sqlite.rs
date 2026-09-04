@@ -261,6 +261,8 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Diagnostic persistence retains only codes, locations, and numeric metrics.
+
     use super::*;
     use crate::repository_graph::{
         domain::{

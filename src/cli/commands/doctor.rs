@@ -1,3 +1,5 @@
+//! Report project registration, runtime, artifact, and graph health checks.
+
 use anyhow::Result;
 
 use super::register;

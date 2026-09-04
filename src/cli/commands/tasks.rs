@@ -1,3 +1,5 @@
+//! List tasks from the current project's SQLite runtime.
+
 use anyhow::Result;
 use clap::Subcommand;
 

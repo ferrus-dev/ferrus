@@ -1,3 +1,6 @@
+//! Run the final check gate and persist submission artifacts with the Reviewing handoff.
+//! A successful graph freeze pins the submitted source tree for stable review and patch generation.
+
 use anyhow::Result;
 use neva::prelude::*;
 use std::{
@@ -559,6 +562,8 @@ async fn persist_submission(
     content: &str,
     freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
 ) -> Result<()> {
+    // Keep the tree reachable only if artifacts and the Reviewing handoff succeed.
+    // The guard also releases the pin if this future is dropped before the handoff.
     let mut pin_cleanup = SubmittedTreePinCleanup::new(context, &freeze);
     project::record_task_check_passed(&context.task_id).await?;
     write_submission(context, content).await?;

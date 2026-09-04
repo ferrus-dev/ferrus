@@ -1,3 +1,5 @@
+//! Federated retrieval tests for domain routing, exact revision links, freshness, and budgets.
+
 use std::{
     fs,
     path::Path,

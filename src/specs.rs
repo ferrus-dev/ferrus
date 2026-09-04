@@ -1,3 +1,5 @@
+//! Parse specification milestones and dependencies; update completion and approved Outcome sections.
+
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -430,6 +432,8 @@ async fn write_spec_lines(path: &str, lines: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Stable milestone parsing, display names, and Outcome section replacement.
+
     use super::*;
 
     #[test]

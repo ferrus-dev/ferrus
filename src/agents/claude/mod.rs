@@ -185,6 +185,8 @@ fn validate_interactive_launch(role: &str, index: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Claude command construction, model settings, and role isolation.
+
     use super::*;
     use crate::agents::tests::assert_program_and_args;
 

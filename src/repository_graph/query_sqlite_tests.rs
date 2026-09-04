@@ -1,3 +1,5 @@
+//! Graph query tests for scoped retrieval, snapshot-bound cursors, and resource limits.
+
 use super::*;
 use crate::repository_graph::{
     config::RepositoryGraphConfig,

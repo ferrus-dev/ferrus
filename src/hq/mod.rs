@@ -1,3 +1,5 @@
+//! Interactive HQ command dispatch and coordination of agent sessions with runtime tasks.
+
 pub mod agent_manager;
 mod commands;
 mod display;
@@ -340,8 +342,8 @@ async fn dispatch_with_human_question_target(
                 "  /reset-spec        Clear the selected spec\n",
                 "  /archive-spec      Summarize and archive completed selected spec artifacts\n",
                 "  /spec              Draft, approve, and save a feature specification; offers archive first\n",
-                "  /check             Run the Ferrus check gate deterministically from HQ\n",
-                "  /check --force     Run configured checks from HQ without state requirements\n",
+                "  /check             Run configured checks from HQ without changing task state\n",
+                "  /check --force     Compatibility form of /check; same behavior\n",
                 "  /supervisor        Open an interactive supervisor session\n",
                 "  /executor          Open an interactive executor session\n",
                 "  /resume            Resume the executor headlessly; recovers Consultation too\n",

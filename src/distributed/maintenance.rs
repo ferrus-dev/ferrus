@@ -83,6 +83,8 @@ pub trait RemoteMaintenanceApi {
 
 #[cfg(test)]
 mod tests {
+    //! Deletion envelope rejection on version or identity mismatch.
+
     use std::collections::BTreeSet;
 
     use super::*;

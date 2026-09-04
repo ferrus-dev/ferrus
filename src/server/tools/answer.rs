@@ -1,3 +1,5 @@
+//! Record a human answer for a paused task so its waiting agent can resume.
+
 use anyhow::Result;
 use neva::prelude::*;
 
@@ -41,6 +43,8 @@ async fn run(response: String) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! Scoped human answers preserve pending questions on invalid input.
+
     use super::*;
     use crate::state::store;
     use tempfile::TempDir;

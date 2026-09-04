@@ -1,3 +1,5 @@
+//! Submission tests for baseline-relative patches, frozen trees, lease ownership, and cleanup.
+
 use super::*;
 use tempfile::TempDir;
 
