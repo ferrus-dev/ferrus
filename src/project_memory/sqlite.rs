@@ -805,6 +805,7 @@ fn repository_link_semantics(relationship: &MemoryRelationship) -> Vec<u8> {
 }
 
 mod schema;
+pub(super) use schema::source_category;
 use schema::*;
 
 #[cfg(test)]

@@ -513,14 +513,120 @@ fn search_candidate_ranking_stops_when_the_deadline_expires() {
     let entities = query.entities(&revision_id).unwrap();
     let mut deadline_checks = 0;
 
-    let (hits, timed_out) = rank_memory_search_hits(entities, &request, || {
-        deadline_checks += 1;
-        deadline_checks > 1
-    });
+    let (hits, _, timed_out) =
+        rank_memory_search_hits(entities.into_iter().map(Ok), &request, 10, || {
+            deadline_checks += 1;
+            deadline_checks > 1
+        })
+        .unwrap();
 
     assert!(timed_out);
     assert_eq!(deadline_checks, 2);
     assert!(hits.len() <= 1);
+}
+
+#[test]
+fn bounded_ranking_keeps_global_order_without_retaining_every_match() {
+    let (_root, data, project, revision_id) = indexed_fixture();
+    let sidecar = MemorySidecar::open_at(data.path()).unwrap();
+    let limits = QueryLimitsConfig::default();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let template = query.entities(&revision_id).unwrap().remove(0);
+    let request = MemorySearchRequest {
+        scope: published_scope(project, &limits),
+        text: super::super::domain::MemoryQueryText::new("needle").unwrap(),
+        entity_kinds: vec![],
+        source_categories: vec![],
+        page: MemoryPageRequest::default(),
+    };
+    let entities = (0..10_000).rev().map(|index| {
+        let mut entity = template.clone();
+        entity.id = MemoryEntityId::new(format!("entity-{index:05}")).unwrap();
+        entity.data = MemoryEntityData::Specification {
+            title: super::super::domain::MemoryTitle::new("Needle").unwrap(),
+        };
+        Ok(entity)
+    });
+    let (hits, total, timed_out) =
+        rank_memory_search_hits(entities, &request, 4, || false).unwrap();
+    assert_eq!(total, 10_000);
+    assert!(!timed_out);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.entity.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "entity-00000",
+            "entity-00001",
+            "entity-00002",
+            "entity-00003"
+        ]
+    );
+}
+
+#[test]
+fn search_filters_before_decoding_and_pages_ranked_unicode_matches() {
+    let (_root, data, project, revision_id) = indexed_fixture();
+    let sidecar = MemorySidecar::open_at(data.path()).unwrap();
+    let limits = QueryLimitsConfig {
+        max_results: 3,
+        ..QueryLimitsConfig::default()
+    };
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let template = query.entities(&revision_id).unwrap().remove(0);
+    let transaction = sidecar.connection().unchecked_transaction().unwrap();
+    for index in 0..20 {
+        let mut entity = template.clone();
+        entity.id = MemoryEntityId::new(format!("needle-{index:03}")).unwrap();
+        entity.data = MemoryEntityData::Specification {
+            title: super::super::domain::MemoryTitle::new("N\u{00e9}edle").unwrap(),
+        };
+        entity.provenance.source_category = MemorySourceCategory::SpecificationStructure;
+        transaction.execute(
+            "INSERT INTO memory_entities(revision_id, id, kind, source_category, entity_json) VALUES (?1, ?2, 'specification', 'specification_structure', ?3)",
+            params![revision_id.as_str(), entity.id.as_str(), serde_json::to_string(&entity).unwrap()],
+        ).unwrap();
+    }
+    for (id, kind, category) in [
+        ("excluded-kind", "decision", "specification_structure"),
+        ("excluded-source", "specification", "runtime_provenance"),
+    ] {
+        transaction.execute(
+            "INSERT INTO memory_entities(revision_id, id, kind, source_category, entity_json) VALUES (?1, ?2, ?3, ?4, 'corrupt JSON')",
+            params![revision_id.as_str(), id, kind, category],
+        ).unwrap();
+    }
+    transaction.commit().unwrap();
+    let query = SqliteMemoryQuery::new(&sidecar, limits.clone());
+    let mut request = MemorySearchRequest {
+        scope: published_scope(project, &limits),
+        text: super::super::domain::MemoryQueryText::new("  N\u{00c9}EDLE  ").unwrap(),
+        entity_kinds: vec![MemoryEntityKind::Specification],
+        source_categories: vec![MemorySourceCategory::SpecificationStructure],
+        page: MemoryPageRequest::default(),
+    };
+    let mut ids = Vec::new();
+    loop {
+        let response = query.search(request.clone()).unwrap();
+        assert!(response.hits.len() <= 3);
+        ids.extend(
+            response
+                .hits
+                .into_iter()
+                .map(|hit| hit.entity.id.as_str().to_string()),
+        );
+        let Some(cursor) = response.page.next_cursor else {
+            break;
+        };
+        assert!(ids.len() < 20);
+        request.page.cursor = Some(cursor);
+    }
+    assert_eq!(
+        ids,
+        (0..20)
+            .map(|index| format!("needle-{index:03}"))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

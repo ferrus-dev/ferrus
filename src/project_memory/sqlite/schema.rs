@@ -317,7 +317,7 @@ pub(super) fn parse_build_state(value: &str) -> Result<MemoryBuildState, MemoryS
     }
 }
 
-pub(super) fn source_category(
+pub(in crate::project_memory) fn source_category(
     category: &super::super::domain::MemorySourceCategory,
 ) -> &'static str {
     match category {

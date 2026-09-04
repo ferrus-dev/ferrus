@@ -192,7 +192,9 @@ model = ""
 ```
 
 Executor MCP checks run in the task workspace and write full logs under `.ferrus/logs/`, returning bounded
-failure summaries. HQ `/check` runs in HQ's working directory without task-state or retry changes.
+failure summaries. Output is spooled to disk; each failed command's feedback retains at most
+`max_feedback_lines` trailing lines and 64 KiB, including for a single long line. HQ `/check` runs in
+HQ's working directory without task-state or retry changes.
 A dispatch limit of zero disables that guard; a fresh rejection resets its counter. `max_parallel_tasks`
 controls Executor concurrency, while `/run --limit N` caps the planned batch. Non-Git projects use the
 canonical directory and permit only one Executor.

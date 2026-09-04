@@ -232,6 +232,40 @@ fn extraction_is_deterministic() {
 }
 
 #[test]
+fn sibling_declarations_do_not_inherit_each_others_lexical_scopes() {
+    let mut source = String::from("mod outer {\n");
+    for index in 0..100 {
+        source.push_str(&format!(
+            "fn function_{index}() {{ {{ struct Local; }} }}\n"
+        ));
+    }
+    source.push_str("}\nstruct Root;\n");
+    let graph = extract("src/lib.rs", source.as_bytes());
+    let keys: BTreeSet<_> = graph
+        .nodes
+        .iter()
+        .filter_map(|node| node.semantic_key.as_ref())
+        .map(|key| key.as_str())
+        .collect();
+    assert!(keys.contains("rust:struct:src/lib.rs:crate::Root"));
+    for index in 0..100 {
+        assert!(
+            keys.contains(
+                format!("rust:function:src/lib.rs:crate::outer::function_{index}").as_str()
+            )
+        );
+    }
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind.as_str() == "struct")
+            .count(),
+        101
+    );
+}
+
+#[test]
 fn semantic_keys_disambiguate_impls_and_block_local_items() {
     let source = br#"
 struct Item;
