@@ -2,6 +2,85 @@
 
 use super::*;
 
+#[tokio::test]
+async fn dashboard_reads_work_while_another_connection_holds_the_writer_lock() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (_dir, previous) = setup_project().await;
+    struct RestoreDirectory(PathBuf);
+    impl Drop for RestoreDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+    let _restore = RestoreDirectory(previous);
+    let path = current_database_path().await.unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "CREATE TABLE runtime_metadata (key TEXT PRIMARY KEY, value TEXT); \
+         INSERT INTO runtime_metadata VALUES ('selected_spec', 'docs/specs/legacy.md');",
+        )
+        .unwrap();
+    // Import once, then prove polling neither reruns migration transactions nor
+    // writes timestamps for metadata that has already been imported.
+    assert_eq!(
+        read_project_selection()
+            .await
+            .unwrap()
+            .selected_spec
+            .as_deref(),
+        Some("docs/specs/legacy.md")
+    );
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        read_project_selection()
+            .await
+            .unwrap()
+            .selected_spec
+            .as_deref(),
+        Some("docs/specs/legacy.md")
+    );
+    assert_eq!(list_tasks().await.unwrap()[0].id, "t-001");
+    assert!(list_runs(8).await.unwrap().is_empty());
+    assert!(list_human_questions().await.unwrap().is_empty());
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn runtime_read_open_validates_schema_and_tracks_database_replacement() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ferrus.db");
+    drop(Connection::open(&path).unwrap());
+    // A valid old database still takes the migration path.
+    let connection = open_runtime_database_for_read(&path).unwrap();
+    assert_eq!(
+        runtime_schema_version(&connection).unwrap(),
+        RUNTIME_SCHEMA_VERSION
+    );
+    drop(connection);
+    std::fs::rename(&path, dir.path().join("old.db")).unwrap();
+    let replacement = Connection::open(&path).unwrap();
+    replacement
+        .pragma_update(None, "user_version", RUNTIME_SCHEMA_VERSION + 1)
+        .unwrap();
+    assert!(open_runtime_database_for_read(&path).is_err());
+    assert_eq!(
+        runtime_schema_version(&replacement).unwrap(),
+        RUNTIME_SCHEMA_VERSION + 1
+    );
+    drop(replacement);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(dir.path().join("old.db"), &path).unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute(
+            "UPDATE runtime_schema_migrations SET name = 'invalid' WHERE version = 1",
+            [],
+        )
+        .unwrap();
+    assert!(open_runtime_database_for_read(&path).is_err());
+}
+
 #[test]
 fn startup_prepares_runtime_schema_for_read_only_graph_queries() {
     let dir = TempDir::new().unwrap();

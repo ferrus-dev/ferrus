@@ -186,6 +186,174 @@ fn cold_build_persists_complete_graph_and_no_op_reuses_every_file() {
 }
 
 #[test]
+fn cache_hits_are_touched_only_when_snapshot_completion_commits() {
+    let directory = tempfile::tempdir().unwrap();
+    fixture_repository(directory.path());
+    let config = RepositoryGraphConfig::default();
+    let (_sidecar_dir, mut sidecar) = sidecar();
+    run(
+        &mut sidecar,
+        &discover(directory.path(), &config),
+        &config,
+        "cold",
+        false,
+    )
+    .unwrap();
+    sidecar
+        .connection()
+        .execute("UPDATE fragment_cache SET last_used_at = 'old'", [])
+        .unwrap();
+
+    let source = CacheObservedSource {
+        inner: discover(directory.path(), &config),
+        sidecar_path: sidecar.path().to_path_buf(),
+        revalidations: Cell::new(0),
+    };
+    let outcome = run(&mut sidecar, &source, &config, "cached", false).unwrap();
+    assert_eq!(outcome.metrics.reused_files, 3);
+    assert_eq!(source.revalidations.get(), 2);
+    let (distinct, unchanged): (i64, i64) = sidecar
+        .connection()
+        .query_row(
+            "SELECT COUNT(DISTINCT last_used_at), SUM(last_used_at = 'old') FROM fragment_cache",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((distinct, unchanged), (1, 0));
+}
+
+#[test]
+fn failed_builds_do_not_leave_partial_cache_touches() {
+    let directory = tempfile::tempdir().unwrap();
+    fixture_repository(directory.path());
+    let config = RepositoryGraphConfig::default();
+    let (_sidecar_dir, mut sidecar) = sidecar();
+    let initial = run(
+        &mut sidecar,
+        &discover(directory.path(), &config),
+        &config,
+        "cold",
+        false,
+    )
+    .unwrap();
+    sidecar
+        .connection()
+        .execute("UPDATE fragment_cache SET last_used_at = 'old'", [])
+        .unwrap();
+    let changed = SequencedSource {
+        inner: discover(directory.path(), &config),
+        revalidations: Cell::new(1),
+    };
+    assert_eq!(
+        run(&mut sidecar, &changed, &config, "source-changed", false).unwrap_err(),
+        IndexError::SourceChanged
+    );
+    let touched = || {
+        sidecar
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_cache WHERE last_used_at != 'old'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(touched(), 0);
+    // Fail the second touch so this also detects autocommit or partial batches.
+    sidecar
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_cache_touch BEFORE UPDATE OF last_used_at ON fragment_cache \
+         WHEN EXISTS (SELECT 1 FROM fragment_cache WHERE last_used_at != 'old') \
+         BEGIN SELECT RAISE(ABORT, 'injected cache touch failure'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        run(
+            &mut sidecar,
+            &discover(directory.path(), &config),
+            &config,
+            "commit-failed",
+            false
+        )
+        .unwrap_err(),
+        IndexError::Commit
+    );
+    let touched: i64 = sidecar
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM fragment_cache WHERE last_used_at != 'old'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(touched, 0);
+    assert_eq!(
+        sidecar
+            .published_view(&repository(), &PublishedViewName::new("canonical").unwrap())
+            .unwrap()
+            .unwrap()
+            .snapshot_id,
+        initial.snapshot.id
+    );
+    sidecar
+        .connection()
+        .execute_batch("DROP TRIGGER fail_cache_touch")
+        .unwrap();
+    let retry = run(
+        &mut sidecar,
+        &discover(directory.path(), &config),
+        &config,
+        "retry",
+        false,
+    )
+    .unwrap();
+    assert_eq!(retry.metrics.reused_files, 3);
+}
+
+struct CacheObservedSource {
+    inner: FilesystemRepositorySource,
+    sidecar_path: PathBuf,
+    revalidations: Cell<u32>,
+}
+
+impl RepositorySource for CacheObservedSource {
+    type Error = SourceError;
+
+    fn repository(&self) -> &RepositoryRef {
+        self.inner.repository()
+    }
+    fn manifest(&self) -> &SourceManifest {
+        self.inner.manifest()
+    }
+    fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error> {
+        self.inner.read_verified(file)
+    }
+    fn revalidate(&self) -> Result<bool, Self::Error> {
+        let connection = rusqlite::Connection::open(&self.sidecar_path).unwrap();
+        connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        connection
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+        let touched: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_cache WHERE last_used_at != 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if self.revalidations.get() == 0 {
+            assert_eq!(touched, 0);
+        } else {
+            assert!(touched > 0);
+        }
+        self.revalidations.set(self.revalidations.get() + 1);
+        self.inner.revalidate()
+    }
+}
+
+#[test]
 fn overlapping_publication_supersedes_the_completed_loser() {
     let repository_dir = tempfile::tempdir().unwrap();
     fixture_repository(repository_dir.path());

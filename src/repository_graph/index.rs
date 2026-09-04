@@ -236,6 +236,7 @@ where
                 files: manifest.files.clone(),
                 graph: prepared.graph,
                 cache_writes: prepared.cache_writes,
+                cache_hits: prepared.cache_hits,
                 metrics: prepared.metrics.clone(),
             })
             .map_err(|_| {
@@ -376,6 +377,7 @@ where
                 .map_err(|error| (error, metrics.clone()))?;
         }
         let mut cache_writes = Vec::new();
+        let mut cache_hits = Vec::new();
 
         let generic = GenericExtractor::new();
         let cargo = CargoExtractor::new();
@@ -411,6 +413,7 @@ where
                 if let Some(cached) = cached
                     && cache_fragment_is_valid(&cached, &key)
                 {
+                    cache_hits.push(key);
                     fragments.push(rebase_fragment(cached, &context));
                 } else {
                     missing.push((extractor, key));
@@ -480,6 +483,7 @@ where
         Ok(PreparedIndex {
             graph,
             cache_writes,
+            cache_hits,
             metrics,
         })
     }
@@ -524,6 +528,7 @@ where
 struct PreparedIndex {
     graph: GraphFragment,
     cache_writes: Vec<CachedFragment>,
+    cache_hits: Vec<FragmentCacheKey>,
     metrics: IndexBuildMetrics,
 }
 

@@ -168,6 +168,23 @@ pub(super) fn open_runtime_database(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Frequent dashboard reads must not contend for the migration writer lock.
+/// Open per operation so replacing a database or switching projects cannot reuse
+/// a stale connection. Only old schemas or pending legacy imports need a writer.
+pub(super) fn open_runtime_database_for_read(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    validate_runtime_migration_history(&connection)?;
+    if runtime_schema_version(&connection)? != RUNTIME_SCHEMA_VERSION
+        || legacy_runtime_metadata_import(&connection)?.is_some()
+    {
+        drop(connection);
+        return open_runtime_database(path);
+    }
+    Ok(connection)
+}
+
 pub(crate) async fn prepare_runtime_database_for_read_only_operations() -> Result<()> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || {
@@ -649,22 +666,9 @@ pub(super) fn ensure_project_runtime_state_row(connection: &Connection) -> Resul
 }
 
 pub(super) fn migrate_legacy_runtime_metadata(connection: &Connection) -> Result<()> {
-    if !table_exists(connection, "runtime_metadata")? {
+    let Some(import) = legacy_runtime_metadata_import(connection)? else {
         return Ok(());
-    }
-
-    let current_selection = read_project_selection_from_database(connection)?;
-    let current_last_spec_path = read_last_spec_path_from_database(connection)?;
-    let selected_spec = current_selection
-        .selected_spec
-        .or(read_legacy_runtime_metadata(connection, "selected_spec")?);
-    let last_spec_path =
-        current_last_spec_path.or(read_legacy_runtime_metadata(connection, "last_spec_path")?);
-
-    if selected_spec.is_none() && last_spec_path.is_none() {
-        return Ok(());
-    }
-
+    };
     ensure_project_runtime_state_row(connection)?;
     connection.execute(
         r#"
@@ -674,9 +678,41 @@ pub(super) fn migrate_legacy_runtime_metadata(connection: &Connection) -> Result
             updated_at = ?3
         WHERE row_id = 1
         "#,
-        params![selected_spec, last_spec_path, timestamp()],
+        params![import.selected_spec, import.last_spec_path, timestamp()],
     )?;
     Ok(())
+}
+
+struct LegacyRuntimeMetadataImport {
+    selected_spec: Option<String>,
+    last_spec_path: Option<String>,
+}
+
+fn legacy_runtime_metadata_import(
+    connection: &Connection,
+) -> Result<Option<LegacyRuntimeMetadataImport>> {
+    if !table_exists(connection, "runtime_metadata")? {
+        return Ok(None);
+    }
+
+    let current_selection = read_project_selection_from_database(connection)?;
+    let current_last_spec_path = read_last_spec_path_from_database(connection)?;
+    let selected_spec = current_selection
+        .selected_spec
+        .clone()
+        .or(read_legacy_runtime_metadata(connection, "selected_spec")?);
+    let last_spec_path = current_last_spec_path
+        .clone()
+        .or(read_legacy_runtime_metadata(connection, "last_spec_path")?);
+
+    if selected_spec == current_selection.selected_spec && last_spec_path == current_last_spec_path
+    {
+        return Ok(None);
+    }
+    Ok(Some(LegacyRuntimeMetadataImport {
+        selected_spec,
+        last_spec_path,
+    }))
 }
 
 pub(super) fn read_legacy_runtime_metadata(

@@ -735,7 +735,7 @@ pub(super) async fn list_registered_projects_from(
 pub async fn list_tasks() -> Result<Vec<TaskRecord>> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || -> Result<Vec<TaskRecord>> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = open_runtime_database_for_read(&database_path)?;
         let mut statement = connection.prepare(
             r#"
             SELECT id, path, spec_path, milestone_id, status, paused_status, claimed_by,
@@ -932,7 +932,7 @@ pub async fn archive_completed_spec(spec_path: &str, outcome: &str) -> Result<Sp
 pub async fn list_human_questions() -> Result<Vec<HumanQuestion>> {
     let database_path = current_database_path().await?;
     let tasks = tokio::task::spawn_blocking(move || -> Result<Vec<TaskRecord>> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = open_runtime_database_for_read(&database_path)?;
         let mut statement = connection.prepare(
             r#"
             SELECT id, path, spec_path, milestone_id, status, paused_status, claimed_by,
@@ -1060,7 +1060,7 @@ pub async fn find_non_terminal_task_by_origin(
 pub async fn list_runs(limit: usize) -> Result<Vec<RunRecord>> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || -> Result<Vec<RunRecord>> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = open_runtime_database_for_read(&database_path)?;
         let mut statement = connection.prepare(
             r#"
             SELECT id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path

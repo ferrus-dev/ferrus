@@ -26,16 +26,15 @@ impl IndexStore for Sidecar {
     ) -> Result<Option<GraphFragment>, Self::Error> {
         let raw = self
             .connection()
-            .query_row(
+            .prepare_cached(
                 "SELECT fragment_json FROM fragment_cache WHERE \
                  repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
                  content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
                  file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
                  analysis_config_digest = ?9 AND extractor_id = ?10 AND \
                  extractor_version = ?11 AND extractor_contract_version = ?12",
-                cache_params(key)?,
-                |row| row.get::<_, String>(0),
-            )
+            )?
+            .query_row(cache_params(key)?, |row| row.get::<_, String>(0))
             .optional()?;
         let Some(raw) = raw else {
             return Ok(None);
@@ -55,29 +54,6 @@ impl IndexStore for Sidecar {
                 return Ok(None);
             }
         };
-        self.connection_mut().execute(
-            "UPDATE fragment_cache SET last_used_at = ?13 WHERE \
-             repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
-             content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
-             file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
-             analysis_config_digest = ?9 AND extractor_id = ?10 AND \
-             extractor_version = ?11 AND extractor_contract_version = ?12",
-            params![
-                key.repository.namespace.as_str(),
-                key.repository.repository_id.as_str(),
-                key.path.as_str(),
-                key.content_identity.algorithm(),
-                key.content_identity.value(),
-                integer(key.byte_len, "fragment byte length")?,
-                file_mode(key.file_mode),
-                key.analysis_config_digest.algorithm(),
-                key.analysis_config_digest.value(),
-                key.extractor.id.as_str(),
-                key.extractor.version,
-                i64::from(key.extractor.contract_version),
-                timestamp(),
-            ],
-        )?;
         Ok(Some(fragment))
     }
 
@@ -110,6 +86,7 @@ impl IndexStore for Sidecar {
         for cached in &commit.cache_writes {
             upsert_cached_fragment(&transaction, &cached.key, &cached.fragment)?;
         }
+        touch_cached_fragments(&transaction, &commit.cache_hits)?;
         upsert_metrics(&transaction, &commit.snapshot.completed_by, &commit.metrics)?;
         transaction.execute(
             "UPDATE index_builds SET finished_at = ?2 WHERE id = ?1",
@@ -409,8 +386,9 @@ fn upsert_cached_fragment(
     fragment: &GraphFragment,
 ) -> Result<(), StoreError> {
     let now = timestamp();
-    transaction.execute(
-        "INSERT INTO fragment_cache(\
+    transaction
+        .prepare_cached(
+            "INSERT INTO fragment_cache(\
             repository_namespace, repository_id, path, content_algorithm, content_digest, \
             byte_length, file_mode, analysis_config_algorithm, analysis_config_digest, \
             extractor_id, extractor_version, extractor_contract_version, fragment_json, \
@@ -418,7 +396,8 @@ fn upsert_cached_fragment(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
          ON CONFLICT DO UPDATE SET fragment_json = excluded.fragment_json, \
             last_used_at = excluded.last_used_at",
-        params![
+        )?
+        .execute(params![
             key.repository.namespace.as_str(),
             key.repository.repository_id.as_str(),
             key.path.as_str(),
@@ -433,8 +412,43 @@ fn upsert_cached_fragment(
             i64::from(key.extractor.contract_version),
             serde_json::to_string(fragment)?,
             now,
-        ],
+        ])?;
+    Ok(())
+}
+
+fn touch_cached_fragments(
+    transaction: &Transaction<'_>,
+    hits: &[FragmentCacheKey],
+) -> Result<(), StoreError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let now = timestamp();
+    let mut statement = transaction.prepare_cached(
+        "UPDATE fragment_cache SET last_used_at = ?13 WHERE \
+         repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
+         content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
+         file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
+         analysis_config_digest = ?9 AND extractor_id = ?10 AND \
+         extractor_version = ?11 AND extractor_contract_version = ?12",
     )?;
+    for key in hits {
+        statement.execute(params![
+            key.repository.namespace.as_str(),
+            key.repository.repository_id.as_str(),
+            key.path.as_str(),
+            key.content_identity.algorithm(),
+            key.content_identity.value(),
+            integer(key.byte_len, "fragment byte length")?,
+            file_mode(key.file_mode),
+            key.analysis_config_digest.algorithm(),
+            key.analysis_config_digest.value(),
+            key.extractor.id.as_str(),
+            key.extractor.version,
+            i64::from(key.extractor.contract_version),
+            now,
+        ])?;
+    }
     Ok(())
 }
 

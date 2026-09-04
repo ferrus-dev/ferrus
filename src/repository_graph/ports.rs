@@ -263,6 +263,9 @@ pub struct IndexCommit {
     pub files: Vec<SourceFileDescriptor>,
     pub graph: GraphFragment,
     pub cache_writes: Vec<CachedFragment>,
+    /// Validated cache hits touched atomically with snapshot completion. A build
+    /// that fails before completion leaves their retention timestamps unchanged.
+    pub cache_hits: Vec<FragmentCacheKey>,
     pub metrics: IndexBuildMetrics,
 }
 

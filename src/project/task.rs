@@ -44,7 +44,7 @@ pub async fn read_project_selection() -> Result<ProjectSelection> {
     let database_path = current_database_path().await?;
 
     tokio::task::spawn_blocking(move || -> Result<ProjectSelection> {
-        let connection = open_runtime_database(&database_path)?;
+        let connection = open_runtime_database_for_read(&database_path)?;
         read_project_selection_from_database(&connection)
     })
     .await?

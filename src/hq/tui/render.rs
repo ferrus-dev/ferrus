@@ -504,7 +504,7 @@ pub(super) fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> 
                 }
             }
             for line in block {
-                lines.push(DashboardLine::new(transcript_activity_line(&line, width)));
+                lines.push(DashboardLine::new(transcript_activity_line(line, width)));
                 if lines.len() >= max_lines {
                     break;
                 }
@@ -519,49 +519,37 @@ pub(super) fn activity_area_lines(app: &App, width: usize, max_lines: usize) -> 
 pub(super) fn recent_transcript_blocks(
     messages: &[TranscriptLine],
     max_lines: usize,
-) -> Vec<Vec<TranscriptLine>> {
+) -> Vec<Vec<&TranscriptLine>> {
     if max_lines == 0 || messages.is_empty() {
         return Vec::new();
     }
 
-    let mut blocks = Vec::new();
-    let mut current = Vec::new();
-    for line in messages {
-        if !line.continuation && !current.is_empty() {
-            blocks.push(std::mem::take(&mut current));
-        }
-        current.push(line.clone());
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-
     let mut selected = Vec::new();
     let mut remaining = max_lines;
-    for block in blocks.into_iter().rev() {
-        if remaining == 0 {
-            break;
-        }
-
+    let mut end = messages.len();
+    while end > 0 {
         let gap_before_newer_block = usize::from(!selected.is_empty());
         if remaining <= gap_before_newer_block {
             break;
         }
 
+        let start = messages[..end]
+            .iter()
+            .rposition(|line| !line.continuation)
+            .unwrap_or(0);
+        let block = &messages[start..end];
         let take = block.len().min(remaining - gap_before_newer_block);
         selected.push(take_transcript_block(block, take));
         remaining -= gap_before_newer_block + take;
+        end = start;
     }
     selected.reverse();
     selected
 }
 
-pub(super) fn take_transcript_block(
-    mut block: Vec<TranscriptLine>,
-    take: usize,
-) -> Vec<TranscriptLine> {
+pub(super) fn take_transcript_block(block: &[TranscriptLine], take: usize) -> Vec<&TranscriptLine> {
     if block.len() <= take {
-        return block;
+        return block.iter().collect();
     }
 
     let is_table = matches!(
@@ -573,14 +561,14 @@ pub(super) fn take_transcript_block(
     );
     if is_table && take >= 2 {
         let bottom = block
-            .pop()
+            .last()
             .expect("table block should have a bottom border");
-        let mut visible = block.into_iter().take(take - 1).collect::<Vec<_>>();
+        let mut visible = block.iter().take(take - 1).collect::<Vec<_>>();
         visible.push(bottom);
         return visible;
     }
 
-    block.into_iter().take(take).collect()
+    block.iter().take(take).collect()
 }
 
 pub(super) fn runtime_task_activity_lines(
