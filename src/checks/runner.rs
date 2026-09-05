@@ -70,6 +70,7 @@ async fn run_command(
     }
     let mut command = platform::shell_command(cmd);
     command.kill_on_drop(true);
+    command.stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -131,6 +132,65 @@ mod tests {
     //! Check ordering, aggregate failure reporting, and empty-command behavior.
 
     use super::*;
+
+    #[cfg(unix)]
+    const STDIN_HELPER_ENV: &str = "FERRUS_CHECK_RUNNER_STDIN_HELPER";
+
+    #[cfg(unix)]
+    #[test]
+    fn check_commands_cannot_consume_runner_stdin() {
+        use std::io::Write as _;
+
+        for mode in ["logged", "unlogged"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "checks::runner::tests::stdin_is_closed_in_check_helper",
+                    "--nocapture",
+                ])
+                .env(STDIN_HELPER_ENV, mode)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"{\"jsonrpc\":\"2.0\"}\n").unwrap();
+            drop(stdin);
+
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} check inherited runner stdin:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_is_closed_in_check_helper() {
+        let Ok(mode) = std::env::var(STDIN_HELPER_ENV) else {
+            return;
+        };
+        let commands = vec!["if IFS= read -r line; then exit 42; fi".into()];
+        let result = if mode == "logged" {
+            let dir = tempfile::tempdir().unwrap();
+            run_checks_logged(
+                &commands,
+                Some(dir.path()),
+                &dir.path().join("checks.log"),
+                30,
+            )
+            .await
+            .unwrap()
+        } else {
+            run_checks(&commands).await.unwrap()
+        };
+
+        assert!(result.passed);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
