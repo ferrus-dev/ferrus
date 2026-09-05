@@ -77,6 +77,20 @@ curl -fsSL https://ferrus.dev/cli/install.sh | sh
 iwr https://ferrus.dev/cli/install.ps1 -useb | iex
 ```
 
+For a smaller Cargo installation, use the same size profile as release assets:
+
+```sh
+cargo install ferrus --locked --profile dist
+```
+
+HQ update notifications are enabled by default. To omit the update-check HTTP/TLS client:
+
+```sh
+cargo install ferrus --locked --profile dist --no-default-features
+```
+
+See [build profiles and size measurements](docs/binary-size.md) for the tradeoffs.
+
 Run:
 
 ```sh

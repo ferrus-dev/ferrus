@@ -39,6 +39,12 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Check build without update notifications
+        run: cargo clippy --locked --no-default-features -- -D warnings
+
+      - name: Test build without update notifications
+        run: cargo test --locked --no-default-features
+
   smoke:
     strategy:
       fail-fast: false

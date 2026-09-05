@@ -23,6 +23,7 @@ use crate::platform;
 use crate::project::{ProjectSelection, TaskRecord};
 use crate::specs::{self, MilestoneReadiness, SelectedMilestone};
 use crate::state::{agents, store};
+#[cfg(feature = "update-check")]
 use crate::update_check;
 use commands::{ModelTarget, ShellCommand, parse_command};
 use display::Display;
@@ -69,12 +70,15 @@ pub async fn run(debug: bool) -> Result<()> {
         ctx.set_hq_config(&hq);
     }
 
-    let update_display = display.clone();
-    tokio::spawn(async move {
-        if let Some(message) = update_check::notification_message().await {
-            update_display.tip(message);
-        }
-    });
+    #[cfg(feature = "update-check")]
+    {
+        let update_display = display.clone();
+        tokio::spawn(async move {
+            if let Some(message) = update_check::notification_message().await {
+                update_display.tip(message);
+            }
+        });
+    }
 
     let mut tui_task = tokio::spawn(tui::run_tui(
         msg_rx,
