@@ -271,9 +271,7 @@ pub(super) fn diagnostic_code(value: &str) -> MemoryDiagnosticCode {
 }
 
 pub(super) fn serialized_len(value: &impl Serialize) -> Result<u64, MemoryQueryError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len() as u64)
-        .map_err(|_| backend_error("federation.serialization"))
+    crate::json_size::serialized_len(value).map_err(|_| backend_error("federation.serialization"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -292,6 +290,7 @@ pub(super) fn fit_federated_search_response(
     ensure_federated_search_fitting_deadline(started, duration)?;
     set_federated_search_page(
         response,
+        response.results.len(),
         initial_reason,
         offset,
         total,
@@ -308,7 +307,7 @@ pub(super) fn fit_federated_search_response(
     }
 
     ensure_federated_search_fitting_deadline(started, duration)?;
-    let original_results = response.results.clone();
+    let mut original_results = std::mem::take(&mut response.results);
     ensure_federated_search_fitting_deadline(started, duration)?;
     let mut lower = 1usize;
     let mut upper = original_results.len() - 1;
@@ -316,16 +315,21 @@ pub(super) fn fit_federated_search_response(
     while lower <= upper {
         ensure_federated_search_fitting_deadline(started, duration)?;
         let midpoint = lower + (upper - lower) / 2;
-        response.results = original_results[..midpoint].to_vec();
         set_federated_search_page(
             response,
+            midpoint,
             Some(MemoryTruncationReason::Bytes),
             offset,
             total,
             fingerprint,
             revision_key,
         )?;
-        if stabilize_federated_search_size(response, started, duration)? <= max_bytes {
+        let extra_bytes = crate::json_size::serialized_len(&original_results[..midpoint])
+            .map_err(|_| backend_error("federation.serialization"))?
+            - 2;
+        if stabilize_federated_search_size_with_extra(response, extra_bytes, started, duration)?
+            <= max_bytes
+        {
             best = Some(midpoint);
             lower = midpoint + 1;
         } else {
@@ -337,9 +341,11 @@ pub(super) fn fit_federated_search_response(
             MemoryTruncationReason::Bytes,
         ));
     };
-    response.results = original_results[..best].to_vec();
+    original_results.truncate(best);
+    response.results = original_results;
     set_federated_search_page(
         response,
+        response.results.len(),
         Some(MemoryTruncationReason::Bytes),
         offset,
         total,
@@ -355,23 +361,24 @@ pub(super) fn fit_federated_search_response(
 
 fn set_federated_search_page(
     response: &mut FederatedSearchResponse,
+    returned_count: usize,
     reason: Option<MemoryTruncationReason>,
     offset: usize,
     total: usize,
     fingerprint: &str,
     revision_key: &str,
 ) -> Result<(), MemoryQueryError> {
-    let has_more = offset + response.results.len() < total;
+    let has_more = offset + returned_count < total;
     response.page = federated_page(
         reason,
-        response.results.len(),
+        returned_count,
         0,
         0,
         has_more,
         "search",
         fingerprint,
         revision_key,
-        offset + response.results.len(),
+        offset + returned_count,
     )?;
     Ok(())
 }
@@ -381,9 +388,20 @@ fn stabilize_federated_search_size(
     started: Instant,
     duration: std::time::Duration,
 ) -> Result<u64, MemoryQueryError> {
+    stabilize_federated_search_size_with_extra(response, 0, started, duration)
+}
+
+// When probing a prefix the response holds an empty array. Add the difference
+// between that array's two JSON bytes and the borrowed prefix's encoded size.
+fn stabilize_federated_search_size_with_extra(
+    response: &mut FederatedSearchResponse,
+    extra_bytes: u64,
+    started: Instant,
+    duration: std::time::Duration,
+) -> Result<u64, MemoryQueryError> {
     for _ in 0..32 {
         ensure_federated_search_fitting_deadline(started, duration)?;
-        let encoded_bytes = serialized_len(response)?;
+        let encoded_bytes = serialized_len(response)?.saturating_add(extra_bytes);
         ensure_federated_search_fitting_deadline(started, duration)?;
         let Some(truncation) = response.page.truncation.as_mut() else {
             return Ok(encoded_bytes);
@@ -507,9 +525,9 @@ pub(super) fn fit_federated_context_response(
     )
 }
 
-fn fit_context_collection<T: Clone>(
+fn fit_context_collection<T: Serialize>(
     response: &mut FederatedContextResponse,
-    original: Vec<T>,
+    mut original: Vec<T>,
     mut assign: impl FnMut(&mut FederatedContextResponse, Vec<T>),
     max_bytes: u64,
     started: Instant,
@@ -525,8 +543,10 @@ fn fit_context_collection<T: Clone>(
             ));
         }
         let midpoint = lower + (upper - lower) / 2;
-        assign(response, original[..midpoint].to_vec());
-        let encoded_bytes = stabilize_federated_context_size(response)?;
+        let extra_bytes = crate::json_size::serialized_len(&original[..midpoint])
+            .map_err(|_| backend_error("federation.serialization"))?
+            - 2;
+        let encoded_bytes = stabilize_federated_context_size_with_extra(response, extra_bytes)?;
         if started.elapsed() >= duration {
             return Err(MemoryQueryError::BudgetExceeded(
                 MemoryTruncationReason::Duration,
@@ -543,7 +563,8 @@ fn fit_context_collection<T: Clone>(
         assign(response, Vec::new());
         return Ok(false);
     };
-    assign(response, original[..best].to_vec());
+    original.truncate(best);
+    assign(response, original);
     let encoded_bytes = stabilize_federated_context_size(response)?;
     if started.elapsed() >= duration {
         return Err(MemoryQueryError::BudgetExceeded(
@@ -565,7 +586,7 @@ fn fit_federated_context_items(
     started: Instant,
     duration: std::time::Duration,
 ) -> Result<(), MemoryQueryError> {
-    let original = std::mem::take(&mut response.items);
+    let mut original = std::mem::take(&mut response.items);
     if original.is_empty() {
         return Err(MemoryQueryError::BudgetExceeded(
             MemoryTruncationReason::Bytes,
@@ -581,9 +602,9 @@ fn fit_federated_context_items(
             ));
         }
         let midpoint = lower + (upper - lower) / 2;
-        response.items = original[..midpoint].to_vec();
-        set_federated_context_page(
+        set_federated_context_page_with_count(
             response,
+            midpoint,
             Some(MemoryTruncationReason::Bytes),
             explored_depth,
             offset,
@@ -591,7 +612,10 @@ fn fit_federated_context_items(
             fingerprint,
             revision_key,
         )?;
-        let encoded_bytes = stabilize_federated_context_size(response)?;
+        let extra_bytes = crate::json_size::serialized_len(&original[..midpoint])
+            .map_err(|_| backend_error("federation.serialization"))?
+            - 2;
+        let encoded_bytes = stabilize_federated_context_size_with_extra(response, extra_bytes)?;
         if started.elapsed() >= duration {
             return Err(MemoryQueryError::BudgetExceeded(
                 MemoryTruncationReason::Duration,
@@ -609,7 +633,8 @@ fn fit_federated_context_items(
             MemoryTruncationReason::Bytes,
         ));
     };
-    response.items = original[..best].to_vec();
+    original.truncate(best);
+    response.items = original;
     set_federated_context_page(
         response,
         Some(MemoryTruncationReason::Bytes),
@@ -641,17 +666,40 @@ fn set_federated_context_page(
     fingerprint: &str,
     revision_key: &str,
 ) -> Result<(), MemoryQueryError> {
-    let has_more = offset + response.items.len() < total;
+    set_federated_context_page_with_count(
+        response,
+        response.items.len(),
+        reason,
+        explored_depth,
+        offset,
+        total,
+        fingerprint,
+        revision_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_federated_context_page_with_count(
+    response: &mut FederatedContextResponse,
+    returned_count: usize,
+    reason: Option<MemoryTruncationReason>,
+    explored_depth: u32,
+    offset: usize,
+    total: usize,
+    fingerprint: &str,
+    revision_key: &str,
+) -> Result<(), MemoryQueryError> {
+    let has_more = offset + returned_count < total;
     response.page = federated_page(
         reason,
-        response.items.len(),
+        returned_count,
         0,
         explored_depth,
         has_more,
         "context",
         fingerprint,
         revision_key,
-        offset + response.items.len(),
+        offset + returned_count,
     )?;
     Ok(())
 }
@@ -659,8 +707,15 @@ fn set_federated_context_page(
 fn stabilize_federated_context_size(
     response: &mut FederatedContextResponse,
 ) -> Result<u64, MemoryQueryError> {
+    stabilize_federated_context_size_with_extra(response, 0)
+}
+
+fn stabilize_federated_context_size_with_extra(
+    response: &mut FederatedContextResponse,
+    extra_bytes: u64,
+) -> Result<u64, MemoryQueryError> {
     for _ in 0..32 {
-        let encoded_bytes = serialized_len(response)?;
+        let encoded_bytes = serialized_len(response)?.saturating_add(extra_bytes);
         let Some(truncation) = response.page.truncation.as_mut() else {
             return Ok(encoded_bytes);
         };

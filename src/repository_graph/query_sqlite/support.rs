@@ -334,10 +334,7 @@ pub(super) fn unsigned(value: i64) -> rusqlite::Result<u64> {
 }
 
 pub(super) fn serialized_len<T: Serialize>(value: &T) -> Result<u64, QueryError> {
-    let len = serde_json::to_vec(value)
-        .map_err(|_| backend_error())?
-        .len();
-    Ok(u64::try_from(len).unwrap_or(u64::MAX))
+    crate::json_size::serialized_len(value).map_err(|_| backend_error())
 }
 
 pub(super) fn escape_like(value: &str) -> String {

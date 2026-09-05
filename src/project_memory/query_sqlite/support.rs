@@ -110,40 +110,37 @@ pub(super) fn resolution_visible(
     }
 }
 
-pub(super) fn memory_search_hit(entity: MemoryEntity, raw_query: &str) -> Option<MemorySearchHit> {
-    let query = raw_query.trim().to_lowercase();
+/// The caller normalizes the query once for the entire scan.
+pub(super) fn memory_search_hit(entity: MemoryEntity, query: &str) -> Option<MemorySearchHit> {
     let id = entity.id.as_str().to_lowercase();
     let title = entity_title(&entity).map(str::to_lowercase);
-    let text = entity_text(&entity).map(str::to_lowercase);
-    let provenance = serde_json::to_string(&entity.provenance)
-        .expect("memory provenance is serializable")
-        .to_lowercase();
     let (match_kind, score, reason) = if id == query {
         (MemorySearchMatchKind::ExactId, 1.0, "search.exactid")
-    } else if title.as_deref() == Some(query.as_str()) {
+    } else if title.as_deref() == Some(query) {
         (MemorySearchMatchKind::ExactTitle, 0.95, "search.exacttitle")
-    } else if title
-        .as_ref()
-        .is_some_and(|title| title.starts_with(&query))
-    {
+    } else if title.as_ref().is_some_and(|title| title.starts_with(query)) {
         (
             MemorySearchMatchKind::TitlePrefix,
             0.85,
             "search.titleprefix",
         )
-    } else if title.as_ref().is_some_and(|title| title.contains(&query)) {
+    } else if title.as_ref().is_some_and(|title| title.contains(query)) {
         (
             MemorySearchMatchKind::TitleContains,
             0.75,
             "search.titlecontains",
         )
-    } else if text.as_ref().is_some_and(|text| text.contains(&query)) {
+    } else if entity_text(&entity).is_some_and(|text| text.to_lowercase().contains(query)) {
         (
             MemorySearchMatchKind::CuratedTextContains,
             0.65,
             "search.textcontains",
         )
-    } else if provenance.contains(&query) {
+    } else if serde_json::to_string(&entity.provenance)
+        .expect("memory provenance is serializable")
+        .to_lowercase()
+        .contains(query)
+    {
         (
             MemorySearchMatchKind::ProvenanceReference,
             0.55,
@@ -330,9 +327,7 @@ pub(super) fn unsigned(value: i64) -> rusqlite::Result<u64> {
 }
 
 pub(super) fn serialized_len(value: &impl Serialize) -> Result<u64, MemoryQueryError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len() as u64)
-        .map_err(serialization_error)
+    crate::json_size::serialized_len(value).map_err(serialization_error)
 }
 
 #[derive(Serialize, Deserialize)]

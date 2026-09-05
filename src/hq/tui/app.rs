@@ -3,6 +3,12 @@
 use super::*;
 
 impl App {
+    pub(super) fn append_transcript(&mut self, mut lines: Vec<TranscriptLine>) {
+        trim_transcript_history(&mut lines);
+        self.messages.extend(lines);
+        trim_transcript_history(&mut self.messages);
+    }
+
     pub(super) fn new() -> Self {
         Self {
             status: StatusSnapshot::default(),
@@ -368,5 +374,39 @@ impl App {
         self.history_idx = None;
         self.history_saved.clear();
         self.clear_completion();
+    }
+}
+
+/// Keep recent complete blocks. An oversized newest block retains its opening
+/// lines and, for a table, its bottom border, just like the visible viewport.
+fn trim_transcript_history(lines: &mut Vec<TranscriptLine>) {
+    if lines.len() <= MAX_TRANSCRIPT_LINES {
+        return;
+    }
+    let cutoff = lines.len() - MAX_TRANSCRIPT_LINES;
+    if let Some(start) = (cutoff..lines.len()).find(|&index| !lines[index].continuation) {
+        lines.drain(..start);
+    } else {
+        let start = lines
+            .iter()
+            .rposition(|line| !line.continuation)
+            .unwrap_or(0);
+        lines.drain(..start);
+        let bottom = if matches!(
+            lines.first().map(|line| line.kind),
+            Some(TranscriptKind::TableTop)
+        ) && matches!(
+            lines.last().map(|line| line.kind),
+            Some(TranscriptKind::TableBottom)
+        ) {
+            lines.pop()
+        } else {
+            None
+        };
+        lines.truncate(MAX_TRANSCRIPT_LINES - usize::from(bottom.is_some()));
+        lines.extend(bottom);
+    }
+    if lines.capacity() > MAX_TRANSCRIPT_LINES * 2 {
+        lines.shrink_to(MAX_TRANSCRIPT_LINES);
     }
 }

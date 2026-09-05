@@ -188,13 +188,23 @@ where
             None,
             &IndexBuildMetrics::default(),
         );
+        let requested_snapshot = GraphSnapshot {
+            id: snapshot_id.clone(),
+            repository: manifest.revision.repository.clone(),
+            source_revision_id: manifest.revision.id.clone(),
+            source_manifest_digest: manifest.revision.manifest_digest.clone(),
+            graph_model_version: GRAPH_MODEL_VERSION,
+            analysis_config_digest: manifest.revision.analysis_config_digest.clone(),
+            extractor_set_digest: manifest.extractor_set_digest.clone(),
+            completed_by: build.id.clone(),
+        };
 
         let mut prepared = match self.prepare(
             source,
             config,
             manifest,
             &active,
-            &build,
+            &requested_snapshot,
             request.force_full,
             started,
         ) {
@@ -219,23 +229,19 @@ where
         }
 
         prepared.metrics.duration_ms = elapsed_ms(started);
-        let requested_snapshot = GraphSnapshot {
-            id: snapshot_id.clone(),
-            repository: manifest.revision.repository.clone(),
-            source_revision_id: manifest.revision.id.clone(),
-            source_manifest_digest: manifest.revision.manifest_digest.clone(),
-            graph_model_version: GRAPH_MODEL_VERSION,
-            analysis_config_digest: manifest.revision.analysis_config_digest.clone(),
-            extractor_set_digest: manifest.extractor_set_digest.clone(),
-            completed_by: build.id.clone(),
-        };
         let completed = self
             .store
             .complete_index(&IndexCommit {
                 snapshot: requested_snapshot,
-                files: manifest.files.clone(),
+                reuse_completed_snapshot: prepared.reuse_completed_snapshot,
+                files: if prepared.reuse_completed_snapshot {
+                    Vec::new()
+                } else {
+                    manifest.files.clone()
+                },
                 graph: prepared.graph,
                 cache_writes: prepared.cache_writes,
+                cache_hits: prepared.cache_hits,
                 metrics: prepared.metrics.clone(),
             })
             .map_err(|_| {
@@ -349,14 +355,14 @@ where
         config: &RepositoryGraphConfig,
         manifest: &SourceManifest,
         active: &ActiveExtractors,
-        build: &GraphBuild,
+        snapshot: &GraphSnapshot,
         force_full: bool,
         started: Instant,
     ) -> Result<PreparedIndex, (IndexError, IndexBuildMetrics)> {
         let context = ExtractionContext {
-            snapshot_id: build.prospective_snapshot_id.clone(),
-            build_id: build.id.clone(),
-            repository: build.repository.clone(),
+            snapshot_id: snapshot.id.clone(),
+            build_id: snapshot.completed_by.clone(),
+            repository: snapshot.repository.clone(),
             max_facts_per_file: config.index_limits.max_facts_per_file,
             max_parser_duration_ms: config.index_limits.max_parser_duration_ms,
             max_diagnostics: config.index_limits.max_diagnostics,
@@ -366,9 +372,42 @@ where
             skipped_files: manifest.metrics.skipped,
             ..IndexBuildMetrics::default()
         };
+        let generic = GenericExtractor::new();
+        let cargo = CargoExtractor::new();
+        let rust = RustSyntaxExtractor::new();
+        let available: [&dyn DynExtractor; 3] = [&generic, &cargo, &rust];
+        let source_graph = source_diagnostics(&context, manifest);
+        if !force_full
+            && let Some(existing) = self
+                .store
+                .reusable_index_metrics(snapshot, &source_graph.diagnostics)
+                .map_err(|_| (IndexError::StorageRead, metrics.clone()))?
+        {
+            for file in &manifest.files {
+                if available.iter().any(|extractor| {
+                    active.file_ids.contains(extractor.identity().id.as_str())
+                        && extractor.supports(file)
+                }) {
+                    metrics.reused_files += 1;
+                } else {
+                    metrics.skipped_files += 1;
+                }
+            }
+            metrics.nodes = existing.nodes;
+            metrics.edges = existing.edges;
+            metrics.diagnostics = existing.diagnostics;
+            metrics.duration_ms = elapsed_ms(started);
+            return Ok(PreparedIndex {
+                reuse_completed_snapshot: true,
+                graph: source_graph,
+                cache_writes: Vec::new(),
+                cache_hits: Vec::new(),
+                metrics,
+            });
+        }
         let mut merger = FragmentMerger::new();
         merger
-            .merge(source_diagnostics(&context, manifest))
+            .merge(source_graph)
             .map_err(|error| (error, metrics.clone()))?;
         if active.generic_enabled {
             merger
@@ -376,11 +415,8 @@ where
                 .map_err(|error| (error, metrics.clone()))?;
         }
         let mut cache_writes = Vec::new();
+        let mut cache_hits = Vec::new();
 
-        let generic = GenericExtractor::new();
-        let cargo = CargoExtractor::new();
-        let rust = RustSyntaxExtractor::new();
-        let available: [&dyn DynExtractor; 3] = [&generic, &cargo, &rust];
         for file in &manifest.files {
             let extractors = available
                 .iter()
@@ -411,6 +447,7 @@ where
                 if let Some(cached) = cached
                     && cache_fragment_is_valid(&cached, &key)
                 {
+                    cache_hits.push(key);
                     fragments.push(rebase_fragment(cached, &context));
                 } else {
                     missing.push((extractor, key));
@@ -478,8 +515,10 @@ where
         metrics.diagnostics = graph.diagnostics.len() as u64;
         metrics.duration_ms = elapsed_ms(started);
         Ok(PreparedIndex {
+            reuse_completed_snapshot: false,
             graph,
             cache_writes,
+            cache_hits,
             metrics,
         })
     }
@@ -522,8 +561,10 @@ where
 }
 
 struct PreparedIndex {
+    reuse_completed_snapshot: bool,
     graph: GraphFragment,
     cache_writes: Vec<CachedFragment>,
+    cache_hits: Vec<FragmentCacheKey>,
     metrics: IndexBuildMetrics,
 }
 

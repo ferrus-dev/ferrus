@@ -196,15 +196,19 @@ impl Ord for MemoryHitOrderKey {
 }
 
 fn rank_memory_search_hits(
-    entities: Vec<MemoryEntity>,
+    entities: impl IntoIterator<Item = Result<MemoryEntity, MemoryQueryError>>,
     request: &MemorySearchRequest,
+    keep: usize,
     mut deadline_reached: impl FnMut() -> bool,
-) -> (Vec<MemorySearchHit>, bool) {
+) -> Result<(Vec<MemorySearchHit>, usize, bool), MemoryQueryError> {
+    let query = request.text.as_str().trim().to_lowercase();
     let mut hits = BTreeMap::new();
+    let mut total = 0usize;
     for entity in entities {
         if deadline_reached() {
-            return (hits.into_values().collect(), true);
+            return Ok((hits.into_values().collect(), total, true));
         }
+        let entity = entity?;
         if (!request.entity_kinds.is_empty() && !request.entity_kinds.contains(&entity.data.kind()))
             || (!request.source_categories.is_empty()
                 && !request
@@ -213,15 +217,19 @@ fn rank_memory_search_hits(
         {
             continue;
         }
-        let Some(hit) = memory_search_hit(entity, request.text.as_str()) else {
+        let Some(hit) = memory_search_hit(entity, &query) else {
             continue;
         };
         if deadline_reached() {
-            return (hits.into_values().collect(), true);
+            return Ok((hits.into_values().collect(), total, true));
         }
+        total = total.saturating_add(1);
         hits.insert(MemoryHitOrderKey::new(&hit), hit);
+        if hits.len() > keep {
+            hits.pop_last();
+        }
     }
-    (hits.into_values().collect(), false)
+    Ok((hits.into_values().collect(), total, false))
 }
 
 /// Local query implementation. It never creates, migrates, or mutates a sidecar.
@@ -290,6 +298,66 @@ impl<'a> SqliteMemoryQuery<'a> {
         let resolved = self.resolve_scope(scope);
         drop(deadline);
         finish_at_deadline(resolved, started, budget.duration())
+    }
+
+    fn search_hits(
+        &self,
+        scope: &ResolvedScope,
+        request: &MemorySearchRequest,
+        keep: usize,
+        started: Instant,
+    ) -> Result<(Vec<MemorySearchHit>, usize, bool), MemoryQueryError> {
+        let mut sql = String::from("SELECT entity_json FROM memory_entities WHERE revision_id = ?");
+        let mut values = vec![scope.revision.id.as_str().to_string()];
+        for (column, filters) in [
+            (
+                "kind",
+                request
+                    .entity_kinds
+                    .iter()
+                    .map(|kind| kind.as_str().to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "source_category",
+                request
+                    .source_categories
+                    .iter()
+                    .map(|category| super::sqlite::source_category(category).to_string())
+                    .collect(),
+            ),
+        ] {
+            if !filters.is_empty() {
+                sql.push_str(&format!(
+                    " AND {column} IN ({})",
+                    vec!["?"; filters.len()].join(",")
+                ));
+                values.extend(filters);
+            }
+        }
+        sql.push_str(" ORDER BY id");
+        let mut statement = self
+            .sidecar
+            .connection()
+            .prepare(&sql)
+            .map_err(sqlite_error)?;
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(values))
+            .map_err(sqlite_error)?;
+        let entities = std::iter::from_fn(|| match rows.next() {
+            Ok(Some(row)) => Some((|| {
+                let encoded = row.get_ref(0).map_err(sqlite_error)?;
+                let encoded = encoded
+                    .as_str()
+                    .map_err(|_| backend_error("storage.corrupt"))?;
+                serde_json::from_str(encoded).map_err(serialization_error)
+            })()),
+            Ok(None) => None,
+            Err(error) => Some(Err(sqlite_error(error))),
+        });
+        rank_memory_search_hits(entities, request, keep, || {
+            started.elapsed() >= scope.budget.duration()
+        })
     }
 
     fn entities(
@@ -714,23 +782,22 @@ impl MemoryQuery for SqliteMemoryQuery<'_> {
         )?;
         let deadline =
             QueryDeadline::install(self.sidecar.connection(), started, scope.budget.duration())?;
-        let (entities, mut query_timed_out) = match self.entities(&scope.revision.id) {
-            Ok(entities) => (entities, false),
+        let offset = usize::try_from(offset).map_err(|_| MemoryQueryError::StaleCursor)?;
+        let keep = offset
+            .saturating_add(scope.budget.max_results as usize)
+            .saturating_add(1);
+        let (hits, total, query_timed_out) = match self.search_hits(&scope, &request, keep, started)
+        {
+            Ok(result) => result,
             Err(MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)) => {
-                (vec![], true)
+                (vec![], 0, true)
             }
             Err(error) => return Err(error),
         };
         drop(deadline);
-        let (hits, ranking_timed_out) = rank_memory_search_hits(entities, &request, || {
-            started.elapsed() >= scope.budget.duration()
-        });
-        query_timed_out |= ranking_timed_out;
-        let offset = usize::try_from(offset).map_err(|_| MemoryQueryError::StaleCursor)?;
-        if offset > hits.len() {
+        if offset > total {
             return Err(MemoryQueryError::StaleCursor);
         }
-        let total = hits.len();
         let mut hits = hits.into_iter().skip(offset).peekable();
         let mut returned = Vec::new();
         let mut returned_bytes = 0_u64;

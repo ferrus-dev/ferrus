@@ -32,6 +32,28 @@ point estimates; compilation and per-iteration setup are excluded.
 | Medium fixture one-file change | 84.0 ms | 1 | 301 | new snapshot |
 | Medium fixture indexed symbol search | 238 us | -- | -- | 1 hit |
 
+## Completed-snapshot reuse recorded 2026-09-04
+
+Environment: macOS arm64, Rust 1.98.0, Criterion 0.8.2. Both runs used
+`cargo bench --offline --locked --bench repository_graph -- --quick` and the same 302-file fixture.
+The before run includes the preceding fragment-cache and allocation improvements from issue #71.
+
+| Operation | Before snapshot reuse | After snapshot reuse |
+|---|---:|---:|
+| Cold indexing | 92.487 ms | 91.644 ms |
+| No-op indexing | 38.127 ms | 24.134 ms |
+| One-file change | 71.513 ms | 73.616 ms |
+| Exact symbol search | 262.55 us | 263.64 us |
+
+No-op elapsed time decreased by about 37% in this smoke run. The quick sample was too small for Criterion's
+significance threshold (p = 0.06); treat the values as preliminary timings, not a statistically established
+speedup. The fast path retains both source revalidations, so it still reads the source during verification.
+It skips fragment loading, graph merging, and resolution, and sends no file or fact payload to completion.
+
+Reuse requires unchanged source warnings and no analyzer diagnostics in the original and current diagnostic
+sets. Otherwise normal indexing runs. Regression tests cover absent fragment caches, forced full builds,
+diagnostic refresh, source changes, concurrent publication, and snapshot collection during revalidation.
+
 ## Ferrus dogfood recorded 2026-07-14
 
 These dogfood timings used the debug CLI build and are retained as functional evidence, not as values to compare

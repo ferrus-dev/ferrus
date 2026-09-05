@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeMap,
     ops::ControlFlow,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -149,9 +150,11 @@ impl Extractor for RustSyntaxExtractor {
         let mut timed_out = !push_named_children(
             &mut stack,
             root,
-            root_id.clone(),
-            root_id,
-            vec![root_name],
+            Rc::new(TraversalContext {
+                parent_id: root_id.clone(),
+                module_id: root_id,
+                scope: Rc::new(vec![root_name]),
+            }),
             started,
             budget,
         );
@@ -171,9 +174,7 @@ impl Extractor for RustSyntaxExtractor {
                 diagnostics.push("rust.missing_syntax", Some(span(work.node)));
             }
 
-            let mut child_parent = work.parent_id.clone();
-            let mut child_module = work.module_id.clone();
-            let mut child_scope = work.scope.clone();
+            let mut child_context = Rc::clone(&work.context);
             if let Some(mut declaration) = declaration(work.node, input.content) {
                 if declaration.enforce_source_value_limit() {
                     diagnostics.push("rust.source_value_limit", Some(span(work.node)));
@@ -183,28 +184,22 @@ impl Extractor for RustSyntaxExtractor {
                 if !facts.push_declaration(built.node, built.containment, built.relationship) {
                     break;
                 }
-                child_parent = built.id.clone();
+                let context = Rc::make_mut(&mut child_context);
+                context.parent_id = built.id.clone();
                 if opens_module {
-                    child_module = built.id;
+                    context.module_id = built.id;
                 }
                 if let Some(scope_segment) = built.scope_segment {
-                    child_scope.push(scope_segment);
+                    Rc::make_mut(&mut context.scope).push(scope_segment);
                 }
             } else if work.node.kind() == "block" {
                 // Rust permits block-local items with the same name in separate
                 // blocks. Preserve that otherwise-anonymous lexical scope.
-                child_scope.push(format!("block@{}", work.node.start_byte()));
+                Rc::make_mut(&mut Rc::make_mut(&mut child_context).scope)
+                    .push(format!("block@{}", work.node.start_byte()));
             }
 
-            if !push_named_children(
-                &mut stack,
-                work.node,
-                child_parent,
-                child_module,
-                child_scope,
-                started,
-                budget,
-            ) {
+            if !push_named_children(&mut stack, work.node, child_context, started, budget) {
                 timed_out = true;
             }
         }
@@ -232,17 +227,20 @@ impl Extractor for RustSyntaxExtractor {
 #[derive(Debug)]
 struct WorkItem<'tree> {
     node: Node<'tree>,
+    context: Rc<TraversalContext>,
+}
+
+#[derive(Debug, Clone)]
+struct TraversalContext {
     parent_id: NodeId,
     module_id: NodeId,
-    scope: Vec<String>,
+    scope: Rc<Vec<String>>,
 }
 
 fn push_named_children<'tree>(
     stack: &mut Vec<WorkItem<'tree>>,
     node: Node<'tree>,
-    parent_id: NodeId,
-    module_id: NodeId,
-    scope: Vec<String>,
+    context: Rc<TraversalContext>,
     started: Instant,
     budget: Duration,
 ) -> bool {
@@ -256,9 +254,7 @@ fn push_named_children<'tree>(
         if let Some(child) = node.named_child(index) {
             stack.push(WorkItem {
                 node: child,
-                parent_id: parent_id.clone(),
-                module_id: module_id.clone(),
-                scope: scope.clone(),
+                context: Rc::clone(&context),
             });
         }
     }
@@ -501,13 +497,11 @@ fn build_declaration(
     } else {
         display_name.clone()
     };
-    let qualified_name = work
-        .scope
-        .iter()
-        .chain(std::iter::once(&identity_name))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("::");
+    let mut qualified_name = work.context.scope.join("::");
+    if !qualified_name.is_empty() {
+        qualified_name.push_str("::");
+    }
+    qualified_name.push_str(&identity_name);
     let semantic_key = format!(
         "rust:{}:{}:{}",
         declaration.kind,
@@ -570,7 +564,7 @@ fn build_declaration(
     let containment = graph_edge(
         input,
         "contains",
-        work.parent_id.clone(),
+        work.context.parent_id.clone(),
         EdgeTarget::Node(id.clone()),
         declaration_span.clone(),
         ResolutionState::Resolved,
@@ -579,7 +573,7 @@ fn build_declaration(
         graph_edge(
             input,
             relationship.kind,
-            work.module_id.clone(),
+            work.context.module_id.clone(),
             EdgeTarget::Unresolved(relationship.target),
             declaration_span,
             ResolutionState::Unresolved,

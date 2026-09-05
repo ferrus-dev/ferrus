@@ -17,6 +17,7 @@ mod server;
 mod specs;
 mod state;
 mod templates;
+#[cfg(feature = "update-check")]
 mod update_check;
 
 use clap::Parser;

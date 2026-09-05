@@ -3,6 +3,87 @@
 use super::*;
 
 #[test]
+fn recent_transcript_borrows_only_visible_lines_from_large_history() {
+    let messages: Vec<_> = (0..100_000)
+        .map(|index| TranscriptLine {
+            text: format!("message {index}"),
+            kind: TranscriptKind::Info,
+            continuation: false,
+        })
+        .collect();
+    let blocks = recent_transcript_blocks(&messages, 20);
+    assert_eq!(blocks.len(), 10);
+    for (block, original) in blocks.iter().zip(&messages[99_990..]) {
+        assert_eq!(block.len(), 1);
+        assert!(std::ptr::eq(block[0], original));
+    }
+    assert!(recent_transcript_blocks(&messages, 0).is_empty());
+}
+
+#[test]
+fn transcript_retention_evicts_whole_blocks() {
+    let mut app = App::new();
+    for index in 0..MAX_TRANSCRIPT_LINES {
+        app.append_transcript(split_transcript(
+            &format!("message {index}\ndetail\nlast detail"),
+            TranscriptKind::Info,
+        ));
+    }
+    assert!(app.messages.len() <= MAX_TRANSCRIPT_LINES);
+    assert_eq!(app.messages.len() % 3, 0);
+    assert!(!app.messages[0].continuation);
+    assert_eq!(app.messages.last().unwrap().text, "last detail");
+    assert_eq!(
+        app.messages[app.messages.len() - 3].text,
+        format!("message {}", MAX_TRANSCRIPT_LINES - 1)
+    );
+}
+
+#[test]
+fn transcript_retention_preserves_oversized_table_borders_and_viewport_width() {
+    let mut app = App::new();
+    app.append_transcript(split_transcript("old message", TranscriptKind::Info));
+    let mut table: Vec<_> = (0..MAX_TRANSCRIPT_LINES * 3)
+        .map(|index| TranscriptLine {
+            text: format!("| row {index} |"),
+            kind: TranscriptKind::TableRow,
+            continuation: true,
+        })
+        .collect();
+    table[0].text = "+-----------+".into();
+    table[0].kind = TranscriptKind::TableTop;
+    table[0].continuation = false;
+    let last = table.last_mut().unwrap();
+    last.text = "+-----------+".into();
+    last.kind = TranscriptKind::TableBottom;
+    app.append_transcript(table);
+    assert_eq!(app.messages.len(), MAX_TRANSCRIPT_LINES);
+    assert!(matches!(app.messages[0].kind, TranscriptKind::TableTop));
+    assert!(matches!(
+        app.messages.last().unwrap().kind,
+        TranscriptKind::TableBottom
+    ));
+    assert!(app.messages.capacity() <= MAX_TRANSCRIPT_LINES * 2);
+    let blocks = recent_transcript_blocks(&app.messages, 3);
+    assert_eq!(blocks[0].len(), 3);
+    assert!(matches!(blocks[0][2].kind, TranscriptKind::TableBottom));
+    let rendered = activity_area_lines(&app, 9, 3);
+    assert_eq!(rendered.len(), 3);
+    for line in rendered {
+        let text: String = line
+            .line
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert!(display_width(&text) <= 9);
+    }
+    app.append_transcript(split_transcript("new message", TranscriptKind::Info));
+    assert_eq!(app.messages.len(), 1);
+    assert_eq!(app.messages[0].text, "new message");
+}
+
+#[test]
 fn first_tab_on_multiple_matches_selects_first_candidate() {
     let mut app = App::new();
     app.input = "/".into();

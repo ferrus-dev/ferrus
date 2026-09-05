@@ -1,6 +1,8 @@
 //! SQLite persistence for complete index snapshots and reusable raw fragments.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use std::collections::BTreeSet;
+
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{
     domain::{
@@ -20,22 +22,29 @@ use super::{
 };
 
 impl IndexStore for Sidecar {
+    fn reusable_index_metrics(
+        &self,
+        snapshot: &GraphSnapshot,
+        source_diagnostics: &[GraphDiagnostic],
+    ) -> Result<Option<IndexBuildMetrics>, Self::Error> {
+        reusable_index_metrics(self.connection(), snapshot, source_diagnostics)
+    }
+
     fn load_cached_fragment(
         &mut self,
         key: &FragmentCacheKey,
     ) -> Result<Option<GraphFragment>, Self::Error> {
         let raw = self
             .connection()
-            .query_row(
+            .prepare_cached(
                 "SELECT fragment_json FROM fragment_cache WHERE \
                  repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
                  content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
                  file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
                  analysis_config_digest = ?9 AND extractor_id = ?10 AND \
                  extractor_version = ?11 AND extractor_contract_version = ?12",
-                cache_params(key)?,
-                |row| row.get::<_, String>(0),
-            )
+            )?
+            .query_row(cache_params(key)?, |row| row.get::<_, String>(0))
             .optional()?;
         let Some(raw) = raw else {
             return Ok(None);
@@ -55,29 +64,6 @@ impl IndexStore for Sidecar {
                 return Ok(None);
             }
         };
-        self.connection_mut().execute(
-            "UPDATE fragment_cache SET last_used_at = ?13 WHERE \
-             repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
-             content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
-             file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
-             analysis_config_digest = ?9 AND extractor_id = ?10 AND \
-             extractor_version = ?11 AND extractor_contract_version = ?12",
-            params![
-                key.repository.namespace.as_str(),
-                key.repository.repository_id.as_str(),
-                key.path.as_str(),
-                key.content_identity.algorithm(),
-                key.content_identity.value(),
-                integer(key.byte_len, "fragment byte length")?,
-                file_mode(key.file_mode),
-                key.analysis_config_digest.algorithm(),
-                key.analysis_config_digest.value(),
-                key.extractor.id.as_str(),
-                key.extractor.version,
-                i64::from(key.extractor.contract_version),
-                timestamp(),
-            ],
-        )?;
         Ok(Some(fragment))
     }
 
@@ -96,6 +82,29 @@ impl IndexStore for Sidecar {
         }
         validate_snapshot_for_build(&commit.snapshot, &build)?;
 
+        if commit.reuse_completed_snapshot {
+            if !commit.files.is_empty()
+                || !commit.graph.nodes.is_empty()
+                || !commit.graph.edges.is_empty()
+                || !commit.cache_writes.is_empty()
+                || !commit.cache_hits.is_empty()
+            {
+                return Err(StoreError::IdentityMismatch("reused snapshot payload"));
+            }
+            // Recheck under the completion transaction: retention or another
+            // build may have changed the candidate after source revalidation.
+            let existing =
+                reusable_index_metrics(&transaction, &commit.snapshot, &commit.graph.diagnostics)?
+                    .ok_or(StoreError::IdentityMismatch("reused snapshot eligibility"))?;
+            if existing.discovered_files != commit.metrics.discovered_files
+                || existing.nodes != commit.metrics.nodes
+                || existing.edges != commit.metrics.edges
+                || existing.diagnostics != commit.metrics.diagnostics
+            {
+                return Err(StoreError::IdentityMismatch("reused snapshot metrics"));
+            }
+        }
+
         let completed = if let Some(existing) = load_snapshot(&transaction, &commit.snapshot.id)? {
             validate_equivalent_snapshot(&commit.snapshot, &existing)?;
             existing
@@ -110,6 +119,7 @@ impl IndexStore for Sidecar {
         for cached in &commit.cache_writes {
             upsert_cached_fragment(&transaction, &cached.key, &cached.fragment)?;
         }
+        touch_cached_fragments(&transaction, &commit.cache_hits)?;
         upsert_metrics(&transaction, &commit.snapshot.completed_by, &commit.metrics)?;
         transaction.execute(
             "UPDATE index_builds SET finished_at = ?2 WHERE id = ?1",
@@ -126,6 +136,116 @@ impl IndexStore for Sidecar {
     ) -> Result<(), Self::Error> {
         upsert_metrics(self.connection(), build_id, metrics)
     }
+}
+
+/// Source warnings are not part of snapshot identity. Reuse only when both the
+/// original fact-producing build and the latest diagnostic set match today's
+/// source warnings exactly. Analyzer warnings (including budget exhaustion)
+/// therefore keep the normal extraction/resolution retry path.
+fn reusable_index_metrics(
+    connection: &Connection,
+    requested: &GraphSnapshot,
+    source_diagnostics: &[GraphDiagnostic],
+) -> Result<Option<IndexBuildMetrics>, StoreError> {
+    let Some(snapshot) = load_snapshot(connection, &requested.id)? else {
+        return Ok(None);
+    };
+    validate_equivalent_snapshot(requested, &snapshot)?;
+    let summary = connection
+        .query_row(
+            "SELECT metrics.discovered_files, metrics.nodes, metrics.edges, \
+                (SELECT COUNT(*) FROM files WHERE snapshot_id = ?1), \
+                (SELECT COUNT(*) FROM nodes WHERE snapshot_id = ?1), \
+                (SELECT COUNT(*) FROM edges WHERE snapshot_id = ?1), sets.build_id \
+         FROM build_metrics AS metrics JOIN snapshot_diagnostic_sets AS sets \
+              ON sets.snapshot_id = ?1 WHERE metrics.build_id = ?2",
+            params![snapshot.id.as_str(), snapshot.completed_by.as_str()],
+            |row| {
+                Ok((
+                    unsigned(row.get(0)?)?,
+                    unsigned(row.get(1)?)?,
+                    unsigned(row.get(2)?)?,
+                    unsigned(row.get(3)?)?,
+                    unsigned(row.get(4)?)?,
+                    unsigned(row.get(5)?)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((files, nodes, edges, actual_files, actual_nodes, actual_edges, diagnostics_build)) =
+        summary
+    else {
+        // Lifecycle-only snapshots and older/incomplete index metadata cannot
+        // prove that all facts were persisted by complete_index.
+        return Ok(None);
+    };
+    if (files, nodes, edges) != (actual_files, actual_nodes, actual_edges) {
+        return Ok(None);
+    }
+    for build_id in [snapshot.completed_by.as_str(), diagnostics_build.as_str()] {
+        if !diagnostics_match_source(connection, &snapshot, build_id, source_diagnostics)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(IndexBuildMetrics {
+        discovered_files: files,
+        nodes,
+        edges,
+        diagnostics: source_diagnostics.len() as u64,
+        ..IndexBuildMetrics::default()
+    }))
+}
+
+fn diagnostics_match_source(
+    connection: &Connection,
+    snapshot: &GraphSnapshot,
+    build_id: &str,
+    source_diagnostics: &[GraphDiagnostic],
+) -> Result<bool, StoreError> {
+    if source_diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity != DiagnosticSeverity::Warning
+            || diagnostic
+                .location
+                .as_ref()
+                .is_some_and(|location| location.span.is_some())
+            || !diagnostic.metrics.is_empty()
+            || diagnostic.snapshot_id.as_ref() != Some(&snapshot.id)
+    }) {
+        return Ok(false);
+    }
+    let mut expected: BTreeSet<_> = source_diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.code.as_str().to_string(),
+                diagnostic
+                    .location
+                    .as_ref()
+                    .map(|location| location.path.as_str().to_string()),
+            )
+        })
+        .collect();
+    if expected.len() != source_diagnostics.len() {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT code, path, COALESCE(snapshot_id = ?2 AND severity = 'warning' \
+            AND span_start_byte IS NULL AND span_start_line IS NULL \
+            AND span_start_column IS NULL AND span_end_byte IS NULL \
+            AND span_end_line IS NULL AND span_end_column IS NULL \
+            AND metadata_json = '{}', 0) \
+         FROM diagnostics WHERE build_id = ?1",
+    )?;
+    let mut rows = statement.query(params![build_id, snapshot.id.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let code: String = row.get(0)?;
+        let path: Option<String> = row.get(1)?;
+        if !row.get::<_, bool>(2)? || !expected.remove(&(code, path)) {
+            return Ok(false);
+        }
+    }
+    Ok(expected.is_empty())
 }
 
 impl Sidecar {
@@ -409,8 +529,9 @@ fn upsert_cached_fragment(
     fragment: &GraphFragment,
 ) -> Result<(), StoreError> {
     let now = timestamp();
-    transaction.execute(
-        "INSERT INTO fragment_cache(\
+    transaction
+        .prepare_cached(
+            "INSERT INTO fragment_cache(\
             repository_namespace, repository_id, path, content_algorithm, content_digest, \
             byte_length, file_mode, analysis_config_algorithm, analysis_config_digest, \
             extractor_id, extractor_version, extractor_contract_version, fragment_json, \
@@ -418,7 +539,8 @@ fn upsert_cached_fragment(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
          ON CONFLICT DO UPDATE SET fragment_json = excluded.fragment_json, \
             last_used_at = excluded.last_used_at",
-        params![
+        )?
+        .execute(params![
             key.repository.namespace.as_str(),
             key.repository.repository_id.as_str(),
             key.path.as_str(),
@@ -433,8 +555,43 @@ fn upsert_cached_fragment(
             i64::from(key.extractor.contract_version),
             serde_json::to_string(fragment)?,
             now,
-        ],
+        ])?;
+    Ok(())
+}
+
+fn touch_cached_fragments(
+    transaction: &Transaction<'_>,
+    hits: &[FragmentCacheKey],
+) -> Result<(), StoreError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let now = timestamp();
+    let mut statement = transaction.prepare_cached(
+        "UPDATE fragment_cache SET last_used_at = ?13 WHERE \
+         repository_namespace = ?1 AND repository_id = ?2 AND path = ?3 AND \
+         content_algorithm = ?4 AND content_digest = ?5 AND byte_length = ?6 AND \
+         file_mode = ?7 AND analysis_config_algorithm = ?8 AND \
+         analysis_config_digest = ?9 AND extractor_id = ?10 AND \
+         extractor_version = ?11 AND extractor_contract_version = ?12",
     )?;
+    for key in hits {
+        statement.execute(params![
+            key.repository.namespace.as_str(),
+            key.repository.repository_id.as_str(),
+            key.path.as_str(),
+            key.content_identity.algorithm(),
+            key.content_identity.value(),
+            integer(key.byte_len, "fragment byte length")?,
+            file_mode(key.file_mode),
+            key.analysis_config_digest.algorithm(),
+            key.analysis_config_digest.value(),
+            key.extractor.id.as_str(),
+            key.extractor.version,
+            i64::from(key.extractor.contract_version),
+            now,
+        ])?;
+    }
     Ok(())
 }
 

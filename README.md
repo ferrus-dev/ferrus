@@ -1,6 +1,6 @@
 # ferrus
 
-[![Ferrus version](https://img.shields.io/badge/ferrus-0.4.0--alpha.3-orange)](https://crates.io/crates/ferrus)
+[![Ferrus version](https://img.shields.io/badge/ferrus-0.4.1--alpha.1-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
 [![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
@@ -76,6 +76,20 @@ curl -fsSL https://ferrus.dev/cli/install.sh | sh
 # or on Windows:
 iwr https://ferrus.dev/cli/install.ps1 -useb | iex
 ```
+
+For a smaller Cargo installation, use the same size profile as release assets:
+
+```sh
+cargo install ferrus --locked --profile dist
+```
+
+HQ update notifications are enabled by default. To omit the update-check HTTP/TLS client:
+
+```sh
+cargo install ferrus --locked --profile dist --no-default-features
+```
+
+See [build profiles and size measurements](docs/binary-size.md) for the tradeoffs.
 
 Run:
 

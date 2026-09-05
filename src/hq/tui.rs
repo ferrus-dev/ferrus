@@ -34,6 +34,7 @@ use super::state_watcher::{WatchedMilestone, WatchedState};
 use crate::specs::MilestoneReadiness;
 
 const MAX_HISTORY: usize = 100;
+const MAX_TRANSCRIPT_LINES: usize = 2_000;
 const MAX_COMPLETIONS: usize = 8;
 const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "spawn supervisor, plan a task"),
@@ -296,7 +297,7 @@ pub async fn run_tui(
                             continuation: false,
                         };
                         app.last_error = Some(line.text.clone());
-                        app.messages.push(line);
+                        app.append_transcript(vec![line]);
                         redraw_dashboard(&mut stdout, &app, &mut ui)?;
                     }
                     None => app.should_quit = true,
@@ -607,20 +608,20 @@ fn handle_message(
     match msg {
         UiMessage::Info(text) => {
             let lines = split_transcript(&text, TranscriptKind::Info);
-            app.messages.extend(lines.iter().cloned());
+            app.append_transcript(lines);
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }
         }
         UiMessage::Table(rows) => {
-            app.messages.extend(table_transcript(&rows));
+            app.append_transcript(table_transcript(&rows));
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }
         }
         UiMessage::Success(text) => {
             let lines = split_transcript(&text, TranscriptKind::Success);
-            app.messages.extend(lines.iter().cloned());
+            app.append_transcript(lines);
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }
@@ -631,14 +632,14 @@ fn handle_message(
                 kind: TranscriptKind::Tip,
                 continuation: false,
             };
-            app.messages.push(line.clone());
+            app.append_transcript(vec![line]);
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }
         }
         UiMessage::Muted(text) => {
             let lines = split_transcript(&text, TranscriptKind::Muted);
-            app.messages.extend(lines.iter().cloned());
+            app.append_transcript(lines);
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
             }

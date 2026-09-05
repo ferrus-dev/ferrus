@@ -1,7 +1,6 @@
 //! Run configured review checks and persist full logs with bounded feedback for the agent.
 
 use anyhow::Result;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,20 +39,28 @@ async fn run_with_cwd(
     log_scope: &str,
     cwd: Option<&Path>,
 ) -> Result<CheckGateResult> {
-    let result = match cwd {
-        Some(cwd) => runner::run_checks_in(&config.checks.commands, cwd).await?,
-        None => runner::run_checks(&config.checks.commands).await?,
-    };
-    if result.passed {
+    if config.checks.commands.is_empty() {
         return Ok(CheckGateResult::Passed);
     }
-
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let log_content = build_full_log(&result.commands);
-    let log_path = store::write_check_log(attempt, ts, log_scope, &log_content).await?;
+    static LOG_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = LOG_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scope = format!("{log_scope}-{}-{sequence}", std::process::id());
+    let log_path = store::write_check_log(attempt, ts, &scope, "").await?;
+    let result = runner::run_checks_logged(
+        &config.checks.commands,
+        cwd,
+        &log_path,
+        config.limits.max_feedback_lines,
+    )
+    .await?;
+    if result.passed {
+        let _ = tokio::fs::remove_file(&log_path).await;
+        return Ok(CheckGateResult::Passed);
+    }
 
     let failed_commands: Vec<&str> = result
         .commands
@@ -74,30 +81,6 @@ async fn run_with_cwd(
     }))
 }
 
-fn build_full_log(commands: &[CommandResult]) -> String {
-    let mut out = String::new();
-    for cmd in commands {
-        let status = if cmd.passed { "PASS" } else { "FAIL" };
-        out.push_str(&format!("=== [{status}] {}\n\n", cmd.command));
-        if !cmd.stdout.trim().is_empty() {
-            out.push_str("--- stdout ---\n");
-            out.push_str(&cmd.stdout);
-            if !cmd.stdout.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if !cmd.stderr.trim().is_empty() {
-            out.push_str("--- stderr ---\n");
-            out.push_str(&cmd.stderr);
-            if !cmd.stderr.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
-
 fn build_report(commands: &[CommandResult], max_lines: usize, log_path: &Path) -> String {
     let failed: Vec<&CommandResult> = commands.iter().filter(|c| !c.passed).collect();
 
@@ -109,14 +92,12 @@ fn build_report(commands: &[CommandResult], max_lines: usize, log_path: &Path) -
 
     for cmd in &failed {
         out.push_str(&format!("`{}`\n", cmd.command));
-        let combined = format!("{}{}", cmd.stdout, cmd.stderr);
-        let total_lines = combined.lines().count();
-        let tail = last_n_lines(&combined, max_lines);
-        if total_lines > max_lines {
-            out.push_str(&format!("(last {max_lines} of {total_lines} lines)\n"));
+        let tail = &cmd.output.tail;
+        if cmd.output.truncated {
+            out.push_str(&format!("(bounded tail of {} lines; up to {max_lines} lines and 64 KiB of output retained)\n", cmd.output.total_lines));
         }
         out.push_str("```\n");
-        out.push_str(&tail);
+        out.push_str(tail);
         if !tail.ends_with('\n') {
             out.push('\n');
         }
@@ -127,43 +108,25 @@ fn build_report(commands: &[CommandResult], max_lines: usize, log_path: &Path) -
     out
 }
 
-fn last_n_lines(s: &str, n: usize) -> String {
-    if n == 0 {
-        return String::new();
-    }
-
-    let mut tail = VecDeque::with_capacity(n);
-    for line in s.lines() {
-        if tail.len() == n {
-            tail.pop_front();
-        }
-        tail.push_back(line);
-    }
-    tail.into_iter().collect::<Vec<_>>().join("\n")
-}
-
 #[cfg(test)]
 mod tests {
-    //! Bounded feedback selects the requested number of trailing log lines.
-
     use super::*;
 
     #[test]
-    fn last_n_lines_returns_only_tail() {
-        let input = "one\ntwo\nthree\nfour";
-
-        assert_eq!(last_n_lines(input, 2), "three\nfour");
-    }
-
-    #[test]
-    fn last_n_lines_handles_longer_limit() {
-        let input = "one\ntwo";
-
-        assert_eq!(last_n_lines(input, 10), "one\ntwo");
-    }
-
-    #[test]
-    fn last_n_lines_zero_limit_is_empty() {
-        assert_eq!(last_n_lines("one\ntwo", 0), "");
+    fn failure_report_uses_bounded_feedback_and_full_log_link() {
+        let commands = vec![CommandResult {
+            command: "check".into(),
+            passed: false,
+            output: crate::checks::runner::CapturedOutput {
+                tail: "last failure".into(),
+                total_lines: 100_000,
+                truncated: true,
+            },
+        }];
+        let report = build_report(&commands, 30, Path::new(".ferrus/logs/check.txt"));
+        assert!(report.contains("last failure"));
+        assert!(report.contains("100000 lines"));
+        assert!(report.contains("Full log: `.ferrus/logs/check.txt`"));
+        assert!(report.len() < 512);
     }
 }

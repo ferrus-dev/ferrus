@@ -260,9 +260,15 @@ pub struct IndexBuildMetrics {
 #[derive(Debug, Clone)]
 pub struct IndexCommit {
     pub snapshot: GraphSnapshot,
+    /// Reuse persisted facts, with no file, fact, or fragment payload. The store
+    /// must recheck eligibility atomically before completing this attempt.
+    pub reuse_completed_snapshot: bool,
     pub files: Vec<SourceFileDescriptor>,
     pub graph: GraphFragment,
     pub cache_writes: Vec<CachedFragment>,
+    /// Validated cache hits touched atomically with snapshot completion. A build
+    /// that fails before completion leaves their retention timestamps unchanged.
+    pub cache_hits: Vec<FragmentCacheKey>,
     pub metrics: IndexBuildMetrics,
 }
 
@@ -356,6 +362,14 @@ pub trait GraphStore {
 /// Persistence operations needed by the indexing coordinator. The DTOs remain
 /// backend-neutral so a remote implementation can preserve the same workflow.
 pub trait IndexStore: GraphStore {
+    /// Return fact counts only for a complete index with unchanged source
+    /// diagnostics and no analyzer diagnostics. A miss uses normal indexing.
+    fn reusable_index_metrics(
+        &self,
+        snapshot: &GraphSnapshot,
+        source_diagnostics: &[GraphDiagnostic],
+    ) -> Result<Option<IndexBuildMetrics>, Self::Error>;
+
     fn load_cached_fragment(
         &mut self,
         key: &FragmentCacheKey,
