@@ -752,3 +752,59 @@ async fn host_denial_returns_feedback_and_absent_usage_is_estimated() {
         }
     )));
 }
+
+#[tokio::test]
+async fn native_workspace_tools_run_through_the_durable_engine() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let journal_root = TempDir::new().unwrap();
+    let mut create = call("create", 1);
+    create.name = "apply_patch".into();
+    create.arguments = json!({"edits":[{"operation":"create","path":"source.txt","content":"native tool result\n"}]}).to_string();
+    let mut read = call("read", 1);
+    read.name = "read_file".into();
+    read.arguments = json!({"path":"source.txt"}).to_string();
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        scripted(vec![
+            response("", vec![create, read]),
+            response("Done", vec![]),
+        ]),
+        super::workspace::Workspace::new(&root, super::workspace::Limits::default()).unwrap(),
+        FakeHost::default(),
+        FileJournal::create(
+            &journal_root.path().canonicalize().unwrap(),
+            "session-1",
+            Quotas::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(
+        std::fs::read(root.join("source.txt")).unwrap(),
+        b"native tool result\n"
+    );
+    let results: Vec<_> = engine
+        .host
+        .records
+        .iter()
+        .filter_map(|record| match &record.event {
+            SessionEvent::ToolResult {
+                outcome: ToolOutcome::Success(value),
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]["changes"][0]["after_digest"],
+        results[1]["source"]["digest"]
+    );
+    assert_eq!(results[1]["text"], "native tool result\n");
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.budget, end.budget);
+}

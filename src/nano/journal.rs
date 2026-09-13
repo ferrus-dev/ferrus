@@ -54,7 +54,6 @@ pub(crate) struct Checkpoint {
 
 pub(crate) struct FileJournal {
     directory: PathBuf,
-    _lock: File,
     file: File,
     quotas: Quotas,
     state: Replay,
@@ -64,6 +63,26 @@ pub(crate) struct FileJournal {
     files: usize,
     digest: Sha256,
     poisoned: bool,
+    // Drop the journal file before releasing its writer lock.
+    _lock: WriterLock,
+}
+
+struct WriterLock(File);
+
+impl WriterLock {
+    fn acquire(file: File) -> Result<Self> {
+        file.try_lock_exclusive()
+            .context("Nano journal already has a writer")?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Closing alone leaves flock held by duplicates inherited across fork,
+        // even with CLOEXEC, until the child reaches exec or closes its copy.
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {
@@ -135,9 +154,7 @@ impl FileJournal {
         private::directory(&directory.join("outputs"), true)?;
         private::directory(&directory.join("checkpoints"), true)?;
 
-        let lock = private::file(&directory.join("writer.lock"), true)?;
-        lock.try_lock_exclusive()
-            .context("Nano journal already has a writer")?;
+        let lock = WriterLock::acquire(private::file(&directory.join("writer.lock"), true)?)?;
 
         let file = private::file(&directory.join("events.jsonl"), true)?;
         private::sync_directory(&directory)?;
@@ -172,10 +189,7 @@ impl FileJournal {
             .to_string();
 
         ensure!(valid_id(&session_id), "Invalid nano session ID");
-        let lock = private::file(&directory.join("writer.lock"), false)?;
-
-        lock.try_lock_exclusive()
-            .context("Nano journal already has a writer")?;
+        let lock = WriterLock::acquire(private::file(&directory.join("writer.lock"), false)?)?;
 
         let (mut total_bytes, files) = measure(directory, &quotas)?;
         let mut file = private::file(&directory.join("events.jsonl"), false)?;
@@ -474,4 +488,27 @@ fn hex_digest(digest: Sha256) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_writer_releases_the_lock_while_a_duplicate_remains_open() {
+        let root = tempfile::TempDir::new().unwrap();
+        let journal = FileJournal::create(root.path(), "s-1", Quotas::default()).unwrap();
+        let directory = journal.directory().to_owned();
+        // dup and fork share the same open file description. Keep the duplicate
+        // alive to model a concurrent child between fork and close-on-exec.
+        let duplicate = journal._lock.0.try_clone().unwrap();
+        assert!(FileJournal::recover(&directory, Quotas::default()).is_err());
+        drop(journal);
+
+        let (recovered, _) = FileJournal::recover(&directory, Quotas::default()).unwrap();
+        drop(duplicate);
+        assert!(FileJournal::recover(&directory, Quotas::default()).is_err());
+        drop(recovered);
+        FileJournal::recover(&directory, Quotas::default()).unwrap();
+    }
 }

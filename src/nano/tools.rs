@@ -38,6 +38,8 @@ pub(crate) enum ToolError {
     Failed,
     Interrupted,
     OutputLimit,
+    /// Bounded native file-tool diagnostics, including per-path edit outcomes.
+    Workspace(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

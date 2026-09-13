@@ -247,6 +247,7 @@ tool catalog. They remain available to the runtime without spending inference tu
 File tools confine paths to authorized roots, handle symlinks safely, preserve unrelated edits,
 and check the expected content before writing. Validate all patch hunks before applying a patch;
 report any partial filesystem failure precisely rather than promising a multi-file transaction.
+The implemented #76 tool contract is documented in [Nano workspace tools](ferrus-nano-workspace.md).
 Keep original/new digests sufficient to reconcile an interrupted edit. Do not silently apply a
 stale edit with fuzzy matching. Binary and oversized content return explicit limitations.
 

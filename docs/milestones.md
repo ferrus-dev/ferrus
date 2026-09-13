@@ -25,7 +25,7 @@ Last reviewed against the repository: 2026-09-07.
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
 | Distributed context data plane | Prototype implemented | Opt-in contracts and local prototype adapters for authorized jobs, encrypted storage, publication, queries, and maintenance. No deployed remote service is implied. |
-| Ferrus nano-agent | Foundation implemented; runtime planned | #73 adds native binding and claim/status/heartbeat; #74 adds the bounded engine/journal; #75 adds opt-in LM Studio Chat Completions. Live model validation, HQ launch, interactive UI, and standalone delivery remain pending. |
+| Ferrus nano-agent | Foundation implemented; runtime planned | #73 adds native binding and claim/status/heartbeat; #74 adds the bounded engine/journal; #75 adds opt-in LM Studio Chat Completions; #76 adds bounded native read/search/patch tools. Live model validation, HQ launch, interactive UI, and standalone delivery remain pending. |
 
 ## Milestone 1: Windows Support
 
@@ -150,7 +150,7 @@ Definition of done:
 
 ## Milestone 5: Ferrus Nano-Agent
 
-Status: native session and engine/journal foundations implemented (#73, #74); the runnable harness is not available yet.
+Status: native session, engine/journal, provider, and file tools implemented (#73-#76); the runnable harness is not available yet.
 
 Goal: build `ferrus-nano` (backend `nano`) as a minimal Rust coding-agent harness. Start with a
 headless managed Executor, using Ferrus operations, repository graph, and project memory through
@@ -168,6 +168,7 @@ Implemented foundation:
 - native typed claim, status, and heartbeat, with exact run validation at transaction boundaries;
 - sequential provider/tool/host boundaries, persisted budgets, cancellation, a private single-writer journal, and pure recorded replay;
 - an opt-in Chat Completions adapter targeting LM Studio, with private credential-file references, bounded streaming, and shared retry accounting;
+- bounded native workspace read/search and exact digest-checked patch tools, with protected runtime paths and explicit partial-edit results ([contract](ferrus-nano-workspace.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -176,7 +177,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
-| N1: headless Executor | #75-#80 | Live model validation, coding tools, command sessions, native context, lifecycle operations, and HQ launch/events |
+| N1: headless Executor | #77-#80 | Live model validation, command sessions, native context, lifecycle operations, and HQ launch/events |
 | N2: context efficiency | #81-#82 | Working-set invalidation, budgets, and compaction |
 | N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |

@@ -56,6 +56,11 @@ pub(crate) fn read_only_file(path: &Path) -> Result<File> {
 
 pub(crate) use imp::{rename, sync_directory};
 
+#[cfg(all(test, windows))]
+pub(crate) fn check_input_handle(file: &File) -> Result<()> {
+    imp::check_input(file, &file.metadata()?)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -300,13 +305,17 @@ mod imp {
     fn check_input_dacl(descriptor: PSECURITY_DESCRIPTOR) -> Result<()> {
         let owner = input_owner(descriptor)?;
         let actual = text(descriptor)?;
-        // Compare canonical DACLs, accepting a single explicit grant to either Owner
-        // Rights or the owning account. Extra or inherited grants still fail closed.
+        // SetSecurityInfo can add the descriptor's AI bookkeeping flag without
+        // changing its ACEs. Require protection and one explicit owner grant in
+        // either form; an inherited ACE (ID) or any extra grant still fails closed.
         for trustee in ["OW", owner.as_str()] {
             for rights in ["FA", "FR", "GR"] {
-                let expected = descriptor_from_text(&format!("D:P(A;;{rights};;;{trustee})"))?;
-                if actual == text(expected.0)? {
-                    return Ok(());
+                for flags in ["P", "PAI"] {
+                    let expected =
+                        descriptor_from_text(&format!("D:{flags}(A;;{rights};;;{trustee})"))?;
+                    if actual == text(expected.0)? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -372,10 +381,12 @@ mod imp {
         fn input_dacl_accepts_owner_account_and_owner_rights_only() {
             for trustee in ["OW", OWNER] {
                 for rights in ["FA", "FR", "GR"] {
-                    let descriptor =
-                        descriptor_from_text(&format!("O:{OWNER}D:P(A;;{rights};;;{trustee})"))
-                            .unwrap();
-                    check_input_dacl(descriptor.0).unwrap();
+                    for flags in ["P", "PAI"] {
+                        let sddl = format!("O:{OWNER}D:{flags}(A;;{rights};;;{trustee})");
+                        let descriptor = descriptor_from_text(&sddl).unwrap();
+                        check_input_dacl(descriptor.0)
+                            .unwrap_or_else(|error| panic!("{sddl}: {error}"));
+                    }
                 }
             }
             for dacl in [
@@ -384,6 +395,12 @@ mod imp {
                 format!("D:P(A;;FR;;;{OWNER})(A;;FR;;;WD)"),
                 format!("D:(A;;FR;;;{OWNER})"),
                 format!("D:P(A;ID;FR;;;{OWNER})"),
+                "D:PAI(A;;FR;;;WD)".to_owned(),
+                "D:PAI(A;;FR;;;S-1-5-21-100-200-300-1002)".to_owned(),
+                format!("D:PAI(A;;FR;;;{OWNER})(A;;FR;;;WD)"),
+                format!("D:AI(A;;FR;;;{OWNER})"),
+                format!("D:PAI(A;ID;FR;;;{OWNER})"),
+                "D:PAI".to_owned(),
             ] {
                 let descriptor = descriptor_from_text(&format!("O:{OWNER}{dacl}")).unwrap();
                 assert!(check_input_dacl(descriptor.0).is_err(), "{dacl}");
