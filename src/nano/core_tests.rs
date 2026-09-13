@@ -49,6 +49,7 @@ struct FakeTools {
     fail: bool,
     stall: bool,
     huge: bool,
+    uncertain_cleanup: bool,
 }
 
 impl Tools for FakeTools {
@@ -84,6 +85,10 @@ impl Tools for FakeTools {
         } else {
             ToolOutcome::Success(call.arguments.clone())
         }
+    }
+
+    async fn shutdown(&mut self) -> bool {
+        !self.uncertain_cleanup
     }
 }
 
@@ -253,6 +258,21 @@ async fn text_completion_records_usage_but_does_not_complete_a_ferrus_task() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn uncertain_tool_cleanup_cannot_certify_model_completion() {
+    let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), limits());
+    engine.tools.uncertain_cleanup = true;
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::EffectUnknown);
+    assert!(end.durable);
+    assert!(matches!(
+        engine.host.records.last().unwrap().event,
+        SessionEvent::Ended {
+            reason: EndReason::EffectUnknown
+        }
+    ));
 }
 
 #[tokio::test]

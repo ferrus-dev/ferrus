@@ -101,8 +101,13 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
 
         self.messages.push(Message::User { text: input });
 
-        let reason = self.drive(cancellation, deadline).await;
+        let mut reason = self.drive(cancellation, deadline).await;
+
         self.provider.cancel();
+
+        if !self.tools.shutdown().await && reason != EndReason::JournalFailed {
+            reason = EndReason::EffectUnknown;
+        }
         if reason == EndReason::JournalFailed {
             return Ok(self.journal_failure());
         }
