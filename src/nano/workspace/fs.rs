@@ -112,7 +112,10 @@ impl Parent {
         );
 
         let directory = self.directory.try_clone()?;
+        #[cfg(unix)]
         let file = platform::child(&directory, &name, false, true)?;
+        #[cfg(windows)]
+        let file = platform::create_staged(&directory, &name, mode.is_some())?;
         let mut staged = Staged {
             directory,
             name,
@@ -286,6 +289,116 @@ mod tests {
         .unwrap();
         assert!(root.open("alias").is_err());
         assert!(root.open("file").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_creates_need_only_inherited_modify_access() {
+        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+                },
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            },
+            Storage::FileSystem::{WRITE_DAC, WRITE_OWNER},
+        };
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path: Vec<u16> = directory
+            .path()
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // Keep full control of the fixture directory, but give children only Modify.
+        // An Owner Rights ACE also suppresses the owner's implicit WRITE_DAC access.
+        let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;OICIIO;0x001301bf;;;OW)"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        // SAFETY: the descriptor owns the ACL until SetNamedSecurityInfoW returns;
+        // the path and all output pointers remain live. Only this temp fixture changes.
+        unsafe {
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            let extracted =
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted);
+            let status = if extracted != 0 && present != 0 && !dacl.is_null() {
+                SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null(),
+                )
+            } else {
+                u32::MAX
+            };
+            LocalFree(descriptor);
+            assert_eq!(status, 0, "fixture DACL setup failed");
+        }
+
+        let probe = directory.path().join("ordinary.txt");
+        fs::write(&probe, b"ordinary").expect("ordinary file creation with Modify access");
+        for access in [WRITE_DAC, WRITE_OWNER] {
+            let error = fs::OpenOptions::new()
+                .access_mode(access)
+                .open(&probe)
+                .expect_err("fixture must deny security-management access");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        let root = Root::new(&directory.path().canonicalize().unwrap()).unwrap();
+        let parent = root.parent("created.txt").unwrap();
+        let staged = parent
+            .stage(b"created", None)
+            .expect("create needs no owner rights");
+        parent
+            .publish(staged, true)
+            .unwrap_or_else(|error| panic!("create publication failed: {}", error.error));
+        let target = directory.path().join("created.txt");
+        assert_eq!(fs::read(&target).unwrap(), b"created");
+        // Publication retains the inherited ACL instead of granting additional rights.
+        for access in [WRITE_DAC, WRITE_OWNER] {
+            assert_eq!(
+                fs::OpenOptions::new()
+                    .access_mode(access)
+                    .open(&target)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        drop(parent.stage(b"discarded", None).unwrap());
+        let mode = parent.open().unwrap().metadata().unwrap().permissions();
+        assert_eq!(
+            parent
+                .stage(b"replacement", Some(&mode))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"created");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[cfg(windows)]

@@ -19,11 +19,12 @@ pub(super) fn identity(file: &File) -> io::Result<(u64, u128)> {
 }
 
 pub(super) fn patch_name_key(name: &str) -> String {
+    use caseless::Caseless;
     use unicode_normalization::UnicodeNormalization;
 
     // Absent targets have no inode. Conservatively reject canonical/case aliases
     // within a batch, including on volumes that permit both spellings.
-    name.nfd().flat_map(char::to_lowercase).nfd().collect()
+    name.nfd().default_case_fold().nfd().collect()
 }
 
 pub(super) fn root(path: &Path) -> io::Result<File> {

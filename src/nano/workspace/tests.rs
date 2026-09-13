@@ -304,6 +304,34 @@ async fn unix_patch_preflight_rejects_canonically_equivalent_new_targets() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn unix_patch_preflight_rejects_full_casefold_aliases() {
+    for (first, second) in [
+        ("source", "\u{17f}ource"),
+        ("strasse", "stra\u{df}e"),
+        ("\u{3c3}", "\u{3c2}"),
+        ("ffi", "\u{fb03}"),
+        ("\u{1fc3}", "\u{3b7}\u{3b9}"),
+    ] {
+        let (dir, mut workspace) = setup();
+        let result = apply(
+            &mut workspace,
+            ["unrelated", first, second]
+                .into_iter()
+                .map(|path| Edit::Create {
+                    path: path.into(),
+                    content: "new\n".into(),
+                })
+                .collect(),
+        )
+        .await;
+        assert!(!result.complete && result.changes.is_empty(), "{result:?}");
+        assert_eq!(result.failure.unwrap().code, Code::InvalidPatch);
+        assert_eq!(disk::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn unix_patch_target_keys_use_the_opened_parent_identity() {
     let (dir, mut workspace) = setup();
     let first = "caf\u{e9}";

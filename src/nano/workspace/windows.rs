@@ -80,7 +80,24 @@ pub(super) fn child(parent: &File, value: &str, directory: bool, create: bool) -
         return parent.try_clone();
     }
 
-    open(parent, value, directory, create, create)
+    open(
+        parent,
+        value,
+        directory,
+        create,
+        if create { DELETE } else { 0 },
+    )
+}
+
+pub(super) fn create_staged(parent: &File, value: &str, copy_security: bool) -> io::Result<File> {
+    // New targets inherit their ACL. Only replacements need to copy security metadata.
+    let access = DELETE
+        | if copy_security {
+            WRITE_DAC | WRITE_OWNER
+        } else {
+            0
+        };
+    open(parent, value, false, true, access)
 }
 
 fn open(
@@ -88,7 +105,7 @@ fn open(
     value: &str,
     directory: bool,
     create: bool,
-    delete: bool,
+    extra_access: u32,
 ) -> io::Result<File> {
     let mut name: Vec<u16> = value.encode_utf16().collect();
     let length = u16::try_from(name.len() * 2).map_err(|_| unsafe_file())?;
@@ -114,13 +131,7 @@ fn open(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_READ
-                | if create {
-                    FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
-                } else {
-                    0
-                }
-                | if delete { DELETE } else { 0 },
+            FILE_GENERIC_READ | if create { FILE_GENERIC_WRITE } else { 0 } | extra_access,
             &attributes,
             &mut status_block,
             std::ptr::null(),
@@ -132,7 +143,7 @@ fn open(
                 | FILE_OPEN_FOR_BACKUP_INTENT
                 | if directory {
                     FILE_DIRECTORY_FILE
-                } else if create || delete {
+                } else if create || extra_access & DELETE != 0 {
                     FILE_NON_DIRECTORY_FILE
                 } else {
                     0
@@ -240,7 +251,7 @@ pub(super) fn finish_publish(_: &File, _: &str, _: bool) -> io::Result<()> {
 }
 
 pub(super) fn delete(parent: &File, value: &str) -> io::Result<()> {
-    let file = open(parent, value, false, false, true)?;
+    let file = open(parent, value, false, false, DELETE)?;
     discard(&file)
 }
 
