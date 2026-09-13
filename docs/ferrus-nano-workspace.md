@@ -31,6 +31,8 @@ for writes, including after edits made outside Nano.
 
 Default host limits are 1 MiB per file, 8 MiB of search content, 4096 visited/pending
 entries, a 24 KiB serialized result, and a cooperative five-second operation deadline.
+Files may consume the exact remaining search allowance. Growth probes share that
+allowance; when no probe byte fits, the opened file's length is checked after reading.
 Read results admit at most 2000 lines; search admits at most 128 matching lines.
 Callers may request smaller outputs. JSON escaping counts toward the output allowance.
 Filesystem work is synchronous and bounded per file; cancellation/deadline checkpoints

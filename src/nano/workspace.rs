@@ -226,16 +226,17 @@ impl Workspace {
     }
 
     fn read_content(&self, file: std::fs::File, path: &str) -> Result<Content> {
-        self.read_content_limited(file, path, self.limits.file_bytes, &mut 0)
+        self.read_content_limited(file, path, self.limits.file_bytes + 1, &mut 0)
     }
 
     fn read_content_limited(
         &self,
-        file: std::fs::File,
+        mut file: std::fs::File,
         path: &str,
-        limit: usize,
+        read_budget: usize,
         inspected: &mut usize,
     ) -> Result<Content> {
+        let limit = self.limits.file_bytes.min(read_budget);
         let meta = file.metadata().map_err(|e| Failure::io(path, e))?;
         fs::regular(&file).map_err(|e| Failure::io(path, e))?;
         if meta.len() > limit as u64 {
@@ -243,10 +244,19 @@ impl Workspace {
         }
 
         let mut bytes = Vec::new();
-        let read = file.take(limit as u64 + 1).read_to_end(&mut bytes);
+        let read_limit = (limit + 1).min(read_budget);
+        let read = file
+            .by_ref()
+            .take(read_limit as u64)
+            .read_to_end(&mut bytes);
         *inspected += bytes.len();
         read.map_err(|e| Failure::io(path, e))?;
-        if bytes.len() > limit {
+        // Probe growth only within the read budget. If content uses it all,
+        // recheck the opened file's length instead of reading an extra byte.
+        if bytes.len() > limit
+            || (bytes.len() == read_budget
+                && file.metadata().map_err(|e| Failure::io(path, e))?.len() > limit as u64)
+        {
             return Err(Failure::new(Code::FileTooLarge, path));
         }
 
@@ -434,9 +444,8 @@ impl Workspace {
                     return Err(Failure::new(Code::FileTooLarge, &path));
                 }
 
-                let cap = self.limits.file_bytes.min(remaining - 1);
                 let content =
-                    self.read_content_limited(file, &path, cap, &mut result.scanned_bytes)?;
+                    self.read_content_limited(file, &path, remaining, &mut result.scanned_bytes)?;
 
                 for (index, line) in content.text.split_inclusive('\n').enumerate() {
                     let Some(column) = line.find(&request.query) else {

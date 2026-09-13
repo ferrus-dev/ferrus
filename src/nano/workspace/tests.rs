@@ -419,6 +419,74 @@ async fn literal_search_is_sorted_bounded_and_reports_skips() {
 }
 
 #[tokio::test]
+async fn search_uses_the_full_remaining_scan_budget() {
+    for (file_bytes, scan_bytes, sizes) in [
+        (8, 64, vec![8; 8]),
+        (8, 13, vec![8, 5]),
+        (8, 9, vec![8, 1]),
+        (8, 8, vec![8]),
+    ] {
+        let (dir, mut workspace) = setup();
+        workspace.limits.file_bytes = file_bytes;
+        workspace.limits.scan_bytes = scan_bytes;
+        for (i, size) in sizes.iter().enumerate() {
+            disk::write(dir.path().join(format!("file{i}")), "x".repeat(*size)).unwrap();
+        }
+        let result = workspace
+            .search_text(
+                serde_json::from_value(json!({"query":"x"})).unwrap(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated, "{result:?}");
+        assert!(result.issues.is_empty(), "{result:?}");
+        assert_eq!(result.scanned_bytes, scan_bytes);
+        assert_eq!(result.matches.len(), sizes.len());
+        assert_eq!(
+            result.matches.last().unwrap().source.path,
+            format!("file{}", sizes.len() - 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_skips_oversized_files_without_spending_the_remaining_budget() {
+    for (scan_bytes, sizes, expected_paths, rejected) in [
+        (8, vec![9, 8], vec!["file1"], "file0"),
+        (9, vec![8, 2, 1], vec!["file0", "file2"], "file1"),
+        (8, vec![8, 1], vec!["file0"], "file1"),
+    ] {
+        let (dir, mut workspace) = setup();
+        workspace.limits.file_bytes = 8;
+        workspace.limits.scan_bytes = scan_bytes;
+        for (i, size) in sizes.iter().enumerate() {
+            disk::write(dir.path().join(format!("file{i}")), "x".repeat(*size)).unwrap();
+        }
+        let result = workspace
+            .search_text(
+                serde_json::from_value(json!({"query":"x"})).unwrap(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.scanned_bytes, scan_bytes);
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(result.issues[0].code, Code::FileTooLarge);
+        assert_eq!(result.issues[0].path, rejected);
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|hit| hit.source.path.as_str())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+    }
+}
+
+#[tokio::test]
 async fn search_caps_content_and_serialized_output_even_with_long_escaped_lines() {
     let (dir, mut workspace) = setup();
     for i in 0..20 {

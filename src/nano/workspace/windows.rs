@@ -97,6 +97,7 @@ pub(super) fn create_staged(parent: &File, value: &str, copy_security: bool) -> 
         } else {
             0
         };
+
     open(parent, value, false, true, access)
 }
 
