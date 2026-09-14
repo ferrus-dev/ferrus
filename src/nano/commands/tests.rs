@@ -181,6 +181,39 @@ fn child_fixture() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn windows_shell_runs_builtin_without_parsing_its_own_path_as_input() {
+    let mut f = fixture("shell-builtin", Limits::default());
+    let started = f
+        .commands
+        .exec(request("echo NANO_SHELL_OK"), &Cancellation::default())
+        .await
+        .unwrap();
+    let finished = terminal(&mut f.commands, &started.process_id).await;
+    let stderr = f
+        .commands
+        .read_output(&finished.stderr.handle, 0, MAX_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.completion,
+        Completion::Exited {
+            code: Some(0),
+            success: true
+        },
+        "stderr: {stderr:?}"
+    );
+    let stdout = f
+        .commands
+        .read_output(&finished.stdout.handle, 0, MAX_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(stdout.text.trim(), "NANO_SHELL_OK");
+    assert!(stderr.text.is_empty(), "stderr: {stderr:?}");
+    assert!(f.commands.shutdown().await);
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn windows_shell_preserves_quoted_paths_arguments_and_redirection() {
     let mut f = fixture("shell-quotes", Limits::default());
     fs::create_dir(f.workspace.join("tools & scripts")).unwrap();

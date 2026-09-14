@@ -89,7 +89,9 @@ impl TrustedLocal {
                     .0
                     .iter()
                     .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("SYSTEMROOT"))
-                    .map(|(_, root)| PathBuf::from(root).join("System32/cmd.exe"))
+                    // A literal "System32/cmd.exe" leaves /c in argv[0], which
+                    // cmd can interpret as its execute switch. Use native separators.
+                    .map(|(_, root)| PathBuf::from(root).join("System32").join("cmd.exe"))
                     .ok_or_else(|| anyhow::anyhow!("Missing Windows system directory"))?,
             );
             command.args(["/D", "/S", "/C"]);
