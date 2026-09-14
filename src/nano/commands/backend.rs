@@ -82,6 +82,8 @@ impl TrustedLocal {
         // Disable cmd.exe AutoRun even when the host has it configured.
         #[cfg(windows)]
         let mut command = {
+            use std::os::windows::process::CommandExt;
+
             let mut command = Command::new(
                 self.environment
                     .0
@@ -90,7 +92,10 @@ impl TrustedLocal {
                     .map(|(_, root)| PathBuf::from(root).join("System32/cmd.exe"))
                     .ok_or_else(|| anyhow::anyhow!("Missing Windows system directory"))?,
             );
-            command.args(["/D", "/S", "/C", text]);
+            command.args(["/D", "/S", "/C"]);
+            // cmd uses shell quoting, not C runtime argument escaping. /S removes
+            // this outer pair while preserving quotes and operators inside text.
+            command.as_std_mut().raw_arg(format!("\"{text}\""));
             command
         };
 

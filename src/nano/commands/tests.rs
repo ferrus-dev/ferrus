@@ -179,6 +179,47 @@ fn child_fixture() {
     }
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_shell_preserves_quoted_paths_arguments_and_redirection() {
+    let mut f = fixture("shell-quotes", Limits::default());
+    fs::create_dir(f.workspace.join("tools & scripts")).unwrap();
+    fs::write(
+        f.workspace.join("tools & scripts/fixture.cmd"),
+        "@echo off\r\necho %1\r\nexit /b 7\r\n",
+    )
+    .unwrap();
+    let started = f
+        .commands
+        .exec(
+            request(r#""tools & scripts\fixture.cmd" "value & spaces" > "captured output.txt""#),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    let finished = terminal(&mut f.commands, &started.process_id).await;
+    let stderr = f
+        .commands
+        .read_output(&finished.stderr.handle, 0, MAX_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.completion,
+        Completion::Exited {
+            code: Some(7),
+            success: false
+        },
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(f.workspace.join("captured output.txt"))
+            .unwrap()
+            .trim(),
+        r#""value & spaces""#
+    );
+    assert!(f.commands.shutdown().await);
+}
+
 #[tokio::test]
 async fn streams_are_spooled_paginated_and_stdin_is_eof() {
     let mut f = fixture("streams", Limits::default());
