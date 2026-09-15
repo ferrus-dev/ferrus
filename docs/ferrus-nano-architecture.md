@@ -1,12 +1,13 @@
 # Ferrus Nano: Native Agent Harness
 
-Status: accepted implementation plan, updated 2026-09-08. The #73 managed-session binding,
-#74 bounded engine/journal, and #75 opt-in Chat Completions adapter are implemented. Live model
+Status: accepted implementation plan, updated 2026-09-13. The #73 managed-session binding,
+#74 bounded engine/journal, #75 opt-in Chat Completions adapter, #76 workspace tools, and
+#77 command sessions are implemented. Live model
 validation, launcher, and later slices remain planned. No measured performance claim.
 
 Working product name: `ferrus-nano`. Ferrus backend name: `nano`.
 
-Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [roadmap](milestones.md), [repository graph](repository-graph-architecture.md),
+Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [command sessions](ferrus-nano-commands.md), [roadmap](milestones.md), [repository graph](repository-graph-architecture.md),
 [project memory](project-memory-architecture.md).
 
 ## 1. Decision
@@ -64,7 +65,7 @@ Audit base: Ferrus commit `4f52783d6f5efa64ea1a2adf48b55c8b27c565be`.
 | MCP | neva 0.5.6 with `server`, `di`, `legacy-spec` | Add client features for external tools, preserve protocol compatibility |
 | Agent engine | Sequential bounded core, provider/tool/host interfaces, durable journal, pure replay, and scripted tests | Live model validation, managed tool wiring, compaction, and live resume |
 | Instructions | Ferrus role prompts, project guidance, and embedded skill templates | A bounded native instruction loader with explicit precedence and provenance |
-| Coding tools | Graph source readers, check runner and process primitives | General bounded reads/search, patch editing, command sessions |
+| Coding tools | Bounded native reads/search, exact patches, and cancellable command sessions | Managed lifecycle/check wiring and context invalidation policy |
 
 Important source locations:
 
@@ -252,8 +253,8 @@ Keep original/new digests sufficient to reconcile an interrupted edit. Do not si
 stale edit with fuzzy matching. Binary and oversized content return explicit limitations.
 
 Use existing process lifecycle helpers and bounded check-output primitives where appropriate.
-General command sessions still need duration limits, process-tree cancellation, output cursors,
-and disk quotas. Build/test commands in managed mode continue through Ferrus `check`; a generic
+The #77 command adapter adds duration limits, process-tree cancellation, output cursors,
+and disk quotas; see [command sessions](ferrus-nano-commands.md). Build/test commands in managed mode continue through Ferrus `check`; a generic
 shell success is not a check receipt. Ferrus retains ownership of Git staging, history, and final
 integration. Native file tools cannot modify runtime databases or `.ferrus/` lifecycle artifacts.
 

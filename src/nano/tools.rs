@@ -84,6 +84,12 @@ pub(crate) trait Tools {
     /// Implementations must clean up owned processes on drop and reconcile effects whose
     /// completion cannot be observed. Cancellation/deadline may drop this future.
     async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome;
+
+    /// Join or stop session-owned effects before the engine records its terminal state.
+    /// False means cleanup could not be confirmed; completion must remain unknown.
+    async fn shutdown(&mut self) -> bool {
+        true
+    }
 }
 
 pub(crate) trait Host {

@@ -19,7 +19,8 @@ The engine imports transport-neutral provider, tool, host, and journal interface
   model responses and duplicate call IDs end the attempt before any tool executes.
 - `Tools` describes the enabled catalog, validates parsed argument objects against each tool's
   schema, and executes validated calls sequentially. Unknown tools and malformed arguments produce
-  typed feedback. The catalog is captured once per model turn.
+  typed feedback. The catalog is captured once per model turn. Before the terminal record,
+  `shutdown` joins/stops owned effects; unconfirmed cleanup changes the reason to `EffectUnknown`.
 - `Host` revalidates authority immediately before an effect and receives committed records.
   Managed Ferrus binding remains in `nano/ferrus.rs`; the engine imports no HQ, MCP, or project types.
 - `Journal` commits versioned records and complete-group checkpoints. The file implementation is
@@ -29,6 +30,8 @@ Tool adapters must clean up owned processes when execution is interrupted. Dropp
 future does not prove rollback: cancellation or deadline during execution records `Unknown` and
 ends the attempt. No subsequent effect runs. Native critical sections and later resume adapters
 must reconcile the outcome against the effect's authority; #79 and #84 provide that integration.
+The #77 [command adapter](ferrus-nano-commands.md) implements bounded background supervision
+and cleanup without blocking provider or host control work.
 
 ## Durable order
 

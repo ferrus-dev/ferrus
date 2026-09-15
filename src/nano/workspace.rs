@@ -527,6 +527,36 @@ fn results() -> usize {
     50
 }
 
+/// Validate a command's initial directory using the native no-follow traversal.
+/// A trusted-local shell can subsequently access the host; this is not a sandbox.
+pub(super) fn command_directory(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
+    let directory = fs::Root::new(root).map_err(|e| Failure::io(relative, e))?;
+    if relative == "." {
+        return Ok(root.to_owned());
+    }
+
+    let relative = path(relative)?;
+    let file = directory
+        .open(&relative)
+        .map_err(|e| Failure::io(&relative, e))?;
+
+    if !file
+        .metadata()
+        .map_err(|e| Failure::io(&relative, e))?
+        .is_dir()
+    {
+        return Err(Failure::new(Code::InvalidPath, &relative));
+    }
+
+    Ok(root.join(relative))
+}
+
+impl Workspace {
+    pub(super) fn invalidate_for_command(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+}
+
 fn roots() -> Vec<String> {
     vec![".".into()]
 }
