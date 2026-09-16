@@ -180,6 +180,8 @@ impl WorkerError {
 
 pub struct StatelessIndexWorker {
     limits: WorkerLimits,
+    #[cfg(test)]
+    elapsed_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -209,7 +211,11 @@ struct MemoryRepositorySnapshots<'a> {
 
 impl StatelessIndexWorker {
     pub fn new(limits: WorkerLimits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            #[cfg(test)]
+            elapsed_ms: None,
+        }
     }
 
     pub fn execute<C, O, F>(
@@ -1052,6 +1058,13 @@ impl StatelessIndexWorker {
     }
 
     fn remaining_job_duration_ms(&self, deadline: WorkerDeadline) -> Result<u64, WorkerError> {
+        #[cfg(test)]
+        if let Some(elapsed_ms) = &self.elapsed_ms {
+            return remaining_duration_ms(
+                deadline.limit_ms,
+                elapsed_ms.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         let elapsed_ms = u64::try_from(deadline.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         remaining_duration_ms(deadline.limit_ms, elapsed_ms)
     }

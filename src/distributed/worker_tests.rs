@@ -2,6 +2,10 @@
 
 use std::{
     cell::Cell,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -238,34 +242,34 @@ fn fact_store(path: &std::path::Path) -> SqliteFactBatchStore {
     .unwrap()
 }
 
-struct DelayedFactStore {
+struct ExpiringFactStore {
     inner: SqliteFactBatchStore,
-    delay: Duration,
-    delay_put: bool,
-    delay_progress: bool,
+    elapsed_ms: Arc<AtomicU64>,
+    expire_put: bool,
+    expire_progress: bool,
     put_calls: u64,
     progress_calls: Cell<u64>,
 }
 
-impl DelayedFactStore {
+impl ExpiringFactStore {
     fn new(
         inner: SqliteFactBatchStore,
-        delay: Duration,
-        delay_put: bool,
-        delay_progress: bool,
+        elapsed_ms: Arc<AtomicU64>,
+        expire_put: bool,
+        expire_progress: bool,
     ) -> Self {
         Self {
             inner,
-            delay,
-            delay_put,
-            delay_progress,
+            elapsed_ms,
+            expire_put,
+            expire_progress,
             put_calls: 0,
             progress_calls: Cell::new(0),
         }
     }
 }
 
-impl FactBatchStore for DelayedFactStore {
+impl FactBatchStore for ExpiringFactStore {
     type Error = crate::distributed::fact_store_sqlite::FactStoreError;
 
     fn protection(&self) -> FactStoreProtection {
@@ -280,8 +284,8 @@ impl FactBatchStore for DelayedFactStore {
     ) -> Result<PutFactBatchOutcome, Self::Error> {
         let outcome = self.inner.put(batch, authority, deadline)?;
         self.put_calls = self.put_calls.saturating_add(1);
-        if self.delay_put && self.put_calls == 1 {
-            std::thread::sleep(self.delay);
+        if self.expire_put && self.put_calls == 1 {
+            self.elapsed_ms.store(u64::MAX, Ordering::Relaxed);
         }
         Ok(outcome)
     }
@@ -293,8 +297,8 @@ impl FactBatchStore for DelayedFactStore {
     ) -> Result<FactBatchProgressOutcome, Self::Error> {
         let calls = self.progress_calls.get().saturating_add(1);
         self.progress_calls.set(calls);
-        if self.delay_progress && calls == 1 {
-            std::thread::sleep(self.delay);
+        if self.expire_progress && calls == 1 {
+            return Ok(FactBatchProgressOutcome::DeadlineExceeded);
         }
         self.inner.progress(job, deadline)
     }
@@ -650,33 +654,52 @@ fn worker_rechecks_the_deadline_after_fact_store_operations() {
     );
     let request = execution_request(running);
     let mut limits = worker_limits();
-    limits.max_job_duration_ms = NonZeroU64::new(1_000).unwrap();
-    let worker = StatelessIndexWorker::new(limits);
-    let delay = Duration::from_millis(1_100);
+    // One batch makes the post-put check observable without another loop iteration.
+    limits.max_facts_per_batch = NonZeroU64::new(100_000).unwrap();
+    let mut worker = StatelessIndexWorker::new(limits);
+    // Freeze worker elapsed time until the store expires it. Real storage calls
+    // retain the normal deadline, so setup speed cannot consume a tiny test budget.
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    worker.elapsed_ms = Some(elapsed_ms.clone());
 
-    let mut delayed_put = DelayedFactStore::new(
-        fact_store(&storage_dir.path().join("delayed-put-facts.db")),
-        delay,
+    let mut unexpired = ExpiringFactStore::new(
+        fact_store(&storage_dir.path().join("unexpired-facts.db")),
+        elapsed_ms.clone(),
+        false,
+        false,
+    );
+    let outcome = worker
+        .execute(&request, &jobs, &objects, &mut unexpired)
+        .unwrap();
+    assert_eq!(outcome.stored_batches, 1);
+    assert_eq!(unexpired.progress_calls.get(), 1);
+
+    let mut expired_put = ExpiringFactStore::new(
+        fact_store(&storage_dir.path().join("expired-put-facts.db")),
+        elapsed_ms.clone(),
         true,
         false,
     );
     assert_eq!(
-        worker.execute(&request, &jobs, &objects, &mut delayed_put),
+        worker.execute(&request, &jobs, &objects, &mut expired_put),
         Err(WorkerError::DeadlineExceeded)
     );
-    assert_eq!(delayed_put.put_calls, 1);
+    assert_eq!(expired_put.put_calls, 1);
+    assert_eq!(expired_put.progress_calls.get(), 0);
 
-    let mut delayed_progress = DelayedFactStore::new(
-        fact_store(&storage_dir.path().join("delayed-progress-facts.db")),
-        delay,
+    elapsed_ms.store(0, Ordering::Relaxed);
+    let mut expired_progress = ExpiringFactStore::new(
+        fact_store(&storage_dir.path().join("expired-progress-facts.db")),
+        elapsed_ms,
         false,
         true,
     );
     assert_eq!(
-        worker.execute(&request, &jobs, &objects, &mut delayed_progress),
+        worker.execute(&request, &jobs, &objects, &mut expired_progress),
         Err(WorkerError::DeadlineExceeded)
     );
-    assert_eq!(delayed_progress.progress_calls.get(), 1);
+    assert_eq!(expired_progress.put_calls, 1);
+    assert_eq!(expired_progress.progress_calls.get(), 1);
 }
 
 #[test]

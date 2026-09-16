@@ -53,7 +53,7 @@ impl LaunchContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct FerrusSession {
     scope: ExecutorSessionScope,
     project_id: String,
@@ -118,6 +118,17 @@ impl FerrusSession {
 
         session.status().await?;
         Ok(session)
+    }
+
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        self.scope
+            .database_path
+            .parent()
+            .expect("bound database has a parent")
+    }
+
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.scope.workspace_path
     }
 
     pub(crate) fn project_id(&self) -> &str {

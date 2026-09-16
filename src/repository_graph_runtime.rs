@@ -58,6 +58,7 @@ struct RefreshAlreadyInProgress;
 
 pub(crate) struct LocalGraphContext {
     pub(crate) project_root: std::path::PathBuf,
+    pub(crate) query_path: Option<std::path::PathBuf>,
     pub(crate) root: std::path::PathBuf,
     pub(crate) repository: RepositoryRef,
     pub(crate) config: RepositoryGraphConfig,
@@ -138,6 +139,7 @@ impl LocalGraphContext {
             .unwrap_or_else(|| root.clone());
         Ok(Self {
             project_root: root,
+            query_path: None,
             root: source_root,
             repository: RepositoryRef {
                 namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
@@ -148,6 +150,45 @@ impl LocalGraphContext {
             task_view_id,
             run_id,
         })
+    }
+
+    /// The caller validated the exact managed run; never consult ambient identity.
+    pub(crate) async fn load_for_runtime(
+        root: &Path,
+        project_id: &str,
+        data_dir: &Path,
+        runtime: &project::RuntimeTaskContext,
+    ) -> Result<Self> {
+        let contents = tokio::fs::read_to_string(root.join("ferrus.toml")).await?;
+        let config = RepositoryGraphConfig::from_ferrus_toml(&contents)?;
+        anyhow::ensure!(
+            runtime.run_role.as_deref() == Some("executor"),
+            "Expected Executor view"
+        );
+        let workspace = runtime
+            .repository_workspace_path
+            .as_ref()
+            .context("Missing managed repository workspace")?;
+        Ok(Self {
+            project_root: root.to_path_buf(),
+            root: workspace.into(),
+            query_path: Some(data_dir.join(SIDECAR_FILE_NAME)),
+            repository: RepositoryRef {
+                namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+                repository_id: RepositoryId::new("root")?,
+            },
+            config,
+            repository_view: Some(runtime.repository_view.clone()),
+            task_view_id: Some(TaskViewId::new(&runtime.task_id)?),
+            run_id: runtime.run_id.clone(),
+        })
+    }
+
+    async fn query_sidecar_path(&self) -> Result<std::path::PathBuf> {
+        match &self.query_path {
+            Some(path) => Ok(path.clone()),
+            None => sidecar_path().await,
+        }
     }
 
     pub(crate) fn discover(&self) -> Result<LocalRepositorySource> {
@@ -227,7 +268,7 @@ impl LocalGraphContext {
             self.attach_task_view_to_status(&mut response);
             return Ok(response);
         }
-        let path = sidecar_path().await?;
+        let path = self.query_sidecar_path().await?;
         // Discovering the current manifest can walk and hash the repository.
         // MCP retrieval must stay latency-bounded, so without a reliable source
         // mutation token it reports freshness as unknown rather than stale data
@@ -256,7 +297,7 @@ impl LocalGraphContext {
         if let Some(status) = self.unavailable_task_view_status() {
             return Ok(Err(unavailable_task_view_error(status)));
         }
-        let path = sidecar_path().await?;
+        let path = self.query_sidecar_path().await?;
         let mut response = search_response_at(self, &path, None, request);
         if let Ok(response) = response.as_mut() {
             // The durable stale marker is conservative and avoids a full
@@ -282,7 +323,7 @@ impl LocalGraphContext {
         if let Some(status) = self.unavailable_task_view_status() {
             return Ok(Err(unavailable_task_view_error(status)));
         }
-        let path = sidecar_path().await?;
+        let path = self.query_sidecar_path().await?;
         let mut response = context_response_at(self, &path, None, request);
         if let Ok(response) = response.as_mut() {
             self.apply_canonical_invalidation(response).await;
@@ -300,7 +341,7 @@ impl LocalGraphContext {
             Ok(response) => response,
             Err(error) => return Ok(Err(error)),
         };
-        let path = sidecar_path().await?;
+        let path = self.query_sidecar_path().await?;
         Ok(attach_snippets_at(
             self,
             &path,

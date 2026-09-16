@@ -153,6 +153,61 @@ impl LocalProjectContext {
         })
     }
 
+    /// Explicit project/run adaptation for native managed retrieval.
+    pub(crate) async fn load_for_runtime(
+        root: &std::path::Path,
+        project_id: &str,
+        data_dir: &std::path::Path,
+        runtime: &project::RuntimeTaskContext,
+        domain: ContextDomain,
+        snippets: bool,
+    ) -> AnyResult<Self> {
+        let contents = tokio::fs::read_to_string(root.join("ferrus.toml")).await?;
+        let graph = if domain != ContextDomain::Memory {
+            Some(LocalGraphContext::load_for_runtime(root, project_id, data_dir, runtime).await?)
+        } else {
+            None
+        };
+        let query_limits = QueryLimitsConfig::from_ferrus_toml(&contents)?;
+        let project = ProjectRef {
+            namespace: ProjectNamespace::new("local:ferrus")?,
+            project_id: ProjectId::new(project_id)?,
+        };
+        let data_dir = data_dir.to_path_buf();
+        let exact_memory_source = if snippets && domain != ContextDomain::Repository {
+            let config: toml::Value = toml::from_str(&contents)?;
+            let spec = config
+                .get("spec")
+                .and_then(|v| v.get("directory"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or("docs/specs");
+            let spec = crate::repository_graph::domain::RepoPath::new(spec)?;
+            let (root, data, project) = (root.to_path_buf(), data_dir.clone(), project.clone());
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    LocalMemorySource::discover_at(
+                        root,
+                        data,
+                        project,
+                        spec,
+                        MemoryPolicy::default(),
+                    )
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            graph,
+            query_limits,
+            project,
+            data_dir,
+            exact_memory_source,
+            compare_local_freshness: false,
+        })
+    }
+
     pub(crate) fn default_budget(&self) -> AnyResult<MemoryQueryBudget> {
         default_memory_budget(&self.query_limits).map_err(Into::into)
     }

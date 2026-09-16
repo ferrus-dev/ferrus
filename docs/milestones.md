@@ -91,7 +91,7 @@ What remains:
 
 - expand language-specific extraction and cross-file resolution beyond Rust/Cargo;
 - broaden task-level quality and token/cost evaluation on realistic repositories;
-- consume graph and memory APIs natively from nano in #78, then add working-set policy in #81;
+- extend native nano graph/memory consumption (#78) with working-set policy in #81;
 - keep graph failures independent of task lifecycle, and retain explicit fallback when context is unavailable.
 
 See [graph architecture](repository-graph-architecture.md),
@@ -150,7 +150,7 @@ Definition of done:
 
 ## Milestone 5: Ferrus Nano-Agent
 
-Status: native session, engine/journal, provider, file tools, and command sessions implemented (#73-#77); the runnable harness is not available yet.
+Status: native session, engine/journal, provider, file/command tools, and scoped native context implemented (#73-#78); the runnable harness is not available yet.
 
 Goal: build `ferrus-nano` (backend `nano`) as a minimal Rust coding-agent harness. Start with a
 headless managed Executor, using Ferrus operations, repository graph, and project memory through
@@ -170,6 +170,7 @@ Implemented foundation:
 - an opt-in Chat Completions adapter targeting LM Studio, with private credential-file references, bounded streaming, and shared retry accounting;
 - bounded native workspace read/search and exact digest-checked patch tools, with protected runtime paths and explicit partial-edit results ([contract](ferrus-nano-workspace.md));
 - trusted-local command sessions with tree cancellation, environment isolation, output cursors/quotas, and engine shutdown cleanup ([contract](ferrus-nano-commands.md));
+- scoped instructions and selected skills with digests/caps, native graph/memory retrieval, and labeled workspace fallback ([contract](ferrus-nano-context.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -178,7 +179,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
-| N1: headless Executor | #78-#80 | Live model validation, native context, lifecycle operations, and HQ launch/events |
+| N1: headless Executor | #79-#80 | Live model validation, lifecycle operations, and HQ launch/events |
 | N2: context efficiency | #81-#82 | Working-set invalidation, budgets, and compaction |
 | N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |
@@ -249,7 +250,7 @@ Remaining work:
 
 - richer archive inspection and optional portable export;
 - wider evaluation of retrieval quality and stale/unresolved cross-links;
-- native context consumption in nano (#78).
+- revision-aware working-set policy in nano (#81), building on native context consumption (#78).
 
 See [project memory](project-memory.md), [architecture](project-memory-architecture.md), and
 [evaluations](project-memory-evaluations.md).

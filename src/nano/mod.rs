@@ -2,6 +2,9 @@
 
 pub(crate) mod coding;
 pub(crate) mod commands;
+pub(crate) mod context;
+pub(crate) mod instructions;
+pub(crate) mod native;
 mod private;
 
 #[cfg(feature = "nano-openai")]
