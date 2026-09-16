@@ -329,6 +329,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap().keep();
         LocalGraphContext {
             project_root: directory.clone(),
+            query_path: None,
             root: directory,
             repository: crate::repository_graph::domain::RepositoryRef {
                 namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")

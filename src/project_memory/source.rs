@@ -174,8 +174,8 @@ impl LocalMemorySource {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn discover_at(
+    /// Discover authorized memory sources under an explicit local project binding.
+    pub fn discover_at(
         root: PathBuf,
         data_dir: PathBuf,
         project: ProjectRef,

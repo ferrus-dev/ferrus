@@ -40,6 +40,8 @@ pub(crate) enum ToolError {
     OutputLimit,
     /// Bounded native file-tool diagnostics, including per-path edit outcomes.
     Workspace(serde_json::Value),
+    /// Read-only context failure; never a successful canonical fallback.
+    Context(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

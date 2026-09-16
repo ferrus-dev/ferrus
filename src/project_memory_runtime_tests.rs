@@ -111,6 +111,7 @@ fn repository_only_queries_ignore_an_incompatible_memory_sidecar() {
     config.enabled = true;
     let graph = LocalGraphContext {
         project_root: workspace.path().to_path_buf(),
+        query_path: None,
         root: workspace.path().to_path_buf(),
         repository: repository.clone(),
         config: config.clone(),

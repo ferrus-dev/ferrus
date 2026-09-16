@@ -77,6 +77,7 @@ fn indexed_context(root: &Path, sidecar_path: &Path) -> (LocalGraphContext, Cont
 fn context(root: &Path) -> LocalGraphContext {
     LocalGraphContext {
         project_root: root.to_path_buf(),
+        query_path: None,
         root: root.to_path_buf(),
         repository: RepositoryRef {
             namespace: RepositoryNamespace::new("local:test").unwrap(),

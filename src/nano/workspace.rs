@@ -764,3 +764,37 @@ fn decode(name: &str, value: &Value) -> std::result::Result<Request, ToolError> 
         Err(ToolError::InvalidArguments)
     }
 }
+
+/// Host-selected instruction files only, including exact scoped Ferrus artifacts.
+/// This is not a model file-tool escape hatch for protected runtime paths.
+pub(super) fn instruction_file(
+    root: &Path,
+    name: &str,
+    limit: usize,
+) -> anyhow::Result<Option<(String, String)>> {
+    let name = RepoPath::new(name)?;
+    anyhow::ensure!(!name.as_str().contains('\\'), "Invalid instruction path");
+    let root = fs::Root::new(root)?;
+    let file = match root.open(name.as_str()) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    fs::regular(&file)?;
+    anyhow::ensure!(
+        file.metadata()?.len() <= limit as u64,
+        "Instruction file exceeds limit"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= limit && !bytes.contains(&0),
+        "Invalid or oversized instruction file"
+    );
+    let fingerprint = digest(&bytes);
+    Ok(Some((String::from_utf8(bytes)?, fingerprint)))
+}
+
+pub(super) fn instruction_target(value: &str) -> anyhow::Result<String> {
+    path(value).map_err(|failure| anyhow::anyhow!("Invalid instruction target: {:?}", failure.code))
+}

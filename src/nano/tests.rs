@@ -522,3 +522,6 @@ async fn missing_database_is_not_created_and_old_schema_is_not_migrated() {
     assert_eq!(version, 0);
     assert_eq!(fixture.events(), events);
 }
+
+#[path = "context_tests.rs"]
+mod context_tests;

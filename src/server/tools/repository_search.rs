@@ -301,6 +301,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = LocalGraphContext {
             project_root: directory.path().to_path_buf(),
+            query_path: None,
             root: directory.path().to_path_buf(),
             repository: crate::repository_graph::domain::RepositoryRef {
                 namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")
@@ -341,6 +342,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = LocalGraphContext {
             project_root: directory.path().to_path_buf(),
+            query_path: None,
             root: directory.path().to_path_buf(),
             repository: crate::repository_graph::domain::RepositoryRef {
                 namespace: crate::repository_graph::domain::RepositoryNamespace::new("local:test")
