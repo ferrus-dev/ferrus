@@ -444,7 +444,6 @@ pub(super) async fn poll_answer(session: &FerrusSession, human: bool) -> Result<
                 &format!("{}/{name}", context.run_dir),
                 16 * 1024,
             )?
-
             else {
                 return Ok(None);
             };
