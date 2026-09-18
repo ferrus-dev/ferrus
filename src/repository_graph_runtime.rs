@@ -531,7 +531,7 @@ fn frozen_tree_matches_snapshot(
         && snapshot_files == source.manifest().files)
 }
 
-fn capture_matching_submitted_tree(
+pub(crate) fn capture_matching_submitted_tree(
     sidecar_path: &Path,
     workspace_root: &Path,
     task_id: &str,
@@ -719,16 +719,64 @@ pub(crate) async fn refresh_task_overlay(
     let existing = project::task_repository_view(task_id)
         .await?
         .context("task repository view has not been initialized")?;
+
+    let context = LocalGraphContext::load(false).await?;
+    let database_path = project::current_project_data_dir().await?.join("ferrus.db");
+
+    let result = refresh_task_overlay_with_context(
+        task_id,
+        workspace_root,
+        baseline_tree,
+        existing,
+        context,
+        database_path,
+    )
+    .await;
+
+    if result.is_ok() {
+        maintain_graph_best_effort().await;
+    }
+    result
+}
+
+pub(crate) async fn refresh_task_overlay_explicit(
+    context: LocalGraphContext,
+    data_dir: &Path,
+    runtime: &project::RuntimeTaskContext,
+    baseline_tree: &str,
+) -> Result<project::RepositoryViewReference> {
+    refresh_task_overlay_with_context(
+        &runtime.task_id,
+        Path::new(
+            runtime
+                .workspace_path
+                .as_deref()
+                .context("Missing workspace")?,
+        ),
+        baseline_tree,
+        runtime.repository_view.clone(),
+        context,
+        data_dir.join("ferrus.db"),
+    )
+    .await
+}
+
+async fn refresh_task_overlay_with_context(
+    task_id: &str,
+    workspace_root: &Path,
+    baseline_tree: &str,
+    existing: project::RepositoryViewReference,
+    context: LocalGraphContext,
+    database_path: std::path::PathBuf,
+) -> Result<project::RepositoryViewReference> {
+    if !context.config.enabled {
+        return Ok(existing);
+    }
     let baseline_snapshot_id = existing
         .baseline_snapshot_id
         .clone()
         .context("task repository graph baseline is unavailable")?;
-    let context = LocalGraphContext::load(false).await?;
-    if !context.config.enabled {
-        return Ok(existing);
-    }
-    let sidecar_path = sidecar_path().await?;
-    let database_path = project::current_project_data_dir().await?.join("ferrus.db");
+    let sidecar_path = context.query_sidecar_path().await?;
     let repository = context.repository.clone();
     let config = context.config.clone();
     let workspace_root = workspace_root.to_path_buf();
@@ -766,12 +814,14 @@ pub(crate) async fn refresh_task_overlay(
         {
             return Err(RefreshAlreadyInProgress.into());
         }
+
         let heartbeat = sidecar.start_refresh_lease_heartbeat(
             &repository,
             &view_name,
             build_id.as_str(),
             REFRESH_LEASE_TTL,
         )?;
+
         let refreshed = (|| -> Result<_> {
             let source = TaskOverlaySource::discover(
                 &workspace_root,
@@ -784,9 +834,11 @@ pub(crate) async fn refresh_task_overlay(
                 baseline_analysis_config_digest,
                 baseline_files,
             )?;
+
             if !source.requires_index() {
                 return Ok(None);
             }
+
             let overlay_revision_id = source.overlay_manifest().revision_id.clone();
             let outcome = IndexCoordinator::new(&mut sidecar).index(
                 &source,
@@ -797,11 +849,14 @@ pub(crate) async fn refresh_task_overlay(
                     force_full: false,
                 },
             )?;
+
             Ok(Some((overlay_revision_id, outcome.snapshot.id)))
         })();
+
         let lease_healthy = heartbeat.finish();
         let released = sidecar.release_refresh_lease(&repository, &view_name, build_id.as_str());
         let refreshed = refreshed?;
+
         if !lease_healthy || !released? {
             anyhow::bail!("task repository graph refresh lease was lost");
         }
@@ -838,7 +893,9 @@ pub(crate) async fn refresh_task_overlay(
             )
             .await?
             {
-                return current_task_repository_view(&task_id).await;
+                return project::task_repository_view_at(&database_path, &task_id)
+                    .await?
+                    .context("task repository view disappeared during refresh");
             }
             return Err(error);
         }
@@ -853,7 +910,9 @@ pub(crate) async fn refresh_task_overlay(
             )
             .await?
             {
-                return current_task_repository_view(&task_id).await;
+                return project::task_repository_view_at(&database_path, &task_id)
+                    .await?
+                    .context("task repository view disappeared during refresh");
             }
             return Err(error.into());
         }
@@ -866,16 +925,11 @@ pub(crate) async fn refresh_task_overlay(
     )
     .await?
     {
-        return current_task_repository_view(&task_id).await;
+        return project::task_repository_view_at(&database_path, &task_id)
+            .await?
+            .context("task repository view disappeared during refresh");
     }
-    maintain_graph_best_effort().await;
     Ok(repository_view)
-}
-
-async fn current_task_repository_view(task_id: &str) -> Result<project::RepositoryViewReference> {
-    project::task_repository_view(task_id)
-        .await?
-        .context("task repository view disappeared during refresh")
 }
 
 fn resolved_repository_view(

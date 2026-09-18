@@ -78,7 +78,7 @@ pub(crate) async fn renew_executor_session_lease(
 
 // Validate the exact run in the same transaction as its effects. Looking up the
 // latest run or lease by agent alone can silently retarget an old child process.
-async fn with_executor_session<T, F>(
+pub(crate) async fn with_executor_session<T, F>(
     scope: &ExecutorSessionScope,
     write: bool,
     operation: F,
@@ -117,6 +117,36 @@ where
         Ok(result)
     })
     .await?
+}
+
+/// Exact-run, live-owner fence used by native lifecycle mutations in this transaction.
+pub(crate) fn require_executor_owner(
+    transaction: &Transaction<'_>,
+    scope: &ExecutorSessionScope,
+) -> Result<()> {
+    let task =
+        task_candidate_by_id(transaction, &scope.task_id)?.context("Bound task is missing")?;
+
+    anyhow::ensure!(
+        task.claimed_by.as_deref() == Some(&scope.agent_id),
+        "Executor lease lost"
+    );
+
+    anyhow::ensure!(
+        parse_lease_until(task.lease_until.as_deref()).is_some_and(|until| Utc::now() < until),
+        "Executor lease expired"
+    );
+
+    Ok(())
+}
+
+pub(crate) fn executor_event(
+    transaction: &Transaction<'_>,
+    scope: &ExecutorSessionScope,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    insert_event_in_transaction(transaction, Some(&scope.run_id), kind, &payload)
 }
 
 fn executor_context_in_transaction(

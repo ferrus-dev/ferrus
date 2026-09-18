@@ -828,3 +828,15 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
     let replay = Replay::from_records(&engine.host.records).unwrap();
     assert_eq!(replay.budget, end.budget);
 }
+
+#[tokio::test]
+async fn replay_rejects_a_submitted_end_without_a_confirmed_handoff() {
+    let (_directory, mut engine) =
+        setup(scripted(vec![response("done", vec![])]), Limits::default());
+    run(&mut engine, &Cancellation::default()).await;
+    let mut records = engine.host.records.clone();
+    records.last_mut().unwrap().event = SessionEvent::Ended {
+        reason: EndReason::Submitted,
+    };
+    assert!(Replay::from_records(&records).is_err());
+}

@@ -1,9 +1,12 @@
 //! Native agent core and managed Ferrus adapter; frontend and provider wiring are separate.
 
+mod checks;
 pub(crate) mod coding;
 pub(crate) mod commands;
 pub(crate) mod context;
 pub(crate) mod instructions;
+mod lifecycle;
+pub(crate) mod managed;
 pub(crate) mod native;
 mod private;
 

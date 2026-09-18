@@ -798,3 +798,102 @@ pub(super) fn instruction_file(
 pub(super) fn instruction_target(value: &str) -> anyhow::Result<String> {
     path(value).map_err(|failure| anyhow::anyhow!("Invalid instruction target: {:?}", failure.code))
 }
+
+/// Host-only scoped lifecycle artifacts, using the same no-follow publication boundary.
+pub(super) fn runtime_artifact(
+    directory: &Path,
+    name: &str,
+    content: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        [
+            "SUBMISSION.md",
+            "PATCH.diff",
+            "INTEGRATION_ERROR.md",
+            "QUESTION.md",
+            "ANSWER.md",
+            "CONSULT_REQUEST.md",
+            "CONSULT_RESPONSE.md"
+        ]
+        .contains(&name),
+        "Invalid runtime artifact"
+    );
+    let root = fs::Root::new(directory)?;
+    let parent = root.parent(name)?;
+    let existing = match parent.open() {
+        Ok(file) => {
+            fs::regular(&file)?;
+            Some(file.metadata()?.permissions())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(content) = content {
+        let staged = parent.stage(content.as_bytes(), existing.as_ref())?;
+        parent
+            .publish(staged, existing.is_none())
+            .map_err(|e| e.error)?;
+    } else if existing.is_some() {
+        parent.delete().map_err(|e| e.error)?;
+    }
+    Ok(())
+}
+
+/// Non-Git submit fence. This scans bounded source bytes, excluding Ferrus runtime artifacts.
+pub(super) fn source_stamp(directory: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let root = fs::Root::new(directory)?;
+    let mut paths = vec![String::from(".")];
+    let mut entries = 0usize;
+    let mut remaining = 64 * 1024 * 1024u64;
+    let mut hash = Sha256::new();
+    while let Some(path) = paths.pop() {
+        entries += 1;
+        anyhow::ensure!(entries <= 10_000, "Non-Git submit entry limit exceeded");
+        let file = if path == "." {
+            root.directory()?
+        } else {
+            root.open(&path)?
+        };
+        if file.metadata()?.is_dir() {
+            let (mut names, truncated) = fs::children(&file, 10_000)?;
+            anyhow::ensure!(!truncated, "Non-Git submit cannot inspect every filename");
+            names.sort();
+            for name in names.into_iter().rev() {
+                if path == "." && matches!(name.as_str(), ".git" | ".ferrus") {
+                    continue;
+                }
+                paths.push(if path == "." {
+                    name
+                } else {
+                    format!("{path}/{name}")
+                });
+            }
+        } else {
+            fs::regular(&file)?;
+            let permissions = file.metadata()?.permissions();
+            hash.update([u8::from(permissions.readonly())]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                hash.update(permissions.mode().to_le_bytes());
+            }
+            let mut bytes = Vec::new();
+            file.take(remaining + 1).read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= remaining,
+                "Non-Git submit byte limit exceeded"
+            );
+            remaining -= bytes.len() as u64;
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path.as_bytes());
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(&bytes);
+        }
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}

@@ -55,7 +55,7 @@ impl LaunchContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FerrusSession {
-    scope: ExecutorSessionScope,
+    pub(super) scope: ExecutorSessionScope,
     project_id: String,
     project_root: PathBuf,
     baseline_tree: Option<String>,
@@ -143,6 +143,10 @@ impl FerrusSession {
         self.baseline_tree.as_deref()
     }
 
+    pub(super) fn lease_ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     /// One nonblocking claim attempt; the future engine owns polling and cancellation.
     pub(crate) async fn claim(&self) -> Result<ReadyTaskClaim> {
         self.validate_baseline().await?;
@@ -157,6 +161,41 @@ impl FerrusSession {
     pub(crate) async fn heartbeat(&self) -> Result<LeaseRenewal> {
         self.validate_baseline().await?;
         project::renew_executor_session_lease(&self.scope, self.ttl_secs).await
+    }
+
+    /// Never reclaim here: after initial claim, loss of ownership ends this session.
+    pub(crate) async fn authorize(&self) -> Result<RuntimeTaskContext> {
+        self.validate_baseline().await?;
+        project::with_executor_session(&self.scope, false, |tx, scope, context| {
+            project::require_executor_owner(tx, scope)?;
+            ensure!(
+                matches!(
+                    context.status.as_str(),
+                    "executing" | "addressing" | "consultation" | "awaiting_human"
+                ),
+                "Executor work phase ended"
+            );
+            Ok(context)
+        })
+        .await
+    }
+
+    pub(super) async fn mutate<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(
+            &rusqlite::Transaction<'_>,
+            &ExecutorSessionScope,
+            RuntimeTaskContext,
+        ) -> Result<T>
+        + Send
+        + 'static,
+    ) -> Result<T> {
+        self.validate_baseline().await?;
+        project::with_executor_session(&self.scope, true, move |tx, scope, context| {
+            project::require_executor_owner(tx, scope)?;
+            operation(tx, scope, context)
+        })
+        .await
     }
 
     async fn validate_baseline(&self) -> Result<()> {

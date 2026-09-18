@@ -20,13 +20,13 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
-pub(super) struct Spool {
+pub(crate) struct Spool {
     file: Option<File>,
     path: PathBuf,
 }
 
 impl Spool {
-    pub(super) fn new(log_path: &Path, stream: &str) -> io::Result<Self> {
+    pub(crate) fn new(log_path: &Path, stream: &str) -> io::Result<Self> {
         loop {
             let sequence = SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path =
@@ -49,7 +49,7 @@ impl Spool {
         }
     }
 
-    pub(super) fn file(&self) -> &File {
+    pub(crate) fn file(&self) -> &File {
         self.file.as_ref().expect("spool is open")
     }
 }
@@ -61,7 +61,7 @@ impl Drop for Spool {
     }
 }
 
-pub(super) fn finish_log(
+pub(crate) fn finish_log(
     log_path: &Path,
     command: &str,
     passed: bool,

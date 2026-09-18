@@ -1,13 +1,14 @@
 # Ferrus Nano: Native Agent Harness
 
-Status: accepted implementation plan, updated 2026-09-15. The #73 managed-session binding,
-#74 bounded engine/journal, #75 opt-in Chat Completions adapter, #76 workspace tools, and
-#77 command sessions, and #78 scoped instructions/native context are implemented. Live model
-validation, launcher, and later slices remain planned. No measured performance claim.
+Status: accepted implementation plan, updated 2026-09-18. The #73 managed-session binding,
+#74 bounded engine/journal, #75 opt-in Chat Completions adapter, #76 workspace tools,
+#77 command sessions, #78 scoped instructions/native context, and #79 managed Executor
+lifecycle are implemented. Live model validation, launcher, and later slices remain planned.
+No measured performance claim.
 
 Working product name: `ferrus-nano`. Ferrus backend name: `nano`.
 
-Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [command sessions](ferrus-nano-commands.md), [native context](ferrus-nano-context.md), [roadmap](milestones.md), [repository graph](repository-graph-architecture.md),
+Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [command sessions](ferrus-nano-commands.md), [native context](ferrus-nano-context.md), [managed lifecycle](ferrus-nano-lifecycle.md), [roadmap](milestones.md), [repository graph](repository-graph-architecture.md),
 [project memory](project-memory-architecture.md).
 
 ## 1. Decision

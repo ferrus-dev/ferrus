@@ -226,58 +226,92 @@ pub async fn record_task_submitted(
             anyhow::bail!("A submitted repository view must be frozen");
         }
     }
+
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
     let task_path = task_path.to_string();
     let run_id = run_id.map(str::to_string);
     let frozen_view = frozen_view.cloned();
+
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_task(
+        task_submitted_in_transaction(
             &transaction,
-            &task_id,
-            &task_path,
-            TaskStatus::Reviewing,
-            None,
-            None,
-        )?;
-        clear_task_lease(&transaction, &task_id)?;
-        if let Some(view) = frozen_view.as_ref() {
-            update_repository_view_in_transaction(&transaction, "tasks", &task_id, view)?;
-            if let Some(run_id) = run_id.as_deref() {
-                update_repository_view_in_transaction(&transaction, "runs", run_id, view)?;
-            }
-            insert_event_in_transaction(
-                &transaction,
-                run_id.as_deref(),
-                "repository_view_frozen",
-                &serde_json::json!({
-                    "task_id": task_id,
-                    "snapshot_id": view.view_snapshot_id.as_ref().map(SnapshotId::as_str),
-                }),
-            )?;
-        } else if freeze_failed {
-            insert_event_in_transaction(
-                &transaction,
-                run_id.as_deref(),
-                "repository_view_freeze_failed",
-                &serde_json::json!({ "task_id": task_id }),
-            )?;
-        }
-        insert_event_in_transaction(
-            &transaction,
-            run_id.as_deref(),
-            "task_status_changed",
-            &serde_json::json!({
-                "task_id": task_id,
-                "status": TaskStatus::Reviewing.as_str(),
-            }),
+            task_id,
+            task_path,
+            run_id,
+            frozen_view,
+            freeze_failed,
         )?;
         transaction.commit()?;
         Ok(())
     })
     .await?
+}
+
+pub(crate) fn task_submitted_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+    task_path: String,
+    run_id: Option<String>,
+    frozen_view: Option<RepositoryViewReference>,
+    freeze_failed: bool,
+) -> Result<()> {
+    if let Some(view) = &frozen_view {
+        view.validate()?;
+        anyhow::ensure!(
+            view.lifecycle == TaskViewLifecycle::FrozenSubmitted,
+            "A submitted repository view must be frozen"
+        );
+    }
+
+    upsert_task(
+        transaction,
+        &task_id,
+        &task_path,
+        TaskStatus::Reviewing,
+        None,
+        None,
+    )?;
+
+    clear_task_lease(transaction, &task_id)?;
+
+    if let Some(view) = frozen_view.as_ref() {
+        update_repository_view_in_transaction(transaction, "tasks", &task_id, view)?;
+        if let Some(run_id) = run_id.as_deref() {
+            update_repository_view_in_transaction(transaction, "runs", run_id, view)?;
+        }
+
+        insert_event_in_transaction(
+            transaction,
+            run_id.as_deref(),
+            "repository_view_frozen",
+            &serde_json::json!({
+                "task_id": task_id,
+                "snapshot_id": view.view_snapshot_id.as_ref().map(SnapshotId::as_str),
+            }),
+        )?;
+    } else if freeze_failed {
+        insert_event_in_transaction(
+            transaction,
+            run_id.as_deref(),
+            "repository_view_freeze_failed",
+            &serde_json::json!({ "task_id": task_id }),
+        )?;
+    }
+
+    insert_event_in_transaction(
+        transaction,
+        run_id.as_deref(),
+        "task_status_changed",
+        &serde_json::json!({
+            "task_id": task_id,
+            "status": TaskStatus::Reviewing.as_str(),
+        }),
+    )?;
+
+    Ok(())
 }
 
 fn update_repository_view_in_transaction(
@@ -293,6 +327,7 @@ fn update_repository_view_in_transaction(
          repository_view_tree_digest = ?5, repository_view_lifecycle = ?6, \
          repository_view_status = ?7 WHERE id = ?8"
     );
+
     let updated = transaction.execute(
         &sql,
         params![
@@ -311,9 +346,11 @@ fn update_repository_view_in_transaction(
             owner_id,
         ],
     )?;
+
     if updated == 0 {
         anyhow::bail!("Cannot record submitted repository view: {owner_table} row does not exist");
     }
+
     Ok(())
 }
 
@@ -321,20 +358,30 @@ pub async fn record_task_check_passed(task_id: &str) -> Result<()> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = open_runtime_database(&database_path)?;
-        connection.execute(
-            "UPDATE tasks SET check_retries = 0, failure_reason = NULL WHERE id = ?1",
-            [&task_id],
-        )?;
-        insert_event(
-            &connection,
-            None,
-            "task_check_passed",
-            &serde_json::json!({ "task_id": task_id }),
-        )?;
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        task_check_passed_in_transaction(&transaction, task_id)?;
+        transaction.commit()?;
         Ok(())
     })
     .await?
+}
+
+pub(crate) fn task_check_passed_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE tasks SET check_retries = 0, failure_reason = NULL WHERE id = ?1",
+        [&task_id],
+    )?;
+    insert_event(
+        transaction,
+        None,
+        "task_check_passed",
+        &serde_json::json!({ "task_id": task_id }),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -427,60 +474,75 @@ pub async fn record_task_check_failed(
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
     let failure_reason = failure_reason.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<TaskCheckFailure> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
-        let retries = task_check_retries(&transaction, &task_id)? + 1;
-        if retries >= max_retries {
-            let limit_failure_reason = format!(
-                "Check failed {max_retries} consecutive times. Last failure:\n{failure_reason}"
-            );
-            transaction.execute(
-                r#"
-                UPDATE tasks
-                SET status = ?1, check_retries = ?2, failure_reason = ?3,
-                    claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
-                WHERE id = ?4
-                "#,
-                params![
-                    TaskStatus::Failed.as_str(),
-                    retries,
-                    limit_failure_reason,
-                    task_id
-                ],
-            )?;
-            insert_event_in_transaction(
-                &transaction,
-                None,
-                "task_check_limit_exceeded",
-                &serde_json::json!({
-                    "task_id": task_id,
-                    "retries": retries,
-                    "max_retries": max_retries,
-                }),
-            )?;
-            transaction.commit()?;
-            Ok(TaskCheckFailure::LimitExceeded { retries })
-        } else {
-            transaction.execute(
-                "UPDATE tasks SET check_retries = ?1, failure_reason = ?2 WHERE id = ?3",
-                params![retries, failure_reason, task_id],
-            )?;
-            insert_event_in_transaction(
-                &transaction,
-                None,
-                "task_check_failed",
-                &serde_json::json!({
-                    "task_id": task_id,
-                    "retries": retries,
-                    "max_retries": max_retries,
-                }),
-            )?;
-            transaction.commit()?;
-            Ok(TaskCheckFailure::Failed { retries })
-        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result =
+            task_check_failed_in_transaction(&transaction, task_id, failure_reason, max_retries)?;
+        transaction.commit()?;
+        Ok(result)
     })
     .await?
+}
+
+pub(crate) fn task_check_failed_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+    failure_reason: String,
+    max_retries: u32,
+) -> Result<TaskCheckFailure> {
+    let retries = task_check_retries(transaction, &task_id)? + 1;
+    if retries >= max_retries {
+        let limit_failure_reason = format!(
+            "Check failed {max_retries} consecutive times. Last failure:\n{failure_reason}"
+        );
+        transaction.execute(
+            r#"
+            UPDATE tasks
+            SET status = ?1, check_retries = ?2, failure_reason = ?3,
+                claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
+            WHERE id = ?4
+            "#,
+            params![
+                TaskStatus::Failed.as_str(),
+                retries,
+                limit_failure_reason,
+                task_id
+            ],
+        )?;
+
+        insert_event_in_transaction(
+            transaction,
+            None,
+            "task_check_limit_exceeded",
+            &serde_json::json!({
+                "task_id": task_id,
+                "retries": retries,
+                "max_retries": max_retries,
+            }),
+        )?;
+
+        Ok(TaskCheckFailure::LimitExceeded { retries })
+    } else {
+        transaction.execute(
+            "UPDATE tasks SET check_retries = ?1, failure_reason = ?2 WHERE id = ?3",
+            params![retries, failure_reason, task_id],
+        )?;
+
+        insert_event_in_transaction(
+            transaction,
+            None,
+            "task_check_failed",
+            &serde_json::json!({
+                "task_id": task_id,
+                "retries": retries,
+                "max_retries": max_retries,
+            }),
+        )?;
+
+        Ok(TaskCheckFailure::Failed { retries })
+    }
 }
 
 pub async fn record_task_review_rejected(
@@ -652,27 +714,40 @@ pub async fn record_task_consultation_requested(
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let connection = open_runtime_database(&database_path)?;
-        connection.execute(
-            "UPDATE tasks SET status = ?1, paused_status = ?2 WHERE id = ?3",
-            params![
-                TaskStatus::Consultation.as_str(),
-                paused_status.as_str(),
-                task_id
-            ],
-        )?;
-        insert_event(
-            &connection,
-            None,
-            "task_consultation_requested",
-            &serde_json::json!({
-                "task_id": task_id,
-                "paused_status": paused_status.as_str(),
-            }),
-        )?;
+        let mut connection = open_runtime_database(&database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        task_consultation_in_transaction(&transaction, task_id, paused_status)?;
+        transaction.commit()?;
         Ok(())
     })
     .await?
+}
+
+pub(crate) fn task_consultation_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+    paused_status: TaskStatus,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE tasks SET status = ?1, paused_status = ?2 WHERE id = ?3",
+        params![
+            TaskStatus::Consultation.as_str(),
+            paused_status.as_str(),
+            task_id
+        ],
+    )?;
+
+    insert_event(
+        transaction,
+        None,
+        "task_consultation_requested",
+        &serde_json::json!({
+            "task_id": task_id,
+            "paused_status": paused_status.as_str(),
+        }),
+    )?;
+
+    Ok(())
 }
 
 pub async fn restore_task_from_consultation(task_id: &str) -> Result<TaskConsultRestore> {
@@ -680,43 +755,49 @@ pub async fn restore_task_from_consultation(task_id: &str) -> Result<TaskConsult
     let task_id = task_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<TaskConsultRestore> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
-        let row = transaction
-            .query_row(
-                "SELECT status, paused_status FROM tasks WHERE id = ?1",
-                [&task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
-        let Some((status, paused_status)) = row else {
-            transaction.commit()?;
-            return Ok(TaskConsultRestore::NotInConsultation);
-        };
-        if status != TaskStatus::Consultation.as_str() {
-            transaction.commit()?;
-            return Ok(TaskConsultRestore::NotInConsultation);
-        }
-        let resumed_status =
-            paused_status.unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
-        transaction.execute(
-            "UPDATE tasks SET status = ?1, paused_status = NULL WHERE id = ?2",
-            params![resumed_status, task_id],
-        )?;
-        insert_event_in_transaction(
-            &transaction,
-            None,
-            "task_consultation_resolved",
-            &serde_json::json!({
-                "task_id": task_id,
-                "resumed_status": resumed_status,
-            }),
-        )?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = task_restore_consultation_in_transaction(&transaction, task_id)?;
         transaction.commit()?;
-        Ok(TaskConsultRestore::Restored {
-            status: resumed_status,
-        })
+        Ok(result)
     })
     .await?
+}
+
+pub(crate) fn task_restore_consultation_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+) -> Result<TaskConsultRestore> {
+    let row = transaction
+        .query_row(
+            "SELECT status, paused_status FROM tasks WHERE id = ?1",
+            [&task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((status, paused_status)) = row else {
+        return Ok(TaskConsultRestore::NotInConsultation);
+    };
+    if status != TaskStatus::Consultation.as_str() {
+        return Ok(TaskConsultRestore::NotInConsultation);
+    }
+    let resumed_status =
+        paused_status.unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
+    transaction.execute(
+        "UPDATE tasks SET status = ?1, paused_status = NULL WHERE id = ?2",
+        params![resumed_status, task_id],
+    )?;
+    insert_event_in_transaction(
+        transaction,
+        None,
+        "task_consultation_resolved",
+        &serde_json::json!({
+            "task_id": task_id,
+            "resumed_status": resumed_status,
+        }),
+    )?;
+    Ok(TaskConsultRestore::Restored {
+        status: resumed_status,
+    })
 }
 
 #[cfg(test)]
@@ -743,45 +824,68 @@ pub async fn record_task_human_question_requested_with_resume(
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
     let awaiting_human_by = awaiting_human_by.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let paused_status = paused_status.map(TaskStatus::as_str);
-        transaction.execute(
-            r#"
-            UPDATE tasks
-            SET status = ?1, paused_status = ?2, awaiting_human_by = ?3,
-                awaiting_human_status = ?4, human_answer_recorded = 0
-            WHERE id = ?5
-            "#,
-            params![
-                TaskStatus::AwaitingHuman.as_str(),
-                paused_status,
-                awaiting_human_by,
-                resume_status.as_str(),
-                task_id
-            ],
-        )?;
-        insert_event_in_transaction(
+        task_human_question_in_transaction(
             &transaction,
-            None,
-            "task_human_question_requested",
-            &serde_json::json!({
-                "task_id": task_id,
-                "paused_status": paused_status,
-                "resume_status": resume_status.as_str(),
-                "awaiting_human_by": awaiting_human_by,
-            }),
+            task_id,
+            resume_status,
+            paused_status,
+            awaiting_human_by,
         )?;
-        let question_order = transaction.last_insert_rowid();
-        transaction.execute(
-            "UPDATE tasks SET human_question_order = ?1 WHERE id = ?2",
-            params![question_order, task_id],
-        )?;
+
         transaction.commit()?;
+
         Ok(())
     })
     .await?
+}
+
+pub(crate) fn task_human_question_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+    resume_status: TaskStatus,
+    paused_status: Option<TaskStatus>,
+    awaiting_human_by: String,
+) -> Result<()> {
+    let paused_status = paused_status.map(TaskStatus::as_str);
+    transaction.execute(
+        r#"
+        UPDATE tasks
+        SET status = ?1, paused_status = ?2, awaiting_human_by = ?3,
+            awaiting_human_status = ?4, human_answer_recorded = 0
+        WHERE id = ?5
+        "#,
+        params![
+            TaskStatus::AwaitingHuman.as_str(),
+            paused_status,
+            awaiting_human_by,
+            resume_status.as_str(),
+            task_id
+        ],
+    )?;
+
+    insert_event_in_transaction(
+        transaction,
+        None,
+        "task_human_question_requested",
+        &serde_json::json!({
+            "task_id": task_id,
+            "paused_status": paused_status,
+            "resume_status": resume_status.as_str(),
+            "awaiting_human_by": awaiting_human_by,
+        }),
+    )?;
+
+    let question_order = transaction.last_insert_rowid();
+    transaction.execute(
+        "UPDATE tasks SET human_question_order = ?1 WHERE id = ?2",
+        params![question_order, task_id],
+    )?;
+
+    Ok(())
 }
 
 pub async fn record_task_human_answer(task_id: &str) -> Result<()> {
@@ -798,16 +902,20 @@ pub async fn record_task_human_answer(task_id: &str) -> Result<()> {
             "#,
             params![task_id, TaskStatus::AwaitingHuman.as_str()],
         )?;
+
         if changed == 0 {
             anyhow::bail!("Task {task_id} is not waiting for a human answer.");
         }
+
         insert_event_in_transaction(
             &transaction,
             None,
             "task_human_answer_recorded",
             &serde_json::json!({ "task_id": task_id }),
         )?;
+
         transaction.commit()?;
+
         Ok(())
     })
     .await?
@@ -826,6 +934,7 @@ pub async fn record_scoped_human_answer(question: &HumanQuestion, response: &str
                 )
             });
         }
+
         return Err(err);
     }
     Ok(())
@@ -834,6 +943,7 @@ pub async fn record_scoped_human_answer(question: &HumanQuestion, response: &str
 async fn clear_task_human_answer_recorded(task_id: &str) -> Result<()> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -854,6 +964,7 @@ async fn clear_task_human_answer_recorded(task_id: &str) -> Result<()> {
 pub async fn task_human_question_owner(task_id: &str) -> Result<Option<String>> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let connection = open_runtime_database(&database_path)?;
         let owner = connection
@@ -872,6 +983,7 @@ pub async fn task_human_question_owner(task_id: &str) -> Result<Option<String>> 
 pub async fn task_awaiting_human_status(task_id: &str) -> Result<Option<String>> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let connection = open_runtime_database(&database_path)?;
         let status = connection
@@ -890,61 +1002,75 @@ pub async fn task_awaiting_human_status(task_id: &str) -> Result<Option<String>>
 pub async fn restore_task_from_human_answer(task_id: &str) -> Result<TaskHumanAnswerRestore> {
     let database_path = current_database_path().await?;
     let task_id = task_id.to_string();
+
     tokio::task::spawn_blocking(move || -> Result<TaskHumanAnswerRestore> {
         let mut connection = open_runtime_database(&database_path)?;
-        let transaction = connection.transaction()?;
-        let row = transaction
-            .query_row(
-                "SELECT status, paused_status, awaiting_human_status FROM tasks WHERE id = ?1",
-                [&task_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((status, paused_status, awaiting_human_status)) = row else {
-            transaction.commit()?;
-            return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
-        };
-        if status != TaskStatus::AwaitingHuman.as_str() {
-            transaction.commit()?;
-            return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
-        }
-        let resumed_status = awaiting_human_status
-            .or_else(|| paused_status.clone())
-            .unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
-        let restored_paused_status = if resumed_status == TaskStatus::Consultation.as_str() {
-            paused_status
-        } else {
-            None
-        };
-        transaction.execute(
-            r#"
-            UPDATE tasks
-            SET status = ?1, paused_status = ?2, awaiting_human_by = NULL,
-                awaiting_human_status = NULL, human_question_order = NULL,
-                human_answer_recorded = 0
-            WHERE id = ?3
-            "#,
-            params![resumed_status, restored_paused_status, task_id],
-        )?;
-        insert_event_in_transaction(
-            &transaction,
-            None,
-            "task_human_answered",
-            &serde_json::json!({
-                "task_id": task_id,
-                "resumed_status": resumed_status,
-            }),
-        )?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = task_restore_human_in_transaction(&transaction, task_id)?;
         transaction.commit()?;
-        Ok(TaskHumanAnswerRestore::Restored {
-            status: resumed_status,
-        })
+        Ok(result)
     })
     .await?
+}
+
+pub(crate) fn task_restore_human_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: String,
+) -> Result<TaskHumanAnswerRestore> {
+    let row = transaction
+        .query_row(
+            "SELECT status, paused_status, awaiting_human_status FROM tasks WHERE id = ?1",
+            [&task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((status, paused_status, awaiting_human_status)) = row else {
+        return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
+    };
+
+    if status != TaskStatus::AwaitingHuman.as_str() {
+        return Ok(TaskHumanAnswerRestore::NotAwaitingHuman);
+    }
+
+    let resumed_status = awaiting_human_status
+        .or_else(|| paused_status.clone())
+        .unwrap_or_else(|| TaskStatus::Executing.as_str().to_string());
+
+    let restored_paused_status = if resumed_status == TaskStatus::Consultation.as_str() {
+        paused_status
+    } else {
+        None
+    };
+
+    transaction.execute(
+        r#"
+        UPDATE tasks
+        SET status = ?1, paused_status = ?2, awaiting_human_by = NULL,
+            awaiting_human_status = NULL, human_question_order = NULL,
+            human_answer_recorded = 0
+        WHERE id = ?3
+        "#,
+        params![resumed_status, restored_paused_status, task_id],
+    )?;
+
+    insert_event_in_transaction(
+        transaction,
+        None,
+        "task_human_answered",
+        &serde_json::json!({
+            "task_id": task_id,
+            "resumed_status": resumed_status,
+        }),
+    )?;
+
+    Ok(TaskHumanAnswerRestore::Restored {
+        status: resumed_status,
+    })
 }

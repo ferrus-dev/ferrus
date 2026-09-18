@@ -629,6 +629,8 @@ async fn lost_supervisor_is_unknown_and_shutdown_rejects_further_work() {
         .get(&started.process_id)
         .unwrap()
         .task
+        .as_ref()
+        .unwrap()
         .abort();
     assert_eq!(
         terminal(&mut f.commands, &started.process_id)

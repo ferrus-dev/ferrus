@@ -1,6 +1,6 @@
 //! Session-owned noninteractive commands with bounded disk output and explicit outcomes.
 
-mod backend;
+pub(super) mod backend;
 mod output;
 #[cfg(test)]
 mod tests;
@@ -134,7 +134,7 @@ struct Entry {
     status: watch::Receiver<Snapshot>,
     stdout: File,
     stderr: File,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct Commands<B: ExecutionBackend = TrustedLocal> {
@@ -293,7 +293,7 @@ impl<B: ExecutionBackend> Commands<B> {
                 status: receiver,
                 stdout: prepared.stdout,
                 stderr: prepared.stderr,
-                task,
+                task: Some(task),
             },
         );
 
@@ -387,6 +387,11 @@ impl<B: ExecutionBackend> Commands<B> {
 
         self.closed = true;
 
+        self.quiesce().await
+    }
+
+    /// Stop and join current writers while allowing subsequent commands after a failed gate.
+    pub(crate) async fn quiesce(&mut self) -> bool {
         for entry in self.entries.values_mut() {
             if entry.status.borrow().completion == Completion::Running {
                 entry.cancel.cancel();
@@ -397,11 +402,12 @@ impl<B: ExecutionBackend> Commands<B> {
         // Cleanup runs concurrently in supervisors; use one total grace period.
         let deadline = Instant::now() + Duration::from_millis(CLEANUP_MS + 500);
         for entry in self.entries.values_mut() {
-            if tokio::time::timeout_at(deadline, &mut entry.task)
-                .await
-                .is_err()
-            {
-                entry.task.abort();
+            let Some(mut task) = entry.task.take() else {
+                continue;
+            };
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
             }
         }
 
@@ -414,7 +420,9 @@ impl<B: ExecutionBackend> Drop for Commands<B> {
         for entry in self.entries.values_mut() {
             entry.cancel.cancel();
             entry.tree.lock().unwrap().stop();
-            entry.task.abort();
+            if let Some(task) = &entry.task {
+                task.abort();
+            }
         }
     }
 }

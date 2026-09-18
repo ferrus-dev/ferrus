@@ -81,7 +81,7 @@ async fn clear_consult_response(context: &RuntimeTaskContext) -> Result<()> {
     store::clear_consult_response_for_run_dir(&context.run_dir).await
 }
 
-fn validate_consult_request(question: &str) -> Result<()> {
+pub(crate) fn validate_consult_request(question: &str) -> Result<()> {
     let trimmed = question.trim();
     if trimmed.is_empty() {
         anyhow::bail!(

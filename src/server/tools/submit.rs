@@ -281,7 +281,7 @@ async fn frozen_tree_patch(
     tree_patch_between(&workspace_root, &baseline, source_tree).await
 }
 
-async fn tree_patch_between(
+pub(crate) async fn tree_patch_between(
     workspace_root: &Path,
     baseline: &crate::repository_graph::domain::Digest,
     source_tree: &crate::repository_graph::domain::Digest,
