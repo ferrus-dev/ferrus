@@ -7,7 +7,7 @@ mod cli;
 mod config;
 mod hq;
 mod legacy_state;
-// Native session entry points are wired into the HQ launcher in nano PR 08 (#80).
+// Optional native frontend/provider entry points also build without nano-openai.
 #[allow(dead_code)]
 mod nano;
 mod platform;

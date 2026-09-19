@@ -3,6 +3,8 @@
 pub mod agent_manager;
 mod commands;
 mod display;
+#[cfg(test)]
+mod nano_tests;
 mod state_watcher;
 mod tui;
 
@@ -98,6 +100,18 @@ pub async fn run(debug: bool) -> Result<()> {
     let loop_result: Result<()> = loop {
         tokio::select! {
             _ = scheduler_tick.tick() => {
+                for (name, handle) in &mut ctx.headless {
+                    if let Some(events) = &mut handle.native_events {
+                        let changed = events.has_changed();
+                        if !matches!(changed, Ok(false)) {
+                            let event = events.borrow_and_update().clone();
+                            if changed.is_err() { handle.native_events = None; }
+                            if let Some(event) = event {
+                                ctx.display.muted(format!("{name}: {}", event.summary()));
+                            }
+                        }
+                    }
+                }
                 if let Err(err) = ctx.reconcile_runtime_schedule().await {
                     tracing::debug!(error = ?err, "skipped runtime schedule reconciliation");
                 }
@@ -448,6 +462,7 @@ fn parse_agent_type(s: &str) -> Option<crate::cli::commands::register::Agent> {
         "goose" => Some(Agent::Goose),
         "opencode" => Some(Agent::OpenCode),
         "qwen-code" => Some(Agent::QwenCode),
+        "nano" => Some(Agent::Nano),
         _ => None,
     }
 }

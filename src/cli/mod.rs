@@ -24,6 +24,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run the native headless Executor (requires nano-openai)
+    #[command(version = env!("CARGO_PKG_VERSION"))]
+    Nano {
+        #[command(subcommand)]
+        command: crate::nano::cli::Command,
+    },
     /// Initialize ferrus in the current directory (creates ferrus.toml and .ferrus/)
     Init {
         /// Root directory for agent skill files (default: .agents)
@@ -109,6 +115,7 @@ impl Cli {
 
     pub async fn run(self, debug: bool) -> Result<()> {
         match self.command {
+            Some(Commands::Nano { command }) => crate::nano::cli::run(command).await,
             Some(Commands::Init { agents_path }) => commands::init::run(agents_path).await,
             Some(Commands::Serve {
                 role,

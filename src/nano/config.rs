@@ -56,7 +56,7 @@ fn default_usage() -> bool {
 }
 
 impl Config {
-    /// The future launcher calls this explicitly; normal Ferrus config never reads it.
+    /// The native launcher calls this explicitly; normal Ferrus config never reads it.
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let bytes = read_private(path, 16 * 1024)?;
         let text = std::str::from_utf8(&bytes).context("Nano settings must be UTF-8")?;
