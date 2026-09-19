@@ -52,6 +52,10 @@ Before either managed check or submit, Nano stops and joins its command writers.
 check can be followed by further coding commands. Cancellation or authority loss stops and
 reaps check processes before a terminal session result is recorded.
 
+Successful overlay refreshes run graph recovery and retention best-effort against the bound
+project's sidecar and runtime references. Maintenance protects active task/run snapshots and
+does not change the check result or task lifecycle on failure.
+
 Submit preserves both required gates and the existing retry accounting. It compares source
 identities before, between, and after the gates, including at the SQLite handoff. Git workspaces
 use captured Git trees without changing the real index. Non-Git workspaces use a bounded

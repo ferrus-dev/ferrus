@@ -23,6 +23,46 @@ pub(crate) async fn maintain_graph() -> Result<GraphMaintenanceReport> {
         return Ok(GraphMaintenanceReport::default());
     }
     let references = project::repository_graph_retention_references().await?;
+    maintain_graph_with_references(config, repository, path, references).await
+}
+
+pub(super) async fn maintain_graph_explicit_best_effort(
+    context: &LocalGraphContext,
+    data_dir: &Path,
+) {
+    if !context.config.enabled {
+        return;
+    }
+    let result = async {
+        let path = context.query_sidecar_path().await?;
+        if !path.exists() {
+            return Ok(GraphMaintenanceReport::default());
+        }
+        let references =
+            project::repository_graph_retention_references_at(&data_dir.join("ferrus.db")).await?;
+        maintain_graph_with_references(
+            context.config.clone(),
+            context.repository.clone(),
+            path,
+            references,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            error = ?error,
+            "repository graph maintenance failed; orchestration lifecycle is unchanged"
+        );
+    }
+}
+
+async fn maintain_graph_with_references(
+    config: RepositoryGraphConfig,
+    repository: RepositoryRef,
+    path: std::path::PathBuf,
+    references: project::RepositoryGraphRetentionReferences,
+) -> Result<GraphMaintenanceReport> {
     let protection = RetentionProtection {
         snapshot_ids: references.snapshot_ids,
         published_views: references.view_names,

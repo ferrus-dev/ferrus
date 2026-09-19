@@ -16,6 +16,13 @@ pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewRe
 /// completed task and run snapshots age out through configured sidecar retention.
 pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRetentionReferences> {
     let database_path = current_database_path().await?;
+    repository_graph_retention_references_at(&database_path).await
+}
+
+pub(crate) async fn repository_graph_retention_references_at(
+    database_path: &Path,
+) -> Result<RepositoryGraphRetentionReferences> {
+    let database_path = database_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<RepositoryGraphRetentionReferences> {
         let connection = open_runtime_database(&database_path)?;
         let mut references = RepositoryGraphRetentionReferences::default();

@@ -728,7 +728,7 @@ pub(crate) async fn refresh_task_overlay(
         workspace_root,
         baseline_tree,
         existing,
-        context,
+        &context,
         database_path,
     )
     .await;
@@ -745,7 +745,7 @@ pub(crate) async fn refresh_task_overlay_explicit(
     runtime: &project::RuntimeTaskContext,
     baseline_tree: &str,
 ) -> Result<project::RepositoryViewReference> {
-    refresh_task_overlay_with_context(
+    let result = refresh_task_overlay_with_context(
         &runtime.task_id,
         Path::new(
             runtime
@@ -755,10 +755,14 @@ pub(crate) async fn refresh_task_overlay_explicit(
         ),
         baseline_tree,
         runtime.repository_view.clone(),
-        context,
+        &context,
         data_dir.join("ferrus.db"),
     )
-    .await
+    .await;
+    if result.is_ok() {
+        canonical::maintain_graph_explicit_best_effort(&context, data_dir).await;
+    }
+    result
 }
 
 async fn refresh_task_overlay_with_context(
@@ -766,7 +770,7 @@ async fn refresh_task_overlay_with_context(
     workspace_root: &Path,
     baseline_tree: &str,
     existing: project::RepositoryViewReference,
-    context: LocalGraphContext,
+    context: &LocalGraphContext,
     database_path: std::path::PathBuf,
 ) -> Result<project::RepositoryViewReference> {
     if !context.config.enabled {
