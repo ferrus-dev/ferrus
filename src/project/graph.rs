@@ -16,6 +16,13 @@ pub async fn run_repository_view(run_id: &str) -> Result<Option<RepositoryViewRe
 /// completed task and run snapshots age out through configured sidecar retention.
 pub async fn repository_graph_retention_references() -> Result<RepositoryGraphRetentionReferences> {
     let database_path = current_database_path().await?;
+    repository_graph_retention_references_at(&database_path).await
+}
+
+pub(crate) async fn repository_graph_retention_references_at(
+    database_path: &Path,
+) -> Result<RepositoryGraphRetentionReferences> {
+    let database_path = database_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<RepositoryGraphRetentionReferences> {
         let connection = open_runtime_database(&database_path)?;
         let mut references = RepositoryGraphRetentionReferences::default();
@@ -386,6 +393,21 @@ async fn read_repository_view(
 ) -> Result<Option<RepositoryViewReference>> {
     debug_assert!(matches!(owner_table, "tasks" | "runs"));
     let database_path = current_database_path().await?;
+    owner_repository_view_at(database_path, owner_table, owner_id).await
+}
+
+pub(crate) async fn task_repository_view_at(
+    database_path: &Path,
+    task_id: &str,
+) -> Result<Option<RepositoryViewReference>> {
+    owner_repository_view_at(database_path.to_path_buf(), "tasks", task_id).await
+}
+
+async fn owner_repository_view_at(
+    database_path: PathBuf,
+    owner_table: &'static str,
+    owner_id: &str,
+) -> Result<Option<RepositoryViewReference>> {
     let owner_id = owner_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<Option<RepositoryViewReference>> {
         let connection = open_runtime_database(&database_path)?;

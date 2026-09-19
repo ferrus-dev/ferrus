@@ -5,7 +5,7 @@ use std::{path::Path, process::Stdio};
 
 use crate::platform;
 
-mod output;
+pub(crate) mod output;
 pub(crate) use output::CapturedOutput;
 use output::Spool;
 

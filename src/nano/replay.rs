@@ -21,6 +21,7 @@ pub(crate) struct Replay {
     pub unknown_effects: Vec<String>,
     model_active: bool,
     final_response_ready: bool,
+    submitted: bool,
     calls: VecDeque<ToolCall>,
 }
 
@@ -173,6 +174,7 @@ impl Replay {
                     "Invalid tool call ID"
                 );
                 self.pending_effect = Some(call_id.clone());
+                self.submitted = false;
             }
             SessionEvent::ToolResult { call_id, outcome } => {
                 ensure!(
@@ -180,6 +182,8 @@ impl Replay {
                     "Tool result has no matching intent"
                 );
                 let call = self.calls.pop_front().expect("intent checked call queue");
+                self.submitted = call.name == "submit"
+                    && matches!(outcome, ToolOutcome::Success(value) if value["status"] == "submitted" && value["task_state"] == "reviewing");
                 self.messages.push(Message::Tool {
                     provider_call_id: call.provider_call_id,
                     outcome: outcome.clone(),
@@ -190,6 +194,12 @@ impl Replay {
                 self.pending_effect = None;
             }
             SessionEvent::Ended { reason } => {
+                if *reason == EndReason::Submitted {
+                    ensure!(
+                        self.submitted && self.pending_effect.is_none() && !self.model_active,
+                        "Submit finish requires a confirmed native handoff"
+                    );
+                }
                 if *reason == EndReason::ModelFinished {
                     ensure!(
                         self.checkpoint_ready(),

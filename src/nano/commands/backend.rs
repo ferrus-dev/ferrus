@@ -171,7 +171,7 @@ pub(crate) struct ProcessTree {
 }
 
 impl ProcessTree {
-    pub(super) fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if self.stopped {
             return;
         }
@@ -190,7 +190,7 @@ impl ProcessTree {
 }
 
 /// Observe Unix exit without reaping: tree cleanup must precede release of the PID.
-pub(super) fn exited(process: &mut Spawned) -> std::io::Result<bool> {
+pub(crate) fn exited(process: &mut Spawned) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();

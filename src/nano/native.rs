@@ -20,6 +20,13 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
 }
 
 impl<B: ExecutionBackend> NativeTools<B> {
+    pub(super) fn belongs_to(&self, session: &FerrusSession) -> bool {
+        self.session.scope.database_path == session.scope.database_path
+            && self.session.scope.agent_id == session.scope.agent_id
+            && self.session.scope.task_id == session.scope.task_id
+            && self.session.scope.run_id == session.scope.run_id
+            && self.session.workspace() == session.workspace()
+    }
     pub(crate) fn new(
         session: FerrusSession,
         coding: CodingTools<B>,

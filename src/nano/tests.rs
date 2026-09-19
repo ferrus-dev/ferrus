@@ -525,3 +525,6 @@ async fn missing_database_is_not_created_and_old_schema_is_not_migrated() {
 
 #[path = "context_tests.rs"]
 mod context_tests;
+
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

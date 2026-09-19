@@ -105,8 +105,13 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
 
         self.provider.cancel();
 
-        if !self.tools.shutdown().await && reason != EndReason::JournalFailed {
-            reason = EndReason::EffectUnknown;
+        let clean = self.tools.shutdown().await;
+        if reason != EndReason::JournalFailed {
+            if !clean {
+                reason = EndReason::EffectUnknown;
+            } else if let Some(terminal) = self.tools.end_reason() {
+                reason = terminal;
+            }
         }
         if reason == EndReason::JournalFailed {
             return Ok(self.journal_failure());
@@ -374,7 +379,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                                 Ok(outcome) => outcome,
                                 Err(reason) => {
                                     interrupted = Some(reason);
-                                    ToolOutcome::Unknown(ToolError::Interrupted)
+                                    self.tools
+                                        .interrupted()
+                                        .await
+                                        .unwrap_or(ToolOutcome::Unknown(ToolError::Interrupted))
                                 }
                             },
                         }
@@ -412,6 +420,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     provider_call_id: call.provider_call_id,
                     outcome: outcome.clone(),
                 });
+
+                if let Some(reason) = self.tools.end_reason() {
+                    return reason;
+                }
 
                 if let Some(reason) = interrupted {
                     return reason;

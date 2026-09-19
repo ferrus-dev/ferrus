@@ -81,7 +81,11 @@ async fn run_with_cwd(
     }))
 }
 
-fn build_report(commands: &[CommandResult], max_lines: usize, log_path: &Path) -> String {
+pub(crate) fn build_report(
+    commands: &[CommandResult],
+    max_lines: usize,
+    log_path: &Path,
+) -> String {
     let failed: Vec<&CommandResult> = commands.iter().filter(|c| !c.passed).collect();
 
     let mut out = String::from("Checks failed.\n\nFailed commands:\n");

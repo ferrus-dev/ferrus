@@ -42,6 +42,8 @@ pub(crate) enum ToolError {
     Workspace(serde_json::Value),
     /// Read-only context failure; never a successful canonical fallback.
     Context(serde_json::Value),
+    /// Bounded managed operation failure; SQLite remains authoritative.
+    Lifecycle(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,10 @@ impl Cancellation {
 }
 
 pub(crate) trait Tools {
+    /// A host-confirmed lifecycle handoff stops the loop before another effect.
+    fn end_reason(&self) -> Option<super::session::EndReason> {
+        None
+    }
     fn descriptors(&self) -> Vec<ToolDescriptor>;
 
     /// The adapter owns schema validation; execution receives only the validated object.
@@ -86,6 +92,12 @@ pub(crate) trait Tools {
     /// Implementations must clean up owned processes on drop and reconcile effects whose
     /// completion cannot be observed. Cancellation/deadline may drop this future.
     async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome;
+
+    /// Settle an owned operation after its execution future was interrupted.
+    /// A committed lifecycle handoff may still have a definitive result.
+    async fn interrupted(&mut self) -> Option<ToolOutcome> {
+        None
+    }
 
     /// Join or stop session-owned effects before the engine records its terminal state.
     /// False means cleanup could not be confirmed; completion must remain unknown.
