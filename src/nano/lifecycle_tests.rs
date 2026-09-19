@@ -987,6 +987,9 @@ async fn managed_isolated_submit_writes_canonical_artifacts_from_the_checked_wor
         ],
     );
     let workspace = f.data.join("worktrees").join(TASK);
+    // Git for Windows rejects verbatim absolute paths when creating a worktree.
+    // The git helper runs in f.root; keep the runtime binding absolute below.
+    let relative_workspace = workspace.strip_prefix(&f.root).unwrap();
     git(
         &f,
         &[
@@ -994,7 +997,7 @@ async fn managed_isolated_submit_writes_canonical_artifacts_from_the_checked_wor
             "add",
             "--quiet",
             "--detach",
-            workspace.to_str().unwrap(),
+            relative_workspace.to_str().unwrap(),
             "HEAD",
         ],
     );
