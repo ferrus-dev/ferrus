@@ -97,6 +97,12 @@ Agent support is normalized through `src/agents/`: shared Supervisor and Executo
 the concrete CLI, while the Claude Code, Codex, Qwen Code, opencode, and goose adapters own launch flags, model
 overrides, headless prompt transport, and local permission or configuration conventions.
 
+The native Nano adapter stays under `src/nano/` and supports headless Executors only.
+Build with `nano-openai`, set an absolute private `FERRUS_NANO_CONFIG`, and select it with
+`ferrus register --executor nano`. HQ retains worktree and process supervision while Nano
+exchanges bounded JSONL commands/events instead of connecting back through Ferrus MCP.
+See [Nano launch](ferrus-nano-launch.md) for configuration, protocol, and current limitations.
+
 Qwen Code and goose are experimental. Ferrus attaches its role-scoped MCP server to goose at launch with
 `--with-extension`, so no project config file is written. Configure its model provider separately with
 `goose configure`. Goose honors per-task worktrees, and Ferrus bounds headless runs with turn and repeated-tool

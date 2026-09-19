@@ -1,8 +1,9 @@
 # Nano Session Engine and Journal
 
 Status: implemented foundation for #74. #75 adds an opt-in
-[Chat Completions provider](ferrus-nano-provider.md). CLI commands, HQ launch, and automatic
-effect resume remain later work. See the [architecture and PR index](ferrus-nano-architecture.md).
+[Chat Completions provider](ferrus-nano-provider.md); #80 adds
+[CLI/HQ launch](ferrus-nano-launch.md). Automatic effect resume remains later work.
+See the [architecture and PR index](ferrus-nano-architecture.md).
 
 ## Boundaries
 

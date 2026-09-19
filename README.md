@@ -29,6 +29,7 @@ Ferrus works with existing coding agents:
 - **Qwen Code** (experimental)
 - **goose** (experimental)
 - **opencode** (experimental; Supervisor and Reviewer only)
+- **Nano** (experimental; native headless Executor, requires `nano-openai`; [setup](docs/ferrus-nano-launch.md))
 
 Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limitations and configuration details.

@@ -342,7 +342,7 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
-        agent.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
+        agent.validate_headless_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)?;
 
         // Gate the dispatch against the per-work-phase budget before committing
         // to any setup. This bounds the respawn loop of a session that keeps

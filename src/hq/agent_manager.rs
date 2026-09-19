@@ -343,6 +343,9 @@ pub struct HeadlessHandle {
     platform_guard: Option<platform::HeadlessProcessGuard>,
     wait_thread: Option<std::thread::JoinHandle<()>>,
     output_threads: Vec<std::thread::JoinHandle<()>>,
+    native_stdin: Option<std::process::ChildStdin>,
+    pub(super) native_events:
+        Option<tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>>,
 }
 
 impl HeadlessHandle {
@@ -363,6 +366,22 @@ impl HeadlessHandle {
     }
 
     fn blocking_shutdown(&mut self, terminate: bool) {
+        if terminate
+            && self.is_alive()
+            && let Some(mut stdin) = self.native_stdin.take()
+        {
+            let _ = crate::nano::wire::write_command(
+                &mut stdin,
+                crate::nano::wire::CommandKind::Cancel,
+            );
+            // Give Nano time to stop owned effects and journal the outcome.
+            for _ in 0..20 {
+                if !self.is_alive() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         if terminate && self.is_alive() {
             self.send_signal(ShutdownSignal::Terminate);
             std::thread::sleep(Duration::from_millis(250));
@@ -397,6 +416,10 @@ pub async fn spawn_headless_executor_with_env(
     env: Vec<(&'static str, String)>,
     workspace: Option<HeadlessWorkspace>,
 ) -> Result<HeadlessHandle> {
+    anyhow::ensure!(
+        agent.capabilities().headless,
+        "Agent does not support headless execution"
+    );
     let command = agent
         .spawn_with_index(AgentRunMode::Headless { prompt }, index)
         .with_context(|| {
@@ -468,6 +491,7 @@ struct HeadlessSpawn<'a> {
 }
 
 async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle> {
+    let native = request.prompt_transport == HeadlessPromptTransport::Jsonl;
     let log_dir = std::path::Path::new(".ferrus/logs");
     tokio::fs::create_dir_all(log_dir)
         .await
@@ -526,11 +550,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     }
     let command_summary = format_command(&request.command);
 
-    let logger = if request.debug {
+    let logger = if request.debug && !native {
         let log_stderr = log_file
             .try_clone()
             .context("Failed to clone log file handle")?;
-        let stdin = if request.prompt_transport == HeadlessPromptTransport::Stdin {
+        let stdin = if request.prompt_transport != HeadlessPromptTransport::Argv {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -542,7 +566,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
             .stderr(Stdio::from(log_stderr));
         None
     } else {
-        let stdin = if request.prompt_transport == HeadlessPromptTransport::Stdin {
+        let stdin = if request.prompt_transport != HeadlessPromptTransport::Argv {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -557,7 +581,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
 
     platform::configure_headless_command(&mut request.command);
 
-    let mut child = request.command.spawn().with_context(|| {
+    let child = request.command.spawn().with_context(|| {
         format!(
             "Failed to spawn {} headlessly as {role}. {}. log={}",
             request.command.get_program().to_string_lossy(),
@@ -566,6 +590,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
             role = request.role
         )
     })?;
+    let mut child = SetupChild(Some(child));
     if request.prompt_transport == HeadlessPromptTransport::Stdin {
         stream_prompt_to_stdin(&mut child, request.prompt)
             .context("Failed to stream initial prompt")?;
@@ -581,55 +606,131 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         workspace_path,
     )
     .await;
-    let platform_guard = match platform::attach_headless_process(pid) {
-        Ok(guard) => Some(guard),
-        Err(err) => {
-            tracing::warn!(
-                error = ?err,
-                pid,
-                role = request.role,
-                agent_type = request.agent_type,
-                "failed to attach platform process guard; continuing without it"
-            );
-            None
+    if native && db_run_id.is_none() {
+        anyhow::bail!("Nano requires a persisted run before start");
+    }
+    let mut output_threads = Vec::new();
+    let setup = async {
+        let platform_guard = match platform::attach_headless_process(pid) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    pid,
+                    role = request.role,
+                    agent_type = request.agent_type,
+                    "failed to attach platform process guard; continuing without it"
+                );
+                None
+            }
+        };
+        let mut native_events = None;
+        let mut native_stdin = None;
+        let mut native_ready = None;
+
+        if let Some(logger) = logger.as_ref() {
+            let mut logger = logger.lock().expect("logger poisoned");
+            logger.log_event(
+                "Started",
+                format!(
+                    "{} ({}, {}, pid {pid})",
+                    request.name, request.role, request.agent_type
+                ),
+            )?;
+            logger.log_event("Agent meta", &command_summary)?;
+            logger.log_initial_prompt(request.prompt)?;
+        }
+
+        if let Some(logger) = logger.as_ref() {
+            if let Some(stdout) = child.stdout.take() {
+                if native {
+                    let (thread, ready, events) =
+                        spawn_native_log_reader(stdout, Arc::clone(logger), pid);
+                    output_threads.push(thread);
+                    native_ready = Some(ready);
+                    native_events = Some(events);
+                } else {
+                    output_threads.push(spawn_slim_log_reader(stdout, Arc::clone(logger)));
+                }
+            }
+            if let Some(stderr) = child.stderr.take() {
+                if native {
+                    let logger = Arc::clone(logger);
+                    output_threads.push(std::thread::spawn(move || {
+                        let mut reader = BufReader::new(stderr);
+                        let mut remaining = 256 * 1024usize;
+                        while let Ok(Some(line)) = crate::nano::wire::read_line(&mut reader) {
+                            if line.len() > remaining {
+                                break;
+                            }
+                            remaining -= line.len();
+                            let text: String = String::from_utf8_lossy(&line)
+                                .chars()
+                                .filter(|ch| !ch.is_control())
+                                .collect();
+                            let _ = logger.lock().unwrap().log_event("Nano diagnostic", text);
+                        }
+                    }));
+                } else {
+                    output_threads.push(spawn_slim_log_reader(stderr, Arc::clone(logger)));
+                }
+            }
+        }
+
+        if let Some(ready) = native_ready {
+            let startup = tokio::time::timeout(Duration::from_secs(30), ready).await;
+            if !matches!(startup, Ok(Ok(()))) {
+                anyhow::bail!(
+                    "Nano failed its protocol startup handshake; see {}",
+                    log_path.display()
+                );
+            }
+            let stdin = child.stdin.take().context("Missing nano command pipe")?;
+            native_stdin = Some(stdin);
+        }
+
+        let mut reg = read_agents().await?;
+        reg.upsert(AgentEntry {
+            role: request.role.to_string(),
+            agent_type: request.agent_type.to_string(),
+            name: request.name.to_string(),
+            pid: Some(pid),
+            status: AgentStatus::Running,
+            started_at: Some(chrono::Utc::now()),
+        });
+        write_agents(&reg).await?;
+
+        if let Some(stdin) = &mut native_stdin {
+            crate::nano::wire::write_command(stdin, crate::nano::wire::CommandKind::Start)?;
+        }
+        Ok::<_, anyhow::Error>((platform_guard, native_stdin, native_events))
+    }
+    .await;
+    let (platform_guard, native_stdin, native_events) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            drop(child);
+            for thread in output_threads {
+                let _ = thread.join();
+            }
+            // Registration may have succeeded before the start command failed.
+            if let Ok(mut reg) = read_agents().await
+                && let Some(entry) = reg.by_name_mut(request.name)
+                && entry.pid == Some(pid)
+            {
+                entry.pid = None;
+                entry.status = AgentStatus::Suspended;
+                let _ = write_agents(&reg).await;
+            }
+            if let Some(run) = &db_run_id {
+                crate::project::record_run_finished_best_effort(run, -1).await;
+            }
+            return Err(error);
         }
     };
-    let mut output_threads = Vec::new();
-
-    if let Some(logger) = logger.as_ref() {
-        let mut logger = logger.lock().expect("logger poisoned");
-        logger.log_event(
-            "Started",
-            format!(
-                "{} ({}, {}, pid {pid})",
-                request.name, request.role, request.agent_type
-            ),
-        )?;
-        logger.log_event("Agent meta", &command_summary)?;
-        logger.log_initial_prompt(request.prompt)?;
-    }
-
-    if let Some(logger) = logger.as_ref() {
-        if let Some(stdout) = child.stdout.take() {
-            output_threads.push(spawn_slim_log_reader(stdout, Arc::clone(logger)));
-        }
-        if let Some(stderr) = child.stderr.take() {
-            output_threads.push(spawn_slim_log_reader(stderr, Arc::clone(logger)));
-        }
-    }
-
-    let mut reg = read_agents().await?;
-    reg.upsert(AgentEntry {
-        role: request.role.to_string(),
-        agent_type: request.agent_type.to_string(),
-        name: request.name.to_string(),
-        pid: Some(pid),
-        status: AgentStatus::Running,
-        started_at: Some(chrono::Utc::now()),
-    });
-    write_agents(&reg).await?;
 
     let (exit_tx, exit_rx) = tokio::sync::watch::channel::<Option<i32>>(None);
+    let mut child = child.0.take().expect("owned child");
     let wait_logger = logger.clone();
     let wait_thread = std::thread::spawn(move || {
         let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
@@ -671,7 +772,71 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         platform_guard,
         wait_thread: Some(wait_thread),
         output_threads,
+        native_stdin,
+        native_events,
     })
+}
+
+// Errors during setup must not leave a child running without a handle.
+struct SetupChild(Option<std::process::Child>);
+impl std::ops::Deref for SetupChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for SetupChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for SetupChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            platform::signal_process_group(child.id(), ShutdownSignal::Kill);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_native_log_reader(
+    stdout: std::process::ChildStdout,
+    logger: Arc<Mutex<SlimLogger>>,
+    pid: u32,
+) -> (
+    std::thread::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>,
+) {
+    use crate::nano::wire::{self, Event};
+    let (ready_tx, ready) = tokio::sync::oneshot::channel();
+    let (events_tx, events) = tokio::sync::watch::channel(None);
+    let thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut ready_tx = Some(ready_tx);
+        loop {
+            match wire::read_event(&mut reader) {
+                Ok(Some(Event::Ready)) if ready_tx.is_some() => {
+                    let _ = ready_tx.take().unwrap().send(());
+                }
+                Ok(Some(event)) if ready_tx.is_none() && !matches!(event, Event::Ready) => {
+                    let _ = logger.lock().unwrap().log_event("Nano", event.summary());
+                    events_tx.send_replace(Some(event));
+                }
+                Ok(None) => break,
+                _ => {
+                    let _ = logger
+                        .lock()
+                        .unwrap()
+                        .log_event("Nano error", "invalid event stream");
+                    platform::signal_process_group(pid, ShutdownSignal::Kill);
+                    break;
+                }
+            }
+        }
+    });
+    (thread, ready, events)
 }
 
 fn headless_log_path(
