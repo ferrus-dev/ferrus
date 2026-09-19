@@ -88,15 +88,22 @@ impl ExecutorAgent for FakeNative {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32")
-                .join("cmd.exe");
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
             let mut command = StdCommand::new(shell);
-            command.args(["/D", "/S", "/C"]).raw_arg(format!(
-                "\"\"{}\"\"",
-                self.script.file_name().unwrap().to_string_lossy()
-            ));
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(self.script.file_name().unwrap());
             Ok(command)
         }
     }
@@ -129,7 +136,7 @@ async fn native_setup_failures_do_not_consume_dispatches() {
     assert!(!f.root.join(".ferrus/logs").exists());
     assert!(!f.data.join("worktrees").exists());
     assert_eq!(f.dispatches(), 0);
-    let script = f.root.join("malformed.cmd");
+    let script = f.root.join("malformed.ps1");
     std::fs::write(&script, "echo malformed-event\n").unwrap();
     let mut ctx = context(
         FakeNative {
@@ -153,11 +160,26 @@ async fn native_setup_failures_do_not_consume_dispatches() {
 async fn native_debug_launch_keeps_protocol_and_stop_cleans_up_the_process() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let script = f.root.join("protocol fixture.cmd");
+    let script = f.root.join("protocol fixture.ps1");
     #[cfg(unix)]
-    let source = "echo '{\"version\":1,\"event\":{\"type\":\"ready\"}}'\nread start\nread cancel\necho '{\"version\":1,\"event\":{\"type\":\"ended\",\"reason\":{\"reason\":\"cancelled\"},\"durable\":true}}'\n";
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+[ "$start" = '{"version":1,"command":"start"}' ] || exit 10
+IFS= read -r cancel
+[ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 11
+echo '{"version":1,"event":{"type":"ended","reason":{"reason":"cancelled"},"durable":true}}'
+"#;
+    // Use a stream reader for the open JSONL pipe, not cmd.exe's console-oriented set /p.
     #[cfg(windows)]
-    let source = "@echo off\r\necho {\"version\":1,\"event\":{\"type\":\"ready\"}}\r\nset /p start=\r\nset /p cancel=\r\necho {\"version\":1,\"event\":{\"type\":\"ended\",\"reason\":{\"reason\":\"cancelled\"},\"durable\":true}}\r\n";
+    let source = r#"$ErrorActionPreference = 'Stop'
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"start"}') { exit 10 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 11 }
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ended","reason":{"reason":"cancelled"},"durable":true}}')
+[Console]::Out.Flush()
+exit 0
+"#;
     std::fs::write(&script, source).unwrap();
     let mut ctx = context(
         FakeNative {
@@ -174,9 +196,19 @@ async fn native_debug_launch_keeps_protocol_and_stop_cleans_up_the_process() {
     let pid = handle.pid;
     let mut exit = handle.exit_rx.clone();
     let log = handle.log_path.clone();
-    assert!(handle.is_alive());
+    assert!(
+        handle.is_alive(),
+        "fixture exited before cancellation: {:?}\n{}",
+        *exit.borrow(),
+        std::fs::read_to_string(&log).unwrap()
+    );
     handle.terminate().await;
-    assert_eq!(*exit.borrow_and_update(), Some(0));
+    assert_eq!(
+        *exit.borrow_and_update(),
+        Some(0),
+        "{}",
+        std::fs::read_to_string(&log).unwrap()
+    );
     assert!(!crate::platform::pid_is_alive(pid));
     assert!(std::fs::read_to_string(log).unwrap().contains("Cancelled"));
     assert_eq!(
