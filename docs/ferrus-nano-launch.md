@@ -82,3 +82,10 @@ Task status and human questions continue through HQ's SQLite/artifact watcher. A
 sentence never marks a task complete. `/stop` first sends cancel and allows a two-second graceful
 cleanup interval, then uses the existing process-group termination fallback. Review, approval,
 consultation scheduling, and crash recovery remain owned by HQ.
+
+When HQ relaunches an answered human waiter, Nano derives the launch action from its bound SQLite
+task instead of an external-agent prompt. Only the question's Executor may reclaim that wait.
+The host checks cancellation and context capacity before consuming the answer, then restores
+Executing or Addressing and includes it in the first model input. Missing answers or failed delivery
+checks leave the task waiting. This starts a fresh session; replaying interrupted tool effects remains
+deferred to #84.

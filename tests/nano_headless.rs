@@ -22,7 +22,9 @@ fn success(command: &mut Command) -> String {
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "status={}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
@@ -40,6 +42,9 @@ fn private_config(path: &Path, text: &str) {
     #[cfg(windows)]
     {
         let owner = std::env::var("USERNAME").unwrap();
+        // Elevated runners can create files owned by Administrators rather than
+        // the account receiving this grant. Make the owner and trustee agree.
+        success(Command::new("icacls").arg(path).args(["/setowner", &owner]));
         success(Command::new("icacls").arg(path).args([
             "/inheritance:r",
             "/grant:r",
@@ -48,6 +53,17 @@ fn private_config(path: &Path, text: &str) {
     }
 }
 struct Process(Child);
+impl Process {
+    fn failure_diagnostics(&mut self) -> String {
+        let _ = self.0.kill();
+        let status = self.0.wait();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.0.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        format!("status={status:?}\n{stderr}")
+    }
+}
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -156,7 +172,10 @@ impl Fixture {
     }
 }
 
-fn serve(listener: TcpListener) -> std::thread::JoinHandle<()> {
+fn serve(
+    listener: TcpListener,
+    resumed: Option<(PathBuf, &'static str)>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         for turn in 0..3 {
@@ -193,6 +212,18 @@ fn serve(listener: TcpListener) -> std::thread::JoinHandle<()> {
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(request["model"], "override-model");
+            if turn == 0
+                && let Some((database, state)) = &resumed
+            {
+                assert!(request["messages"].to_string().contains("Use forty-two."));
+                let db = Connection::open(database).unwrap();
+                let restored: String = db
+                    .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(&restored, state);
+            }
             let calls = match turn {
                 0 => vec![
                     (
@@ -220,7 +251,46 @@ fn serve(listener: TcpListener) -> std::thread::JoinHandle<()> {
 
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
+    run_headless_task(None);
+}
+
+#[test]
+fn relaunched_human_waiter_delivers_the_answer_before_inference_and_submits() {
+    for state in ["executing", "addressing"] {
+        run_headless_task(Some(state));
+    }
+}
+
+fn run_headless_task(resume: Option<&'static str>) {
     let fixture = Fixture::new();
+    if let Some(state) = resume {
+        let directory = fixture.root.join(".ferrus/runs/t-001");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("QUESTION.md"), "Which answer?").unwrap();
+        fs::write(directory.join("ANSWER.md"), "Use forty-two.").unwrap();
+        if state == "addressing" {
+            fs::write(
+                directory.join("REVIEW.md"),
+                "Address the stored human guidance.",
+            )
+            .unwrap();
+        }
+        let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
+        db.execute(
+            "INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path)
+             SELECT 'previous-nano-run',task_id,role,agent,'exited',started_at,updated_at,workspace_path
+             FROM runs WHERE id='nano-e2e-run'",
+            [],
+        ).unwrap();
+        db.execute(
+            "UPDATE tasks SET status='awaiting_human', paused_status=?1,
+            awaiting_human_status=?1, awaiting_human_by='executor:nano:1',
+            claimed_by='executor:nano:1', lease_until='2000-01-01T00:00:00Z',
+            human_answer_recorded=1 WHERE id='t-001'",
+            [state],
+        )
+        .unwrap();
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let settings = fixture.data.join("provider.toml");
     private_config(
@@ -230,7 +300,10 @@ fn headless_process_edits_checks_and_submits_an_isolated_task() {
             listener.local_addr().unwrap()
         ),
     );
-    let server = serve(listener);
+    let server = serve(
+        listener,
+        resume.map(|state| (fixture.data.join("ferrus.db"), state)),
+    );
     let mut child = Process(fixture.command(&settings).spawn().unwrap());
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();
@@ -241,7 +314,9 @@ fn headless_process_edits_checks_and_submits_an_isolated_task() {
                 .unwrap();
         }
     });
-    let ready = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let ready = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("No ready event: {error}; {}", child.failure_diagnostics()));
     assert_eq!(ready, json!({"version":1,"event":{"type":"ready"}}));
     writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
     let mut ended = None;
@@ -305,6 +380,25 @@ fn headless_process_edits_checks_and_submits_an_isolated_task() {
     let journal =
         fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
     assert!(journal.contains("not-a-json-event"));
+    if resume.is_some() {
+        assert!(journal.contains("Use forty-two."));
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM events WHERE type='task_human_answered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            1
+        );
+        for name in ["QUESTION.md", "ANSWER.md"] {
+            assert!(
+                fs::read_to_string(fixture.root.join(".ferrus/runs/t-001").join(name))
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+    }
     drop(stdin);
 }
 
@@ -378,7 +472,11 @@ fn invalid_start_frames_fail_without_claiming_or_creating_a_journal() {
         let mut child = Process(f.command(&settings).spawn().unwrap());
         let mut reader = BufReader::new(child.0.stdout.take().unwrap());
         let mut ready = String::new();
-        reader.read_line(&mut ready).unwrap();
+        assert!(
+            reader.read_line(&mut ready).unwrap() > 0,
+            "No ready event: {}",
+            child.failure_diagnostics()
+        );
         assert_eq!(
             serde_json::from_str::<Value>(&ready).unwrap()["event"]["type"],
             "ready"

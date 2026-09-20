@@ -391,6 +391,15 @@ pub(super) async fn ask(session: &FerrusSession, human: bool, question: String) 
 }
 
 pub(super) async fn poll_answer(session: &FerrusSession, human: bool) -> Result<Option<Value>> {
+    poll_answer_checked(session, human, |_| Ok(())).await
+}
+
+/// Validate delivery before committing restoration or clearing the answer artifacts.
+pub(super) async fn poll_answer_checked(
+    session: &FerrusSession,
+    human: bool,
+    validate: impl FnOnce(&Value) -> Result<()> + Send + 'static,
+) -> Result<Option<Value>> {
     let root = session.project_root().to_path_buf();
     session
         .mutate(move |tx, scope, context| {
@@ -470,6 +479,8 @@ pub(super) async fn poll_answer(session: &FerrusSession, human: bool) -> Result<
                 }
             };
 
+            let result = json!({"status":"answered", "answer":text.trim(), "resumed_state":status});
+            validate(&result)?;
             clear(&directory, name)?;
             clear(
                 &directory,
@@ -480,9 +491,7 @@ pub(super) async fn poll_answer(session: &FerrusSession, human: bool) -> Result<
                 },
             )?;
 
-            Ok(Some(
-                json!({"status":"answered", "answer":text.trim(), "resumed_state":status}),
-            ))
+            Ok(Some(result))
         })
         .await
 }
