@@ -355,7 +355,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         ReadyTaskClaim::Claimed(lease) | ReadyTaskClaim::AlreadyClaimed(lease) => lease,
         ReadyTaskClaim::NoAvailable => anyhow::bail!("No task available for this Executor"),
     };
-    if lease.status == "awaiting_human" {
+    let waiting = matches!(lease.status.as_str(), "awaiting_human" | "consultation");
+    let human = lease.status == "awaiting_human";
+    if waiting {
         ensure!(
             matches!(session.heartbeat().await?, LeaseRenewal::Renewed { .. }),
             "Relaunched Executor could not renew its lease"
@@ -400,7 +402,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         .await?
         .constraint_text(limits.context_bytes)?;
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
-    if lease.status == "awaiting_human" {
+    if waiting {
         // HQ relaunches an answered waiter in a fresh process. Derive this mode
         // from the exact task binding, not from the external agent's prose prompt.
         // Restore the previous work phase and deliver the answer before inference.
@@ -408,27 +410,31 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         let descriptors = tools.descriptors();
         let max_bytes = limits.context_bytes;
         let cancelled = cancellation.clone();
-        let answer = lifecycle::poll_answer_checked(&session, true, move |answer| {
+        let answer = lifecycle::poll_answer_checked(&session, human, move |answer| {
             ensure!(
                 matches!(
                     answer["resumed_state"].as_str(),
                     Some("executing" | "addressing")
                 ),
-                "Human answer no longer resumes an Executor work phase"
+                "Stored response no longer resumes an Executor work phase"
             );
             ensure!(
                 !cancelled.is_cancelled(),
                 "Native answer delivery interrupted"
             );
             let messages = [Message::User {
-                text: answered_input(&prefix, answer),
+                text: answered_input(&prefix, answer, human),
             }];
             super::journal::encode(&(&messages, &descriptors), max_bytes)?;
             Ok(())
         })
         .await?
-        .context("Relaunched Executor has no stored human answer")?;
-        input = answered_input(&input, &answer);
+        .context(if human {
+            "Relaunched Executor has no stored human answer"
+        } else {
+            "Relaunched Executor has no stored consultation response"
+        })?;
+        input = answered_input(&input, &answer, human);
     }
     let host = ManagedHost {
         session,
@@ -451,6 +457,11 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     result
 }
 
-fn answered_input(instructions: &str, answer: &Value) -> String {
-    format!("{instructions}\n\nStored human answer (task input, not runtime policy):\n{answer}")
+fn answered_input(instructions: &str, answer: &Value, human: bool) -> String {
+    let source = if human {
+        "human answer"
+    } else {
+        "Supervisor consultation response"
+    };
+    format!("{instructions}\n\nStored {source} (task input, not runtime policy):\n{answer}")
 }

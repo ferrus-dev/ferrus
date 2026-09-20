@@ -417,53 +417,95 @@ async fn managed_relaunch_cannot_claim_foreign_or_nonworking_human_waits() {
 #[tokio::test]
 async fn managed_relaunch_preserves_answers_when_delivery_cannot_start() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for reason in ["missing", "cancelled", "context"] {
-        let f = Fixture::new().await;
-        let session = FerrusSession::bind(f.launch()).await.unwrap();
-        session.claim().await.unwrap();
-        lifecycle::ask(&session, true, "Which option?".into())
-            .await
-            .unwrap();
-        let path = f.root.join(".ferrus/runs/t-001/ANSWER.md");
-        let answer = if reason == "missing" {
-            String::new()
+    for human in [true, false] {
+        let (state, file, event) = if human {
+            ("awaiting_human", "ANSWER.md", "task_human_answered")
         } else {
-            "x".repeat(16 * 1024)
+            (
+                "consultation",
+                "CONSULT_RESPONSE.md",
+                "task_consultation_resolved",
+            )
         };
-        std::fs::write(&path, &answer).unwrap();
-        let (tools, journal) = native(&f, session.clone(), "answer-delivery");
-        let provider = script(vec![]);
-        let starts = provider.starts.clone();
-        let stop = Cancellation::default();
-        let mut limits = Limits::default();
-        if reason == "cancelled" {
-            stop.cancel();
+        for reason in ["missing", "cancelled", "context"] {
+            let f = Fixture::new().await;
+            let session = FerrusSession::bind(f.launch()).await.unwrap();
+            session.claim().await.unwrap();
+            lifecycle::ask(&session, human, QUESTION.into())
+                .await
+                .unwrap();
+            let path = f.root.join(".ferrus/runs/t-001").join(file);
+            let answer = if reason == "missing" {
+                String::new()
+            } else {
+                "x".repeat(16 * 1024)
+            };
+            std::fs::write(&path, &answer).unwrap();
+            let (tools, journal) = native(&f, session.clone(), "answer-delivery");
+            let provider = script(vec![]);
+            let starts = provider.starts.clone();
+            let stop = Cancellation::default();
+            let mut limits = Limits::default();
+            if reason == "cancelled" {
+                stop.cancel();
+            }
+            if reason == "context" {
+                limits.context_bytes = 16 * 1024;
+            }
+            let error = managed::run(
+                session.clone(),
+                identity("answer-delivery"),
+                limits,
+                provider,
+                tools,
+                journal,
+                &stop,
+            )
+            .await
+            .unwrap_err();
+            if reason == "missing" {
+                assert!(error.to_string().contains("no stored"));
+            }
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert_eq!(session.status().await.unwrap().status, state);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), answer);
+            assert!(!f.events().iter().any(|(kind, _)| kind == event));
         }
-        if reason == "context" {
-            limits.context_bytes = 16 * 1024;
-        }
-        let error = managed::run(
-            session.clone(),
-            identity("answer-delivery"),
-            limits,
-            provider,
-            tools,
-            journal,
-            &stop,
-        )
+    }
+}
+
+#[tokio::test]
+async fn managed_consultation_relaunch_rejects_invalid_resume_and_foreign_live_lease() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    lifecycle::ask(&session, false, QUESTION.into())
         .await
-        .unwrap_err();
-        if reason == "missing" {
-            assert!(error.to_string().contains("no stored human answer"));
-        }
-        assert_eq!(starts.load(Ordering::SeqCst), 0);
-        assert_eq!(session.status().await.unwrap().status, "awaiting_human");
-        assert_eq!(std::fs::read_to_string(path).unwrap(), answer);
-        assert!(
-            !f.events()
-                .iter()
-                .any(|(kind, _)| kind == "task_human_answered")
-        );
+        .unwrap();
+    for (resume, owner, until) in [
+        (None, AGENT, "2000-01-01T00:00:00Z"),
+        (Some("reviewing"), AGENT, "2000-01-01T00:00:00Z"),
+        (Some("consultation"), AGENT, "2000-01-01T00:00:00Z"),
+        (
+            Some("addressing"),
+            "executor:nano:2",
+            "2999-01-01T00:00:00Z",
+        ),
+    ] {
+        f.connection()
+            .execute(
+                "UPDATE tasks SET paused_status=?1, claimed_by=?2, lease_until=?3 WHERE id=?4",
+                rusqlite::params![resume, owner, until, TASK],
+            )
+            .unwrap();
+        let tasks = project::list_tasks().await.unwrap();
+        let events = f.events();
+        assert!(matches!(
+            session.claim().await.unwrap(),
+            ReadyTaskClaim::NoAvailable
+        ));
+        f.assert_no_effect(tasks, events).await;
     }
 }
 

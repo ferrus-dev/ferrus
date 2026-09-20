@@ -83,9 +83,10 @@ sentence never marks a task complete. `/stop` first sends cancel and allows a tw
 cleanup interval, then uses the existing process-group termination fallback. Review, approval,
 consultation scheduling, and crash recovery remain owned by HQ.
 
-When HQ relaunches an answered human waiter, Nano derives the launch action from its bound SQLite
-task instead of an external-agent prompt. Only the question's Executor may reclaim that wait.
+When HQ relaunches an answered human or consultation waiter, Nano derives the launch action from
+its bound SQLite task instead of an external-agent prompt. Human waits require the question's
+Executor; neither wait can take another agent's live lease or resume a non-Executor phase.
 The host checks cancellation and context capacity before consuming the answer, then restores
-Executing or Addressing and includes it in the first model input. Missing answers or failed delivery
-checks leave the task waiting. This starts a fresh session; replaying interrupted tool effects remains
-deferred to #84.
+Executing or Addressing and includes the human answer or Supervisor response in the first model input.
+Missing answers or failed delivery checks leave the task waiting. This starts a fresh session;
+replaying interrupted tool effects remains deferred to #84.

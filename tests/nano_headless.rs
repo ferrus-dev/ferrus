@@ -1,6 +1,11 @@
 //! Real process/HTTP/SQLite regression for the opt-in native Executor frontend.
 #![cfg(feature = "nano-openai")]
 
+// Reuse the native private-file implementation for host configuration fixtures.
+#[path = "../src/nano/private.rs"]
+#[allow(dead_code, unused_imports)]
+mod private;
+
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -33,24 +38,16 @@ fn git(root: &Path, args: &[&str]) -> String {
     success(Command::new("git").current_dir(root).args(args))
 }
 fn private_config(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    #[cfg(windows)]
-    {
-        let owner = std::env::var("USERNAME").unwrap();
-        // Elevated runners can create files owned by Administrators rather than
-        // the account receiving this grant. Make the owner and trustee agree.
-        success(Command::new("icacls").arg(path).args(["/setowner", &owner]));
-        success(Command::new("icacls").arg(path).args([
-            "/inheritance:r",
-            "/grant:r",
-            &format!("{owner}:R"),
-        ]));
-    }
+    let mut file = private::file(path, true).unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+    drop(file);
+    // Fail at provisioning with the actual security error, before launching a child.
+    let mut bytes = String::new();
+    private::read_only_file(path)
+        .unwrap()
+        .read_to_string(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, text);
 }
 struct Process(Child);
 impl Process {
@@ -257,23 +254,34 @@ fn headless_process_edits_checks_and_submits_an_isolated_task() {
 #[test]
 fn relaunched_human_waiter_delivers_the_answer_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some(state));
+        run_headless_task(Some((state, true)));
     }
 }
 
-fn run_headless_task(resume: Option<&'static str>) {
+#[test]
+fn relaunched_consultation_delivers_the_response_before_inference_and_submits() {
+    for state in ["executing", "addressing"] {
+        run_headless_task(Some((state, false)));
+    }
+}
+
+fn run_headless_task(resume: Option<(&'static str, bool)>) {
     let fixture = Fixture::new();
-    if let Some(state) = resume {
+    let (request_file, response_file, restored_event) = match resume {
+        Some((_, false)) => (
+            "CONSULT_REQUEST.md",
+            "CONSULT_RESPONSE.md",
+            "task_consultation_resolved",
+        ),
+        _ => ("QUESTION.md", "ANSWER.md", "task_human_answered"),
+    };
+    if let Some((state, human)) = resume {
         let directory = fixture.root.join(".ferrus/runs/t-001");
         fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("QUESTION.md"), "Which answer?").unwrap();
-        fs::write(directory.join("ANSWER.md"), "Use forty-two.").unwrap();
+        fs::write(directory.join(request_file), "Which answer?").unwrap();
+        fs::write(directory.join(response_file), "Use forty-two.").unwrap();
         if state == "addressing" {
-            fs::write(
-                directory.join("REVIEW.md"),
-                "Address the stored human guidance.",
-            )
-            .unwrap();
+            fs::write(directory.join("REVIEW.md"), "Address the stored guidance.").unwrap();
         }
         let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
         db.execute(
@@ -290,6 +298,14 @@ fn run_headless_task(resume: Option<&'static str>) {
             [state],
         )
         .unwrap();
+        if !human {
+            db.execute(
+                "UPDATE tasks SET status='consultation', awaiting_human_status=NULL,
+                awaiting_human_by=NULL, human_answer_recorded=0 WHERE id='t-001'",
+                [],
+            )
+            .unwrap();
+        }
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let settings = fixture.data.join("provider.toml");
@@ -302,7 +318,7 @@ fn run_headless_task(resume: Option<&'static str>) {
     );
     let server = serve(
         listener,
-        resume.map(|state| (fixture.data.join("ferrus.db"), state)),
+        resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
     );
     let mut child = Process(fixture.command(&settings).spawn().unwrap());
     let mut stdin = child.0.stdin.take().unwrap();
@@ -384,14 +400,14 @@ fn run_headless_task(resume: Option<&'static str>) {
         assert!(journal.contains("Use forty-two."));
         assert_eq!(
             db.query_row::<i64, _, _>(
-                "SELECT count(*) FROM events WHERE type='task_human_answered'",
-                [],
+                "SELECT count(*) FROM events WHERE type=?1",
+                [restored_event],
                 |row| row.get(0),
             )
             .unwrap(),
             1
         );
-        for name in ["QUESTION.md", "ANSWER.md"] {
+        for name in [request_file, response_file] {
             assert!(
                 fs::read_to_string(fixture.root.join(".ferrus/runs/t-001").join(name))
                     .unwrap_or_default()

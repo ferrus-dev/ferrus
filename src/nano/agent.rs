@@ -80,7 +80,7 @@ impl ExecutorAgent for Executor {
             matches!(mode, AgentRunMode::Headless { .. }),
             "Nano supports headless Executor sessions only"
         );
-        // The native host selects work or human-answer delivery from the bound
+        // The native host selects work or stored-response delivery from the bound
         // SQLite task; external-agent relaunch prompts are not model input here.
         validate_config(None, self.model())?;
         let mut command = Command::new(std::env::current_exe()?);
