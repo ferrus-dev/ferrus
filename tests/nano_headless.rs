@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -49,16 +49,32 @@ fn private_config(path: &Path, text: &str) {
         .unwrap();
     assert_eq!(bytes, text);
 }
-struct Process(Child);
+fn log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(8192);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(8192).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+struct Process(Child, tempfile::NamedTempFile);
 impl Process {
+    fn spawn(command: &mut Command) -> Self {
+        // A pipe read only after exit can fill and block the child on Windows.
+        let stderr = tempfile::NamedTempFile::new().unwrap();
+        let child = command.stderr(stderr.reopen().unwrap()).spawn().unwrap();
+        Self(child, stderr)
+    }
+
+    fn stderr(&self) -> String {
+        log_tail(self.1.path()).unwrap()
+    }
+
     fn failure_diagnostics(&mut self) -> String {
         let _ = self.0.kill();
         let status = self.0.wait();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = self.0.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
-        format!("status={status:?}\n{stderr}")
+        format!("status={status:?}\nstderr tail:\n{}", self.stderr())
     }
 }
 impl Drop for Process {
@@ -66,6 +82,43 @@ impl Drop for Process {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[test]
+fn process_diagnostics_do_not_block_verbose_children() {
+    const CHILD: &str = "FERRUS_TEST_VERBOSE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        std::io::stderr()
+            .write_all(&vec![b'x'; 256 * 1024])
+            .unwrap();
+        return;
+    }
+
+    let mut child = Process::spawn(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_diagnostics_do_not_block_verbose_children",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{}", child.stderr());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "verbose child did not exit: {}",
+            child.failure_diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(child.stderr(), "x".repeat(8192));
 }
 
 struct Fixture {
@@ -320,7 +373,7 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
         listener,
         resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
     );
-    let mut child = Process(fixture.command(&settings).spawn().unwrap());
+    let mut child = Process::spawn(&mut fixture.command(&settings));
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -336,35 +389,40 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
     assert_eq!(ready, json!({"version":1,"event":{"type":"ready"}}));
     writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
     let mut ended = None;
+    let mut last_event = ready;
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
             assert_eq!(event["version"], 1);
+            last_event = event.clone();
             if event["event"]["type"] == "ended" {
                 ended = Some(event);
             }
         }
         if let Some(status) = child.0.try_wait().unwrap() {
-            let mut stderr = String::new();
-            child
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            assert!(status.success(), "{stderr}");
+            assert!(status.success(), "{}", child.stderr());
             break;
         }
     }
-    assert!(child.0.try_wait().unwrap().is_some(), "nano did not exit");
+    if child.0.try_wait().unwrap().is_none() {
+        let diagnostics = child.failure_diagnostics();
+        let journal = log_tail(&fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl"));
+        panic!(
+            "nano did not exit; last event={last_event}\n{diagnostics}\njournal tail={journal:?}"
+        );
+    }
     reader.join().unwrap();
     for event in rx.try_iter() {
         if event["event"]["type"] == "ended" {
             ended = Some(event);
         }
     }
-    let ended = ended.expect("terminal protocol event");
+    let ended = ended.unwrap_or_else(|| {
+        panic!(
+            "No terminal protocol event; last event={last_event}\n{}",
+            child.stderr()
+        )
+    });
     assert_eq!(ended["event"]["reason"]["reason"], "submitted");
     assert_eq!(ended["event"]["durable"], true);
     server.join().unwrap();
@@ -485,7 +543,7 @@ fn invalid_start_frames_fail_without_claiming_or_creating_a_journal() {
         b"garbage\n".to_vec(),
         vec![b' '; 4097],
     ] {
-        let mut child = Process(f.command(&settings).spawn().unwrap());
+        let mut child = Process::spawn(&mut f.command(&settings));
         let mut reader = BufReader::new(child.0.stdout.take().unwrap());
         let mut ready = String::new();
         assert!(
@@ -507,7 +565,8 @@ fn invalid_start_frames_fail_without_claiming_or_creating_a_journal() {
             }
             assert!(
                 Instant::now() < deadline,
-                "invalid input did not stop the process"
+                "invalid input did not stop the process: {}",
+                child.failure_diagnostics()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
