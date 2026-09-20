@@ -365,6 +365,151 @@ async fn managed_model_final_is_incomplete_and_never_completes_the_task() {
 }
 
 #[tokio::test]
+async fn managed_relaunch_cannot_claim_foreign_or_nonworking_human_waits() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    lifecycle::ask(&session, true, "Which option?".into())
+        .await
+        .unwrap();
+    for (index, (owner, resume)) in [
+        (Some("supervisor:codex:1"), "executing"),
+        (Some("executor:nano:2"), "addressing"),
+        (None, "executing"),
+        (Some(AGENT), "consultation"),
+        (Some(AGENT), "reviewing"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.connection()
+            .execute(
+                "UPDATE tasks SET awaiting_human_by=?1, awaiting_human_status=?2,
+             lease_until='2000-01-01T00:00:00Z' WHERE id=?3",
+                rusqlite::params![owner, resume, TASK],
+            )
+            .unwrap();
+        let tasks = project::list_tasks().await.unwrap();
+        let events = f.events();
+        let id = format!("invalid-wait-{index}");
+        let (tools, journal) = native(&f, session.clone(), &id);
+        let provider = script(vec![]);
+        let starts = provider.starts.clone();
+        assert!(
+            managed::run(
+                session.clone(),
+                identity(&id),
+                Limits::default(),
+                provider,
+                tools,
+                journal,
+                &Cancellation::default()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        f.assert_no_effect(tasks, events).await;
+    }
+}
+
+#[tokio::test]
+async fn managed_relaunch_preserves_answers_when_delivery_cannot_start() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for human in [true, false] {
+        let (state, file, event) = if human {
+            ("awaiting_human", "ANSWER.md", "task_human_answered")
+        } else {
+            (
+                "consultation",
+                "CONSULT_RESPONSE.md",
+                "task_consultation_resolved",
+            )
+        };
+        for reason in ["missing", "cancelled", "context"] {
+            let f = Fixture::new().await;
+            let session = FerrusSession::bind(f.launch()).await.unwrap();
+            session.claim().await.unwrap();
+            lifecycle::ask(&session, human, QUESTION.into())
+                .await
+                .unwrap();
+            let path = f.root.join(".ferrus/runs/t-001").join(file);
+            let answer = if reason == "missing" {
+                String::new()
+            } else {
+                "x".repeat(16 * 1024)
+            };
+            std::fs::write(&path, &answer).unwrap();
+            let (tools, journal) = native(&f, session.clone(), "answer-delivery");
+            let provider = script(vec![]);
+            let starts = provider.starts.clone();
+            let stop = Cancellation::default();
+            let mut limits = Limits::default();
+            if reason == "cancelled" {
+                stop.cancel();
+            }
+            if reason == "context" {
+                limits.context_bytes = 16 * 1024;
+            }
+            let error = managed::run(
+                session.clone(),
+                identity("answer-delivery"),
+                limits,
+                provider,
+                tools,
+                journal,
+                &stop,
+            )
+            .await
+            .unwrap_err();
+            if reason == "missing" {
+                assert!(error.to_string().contains("no stored"));
+            }
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert_eq!(session.status().await.unwrap().status, state);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), answer);
+            assert!(!f.events().iter().any(|(kind, _)| kind == event));
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_consultation_relaunch_rejects_invalid_resume_and_foreign_live_lease() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    lifecycle::ask(&session, false, QUESTION.into())
+        .await
+        .unwrap();
+    for (resume, owner, until) in [
+        (None, AGENT, "2000-01-01T00:00:00Z"),
+        (Some("reviewing"), AGENT, "2000-01-01T00:00:00Z"),
+        (Some("consultation"), AGENT, "2000-01-01T00:00:00Z"),
+        (
+            Some("addressing"),
+            "executor:nano:2",
+            "2999-01-01T00:00:00Z",
+        ),
+    ] {
+        f.connection()
+            .execute(
+                "UPDATE tasks SET paused_status=?1, claimed_by=?2, lease_until=?3 WHERE id=?4",
+                rusqlite::params![resume, owner, until, TASK],
+            )
+            .unwrap();
+        let tasks = project::list_tasks().await.unwrap();
+        let events = f.events();
+        assert!(matches!(
+            session.claim().await.unwrap(),
+            ReadyTaskClaim::NoAvailable
+        ));
+        f.assert_no_effect(tasks, events).await;
+    }
+}
+
+#[tokio::test]
 async fn managed_heartbeat_renews_during_stalled_inference_then_stops_on_loss() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;

@@ -6,6 +6,7 @@ use neva::prelude::*;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::process::Command;
@@ -293,6 +294,9 @@ pub(crate) async fn tree_patch_between(
         .arg(baseline.value())
         .arg(source_tree.value())
         .arg("--")
+        // Tokio output() inherits stdin. Git must not share the host's open
+        // control pipe: on Windows, startup can block behind its pending read.
+        .stdin(Stdio::null())
         .output()
         .await?;
     if !output.status.success() {

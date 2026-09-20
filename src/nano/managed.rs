@@ -7,7 +7,7 @@ use super::{
     journal::Journal,
     lifecycle,
     native::NativeTools,
-    provider::Provider,
+    provider::{Message, Provider},
     session::{EndReason, Limits, Record, SessionCommand, SessionEnd, SessionIdentity},
     tools::*,
 };
@@ -15,7 +15,7 @@ use crate::{
     config::Config,
     project::{LeaseRenewal, ReadyTaskClaim},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -351,13 +351,18 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     let config = Config::load_from(session.project_root()).await?;
     let ttl_secs = session.lease_ttl_secs();
     ensure!(ttl_secs > 0, "Managed lease TTL must be positive");
-    ensure!(
-        matches!(
-            session.claim().await?,
-            ReadyTaskClaim::Claimed(_) | ReadyTaskClaim::AlreadyClaimed(_)
-        ),
-        "No task available for this Executor"
-    );
+    let lease = match session.claim().await? {
+        ReadyTaskClaim::Claimed(lease) | ReadyTaskClaim::AlreadyClaimed(lease) => lease,
+        ReadyTaskClaim::NoAvailable => anyhow::bail!("No task available for this Executor"),
+    };
+    let waiting = matches!(lease.status.as_str(), "awaiting_human" | "consultation");
+    let human = lease.status == "awaiting_human";
+    if waiting {
+        ensure!(
+            matches!(session.heartbeat().await?, LeaseRenewal::Renewed { .. }),
+            "Relaunched Executor could not renew its lease"
+        );
+    }
     let stop = Cancellation::default();
     let heartbeat_stop = Cancellation::default();
     let lost = Arc::new(AtomicBool::new(false));
@@ -391,12 +396,46 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if cancellation.is_cancelled() {
         stop.cancel();
     }
-    let input = native
+    let mut input = native
         .instructions
         .load(&[], &[])
         .await?
         .constraint_text(limits.context_bytes)?;
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
+    if waiting {
+        // HQ relaunches an answered waiter in a fresh process. Derive this mode
+        // from the exact task binding, not from the external agent's prose prompt.
+        // Restore the previous work phase and deliver the answer before inference.
+        let prefix = input.clone();
+        let descriptors = tools.descriptors();
+        let max_bytes = limits.context_bytes;
+        let cancelled = cancellation.clone();
+        let answer = lifecycle::poll_answer_checked(&session, human, move |answer| {
+            ensure!(
+                matches!(
+                    answer["resumed_state"].as_str(),
+                    Some("executing" | "addressing")
+                ),
+                "Stored response no longer resumes an Executor work phase"
+            );
+            ensure!(
+                !cancelled.is_cancelled(),
+                "Native answer delivery interrupted"
+            );
+            let messages = [Message::User {
+                text: answered_input(&prefix, answer, human),
+            }];
+            super::journal::encode(&(&messages, &descriptors), max_bytes)?;
+            Ok(())
+        })
+        .await?
+        .context(if human {
+            "Relaunched Executor has no stored human answer"
+        } else {
+            "Relaunched Executor has no stored consultation response"
+        })?;
+        input = answered_input(&input, &answer, human);
+    }
     let host = ManagedHost {
         session,
         lost: lost.clone(),
@@ -416,4 +455,13 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     let _ = (&mut heartbeat.task).await;
     drop(heartbeat);
     result
+}
+
+fn answered_input(instructions: &str, answer: &Value, human: bool) -> String {
+    let source = if human {
+        "human answer"
+    } else {
+        "Supervisor consultation response"
+    };
+    format!("{instructions}\n\nStored {source} (task input, not runtime policy):\n{answer}")
 }

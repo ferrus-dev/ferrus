@@ -16,7 +16,32 @@ pub(crate) async fn claim_executor_session(
     scope: &ExecutorSessionScope,
     ttl_secs: u64,
 ) -> Result<ReadyTaskClaim> {
-    with_executor_session(scope, true, move |transaction, scope, _| {
+    with_executor_session(scope, true, move |transaction, scope, context| {
+        // A relaunched native Executor resumes work waits, never a Supervisor's
+        // human question or a paused review phase.
+        if context.status == TaskStatus::AwaitingHuman.as_str() {
+            let (owner, resume): (Option<String>, Option<String>) = transaction.query_row(
+                "SELECT awaiting_human_by, awaiting_human_status FROM tasks WHERE id = ?1",
+                [&scope.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if owner.as_deref() != Some(&scope.agent_id)
+                || !matches!(
+                    resume.as_deref().or(context.paused_status.as_deref()),
+                    Some("executing" | "addressing")
+                )
+            {
+                return Ok(ReadyTaskClaim::NoAvailable);
+            }
+        }
+        if context.status == TaskStatus::Consultation.as_str()
+            && !matches!(
+                context.paused_status.as_deref(),
+                Some("executing" | "addressing")
+            )
+        {
+            return Ok(ReadyTaskClaim::NoAvailable);
+        }
         claim_ready_task_in_transaction(
             transaction,
             &scope.task_id,
@@ -26,6 +51,8 @@ pub(crate) async fn claim_executor_session(
                 TaskStatus::Pending,
                 TaskStatus::Executing,
                 TaskStatus::Addressing,
+                TaskStatus::AwaitingHuman,
+                TaskStatus::Consultation,
             ],
             true,
         )

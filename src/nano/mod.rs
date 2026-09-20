@@ -1,6 +1,8 @@
 //! Native agent core and managed Ferrus adapter; frontend and provider wiring are separate.
 
+pub(crate) mod agent;
 mod checks;
+pub(crate) mod cli;
 pub(crate) mod coding;
 pub(crate) mod commands;
 pub(crate) mod context;
@@ -9,6 +11,7 @@ mod lifecycle;
 pub(crate) mod managed;
 pub(crate) mod native;
 mod private;
+pub(crate) mod wire;
 
 #[cfg(feature = "nano-openai")]
 pub(crate) mod config;

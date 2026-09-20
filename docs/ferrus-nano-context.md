@@ -1,6 +1,6 @@
 # Nano instructions and native context
 
-Status: implemented for #78. Managed lifecycle is implemented in #79; HQ launch remains in #80.
+Status: implemented for #78. Managed lifecycle is implemented in #79; HQ launch is wired in #80.
 
 `NativeTools` composes the bounded workspace and command tools with instruction loading and
 seven context operations. It does not expose the entire Ferrus tool catalog. The host supplies

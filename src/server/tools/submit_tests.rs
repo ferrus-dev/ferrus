@@ -108,6 +108,41 @@ async fn frozen_tree_patch_ignores_later_worktree_changes() {
     assert!(!patch.contains("LaterEdit"));
 }
 
+#[cfg(unix)]
+#[test]
+fn frozen_tree_patch_does_not_inherit_host_stdin() {
+    use std::{io::Write, process::Stdio};
+
+    // Run the existing real-Git test in an isolated process. The external diff
+    // driver rejects inherited input and emits the expected patch only on EOF.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server::tools::submit::tests::frozen_tree_patch_ignores_later_worktree_changes",
+            "--nocapture",
+        ])
+        .env(
+            "GIT_EXTERNAL_DIFF",
+            "sh -c 'if IFS= read -r line; then exit 42; fi; printf \"+pub struct Submitted;\"' --",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "host control frame").unwrap();
+    let output = child.wait_with_output().unwrap();
+    // Keep the host stream open until patch capture has finished.
+    drop(input);
+    assert!(
+        output.status.success(),
+        "patch capture inherited host stdin:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 async fn setup() -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
     let previous = std::env::current_dir().unwrap();

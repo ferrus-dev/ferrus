@@ -9,6 +9,7 @@ use crate::config::{Config, HqRole, ensure_claude_mcp_isolation_default, update_
 
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Agent {
+    Nano,
     #[value(name = crate::agents::claude::NAME)]
     ClaudeCode,
     Codex,
@@ -24,6 +25,7 @@ impl Agent {
     /// The string representation used in --agent-name CLI flags and claimed_by identifiers.
     pub fn name(&self) -> &str {
         match self {
+            Agent::Nano => crate::nano::agent::NAME,
             Agent::ClaudeCode => crate::agents::claude::NAME,
             Agent::Codex => crate::agents::codex::NAME,
             Agent::Goose => crate::agents::goose::NAME,
@@ -39,11 +41,23 @@ pub async fn run(
     executor: Option<Agent>,
     executor_model: Option<String>,
 ) -> Result<()> {
+    let executor_model = if executor == Some(Agent::Nano) {
+        executor_model.map(|model| model.trim().to_string())
+    } else {
+        executor_model
+    };
     if supervisor.is_none() && supervisor_model.is_some() {
         anyhow::bail!("--supervisor-model requires --supervisor");
     }
     if executor.is_none() && executor_model.is_some() {
         anyhow::bail!("--executor-model requires --executor");
+    }
+    // Validate native selection before writing any role configuration.
+    if supervisor == Some(Agent::Nano) {
+        anyhow::bail!("Nano supports headless Executor sessions only");
+    }
+    if executor == Some(Agent::Nano) {
+        crate::nano::agent::validate_config(None, executor_model.as_deref())?;
     }
 
     if let Some(agent) = &supervisor {
@@ -157,17 +171,22 @@ pub(crate) async fn configured_hq_mcp_checks() -> Result<Vec<McpLaunchCheck>> {
             supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)
         }),
         mcp_launch_check(ROLE_EXECUTOR, hq.executor_name(), || {
-            executor.validate_interactive_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)
+            executor.validate_headless_launch(ROLE_EXECUTOR, DEFAULT_AGENT_INDEX)
         }),
     ])
 }
 
 fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>) -> McpLaunchCheck {
+    let config_kind = if agent == "nano" {
+        "native config"
+    } else {
+        "MCP config"
+    };
     match check() {
         Ok(()) => McpLaunchCheck {
             ok: true,
             fatal: false,
-            message: format!("{role} MCP config is launchable for {agent}"),
+            message: format!("{role} {config_kind} is launchable for {agent}"),
         },
         Err(err) => {
             let message = err.to_string();
@@ -180,7 +199,7 @@ fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>)
                         "{role} MCP config is not registered for {agent}; run `ferrus register --{role} {agent}`"
                     )
                 } else {
-                    format!("{role} MCP config is not launchable for {agent} ({err})")
+                    format!("{role} {config_kind} is not launchable for {agent} ({err})")
                 },
             }
         }
@@ -189,6 +208,7 @@ fn mcp_launch_check(role: &str, agent: &str, check: impl FnOnce() -> Result<()>)
 
 fn agent_from_name(name: &str) -> Result<Agent> {
     match name {
+        "nano" => Ok(Agent::Nano),
         crate::agents::claude::NAME => Ok(Agent::ClaudeCode),
         crate::agents::codex::NAME => Ok(Agent::Codex),
         crate::agents::goose::NAME => Ok(Agent::Goose),
@@ -206,6 +226,13 @@ async fn register_role(
 ) -> Result<()> {
     let agent_name = agent.name();
     match agent {
+        Agent::Nano => {
+            anyhow::ensure!(
+                role == ROLE_EXECUTOR,
+                "Nano supports headless Executor sessions only"
+            );
+            crate::nano::agent::validate_config(None, model)
+        }
         Agent::ClaudeCode => register_claude_code(role, agent_name, model, update_agent_docs).await,
         Agent::Codex => register_codex(role, agent_name, model, update_agent_docs).await,
         Agent::Goose => register_goose(role).await,

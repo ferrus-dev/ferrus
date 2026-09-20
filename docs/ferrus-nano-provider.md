@@ -2,14 +2,15 @@
 
 The first inference adapter targets **LM Studio's OpenAI-compatible
 `POST /v1/chat/completions` streaming API**. It is opt-in through the `nano-openai`
-Cargo feature. This implements #75; a Nano CLI and HQ launcher remain #80 work.
+Cargo feature. This implements #75; [CLI/HQ launch](ferrus-nano-launch.md) is implemented in #80.
 An OpenAI-compatible label alone does not establish endpoint or model compatibility.
 
 ## Host configuration
 
-The caller explicitly loads `nano::config::Config` and constructs `OpenAi`. Ordinary
-Ferrus configuration, HQ, MCP, graph, and memory paths do not load these settings,
-resolve credentials, or initialize the client. No model is selected automatically.
+The native launcher explicitly loads `nano::config::Config` and constructs `OpenAi`.
+Selecting Nano in HQ or registration validates its host-local settings and credential.
+Other Ferrus backends, MCP, graph, and memory paths do not initialize this provider.
+No model is selected automatically.
 
 Keep the settings file outside the project, for example in your private Ferrus
 configuration directory. The loader opens inputs read-only and requires an existing

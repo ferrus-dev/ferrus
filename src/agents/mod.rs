@@ -75,6 +75,16 @@ pub enum HeadlessPromptTransport {
     Argv,
     /// Pass prompt via stdin and close stdin after writing.
     Stdin,
+    /// Versioned commands on open stdin and structured events on stdout.
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorCapabilities {
+    pub interactive: bool,
+    pub headless: bool,
+    pub native: bool,
+    pub event_output: bool,
 }
 
 /// Behavior required from a supervisor-capable agent implementation.
@@ -155,6 +165,18 @@ pub trait SupervisorAgent: Send + Sync {
 /// Executors mirror the supervisor API because HQ may start them in interactive
 /// or headless modes depending on the orchestration context.
 pub trait ExecutorAgent: Send + Sync {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities {
+            interactive: true,
+            headless: true,
+            native: false,
+            event_output: false,
+        }
+    }
+
+    fn validate_headless_launch(&self, role: &str, index: u32) -> Result<()> {
+        self.validate_interactive_launch(role, index)
+    }
     /// Returns the stable configuration name for this agent backend.
     fn name(&self) -> &'static str;
 
@@ -230,6 +252,7 @@ pub fn parse_supervisor_agent(
     model: Option<&str>,
 ) -> Result<Arc<dyn SupervisorAgent>> {
     match agent_type {
+        "nano" => bail!("Nano supports headless Executor sessions only"),
         claude::NAME => Ok(Arc::new(claude::Supervisor::new(
             model,
             crate::config::load_claude_mcp_isolation(),
@@ -255,6 +278,7 @@ pub fn parse_executor_agent(
     model: Option<&str>,
 ) -> Result<Arc<dyn ExecutorAgent>> {
     match agent_type {
+        "nano" => Ok(Arc::new(crate::nano::agent::Executor::new(model))),
         claude::NAME => Ok(Arc::new(claude::Executor::new(
             model,
             crate::config::load_claude_mcp_isolation(),
@@ -264,7 +288,7 @@ pub fn parse_executor_agent(
         opencode::NAME => Ok(Arc::new(opencode::Executor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Executor::new(model))),
         other => bail!(
-            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
+            "Unknown executor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\", \"nano\"."
         ),
     }
 }

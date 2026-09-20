@@ -20,12 +20,12 @@ Last reviewed against the repository: 2026-09-07.
 | Windows support | Mostly implemented | Windows platform hooks, shell execution, installer, Windows CI, and smoke tests exist. Real agent-loop validation and support-policy docs still need tightening. |
 | Storage layer and SQLite backend | Done | Versioned SQLite migrations, tasks, runs, events, leases, counters, selected spec state, and recovery. Markdown remains scoped human-readable artifacts. |
 | Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
-| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits and adapters for Codex, Claude Code, Qwen Code, goose, and opencode exist. Explicit capability contracts and runnable native agents remain future work. |
+| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits cover external backends and the opt-in native Nano headless Executor. Nano declares its launch capabilities; interactive native roles remain future work. |
 | Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, frozen submissions, three-way integration with rollback, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
 | Distributed context data plane | Prototype implemented | Opt-in contracts and local prototype adapters for authorized jobs, encrypted storage, publication, queries, and maintenance. No deployed remote service is implied. |
-| Ferrus nano-agent | Foundation implemented; runtime planned | #73 adds native binding and claim/status/heartbeat; #74 adds the bounded engine/journal; #75 adds opt-in LM Studio Chat Completions; #76 adds bounded native read/search/patch tools; #77 adds cancellable commands and bounded output. Live model validation, HQ launch, interactive UI, and standalone delivery remain pending. |
+| Ferrus nano-agent | Headless Executor implemented; release validation pending | #73-#80 add native binding, bounded sessions and tools, an opt-in Chat Completions provider, graph/memory context, managed lifecycle, and CLI/HQ launch. Live model validation, release gates, interactive UI, and standalone delivery remain pending. |
 
 ## Milestone 1: Windows Support
 
@@ -151,7 +151,8 @@ Definition of done:
 ## Milestone 5: Ferrus Nano-Agent
 
 Status: native session, engine/journal, provider, file/command tools, scoped native context,
-and managed Executor lifecycle implemented (#73-#79); the runnable harness is not available yet.
+managed Executor lifecycle, and CLI/HQ headless launch implemented (#73-#80). Nano is opt-in
+through `nano-openai`; live model validation and later release gates remain outstanding.
 
 Goal: build `ferrus-nano` (backend `nano`) as a minimal Rust coding-agent harness. Start with a
 headless managed Executor, using Ferrus operations, repository graph, and project memory through
@@ -173,6 +174,7 @@ Implemented foundation:
 - trusted-local command sessions with tree cancellation, environment isolation, output cursors/quotas, and engine shutdown cleanup ([contract](ferrus-nano-commands.md));
 - scoped instructions and selected skills with digests/caps, native graph/memory retrieval, and labeled workspace fallback ([contract](ferrus-nano-context.md));
 - managed claim/heartbeat, native check/submit, host-owned consultation/human waits, and distinct session outcomes ([contract](ferrus-nano-lifecycle.md));
+- headless backend registration, private provider configuration, versioned JSONL launch/events, and HQ process supervision ([contract](ferrus-nano-launch.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -181,7 +183,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
-| N1: headless Executor | #80 | Live model validation and HQ launch/events |
+| N1: headless Executor | #80 implemented; #85 validation | Live model validation and release gates |
 | N2: context efficiency | #81-#82 | Working-set invalidation, budgets, and compaction |
 | N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |

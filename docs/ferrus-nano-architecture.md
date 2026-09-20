@@ -1,9 +1,10 @@
 # Ferrus Nano: Native Agent Harness
 
-Status: accepted implementation plan, updated 2026-09-18. The #73 managed-session binding,
+Status: accepted implementation plan, updated 2026-09-19. The #73 managed-session binding,
 #74 bounded engine/journal, #75 opt-in Chat Completions adapter, #76 workspace tools,
 #77 command sessions, #78 scoped instructions/native context, and #79 managed Executor
-lifecycle are implemented. Live model validation, launcher, and later slices remain planned.
+lifecycle are implemented. #80 adds opt-in [CLI/HQ launch](ferrus-nano-launch.md) and structured
+events. Live model validation and later slices remain planned.
 No measured performance claim.
 
 Working product name: `ferrus-nano`. Ferrus backend name: `nano`.
@@ -47,10 +48,10 @@ promotion and retry semantics; heartbeat cannot renew outside an Executor work p
 
 The Git baseline is checked against HQ's existing task baseline metadata independently of optional
 graph snapshot IDs. The database is opened without create/migrate behavior: HQ must prepare it and
-persist the run binding before the child uses the adapter. The later launcher (#80) must account
-for run-start ordering; the current external launcher writes the run after spawning. This slice
-adds no runnable backend or automatic launch retry. The nano module's temporary dead-code allowance
-can be removed when the launcher makes these entry points reachable.
+persist the run binding before the child uses the adapter. The #80 launcher starts the process,
+persists the run, waits for protocol readiness, and only then authorizes inference with a start
+command. HQ retains dispatch/retry ownership. Core extension entry points for later recovery
+remain available alongside the optional provider frontend.
 
 Audit base: Ferrus commit `4f52783d6f5efa64ea1a2adf48b55c8b27c565be`.
 

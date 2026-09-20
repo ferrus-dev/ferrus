@@ -1,7 +1,8 @@
 # Nano command sessions
 
 Status: implemented for #77. These are native tool adapters, not a new CLI entry point.
-Lifecycle/check/submit integration and HQ launch remain in #79 and #80.
+Lifecycle/check/submit integration is implemented in #79; [HQ launch](ferrus-nano-launch.md)
+is wired in #80.
 
 `CodingTools` composes the existing workspace tools with `Commands`. The host binds a
 workspace, session ID, private journal directory, execution backend, and limits before

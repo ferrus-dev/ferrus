@@ -1,8 +1,8 @@
 # Nano managed Executor lifecycle
 
-Status: implemented for #79. CLI/HQ launch and structured UI delivery remain in #80;
-live crash recovery remains in #84. This module is exercised with scripted providers and
-temporary runtime projects. It does not enable a new CLI command or register an agent.
+Status: implemented for #79 and connected to [CLI/HQ launch](ferrus-nano-launch.md) in #80.
+Live crash recovery remains in #84. Lifecycle regressions use scripted providers and temporary
+runtime projects; the launch tests also exercise a real child process against a local mock API.
 
 ## Host and authority
 
