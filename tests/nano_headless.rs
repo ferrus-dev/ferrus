@@ -242,6 +242,9 @@ fn serve(
                     Err(err) => panic!("mock API: {err}"),
                 }
             };
+            // Accepted sockets can inherit the listener's nonblocking mode.
+            // Only accept polls; request reads use the bounded blocking timeout.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
@@ -282,7 +285,7 @@ fn serve(
                     ),
                     (
                         "exec",
-                        json!({"command":"echo not-a-json-event", "timeout_ms":1000}),
+                        json!({"command":"echo not-a-json-event", "cwd":".", "timeout_ms":1000}),
                     ),
                 ],
                 1 => vec![("check", json!({}))],
@@ -423,7 +426,12 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
             child.stderr()
         )
     });
-    assert_eq!(ended["event"]["reason"]["reason"], "submitted");
+    assert_eq!(
+        ended["event"]["reason"]["reason"],
+        "submitted",
+        "{ended}; journal tail={:?}",
+        log_tail(&fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl"))
+    );
     assert_eq!(ended["event"]["durable"], true);
     server.join().unwrap();
     let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
@@ -454,6 +462,15 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
     let journal =
         fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
     assert!(journal.contains("not-a-json-event"));
+    let results: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["event"]["event"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 4);
+    for result in results {
+        assert_eq!(result["event"]["outcome"]["status"], "success", "{result}");
+    }
     if resume.is_some() {
         assert!(journal.contains("Use forty-two."));
         assert_eq!(
