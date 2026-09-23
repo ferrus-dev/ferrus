@@ -286,6 +286,40 @@ impl LocalProjectContext {
         })
     }
 
+    /// Resolve both publications against the already captured runtime binding.
+    pub(crate) async fn pinned_scope(
+        &self,
+        domain: ContextDomain,
+        budget: MemoryQueryBudget,
+    ) -> AnyResult<FederatedScope> {
+        let mut scope = self.scope(domain, budget)?;
+        match &mut scope.target {
+            FederatedTarget::Repository { repository }
+            | FederatedTarget::All { repository, .. } => {
+                let graph = self.graph.as_ref().context("Missing repository binding")?;
+                let snapshot = graph
+                    .status()
+                    .await?
+                    .snapshot_id
+                    .context("No repository snapshot available for context assembly")?;
+                repository.snapshot =
+                    crate::repository_graph::query::SnapshotSelector::Snapshot(snapshot);
+            }
+            _ => (),
+        }
+        match &mut scope.target {
+            FederatedTarget::Memory { memory } | FederatedTarget::All { memory, .. } => {
+                let revision = self
+                    .memory_status(budget)?
+                    .revision_id
+                    .context("No memory revision available for context assembly")?;
+                *memory = MemoryRevisionSelector::Revision(revision);
+            }
+            _ => (),
+        }
+        Ok(scope)
+    }
+
     pub(crate) fn memory_status(
         &self,
         budget: MemoryQueryBudget,

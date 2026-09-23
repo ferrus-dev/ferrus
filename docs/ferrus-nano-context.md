@@ -26,8 +26,8 @@ unsafe required input fails instead of silently omitting a constraint.
 context. `load_instructions` makes explicit reloads available as a tool. Every load returns a
 replacement set, so edits and deleted optional guidance do not accumulate stale instructions.
 The host must retain this entire set through later context projection or reject the projection;
-working-set management and compaction remain #81 and #82. Automatic turn-time projection is not
-part of this slice.
+the [working set](ferrus-nano-working-set.md) preserves it during turn-time evidence selection.
+Token-budgeted compaction remains #82.
 
 Defaults are 32 KiB per file, 96 KiB per encoded set, and 32 documents. Selection is limited to
 16 file targets, 16 path components, and eight skills. Limits are host-configurable within hard

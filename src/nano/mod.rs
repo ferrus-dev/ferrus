@@ -11,6 +11,7 @@ mod lifecycle;
 pub(crate) mod managed;
 pub(crate) mod native;
 mod private;
+mod refresh;
 pub(crate) mod wire;
 
 #[cfg(feature = "nano-openai")]
@@ -24,6 +25,7 @@ pub(crate) mod providers;
 pub(crate) mod replay;
 pub(crate) mod session;
 pub(crate) mod tools;
+pub(crate) mod working_set;
 pub(crate) mod workspace;
 
 #[cfg(test)]

@@ -840,3 +840,131 @@ async fn replay_rejects_a_submitted_end_without_a_confirmed_handoff() {
     };
     assert!(Replay::from_records(&records).is_err());
 }
+
+struct EvidenceTools {
+    workspace: super::workspace::Workspace,
+    enabled: bool,
+}
+impl Tools for EvidenceTools {
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.workspace.descriptors()
+    }
+    fn validate(&self, name: &str, args: &serde_json::Value) -> Result<(), ToolError> {
+        self.workspace.validate(name, args)
+    }
+    async fn execute(&mut self, call: &ValidatedCall, cancel: &Cancellation) -> ToolOutcome {
+        self.workspace.execute(call, cancel).await
+    }
+    async fn prepare_context(
+        &mut self,
+        messages: &[Message],
+        _: &Cancellation,
+    ) -> Result<Option<super::working_set::Preparation>, ToolError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        super::working_set::prepare(messages, &json!({}), &json!({}), &self.workspace, false)
+            .map(Some)
+            .map_err(|_| ToolError::OutputLimit)
+    }
+}
+
+#[tokio::test]
+async fn working_set_projection_is_durable_replayable_and_independently_disabled() {
+    for enabled in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.txt"), "content needed to edit\n").unwrap();
+        let read = |id: &str| ToolCall {
+            provider_call_id: id.into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"source.txt"}).to_string(),
+        };
+        let mut engine = Engine::new(
+            identity(),
+            limits(),
+            scripted(vec![
+                response("", vec![read("a")]),
+                response("", vec![read("b")]),
+                response("done", vec![]),
+            ]),
+            EvidenceTools {
+                workspace: super::workspace::Workspace::new(
+                    &root,
+                    super::workspace::Limits::default(),
+                )
+                .unwrap(),
+                enabled,
+            },
+            FakeHost::default(),
+            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&mut engine, &Cancellation::default()).await.reason,
+            EndReason::ModelFinished
+        );
+        let mut replay = Replay::default();
+        let mut projected = Vec::new();
+        for record in &engine.host.records {
+            replay.apply(record).unwrap();
+            if let SessionEvent::ContextPrepared { preparation } = &record.event {
+                projected.push(preparation.apply(&replay.messages).unwrap());
+            }
+        }
+        assert_eq!(projected.len(), if enabled { 3 } else { 0 });
+        if enabled {
+            for (messages, request) in projected.iter().zip(&engine.provider.requests) {
+                assert_eq!(messages, &request.messages);
+            }
+            assert!(
+                matches!(&projected[2][2], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["kind"] == "evidence_reference")
+            );
+        }
+        assert!(
+            matches!(&replay.messages[2], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["text"] == "content needed to edit\n")
+        );
+        assert!(
+            matches!(&engine.provider.requests[2].messages[4], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["text"] == "content needed to edit\n")
+        );
+        assert_eq!(engine.provider.requests[0].messages[0], replay.messages[0]);
+    }
+}
+
+struct RejectPreparation(FileJournal);
+impl Journal for RejectPreparation {
+    fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
+        anyhow::ensure!(
+            !matches!(event, SessionEvent::ContextPrepared { .. }),
+            "injected preparation commit failure"
+        );
+        self.0.append(event, budget)
+    }
+    fn checkpoint(&mut self) -> Result<()> {
+        self.0.checkpoint()
+    }
+}
+
+#[tokio::test]
+async fn uncommitted_projection_never_reaches_the_provider() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        scripted(vec![response("done", vec![])]),
+        EvidenceTools {
+            workspace: super::workspace::Workspace::new(&root, super::workspace::Limits::default())
+                .unwrap(),
+            enabled: true,
+        },
+        FakeHost::default(),
+        RejectPreparation(FileJournal::create(&root, "session-1", Quotas::default()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut engine, &Cancellation::default()).await.reason,
+        EndReason::JournalFailed
+    );
+    assert!(engine.provider.requests.is_empty());
+}

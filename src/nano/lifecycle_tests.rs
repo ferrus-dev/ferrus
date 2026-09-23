@@ -1347,3 +1347,111 @@ async fn managed_consult_wait_preserves_a_nested_supervisor_human_question() {
     assert_eq!(result["answer"], "Supervisor recommendation");
     assert_eq!(result["resumed_state"], "executing");
 }
+
+#[tokio::test]
+async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
+    use crate::nano::{
+        context::{Context, Request, Response},
+        refresh::Refresh,
+    };
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let before = session.status().await.unwrap();
+    std::fs::write(f.root.join("src/lib.rs"), "pub struct WorkingSetEdit;\n").unwrap();
+    let mut refresh = Refresh::default();
+    refresh.elapse_debounce();
+    assert_eq!(
+        refresh.prepare(&session, false).await[0]["status"],
+        "scheduled"
+    );
+    assert_eq!(refresh.settle().await.unwrap()["status"], "published");
+    let after = session.status().await.unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.check_retries, before.check_retries);
+    assert_eq!(
+        after.repository_view.baseline_snapshot_id,
+        before.repository_view.baseline_snapshot_id
+    );
+    assert_ne!(
+        after.repository_view.view_snapshot_id,
+        before.repository_view.view_snapshot_id
+    );
+    let context = Context::new(session);
+    let Response::RepositorySearch(Ok(result)) = context
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", json!({"query":"WorkingSetEdit"})).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("search")
+    };
+    assert!(!result.data.hits.is_empty());
+    assert_eq!(
+        Some(result.snapshot_id),
+        after.repository_view.view_snapshot_id
+    );
+}
+
+#[tokio::test]
+async fn explicit_prefetch_is_read_only_host_evidence_and_rechecks_source_bytes() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let (mut tools, _journal) = native(&f, session, "prefetch-test");
+    tools.working_set_enabled = false;
+    tools.context.cache_enabled = false;
+    let messages = vec![Message::User {
+        text: "bound task and constraints".into(),
+    }];
+    assert!(
+        tools
+            .prepare_context(&messages, &Cancellation::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let events = f.events();
+    let tasks = project::list_tasks().await.unwrap();
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.replacements.is_empty());
+    assert_eq!(prepared.observations.len(), 1);
+    assert_eq!(prepared.observations[0]["kind"], "prefetch");
+    assert_eq!(
+        prepared.observations[0]["evidence"]["binding"]["task"],
+        TASK
+    );
+    assert!(
+        !prepared.observations[0]["evidence"]["sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let projected = prepared.apply(&messages).unwrap();
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[0], messages[0]);
+    assert!(
+        matches!(&projected[1], Message::User {text} if text.contains("Ferrus host observation") && text.contains("pub struct Baseline;"))
+    );
+    std::fs::write(f.root.join("src/lib.rs"), "pub struct ExternalChange;\n").unwrap();
+    let next = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&next.apply(&messages).unwrap())
+            .unwrap()
+            .contains("pub struct Baseline;")
+    );
+    assert_eq!(messages.len(), 1);
+    f.assert_no_effect(tasks, events).await;
+    assert!(tools.shutdown().await);
+}

@@ -390,8 +390,61 @@ async fn native_graph_preserves_pinned_views_and_verified_snippets() {
         old.snapshot_id, baseline,
         "canonical publication must not retarget the task"
     );
+    let page_request = serde_json::json!({"query":"src/lib.rs", "max_results":1});
+    let first = native
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", page_request.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let repeated = native
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", page_request.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(repeated).unwrap()
+    );
+    let Response::RepositorySearch(Ok(first)) = first else {
+        panic!("first page")
+    };
+    let cursor = first
+        .page
+        .next_cursor
+        .expect("multiple nodes on the same source path");
     f.assert_no_effect(tasks, events).await;
     f.connection().execute("UPDATE tasks SET repository_view_snapshot_id = ?1, overlay_revision_id = 'overlay-1' WHERE id = ?2", [overlay.as_str(), TASK]).unwrap();
+    let Response::RepositorySearch(Ok(updated)) = native
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", page_request.clone()).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("new publication")
+    };
+    assert_eq!(updated.snapshot_id, overlay);
+    let mut continued = page_request;
+    continued["cursor"] = serde_json::to_value(cursor).unwrap();
+    let Response::RepositorySearch(Err(error)) = native
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", continued).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("stale cursor accepted")
+    };
+    assert_eq!(
+        error.code,
+        crate::repository_graph::query::QueryErrorCode::StaleCursor
+    );
     let Response::RepositorySearch(Ok(new)) = native
         .retrieve("repository_search", search("OverlaySymbol"))
         .await
@@ -616,4 +669,60 @@ async fn native_memory_preserves_revision_and_source_policy() {
     assert!(context.repository.is_none());
     assert!(!f.data.join("repo-graph.db").exists());
     f.assert_no_effect(tasks, events).await;
+}
+
+#[tokio::test]
+async fn working_set_refresh_is_best_effort_and_preserves_failed_publications() {
+    use crate::nano::{context::Context, refresh::Refresh};
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    let mut refresh = Refresh::default();
+    refresh.elapse_debounce();
+    assert!(refresh.prepare(&session, true).await.is_empty());
+    assert_eq!(
+        refresh.prepare(&session, false).await[0]["status"],
+        "scheduled"
+    );
+    assert_eq!(refresh.settle().await.unwrap()["status"], "disabled");
+    // Missing optional graph/memory sidecars still permit workspace evidence.
+    let revisions = Context::new(session).revisions().await.unwrap();
+    assert!(revisions["snapshot_id"].is_null());
+    assert!(revisions["memory_revision_id"].is_null());
+
+    let config = std::fs::read_to_string(f.root.join("ferrus.toml")).unwrap();
+    std::fs::write(
+        f.root.join("ferrus.toml"),
+        format!("{config}\n[repository_graph]\nenabled = true\n"),
+    )
+    .unwrap();
+    let view = project::RepositoryViewReference::new(
+        Some(crate::repository_graph::domain::SnapshotId::new("last-publication").unwrap()),
+        None,
+        project::RepositoryViewStatus::Available,
+    )
+    .unwrap();
+    project::record_task_repository_view(TASK, &view)
+        .await
+        .unwrap();
+    let mut launch = f.launch();
+    launch.baseline_tree = Some("a".repeat(40));
+    std::fs::create_dir_all(f.data.join("worktrees/.baseline-trees")).unwrap();
+    std::fs::write(
+        f.data.join("worktrees/.baseline-trees/t-001.txt"),
+        launch.baseline_tree.as_ref().unwrap(),
+    )
+    .unwrap();
+    let session = FerrusSession::bind(launch).await.unwrap();
+    let before = session.status().await.unwrap();
+    refresh.elapse_debounce();
+    refresh.prepare(&session, false).await;
+    assert_eq!(refresh.settle().await.unwrap()["status"], "failed");
+    let after = session.status().await.unwrap();
+    let mut expected = view;
+    expected.status = project::RepositoryViewStatus::Stale;
+    assert_eq!(after.repository_view, expected);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.check_retries, before.check_retries);
 }

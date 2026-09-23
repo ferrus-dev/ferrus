@@ -140,6 +140,31 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 return EndReason::Limit(LimitKind::ModelTurns);
             }
 
+            let preparation = match interrupt(
+                self.tools.prepare_context(&self.messages, cancellation),
+                cancellation,
+                deadline,
+            )
+            .await
+            {
+                Ok(Ok(preparation)) => preparation,
+                Ok(Err(super::tools::ToolError::Denied)) => return EndReason::AuthorityLost,
+                Ok(Err(super::tools::ToolError::Interrupted)) => return EndReason::Cancelled,
+                Ok(Err(_)) => return EndReason::Limit(LimitKind::ContextBytes),
+                Err(reason) => return reason,
+            };
+            let messages = if let Some(preparation) = preparation {
+                let messages = match preparation.apply(&self.messages) {
+                    Ok(messages) => messages,
+                    Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
+                };
+                if !self.commit(SessionEvent::ContextPrepared { preparation }) {
+                    return EndReason::JournalFailed;
+                }
+                messages
+            } else {
+                self.messages.clone()
+            };
             let descriptors = self.tools.descriptors();
             let mut names = HashSet::new();
             if descriptors
@@ -149,7 +174,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 return EndReason::ProviderProtocol;
             }
 
-            let context = match encode(&(&self.messages, &descriptors), self.limits.context_bytes) {
+            let context = match encode(&(&messages, &descriptors), self.limits.context_bytes) {
                 Ok(bytes) => bytes,
                 Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
             };
@@ -180,7 +205,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             }
 
             let request = ModelRequest {
-                messages: self.messages.clone(),
+                messages,
                 tools: descriptors,
                 max_output_tokens: output_reservation,
             };

@@ -17,6 +17,10 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     pub context: Context,
     pub instructions: Instructions,
     session: FerrusSession,
+    pub(super) working_set_enabled: bool,
+    pub(super) prefetch: Vec<Value>,
+    refresh: super::refresh::Refresh,
+    observations: Vec<Value>,
 }
 
 impl<B: ExecutionBackend> NativeTools<B> {
@@ -37,7 +41,23 @@ impl<B: ExecutionBackend> NativeTools<B> {
             context: Context::new(session.clone()),
             instructions: Instructions::new(session.clone(), limits)?,
             session,
+            working_set_enabled: true,
+            prefetch: Vec::new(),
+            refresh: Default::default(),
+            observations: Vec::new(),
         })
+    }
+
+    pub(super) async fn invalidate_unknown(&mut self) {
+        self.before_mutation().await;
+        self.context.invalidate();
+        self.refresh.invalidate();
+    }
+
+    async fn before_mutation(&mut self) {
+        if let Some(observation) = self.refresh.settle().await {
+            self.observations.push(observation);
+        }
     }
 }
 #[derive(Deserialize)]
@@ -117,6 +137,69 @@ fn descriptor(name: &str) -> ToolDescriptor {
 }
 
 impl<B: ExecutionBackend> Tools for NativeTools<B> {
+    async fn prepare_context(
+        &mut self,
+        messages: &[super::provider::Message],
+        cancellation: &Cancellation,
+    ) -> std::result::Result<Option<super::working_set::Preparation>, ToolError> {
+        if !self.working_set_enabled && self.prefetch.is_empty() {
+            return Ok(None);
+        }
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Interrupted);
+        }
+        let revisions = self
+            .context
+            .revisions()
+            .await
+            .map_err(|_| ToolError::Denied)?;
+        let writers = self.coding.commands.potentially_active_writers() > 0;
+        let binding = json!({"project":self.session.project_id(), "task":self.session.scope.task_id,
+            "run":self.session.scope.run_id, "workspace":self.session.workspace()});
+        let mut prepared = if self.working_set_enabled {
+            super::working_set::prepare(
+                messages,
+                &binding,
+                &revisions,
+                &self.coding.workspace,
+                writers,
+            )
+            .map_err(|_| ToolError::OutputLimit)?
+        } else {
+            super::working_set::Preparation::default()
+        };
+        if !self.prefetch.is_empty() && !writers {
+            // Explicit host seeds only; no task-text heuristic or hidden planner.
+            let request = json!({"seeds":self.prefetch, "max_results":8, "max_bytes":8192,
+                "max_depth":1, "max_duration_ms":250, "max_snippet_bytes":4096, "include_snippets":true});
+            let result = async {
+                anyhow::ensure!(self.prefetch.len() <= 8, "Too many prefetch seeds");
+                let response = self
+                    .context
+                    .retrieve(
+                        "repository_context",
+                        Request::parse("repository_context", request.clone())?,
+                    )
+                    .await?;
+                serde_json::to_value(response).map_err(Into::into)
+            }
+            .await;
+            match result {
+                Ok(value) => {
+                    let evidence = super::working_set::evidence("repository_context", &value, &binding);
+                    prepared.observations.push(json!({"kind":"prefetch", "request":request, "response":value, "evidence":evidence}));
+                }
+                Err(error) => prepared.observations.push(json!({"kind":"prefetch_unavailable", "message":error.to_string().chars().take(256).collect::<String>()})),
+            }
+        }
+        prepared.observations.append(&mut self.observations);
+        if self.working_set_enabled {
+            prepared
+                .observations
+                .extend(self.refresh.prepare(&self.session, writers).await);
+        }
+        Ok(Some(prepared))
+    }
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.coding.descriptors();
         tools.extend(context::NAMES.iter().map(|name| descriptor(name)));
@@ -153,6 +236,9 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         }
 
         if !context::NAMES.contains(&call.name.as_str()) && call.name != "load_instructions" {
+            if matches!(call.name.as_str(), "exec" | "apply_patch") {
+                self.invalidate_unknown().await;
+            }
             return self.coding.execute(call, cancellation).await;
         }
 
@@ -196,6 +282,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
     }
 
     async fn shutdown(&mut self) -> bool {
+        self.before_mutation().await;
         self.coding.shutdown().await
     }
 }

@@ -90,3 +90,8 @@ The host checks cancellation and context capacity before consuming the answer, t
 Executing or Addressing and includes the human answer or Supervisor response in the first model input.
 Missing answers or failed delivery checks leave the task waiting. This starts a fresh session;
 replaying interrupted tool effects remains deferred to #84.
+
+Working-set selection is enabled by default. The managed `nano run` entry point accepts
+`--no-working-set` and optional explicit `--prefetch-path` / `--prefetch-symbol` seeds for evaluation;
+see the [working-set contract](ferrus-nano-working-set.md). These options do not change HQ task
+ownership, provider configuration, or the start/cancel protocol.

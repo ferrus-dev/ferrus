@@ -95,7 +95,7 @@ pub(super) fn fields(name: &str) -> &'static [&'static str] {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     domain: Option<ContextDomain>,
@@ -123,7 +123,7 @@ pub(crate) struct Request {
     direction: query::EdgeDirection,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     content = "value",
@@ -309,7 +309,7 @@ impl Request {
 }
 
 /// Keep typed domain responses up to the final model-tool encoding boundary.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub(crate) enum Response {
     RepositoryStatus(query::StatusResponse),
@@ -322,11 +322,62 @@ pub(crate) enum Response {
 
 pub(crate) struct Context {
     session: FerrusSession,
+    cache: std::sync::Mutex<super::working_set::QueryCache>,
+    pub(super) cache_enabled: bool,
 }
 
 impl Context {
     pub(crate) fn new(session: FerrusSession) -> Self {
-        Self { session }
+        Self {
+            session,
+            cache: Default::default(),
+            cache_enabled: true,
+        }
+    }
+
+    pub(super) fn invalidate(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+
+    pub(super) async fn revisions(&self) -> Result<Value> {
+        let runtime = self.session.status().await?;
+        let graph = LocalGraphContext::load_for_runtime(
+            self.session.project_root(),
+            self.session.project_id(),
+            self.session.data_dir(),
+            &runtime,
+        )
+        .await;
+        let snapshot = match graph {
+            Ok(graph) => graph.status().await.ok().and_then(|s| s.snapshot_id),
+            Err(_) => None,
+        };
+        // Optional sidecars must not prevent ordinary workspace tools from running.
+        let memory = async {
+            let local = LocalProjectContext::load_for_runtime(
+                self.session.project_root(),
+                self.session.project_id(),
+                self.session.data_dir(),
+                &runtime,
+                ContextDomain::Memory,
+                false,
+            )
+            .await?;
+            let budget = local.requested_budget(
+                Some(1),
+                Some(4096),
+                Some(1),
+                Some(1),
+                Some(1000),
+                Some(1),
+            )?;
+            local.memory_status(budget).map(|s| s.revision_id)
+        }
+        .await
+        .unwrap_or(None);
+        Ok(
+            json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":super::working_set::view_identity(&runtime.repository_view)}),
+        )
     }
 
     async fn graph(&self) -> Result<LocalGraphContext> {
@@ -357,13 +408,38 @@ impl Context {
                 return Ok(Response::RepositoryStatus(graph.status().await?));
             }
 
-            let scope = graph.scope(input.graph_budget(&graph)?)?;
+            let mut scope = graph.scope(input.graph_budget(&graph)?)?;
+            // Resolve a mutable publication exactly once for this assembly.
+            let status = graph.status().await?;
+            if let Some(snapshot) = &status.snapshot_id {
+                scope.snapshot = query::SnapshotSelector::Snapshot(snapshot.clone());
+            }
+            let cacheable =
+                self.cache_enabled && !input.include_snippets && status.snapshot_id.is_some();
+            let key = super::working_set::identity(&(
+                name,
+                &input,
+                &scope,
+                &status,
+                graph
+                    .repository_view
+                    .as_ref()
+                    .map(super::working_set::view_identity),
+                &graph.run_id,
+                format!("{:?}", graph.config),
+                self.session.project_id(),
+                &self.session.scope.task_id,
+                self.session.workspace(),
+            ));
+            if cacheable && let Some(value) = self.cache.lock().unwrap().get(&key) {
+                return Ok(serde_json::from_value(value)?);
+            }
             let page = PageRequest {
                 cursor: input.cursor.map(PageCursor::new).transpose()?,
             };
 
-            return if name == "repository_search" {
-                Ok(Response::RepositorySearch(
+            let response = if name == "repository_search" {
+                Response::RepositorySearch(
                     graph
                         .search(&query::SearchRequest {
                             scope,
@@ -377,7 +453,7 @@ impl Context {
                             page,
                         })
                         .await?,
-                ))
+                )
             } else {
                 let seeds = input
                     .seeds
@@ -400,7 +476,7 @@ impl Context {
                     },
                 };
 
-                Ok(Response::RepositoryContext(if input.include_snippets {
+                Response::RepositoryContext(if input.include_snippets {
                     graph
                         .context_with_snippets(
                             &request,
@@ -410,8 +486,20 @@ impl Context {
                         .await?
                 } else {
                     graph.context(&request).await?
-                }))
+                })
             };
+            if cacheable
+                && matches!(
+                    &response,
+                    Response::RepositorySearch(Ok(_)) | Response::RepositoryContext(Ok(_))
+                )
+            {
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, serde_json::to_value(&response)?);
+            }
+            return Ok(response);
         }
 
         let domain = input.domain.unwrap_or(ContextDomain::Memory);
@@ -438,7 +526,7 @@ impl Context {
             return Ok(Response::MemoryStatus(local.memory_status(budget)?));
         }
 
-        let scope = local.scope(domain, budget)?;
+        let scope = local.pinned_scope(domain, budget).await?;
         let cursor = input.cursor.map(FederationPageCursor::new).transpose()?;
 
         if name == "project_context_search" {

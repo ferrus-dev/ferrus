@@ -13,20 +13,50 @@ pub(crate) enum Command {
         /// Override the configured provider model
         #[arg(long)]
         model: Option<String>,
+        /// Disable working-set selection, query reuse, and scheduled overlay refresh
+        #[arg(long)]
+        no_working_set: bool,
+        /// Prefetch this explicit task path (repeatable; at most eight seeds total)
+        #[arg(long)]
+        prefetch_path: Vec<String>,
+        /// Prefetch this exact graph symbol key (repeatable; opt-in)
+        #[arg(long)]
+        prefetch_symbol: Vec<String>,
     },
 }
 
 pub(crate) async fn run(command: Command) -> Result<()> {
-    let Command::Run { config, model } = command;
+    let Command::Run {
+        config,
+        model,
+        no_working_set,
+        prefetch_path,
+        prefetch_symbol,
+    } = command;
+    let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
     super::agent::validate_config(config.as_deref(), model.as_deref())?;
     #[cfg(feature = "nano-openai")]
-    return launch(super::agent::config_path(config.as_deref())?, model).await;
+    return launch(
+        super::agent::config_path(config.as_deref())?,
+        model,
+        !no_working_set,
+        seeds,
+    )
+    .await;
     #[cfg(not(feature = "nano-openai"))]
-    unreachable!("feature validated above");
+    {
+        let _ = (no_working_set, seeds);
+        unreachable!("feature validated above");
+    }
 }
 
 #[cfg(feature = "nano-openai")]
-async fn launch(config: PathBuf, model: Option<String>) -> Result<()> {
+async fn launch(
+    config: PathBuf,
+    model: Option<String>,
+    working_set: bool,
+    seeds: Vec<serde_json::Value>,
+) -> Result<()> {
     use super::{
         coding::CodingTools,
         commands,
@@ -99,7 +129,11 @@ async fn launch(config: PathBuf, model: Option<String>) -> Result<()> {
                 commands::Limits::default(),
             )?,
         };
-        let native = NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
+        let mut native =
+            NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
+        native.working_set_enabled = working_set;
+        native.context.cache_enabled = working_set;
+        native.prefetch = seeds;
         let journal = ObservedJournal {
             journal,
             output: output.clone(),
@@ -140,4 +174,58 @@ async fn launch(config: PathBuf, model: Option<String>) -> Result<()> {
     result?;
     anyhow::ensure!(protocol_error.is_none(), "Invalid nano command stream");
     Ok(())
+}
+
+fn prefetch_seeds(paths: Vec<String>, symbols: Vec<String>) -> Result<Vec<serde_json::Value>> {
+    use serde_json::json;
+    anyhow::ensure!(
+        paths.len() + symbols.len() <= 8,
+        "At most eight prefetch seeds are allowed"
+    );
+    let seeds: std::collections::BTreeSet<_> = paths
+        .into_iter()
+        .map(|p| ("path", p))
+        .chain(symbols.into_iter().map(|s| ("symbol", s)))
+        .collect();
+    let seeds: Vec<_> = seeds
+        .into_iter()
+        .map(|(kind, value)| json!({"type":kind, "value":value}))
+        .collect();
+    if !seeds.is_empty() {
+        super::context::Request::parse("repository_context", json!({"seeds":seeds}))?;
+    }
+    Ok(seeds)
+}
+
+#[cfg(test)]
+mod working_set_tests {
+    use super::*;
+    #[test]
+    fn explicit_prefetch_is_opt_in_validated_bounded_and_sorted() {
+        assert!(prefetch_seeds(vec![], vec![]).unwrap().is_empty());
+        assert!(prefetch_seeds(vec!["../escape".into()], vec![]).is_err());
+        assert!(prefetch_seeds(vec![], vec!["".into()]).is_err());
+        assert!(prefetch_seeds(vec!["a.rs".into(); 9], vec![]).is_err());
+        let seeds = prefetch_seeds(
+            vec!["b.rs".into(), "a.rs".into(), "a.rs".into()],
+            vec!["symbol:one".into()],
+        )
+        .unwrap();
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds[0]["value"], "a.rs");
+        use clap::Parser;
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "ferrus",
+                "nano",
+                "run",
+                "--no-working-set",
+                "--prefetch-path",
+                "a.rs",
+                "--prefetch-symbol",
+                "symbol:one"
+            ])
+            .is_ok()
+        );
+    }
 }

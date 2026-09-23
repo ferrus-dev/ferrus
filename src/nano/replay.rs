@@ -16,6 +16,7 @@ pub(crate) struct Replay {
     pub session_id: String,
     pub budget: Budget,
     pub messages: Vec<Message>,
+    pub projection: Option<super::working_set::Preparation>,
     pub end: Option<EndReason>,
     pub pending_effect: Option<String>,
     pub unknown_effects: Vec<String>,
@@ -133,6 +134,14 @@ impl Replay {
                 self.messages.push(Message::User {
                     text: input.clone(),
                 });
+            }
+            SessionEvent::ContextPrepared { preparation } => {
+                ensure!(
+                    self.sequence > 0 && self.checkpoint_ready(),
+                    "Context prepared inside an unfinished group"
+                );
+                preparation.apply(&self.messages)?;
+                self.projection = Some(preparation.clone());
             }
             SessionEvent::ModelStarted { turn } => {
                 ensure!(

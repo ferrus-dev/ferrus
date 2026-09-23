@@ -157,6 +157,9 @@ pub(crate) enum SessionEvent {
     ModelStarted {
         turn: u64,
     },
+    ContextPrepared {
+        preparation: super::working_set::Preparation,
+    },
     ModelCompleted {
         response: ModelResponse,
         usage: Usage,
