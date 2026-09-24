@@ -977,6 +977,7 @@ async fn uncommitted_projection_never_reaches_the_provider() {
 struct CompactionProvider {
     normal_turns: usize,
     summaries: usize,
+    read_calls: bool,
     fail_summary: bool,
     stall_summary: bool,
     active_summary: bool,
@@ -1010,13 +1011,17 @@ impl Provider for CompactionProvider {
         } else if self.normal_turns < 10 {
             self.active_summary = false;
             self.normal_turns += 1;
-            response(
-                "",
-                vec![call(
-                    &format!("call-{}", self.normal_turns),
-                    self.normal_turns as i64,
-                )],
-            )
+            let id = format!("call-{}", self.normal_turns);
+            let call = if self.read_calls {
+                ToolCall {
+                    provider_call_id: id,
+                    name: "read_file".into(),
+                    arguments: json!({"path":"source.txt"}).to_string(),
+                }
+            } else {
+                call(&id, self.normal_turns as i64)
+            };
+            response("", vec![call])
         } else {
             self.active_summary = false;
             response("Done", vec![])
@@ -1032,6 +1037,129 @@ impl Provider for CompactionProvider {
         }
         Ok(self.active.pop_front())
     }
+}
+
+struct PreparedReads;
+
+impl Tools for PreparedReads {
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
+        vec![ToolDescriptor {
+            name: "read_file".into(),
+            description: "Fixture read".into(),
+            input_schema: json!({"type":"object","required":["path"]}),
+        }]
+    }
+
+    fn validate(&self, name: &str, arguments: &serde_json::Value) -> Result<(), ToolError> {
+        if name == "read_file" && arguments["path"] == "source.txt" {
+            Ok(())
+        } else {
+            Err(ToolError::InvalidArguments)
+        }
+    }
+
+    async fn execute(&mut self, _: &ValidatedCall, _: &Cancellation) -> ToolOutcome {
+        ToolOutcome::Success(json!({
+            "text":"x".repeat(700),
+            "source":{"path":"source.txt","digest":"a".repeat(64)}
+        }))
+    }
+
+    async fn prepare_context(
+        &mut self,
+        messages: &[Message],
+        _: &Cancellation,
+    ) -> Result<Option<super::working_set::Preparation>, ToolError> {
+        let replacements = messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| {
+                matches!(message, Message::Tool { .. }).then_some(super::working_set::Replacement {
+                    message: index,
+                    value: json!({"kind":"evidence_reference","marker":"prepared-input"}),
+                })
+            })
+            .into_iter()
+            .collect();
+        Ok(Some(super::working_set::Preparation {
+            replacements,
+            observations: vec![json!({"kind":"prefetch", "marker":"prepared-input"})],
+            ..Default::default()
+        }))
+    }
+}
+
+struct RejectPostCompactionPreparation {
+    inner: FileJournal,
+    compacted: bool,
+}
+
+impl Journal for RejectPostCompactionPreparation {
+    fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
+        anyhow::ensure!(
+            !(self.compacted && matches!(event, SessionEvent::ContextPrepared { .. })),
+            "injected final projection commit failure"
+        );
+        let compacted = matches!(event, SessionEvent::CompactionCompleted { .. });
+        let record = self.inner.append(event, budget)?;
+        self.compacted |= compacted;
+        Ok(record)
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        self.inner.checkpoint()
+    }
+}
+
+#[tokio::test]
+async fn prepared_context_precedes_compaction_and_survives_final_projection_failure() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut bounds = limits();
+    bounds.context_bytes = 4 * 1024;
+    bounds.response_bytes = 1024;
+    let mut engine = Engine::new(
+        identity(),
+        bounds,
+        CompactionProvider {
+            read_calls: true,
+            ..Default::default()
+        },
+        PreparedReads,
+        FakeHost::default(),
+        RejectPostCompactionPreparation {
+            inner: FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+            compacted: false,
+        },
+    )
+    .unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::JournalFailed);
+    assert!(!end.durable);
+    let records = engine.host.records.clone();
+    let started = records
+        .iter()
+        .position(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+        .expect("the prepared session must compact");
+    assert!(records[..started].iter().rev().any(|record| {
+        matches!(&record.event, SessionEvent::ContextPrepared { preparation }
+            if preparation.observations[0]["marker"] == "prepared-input")
+    }));
+    assert!(
+        records
+            .iter()
+            .any(|record| { matches!(record.event, SessionEvent::CompactionCompleted { .. }) })
+    );
+    assert!(engine.provider.requests.iter().any(|request| {
+        request.tools.is_empty()
+            && matches!(request.messages.first(), Some(Message::User { text }) if text.contains("prepared-input"))
+    }));
+    drop(engine);
+    let (_journal, recovered) =
+        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
+    let replay = Replay::from_records(&recovered).unwrap();
+    assert!(replay.summary.is_some());
+    assert_eq!(replay.end, Some(EndReason::Limit(LimitKind::Elapsed)));
 }
 
 struct UnsupportedEstimate;

@@ -167,6 +167,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             };
             let had_preparation = preparation.is_some();
             let mut preparation = preparation.unwrap_or_default();
+            if preparation.projection.is_some() {
+                return EndReason::Limit(LimitKind::ContextBytes);
+            }
             let base = match preparation.apply(&self.messages) {
                 Ok(messages) => messages,
                 Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
@@ -202,6 +205,18 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     ..Default::default()
                 });
             }
+            // Compaction may call the provider before the final projection is known.
+            // Persist host replacements and observations before that inference.
+            let committed_preparation = if had_preparation {
+                if !self.commit(SessionEvent::ContextPrepared {
+                    preparation: preparation.clone(),
+                }) {
+                    return EndReason::JournalFailed;
+                }
+                Some(preparation.clone())
+            } else {
+                None
+            };
             let mut messages = match preparation.apply(&self.messages) {
                 Ok(messages) => messages,
                 Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
@@ -322,6 +337,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     .is_some_and(|p| p.summary.is_some()),
             };
             if (had_preparation || preparation.projection.is_some())
+                && committed_preparation.as_ref() != Some(&preparation)
                 && !self.commit(SessionEvent::ContextPrepared { preparation })
             {
                 return EndReason::JournalFailed;
