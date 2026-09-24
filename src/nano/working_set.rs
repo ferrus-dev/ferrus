@@ -156,6 +156,30 @@ pub(super) struct Evidence {
     pub inclusion_reason: String,
 }
 
+impl Evidence {
+    /// Prefetch must not present snapshot facts for paths whose current bytes
+    /// differ from their recorded source identities.
+    pub(super) fn sources_match(&self, workspace: &Workspace) -> bool {
+        let mut remaining = VERIFY_BYTES;
+        let mut verified = BTreeMap::new();
+        for source in &self.sources {
+            if !verified.contains_key(&source.path) {
+                if verified.len() >= 32 {
+                    return false;
+                }
+                verified.insert(
+                    source.path.clone(),
+                    workspace.evidence_digest(&source.path, &mut remaining).ok(),
+                );
+            }
+            if verified[&source.path].as_deref() != Some(source.digest.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 struct Candidate {
     message: usize,
     evidence: Evidence,

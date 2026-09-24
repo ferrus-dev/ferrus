@@ -19,6 +19,7 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     session: FerrusSession,
     pub(super) working_set_enabled: bool,
     pub(super) prefetch: Vec<Value>,
+    prefetch_invalidated: bool,
     refresh: super::refresh::Refresh,
     observations: Vec<Value>,
 }
@@ -43,21 +44,34 @@ impl<B: ExecutionBackend> NativeTools<B> {
             session,
             working_set_enabled: true,
             prefetch: Vec::new(),
+            prefetch_invalidated: false,
             refresh: Default::default(),
             observations: Vec::new(),
         })
     }
 
     pub(super) async fn invalidate_unknown(&mut self) {
+        if !self.working_set_enabled {
+            self.prefetch_invalidated = true;
+            return;
+        }
         self.before_mutation().await;
         self.context.invalidate();
         self.refresh.invalidate();
+        self.prefetch_invalidated = true;
     }
 
     async fn before_mutation(&mut self) {
         if let Some(observation) = self.refresh.settle().await {
-            self.observations.push(observation);
+            self.record_refresh(observation);
         }
+    }
+
+    fn record_refresh(&mut self, observation: Value) {
+        if observation["status"] == "published" {
+            self.prefetch_invalidated = false;
+        }
+        self.observations.push(observation);
     }
 }
 #[derive(Deserialize)]
@@ -148,6 +162,13 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if cancellation.is_cancelled() {
             return Err(ToolError::Interrupted);
         }
+        if self.working_set_enabled && !self.prefetch.is_empty() {
+            // Prefetch shares the graph-read barrier: never assemble a prompt
+            // from the prior task view while a refresh is armed or running.
+            if let Some(observation) = self.refresh.settle().await {
+                self.record_refresh(observation);
+            }
+        }
         let revisions = self
             .context
             .revisions()
@@ -168,7 +189,10 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         } else {
             super::working_set::Preparation::default()
         };
-        if !self.prefetch.is_empty() && !writers {
+        let prefetch_ready = !writers
+            && !self.prefetch_invalidated
+            && (!self.working_set_enabled || self.refresh.pending_reason().is_none());
+        if !self.prefetch.is_empty() && prefetch_ready {
             // Explicit host seeds only; no task-text heuristic or hidden planner.
             let request = json!({"seeds":self.prefetch, "max_results":8, "max_bytes":8192,
                 "max_depth":1, "max_duration_ms":250, "max_snippet_bytes":4096, "include_snippets":true});
@@ -187,10 +211,23 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             match result {
                 Ok(value) => {
                     let evidence = super::working_set::evidence("repository_context", &value, &binding);
-                    prepared.observations.push(json!({"kind":"prefetch", "request":request, "response":value, "evidence":evidence}));
+                    if evidence.as_ref().is_some_and(|handle| {
+                        let returned = value.pointer("/result/Ok/data/items")
+                            .and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+                        (!returned || !handle.sources.is_empty())
+                            && handle.sources_match(&self.coding.workspace)
+                    }) {
+                        prepared.observations.push(json!({"kind":"prefetch", "request":request, "response":value, "evidence":evidence}));
+                    } else {
+                        prepared.observations.push(json!({"kind":"prefetch_unavailable", "reason":"source_changed_or_unverified"}));
+                    }
                 }
                 Err(error) => prepared.observations.push(json!({"kind":"prefetch_unavailable", "message":error.to_string().chars().take(256).collect::<String>()})),
             }
+        } else if !self.prefetch.is_empty() {
+            prepared
+                .observations
+                .push(json!({"kind":"prefetch_unavailable", "reason":"overlay_not_current"}));
         }
         prepared.observations.append(&mut self.observations);
         if self.working_set_enabled {
@@ -239,9 +276,11 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             if matches!(call.name.as_str(), "exec" | "apply_patch") {
                 self.invalidate_unknown().await;
                 let outcome = self.coding.execute(call, cancellation).await;
-                let writers = self.coding.commands.potentially_active_writers() > 0;
-                self.observations
-                    .extend(self.refresh.prepare(&self.session, writers).await);
+                if self.working_set_enabled {
+                    let writers = self.coding.commands.potentially_active_writers() > 0;
+                    self.observations
+                        .extend(self.refresh.prepare(&self.session, writers).await);
+                }
                 return outcome;
             }
             return self.coding.execute(call, cancellation).await;
@@ -254,9 +293,9 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             call.name.as_str(),
             "project_context_search" | "project_context"
         ) && call.arguments["domain"] != "memory";
-        if needs_graph {
+        if needs_graph && self.working_set_enabled {
             if let Some(observation) = self.refresh.settle().await {
-                self.observations.push(observation);
+                self.record_refresh(observation);
             }
             if let Some(reason) = self.refresh.pending_reason() {
                 return ToolOutcome::Failed(ToolError::Context(json!({

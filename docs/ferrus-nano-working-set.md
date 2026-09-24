@@ -73,11 +73,15 @@ There are no background watchers, automatic memory writes, or inferred canonical
 HQ enables these by default. For explicit managed-host experiments, repeat `--prefetch-path` or
 `--prefetch-symbol` to provide at most eight task paths or exact graph symbol keys. Prefetch is off
 by default and independent of `--no-working-set`; paths are never guessed from prose.
+After a workspace mutation with the working set disabled, prefetch reports unavailable until a
+new session; Nano does not schedule a refresh in this mode.
 
 Each assembly makes one bounded native context request for those seeds: eight results, depth one,
 8 KiB response, 4 KiB verified snippets, and a 250 ms query budget. Active writers defer it. The
 request, response, and evidence handles are journaled as a host observation. Its provider-neutral
-encoding is an explicitly labeled untrusted-evidence user message, limited to 24 KiB. No assistant
+encoding is an explicitly labeled untrusted-evidence user message, limited to 24 KiB. It waits for
+an armed overlay refresh and verifies each referenced source against current workspace bytes.
+Unverifiable or changed sources make prefetch unavailable. No assistant
 tool call is fabricated, and task/review artifacts are never edited. The next assembly re-resolves
 the view and rechecks snippets instead of reusing an unverifiable source body. Missing coverage or
 an optional prefetch failure leaves normal tools available.
