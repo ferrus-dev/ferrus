@@ -225,6 +225,18 @@ impl Workspace {
         self.read_content(file, path)
     }
 
+    pub(super) fn evidence_digest(&self, value: &str, remaining: &mut usize) -> Result<String> {
+        let path = path(value)?;
+        if *remaining == 0 {
+            return Err(Failure::new(Code::OutputLimit, &path));
+        }
+        let file = self.root.open(&path).map_err(|e| Failure::io(&path, e))?;
+        let mut inspected = 0;
+        let content = self.read_content_limited(file, &path, *remaining, &mut inspected);
+        *remaining = remaining.saturating_sub(inspected);
+        content.map(|content| content.digest)
+    }
+
     fn read_content(&self, file: std::fs::File, path: &str) -> Result<Content> {
         self.read_content_limited(file, path, self.limits.file_bytes + 1, &mut 0)
     }

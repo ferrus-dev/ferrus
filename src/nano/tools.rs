@@ -80,6 +80,15 @@ impl Cancellation {
 }
 
 pub(crate) trait Tools {
+    /// Host context maintenance is distinct from model-requested tool execution.
+    async fn prepare_context(
+        &mut self,
+        _messages: &[super::provider::Message],
+        _cancellation: &Cancellation,
+    ) -> Result<Option<super::working_set::Preparation>, ToolError> {
+        Ok(None)
+    }
+
     /// A host-confirmed lifecycle handoff stops the loop before another effect.
     fn end_reason(&self) -> Option<super::session::EndReason> {
         None

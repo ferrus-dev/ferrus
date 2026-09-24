@@ -1347,3 +1347,402 @@ async fn managed_consult_wait_preserves_a_nested_supervisor_human_question() {
     assert_eq!(result["answer"], "Supervisor recommendation");
     assert_eq!(result["resumed_state"], "executing");
 }
+
+#[tokio::test]
+async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
+    use crate::nano::{
+        context::{Context, Request, Response},
+        refresh::Refresh,
+    };
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let before = session.status().await.unwrap();
+    std::fs::write(f.root.join("src/lib.rs"), "pub struct WorkingSetEdit;\n").unwrap();
+    let mut refresh = Refresh::default();
+    refresh.invalidate();
+    assert_eq!(
+        refresh.prepare(&session, false).await[0]["status"],
+        "scheduled"
+    );
+    assert_eq!(refresh.settle().await.unwrap()["status"], "published");
+    let after = session.status().await.unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.check_retries, before.check_retries);
+    assert_eq!(
+        after.repository_view.baseline_snapshot_id,
+        before.repository_view.baseline_snapshot_id
+    );
+    assert_ne!(
+        after.repository_view.view_snapshot_id,
+        before.repository_view.view_snapshot_id
+    );
+    let context = Context::new(session);
+    let Response::RepositorySearch(Ok(result)) = context
+        .retrieve(
+            "repository_search",
+            Request::parse("repository_search", json!({"query":"WorkingSetEdit"})).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("search")
+    };
+    assert!(!result.data.hits.is_empty());
+    assert_eq!(
+        Some(result.snapshot_id),
+        after.repository_view.view_snapshot_id
+    );
+}
+
+#[tokio::test]
+async fn quick_patch_schedules_refresh_before_the_next_graph_query() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "quick-patch-refresh");
+    let patch = baseline_patch(&tools, "QuickPatch");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    // A graph lookup in the same tool group waits for the already scheduled
+    // refresh. No further model turn or second prepare_context is needed.
+    let query = call("repository_search", json!({"query":"QuickPatch"}));
+    let ToolOutcome::Success(value) = tools.execute(&query, &Cancellation::default()).await else {
+        panic!("query failed before the scheduled refresh completed");
+    };
+    assert!(
+        serde_json::to_string(&value)
+            .unwrap()
+            .contains("QuickPatch")
+    );
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+}
+
+#[tokio::test]
+async fn working_set_settles_refresh_before_reusing_graph_evidence_without_prefetch() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "working-set-after-patch");
+    let query = call("repository_search", json!({"query":"Baseline"}));
+    let result = tools.execute(&query, &Cancellation::default()).await;
+    assert!(
+        matches!(&result, ToolOutcome::Success(value) if serde_json::to_string(value).unwrap().contains("Baseline"))
+    );
+    let messages = vec![
+        Message::Assistant {
+            response: ModelResponse {
+                finish: FinishReason::ToolCalls,
+                text: String::new(),
+                calls: vec![ToolCall {
+                    provider_call_id: query.provider_call_id.clone(),
+                    name: query.name.clone(),
+                    arguments: query.arguments.to_string(),
+                }],
+                continuation: None,
+            },
+        },
+        Message::Tool {
+            provider_call_id: query.provider_call_id,
+            outcome: result,
+        },
+    ];
+    let patch = baseline_patch(&tools, "CurrentSymbol");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.replacements.iter().any(|replacement| {
+        replacement.message == 1 && replacement.value["kind"] == "evidence_unavailable"
+    }));
+    assert!(
+        !serde_json::to_string(&prepared.apply(&messages).unwrap())
+            .unwrap()
+            .contains("pub struct Baseline;")
+    );
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+}
+
+fn baseline_patch(tools: &NativeTools<TrustedLocal>, symbol: &str) -> ValidatedCall {
+    let digest = tools
+        .coding
+        .workspace
+        .read_file(
+            serde_json::from_value(json!({
+                "path":"src/lib.rs"
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .source
+        .digest;
+    call(
+        "apply_patch",
+        json!({"edits":[{
+            "operation":"update", "path":"src/lib.rs", "expected_digest":digest,
+            "hunks":[{"start_line":1, "old_text":"pub struct Baseline;\n",
+                "new_text":format!("pub struct {symbol};\n")}]
+        }]}),
+    )
+}
+
+#[tokio::test]
+async fn disabled_working_set_keeps_workspace_tools_but_never_schedules_refresh() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session.status().await.unwrap().repository_view;
+    let (mut tools, _journal) = native(&f, session.clone(), "disabled-working-set");
+    tools.working_set_enabled = false;
+    tools.context.cache_enabled = false;
+    let patch = baseline_patch(&tools, "DisabledModeEdit");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let messages = vec![Message::User {
+        text: "task".into(),
+    }];
+    assert!(
+        tools
+            .prepare_context(&messages, &Cancellation::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "prefetch_unavailable")
+    );
+    assert!(
+        !prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "overlay_refresh")
+    );
+    assert_eq!(session.status().await.unwrap().repository_view, previous);
+    assert!(tools.shutdown().await);
+    assert_eq!(session.status().await.unwrap().repository_view, previous);
+}
+
+#[tokio::test]
+async fn prefetch_waits_for_the_new_overlay_after_a_quick_patch() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "prefetch-after-patch");
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let patch = baseline_patch(&tools, "PrefetchedEdit");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let prepared = tools
+        .prepare_context(
+            &[Message::User {
+                text: "task".into(),
+            }],
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let prefetched = prepared
+        .observations
+        .iter()
+        .find(|item| item["kind"] == "prefetch")
+        .expect("prefetch should use the new task view");
+    assert!(
+        serde_json::to_string(prefetched)
+            .unwrap()
+            .contains("PrefetchedEdit")
+    );
+    assert!(
+        !serde_json::to_string(prefetched)
+            .unwrap()
+            .contains("pub struct Baseline;")
+    );
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+}
+
+#[tokio::test]
+async fn shutdown_refreshes_an_overlay_deferred_by_an_active_writer() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "writer-at-shutdown");
+    let command = if cfg!(windows) {
+        r"echo pub struct ShutdownEdit;> src\lib.rs & ping -n 30 127.0.0.1 > nul"
+    } else {
+        "printf 'pub struct ShutdownEdit;\\n' > src/lib.rs; sleep 30"
+    };
+    let started = tools
+        .execute(
+            &call(
+                "exec",
+                json!({"command":command, "cwd":".", "timeout_ms":30_000}),
+            ),
+            &Cancellation::default(),
+        )
+        .await;
+    assert!(matches!(started, ToolOutcome::Success(_)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if std::fs::read_to_string(f.root.join("src/lib.rs"))
+                .is_ok_and(|source| source.contains("ShutdownEdit"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command must write before shutdown");
+    assert!(tools.coding.commands.potentially_active_writers() > 0);
+    assert_eq!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+}
+
+#[tokio::test]
+async fn explicit_prefetch_is_read_only_host_evidence_and_rechecks_source_bytes() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let (mut tools, _journal) = native(&f, session, "prefetch-test");
+    tools.working_set_enabled = false;
+    tools.context.cache_enabled = false;
+    let messages = vec![Message::User {
+        text: "bound task and constraints".into(),
+    }];
+    assert!(
+        tools
+            .prepare_context(&messages, &Cancellation::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let events = f.events();
+    let tasks = project::list_tasks().await.unwrap();
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.replacements.is_empty());
+    assert_eq!(prepared.observations.len(), 1);
+    assert_eq!(prepared.observations[0]["kind"], "prefetch");
+    assert_eq!(
+        prepared.observations[0]["evidence"]["binding"]["task"],
+        TASK
+    );
+    assert!(
+        !prepared.observations[0]["evidence"]["sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let projected = prepared.apply(&messages).unwrap();
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[0], messages[0]);
+    assert!(
+        matches!(&projected[1], Message::User {text} if text.contains("Ferrus host observation") && text.contains("pub struct Baseline;"))
+    );
+    std::fs::write(f.root.join("src/lib.rs"), "pub struct ExternalChange;\n").unwrap();
+    let next = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.observations[0]["kind"], "prefetch_unavailable");
+    assert!(
+        !serde_json::to_string(&next.apply(&messages).unwrap())
+            .unwrap()
+            .contains("pub struct Baseline;")
+    );
+    assert_eq!(messages.len(), 1);
+    f.assert_no_effect(tasks, events).await;
+    assert!(tools.shutdown().await);
+}

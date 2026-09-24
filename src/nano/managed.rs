@@ -105,6 +105,13 @@ struct Submission {
 }
 
 impl<B: ExecutionBackend> Tools for ManagedTools<B> {
+    async fn prepare_context(
+        &mut self,
+        messages: &[Message],
+        cancellation: &Cancellation,
+    ) -> std::result::Result<Option<super::working_set::Preparation>, ToolError> {
+        self.native.prepare_context(messages, cancellation).await
+    }
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.native.descriptors();
         for name in lifecycle::NAMES {
@@ -182,6 +189,7 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
             return ToolOutcome::Failed(ToolError::InvalidArguments);
         }
 
+        self.native.invalidate_unknown().await;
         // Await cleanup before starting lifecycle effects; failure cannot be certified.
         if !self.native.coding.commands.quiesce().await {
             return ToolOutcome::Unknown(ToolError::Failed);

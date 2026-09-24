@@ -29,7 +29,7 @@ update-check = ["dep:semver", "dep:ureq"]
 nano-openai = ["dep:reqwest"]
 
 [dependencies]
-neva = { version = "0.5.7", features = ["server", "di", "legacy-spec"] }
+neva = { version = "0.6.1", features = ["server", "di", "legacy-spec"] }
 tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -91,7 +91,7 @@ What remains:
 
 - expand language-specific extraction and cross-file resolution beyond Rust/Cargo;
 - broaden task-level quality and token/cost evaluation on realistic repositories;
-- extend native nano graph/memory consumption (#78) with working-set policy in #81;
+- evaluate native nano working-set policy (#81) on realistic coding tasks;
 - keep graph failures independent of task lifecycle, and retain explicit fallback when context is unavailable.
 
 See [graph architecture](repository-graph-architecture.md),
@@ -175,6 +175,7 @@ Implemented foundation:
 - scoped instructions and selected skills with digests/caps, native graph/memory retrieval, and labeled workspace fallback ([contract](ferrus-nano-context.md));
 - managed claim/heartbeat, native check/submit, host-owned consultation/human waits, and distinct session outcomes ([contract](ferrus-nano-lifecycle.md));
 - headless backend registration, private provider configuration, versioned JSONL launch/events, and HQ process supervision ([contract](ferrus-nano-launch.md));
+- revision-aware evidence selection, bounded query reuse, explicit prefetch, and debounced overlay refresh ([contract](ferrus-nano-working-set.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -184,7 +185,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
 | N1: headless Executor | #80 implemented; #85 validation | Live model validation and release gates |
-| N2: context efficiency | #81-#82 | Working-set invalidation, budgets, and compaction |
+| N2: context efficiency | #81 implemented; #82 remaining | Token-budgeted projection and compaction |
 | N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
@@ -254,7 +255,7 @@ Remaining work:
 
 - richer archive inspection and optional portable export;
 - wider evaluation of retrieval quality and stale/unresolved cross-links;
-- revision-aware working-set policy in nano (#81), building on native context consumption (#78).
+- token-budgeted context projection and compaction in nano (#82), building on the working set (#81).
 
 See [project memory](project-memory.md), [architecture](project-memory-architecture.md), and
 [evaluations](project-memory-evaluations.md).
