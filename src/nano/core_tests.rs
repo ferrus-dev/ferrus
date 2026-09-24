@@ -12,7 +12,11 @@ use anyhow::Result;
 use serde_json::json;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 use tempfile::TempDir;
 
@@ -967,4 +971,260 @@ async fn uncommitted_projection_never_reaches_the_provider() {
         EndReason::JournalFailed
     );
     assert!(engine.provider.requests.is_empty());
+}
+
+#[derive(Default)]
+struct CompactionProvider {
+    normal_turns: usize,
+    summaries: usize,
+    fail_summary: bool,
+    stall_summary: bool,
+    active_summary: bool,
+    summary_started: Arc<AtomicBool>,
+    active: VecDeque<ProviderEvent>,
+    requests: Vec<ModelRequest>,
+}
+
+impl Provider for CompactionProvider {
+    async fn start(&mut self, request: ModelRequest) -> Result<(), ProviderError> {
+        let event = if request.tools.is_empty() {
+            self.summaries += 1;
+            self.active_summary = true;
+            self.summary_started.store(true, Ordering::SeqCst);
+            if self.fail_summary {
+                return Err(ProviderError::new(ProviderErrorKind::Transport, false));
+            }
+            ProviderEvent::Completed {
+                response: ModelResponse {
+                    finish: FinishReason::Stop,
+                    text: "Earlier edits completed; recheck source before changing it.".into(),
+                    calls: Vec::new(),
+                    continuation: None,
+                },
+                usage: Some(Usage {
+                    input_tokens: 17,
+                    output_tokens: 9,
+                    reported: true,
+                }),
+            }
+        } else if self.normal_turns < 10 {
+            self.active_summary = false;
+            self.normal_turns += 1;
+            response(
+                "",
+                vec![call(
+                    &format!("call-{}", self.normal_turns),
+                    self.normal_turns as i64,
+                )],
+            )
+        } else {
+            self.active_summary = false;
+            response("Done", vec![])
+        };
+        self.requests.push(request);
+        self.active = VecDeque::from([event]);
+        Ok(())
+    }
+
+    async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderError> {
+        if self.active_summary && self.stall_summary {
+            std::future::pending::<()>().await;
+        }
+        Ok(self.active.pop_front())
+    }
+}
+
+#[tokio::test]
+async fn canceled_compaction_is_charged_and_never_replays_tools() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut bounds = limits();
+    bounds.context_bytes = 4 * 1024;
+    bounds.response_bytes = 1024;
+    let provider = CompactionProvider {
+        stall_summary: true,
+        ..Default::default()
+    };
+    let started = provider.summary_started.clone();
+    let cancellation = Cancellation::default();
+    let control = cancellation.clone();
+    let canceller = tokio::spawn(async move {
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        control.cancel();
+    });
+    let mut engine = Engine::new(
+        identity(),
+        bounds,
+        provider,
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(10), run(&mut engine, &cancellation))
+        .await
+        .expect("compaction must become cancellable");
+    canceller.await.unwrap();
+    assert_eq!(end.reason, EndReason::Cancelled);
+    assert!(end.durable);
+    assert!(
+        engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+    );
+    assert!(
+        engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+    );
+    let effects = engine.tools.effects.lock().unwrap().len();
+    drop(engine);
+    let (_journal, recovered) =
+        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
+    let replay = Replay::from_records(&recovered).unwrap();
+    assert_eq!(replay.end, Some(EndReason::Cancelled));
+    assert_eq!(replay.budget, end.budget);
+    assert!(effects > 0);
+}
+
+#[tokio::test]
+async fn failed_compaction_charges_reservation_and_recovers_without_replaying_effects() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut bounds = limits();
+    bounds.context_bytes = 4 * 1024;
+    bounds.response_bytes = 1024;
+    let mut engine = Engine::new(
+        identity(),
+        bounds,
+        CompactionProvider {
+            fail_summary: true,
+            ..Default::default()
+        },
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ProviderFailed);
+    assert!(end.durable);
+    assert!(end.budget.estimated_input_tokens > 0);
+    let effects = engine.tools.effects.lock().unwrap().len();
+    let records = engine.host.records.clone();
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+    );
+    drop(engine);
+    let (_journal, recovered) =
+        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
+    let replay = Replay::from_records(&recovered).unwrap();
+    assert_eq!(replay.end, Some(EndReason::ProviderFailed));
+    assert_eq!(replay.budget, end.budget);
+    assert!(effects > 0);
+}
+
+#[tokio::test]
+async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut bounds = limits();
+    bounds.context_bytes = 4 * 1024;
+    bounds.response_bytes = 1024;
+    let mut engine = Engine::new(
+        identity(),
+        bounds,
+        CompactionProvider::default(),
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert!(engine.provider.summaries > 0);
+    assert_eq!(engine.provider.normal_turns, 10);
+    assert_eq!(
+        end.budget.model_turns,
+        11 + engine.provider.summaries as u64
+    );
+    assert!(end.budget.reported_input_tokens >= 110 + 17 * engine.provider.summaries as u64);
+    assert!(
+        engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::CompactionCompleted { .. }))
+    );
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.messages.len(), 22);
+    assert!(replay.summary.is_some());
+    let composed: Vec<_> = engine
+        .host
+        .records
+        .iter()
+        .filter_map(|record| {
+            if let SessionEvent::ContextComposed { composition } = &record.event {
+                Some(composition)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(composed.len(), 11 + engine.provider.summaries);
+    assert!(composed.iter().any(|entry| entry.summary_present));
+    assert!(composed.iter().all(|entry| {
+        let margin = (entry.context_window_tokens / 20).clamp(16, 1024);
+        entry.input_tokens_estimated + entry.output_tokens_reserved + margin
+            <= entry.context_window_tokens
+            && entry.stable_prefix_messages <= entry.request_messages
+    }));
+    assert!(
+        engine
+            .provider
+            .requests
+            .iter()
+            .filter(|request| !request.tools.is_empty())
+            .all(|request| {
+                super::compaction::boundaries(&request.messages).is_ok()
+                    && request.messages[0]
+                        == Message::User {
+                            text: "Implement a fixture task".into(),
+                        }
+                    && serde_json::to_vec(&(&request.messages, &request.tools))
+                        .unwrap()
+                        .len()
+                        <= 4 * 1024
+            })
+    );
+    assert!(engine.provider.requests.iter().any(|request| {
+        request.messages.iter().any(|message| matches!(message, Message::User {text} if text.contains("Historical session summary")))
+    }));
+    assert!(engine
+        .provider
+        .requests
+        .iter()
+        .filter(|request| {
+            !request.tools.is_empty()
+                && request.messages.iter().any(|message| {
+                    matches!(message, Message::User { text } if text.contains("Historical session summary"))
+                })
+        })
+        .all(|request| request
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Assistant { .. }))));
 }

@@ -113,7 +113,7 @@ Checkpoints identify a complete journal prefix by sequence, SHA-256 digest, and 
 They cannot split a model response's tool-call/result group. Files are flushed before atomic
 publication; Unix also syncs directories, and Windows uses write-through rename. Storage durability
 ultimately depends on the filesystem. Checkpoints are prefix markers, not compacted conversation
-copies; #82 and #84 add compaction and live recovery.
+copies; #82 adds a separately journaled context projection and #84 covers live recovery.
 
 `FileJournal::recover` acquires the writer lock, enforces quotas, validates version/identity/order,
 and removes only an unterminated final line. A malformed newline-terminated record is an error.

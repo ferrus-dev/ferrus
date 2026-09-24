@@ -1,7 +1,7 @@
 //! LM Studio /v1/chat/completions transport with optional Bearer authentication.
 
 use super::sse::{Decoder, error};
-use crate::nano::{config::Config, journal::encode, provider::*};
+use crate::nano::{config::Config, provider::*};
 use anyhow::Result;
 use reqwest::{
     Client, Response, Url,
@@ -48,6 +48,14 @@ impl OpenAi {
     }
 
     pub(super) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
+        let (body, output) = self.body_unbounded(request)?;
+        if body.len() as u64 > self.settings.context_tokens.saturating_sub(output) {
+            return Err(error(ProviderErrorKind::ContextOverflow));
+        }
+        Ok(body)
+    }
+
+    fn body_unbounded(&self, request: ModelRequest) -> Result<(Vec<u8>, u64), ProviderError> {
         let output = request
             .max_output_tokens
             .min(self.settings.max_output_tokens);
@@ -55,13 +63,6 @@ impl OpenAi {
         if output == 0 {
             return Err(error(ProviderErrorKind::ContextOverflow));
         }
-
-        // Bound the input before constructing the provider-specific projection.
-        encode(
-            &(&request.messages, &request.tools),
-            self.settings.context_tokens as usize,
-        )
-        .map_err(|_| error(ProviderErrorKind::ContextOverflow))?;
 
         let mut messages = Vec::new();
         for message in request.messages {
@@ -106,17 +107,16 @@ impl OpenAi {
             body["tool_choice"] = json!("auto");
         }
 
-        // One serialized byte per token is a conservative admission estimate.
-        // The server's context-overflow response remains authoritative.
-        encode(
-            &body,
-            self.settings.context_tokens.saturating_sub(output) as usize,
-        )
-        .map_err(|_| error(ProviderErrorKind::ContextOverflow))
+        let bytes = serde_json::to_vec(&body).map_err(|_| error(ProviderErrorKind::Protocol))?;
+        Ok((bytes, output))
     }
 }
 
 impl Provider for OpenAi {
+    fn estimate_input_tokens(&self, request: &ModelRequest) -> Result<u64, ProviderError> {
+        self.body_unbounded(request.clone())
+            .map(|(body, _)| body.len() as u64)
+    }
     fn cancel(&mut self) {
         self.active = None;
     }

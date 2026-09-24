@@ -2,7 +2,8 @@
 
 Status: implemented for #81. The managed host selects repository evidence before each model
 attempt. Task lifecycle, graph publication, and memory source policies retain their existing
-owners. Token-based compaction and live session resume remain #82 and #84.
+owners. Token-based projection and compaction are described in
+[ferrus-nano-compaction.md](ferrus-nano-compaction.md); live session resume remains #84.
 
 ## Journal, selection, and projection
 
@@ -28,8 +29,8 @@ Bounds per preparation are 256 candidate observations, 64 selected handles, 128 
 retrieval packets, 32 verified paths, and 8 MiB of source reads. The workspace per-file bound still
 applies. Encoded preparation is limited to 256 KiB; merged reads to 24 KiB. Source verification uses
 the existing no-follow workspace reader. Overflow fails closed. These bounds supplement the engine's
-context and journal quotas; the raw transcript still grows until its existing limit. This is not
-conversation compaction.
+context and journal quotas. The original transcript remains in the journal; #82 adds a separate
+bounded model-request projection.
 
 ## Queries and invalidation
 

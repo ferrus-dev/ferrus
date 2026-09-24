@@ -185,7 +185,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
 | N1: headless Executor | #80 implemented; #85 validation | Live model validation and release gates |
-| N2: context efficiency | #81 implemented; #82 remaining | Token-budgeted projection and compaction |
+| N2: context efficiency | #81 and #82 implemented | Comparative context-quality and cache measurements (#85) |
 | N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
@@ -255,7 +255,7 @@ Remaining work:
 
 - richer archive inspection and optional portable export;
 - wider evaluation of retrieval quality and stale/unresolved cross-links;
-- token-budgeted context projection and compaction in nano (#82), building on the working set (#81).
+- comparative nano evaluation (#85), following the working set (#81) and compaction (#82).
 
 See [project memory](project-memory.md), [architecture](project-memory-architecture.md), and
 [evaluations](project-memory-evaluations.md).

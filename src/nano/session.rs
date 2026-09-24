@@ -157,8 +157,19 @@ pub(crate) enum SessionEvent {
     ModelStarted {
         turn: u64,
     },
+    CompactionStarted {
+        turn: u64,
+        retained_from: usize,
+    },
+    CompactionCompleted {
+        summary: super::compaction::Summary,
+        usage: Usage,
+    },
     ContextPrepared {
         preparation: super::working_set::Preparation,
+    },
+    ContextComposed {
+        composition: ContextComposition,
     },
     ModelCompleted {
         response: ModelResponse,
@@ -181,6 +192,19 @@ pub(crate) enum SessionEvent {
     Ended {
         reason: EndReason,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextComposition {
+    pub history_messages: usize,
+    pub request_messages: usize,
+    pub stable_prefix_messages: usize,
+    pub input_tokens_estimated: u64,
+    pub output_tokens_reserved: u64,
+    pub context_window_tokens: u64,
+    pub evicted_outputs: usize,
+    pub summary_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
