@@ -124,14 +124,24 @@ pub(crate) fn handles(messages: &[Message]) -> Vec<Handle> {
     result
 }
 
+fn evicted_value(handle: &Handle) -> Value {
+    json!({
+        "kind":"evicted_output", "digest":handle.digest,
+        "tool":handle.name, "arguments":handle.arguments,
+        "action":"reissue_read_only_tool_for_current_evidence"
+    })
+}
+
 impl Projection {
-    pub(crate) fn deterministic(messages: &[Message]) -> Self {
+    pub(crate) fn deterministic(messages: &[Message], retained_from: usize) -> Self {
         let mut evicted: Vec<_> = handles(messages)
             .into_iter()
             .filter(|handle| {
-                handle.message + 4 < messages.len()
+                handle.message >= retained_from
+                    && handle.message + 4 < messages.len()
                     && matches!(&messages[handle.message], Message::Tool { outcome:ToolOutcome::Success(value),.. }
-                        if serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() > 512))
+                        if serde_json::to_vec(value).is_ok_and(|original| original.len() > 512
+                            && serde_json::to_vec(&evicted_value(handle)).is_ok_and(|replacement| replacement.len() < original.len())))
             })
             .take(MAX_HANDLES)
             .collect();
@@ -160,11 +170,7 @@ impl Projection {
             let Message::Tool { outcome, .. } = &mut projected[handle.message] else {
                 anyhow::bail!("Output handle is not a tool result");
             };
-            *outcome = ToolOutcome::Success(json!({
-                "kind":"evicted_output", "digest":handle.digest,
-                "tool":handle.name, "arguments":handle.arguments,
-                "action":"reissue_read_only_tool_for_current_evidence"
-            }));
+            *outcome = ToolOutcome::Success(evicted_value(handle));
             previous = Some(handle.message);
         }
         if let Some(summary) = &self.summary {
@@ -231,7 +237,7 @@ mod tests {
     #[test]
     fn output_handles_preserve_complete_groups_and_require_a_fresh_read() {
         let messages = conversation();
-        let projection = Projection::deterministic(&messages);
+        let projection = Projection::deterministic(&messages, 1);
         assert!(!projection.evicted.is_empty());
         let projected = projection.apply(&messages).unwrap();
         assert_eq!(projected.len(), messages.len());
@@ -247,6 +253,22 @@ mod tests {
         let mut tampered = projection;
         tampered.evicted[0].digest = "0".repeat(64);
         assert!(tampered.apply(&messages).is_err());
+    }
+
+    #[test]
+    fn eviction_skips_handles_that_would_expand_the_request() {
+        let mut messages = conversation();
+        let Message::Assistant { response } = &mut messages[1] else {
+            panic!("fixture must start with a tool call");
+        };
+        response.calls[0].arguments = json!({"path":"x".repeat(1500)}).to_string();
+        messages[2] = Message::Tool {
+            provider_call_id: "tool-0".into(),
+            outcome: ToolOutcome::Success(json!({"text":"x".repeat(600)})),
+        };
+        let projection = Projection::deterministic(&messages, 1);
+        assert!(!projection.evicted.iter().any(|handle| handle.message == 2));
+        assert!(projection.evicted.iter().any(|handle| handle.message == 4));
     }
 
     #[test]
@@ -276,5 +298,40 @@ mod tests {
         let mut invalid = projection;
         invalid.summary.as_mut().unwrap().retained_from = 4;
         assert!(invalid.apply(&messages).is_err());
+    }
+
+    #[test]
+    fn eviction_limit_is_applied_after_the_summary_boundary() {
+        let mut messages = conversation();
+        for index in 4..75 {
+            let id = format!("tool-{index}");
+            messages.push(Message::Assistant {
+                response: ModelResponse {
+                    finish: FinishReason::ToolCalls,
+                    text: String::new(),
+                    calls: vec![ToolCall {
+                        provider_call_id: id.clone(),
+                        name: "read_file".into(),
+                        arguments: json!({"path":"src/lib.rs"}).to_string(),
+                    }],
+                    continuation: None,
+                },
+            });
+            messages.push(Message::Tool {
+                provider_call_id: id,
+                outcome: ToolOutcome::Success(json!({"text":"x".repeat(1024)})),
+            });
+        }
+        let retained_from = 131;
+        assert!(boundaries(&messages).unwrap().contains(&retained_from));
+        let projection = Projection::deterministic(&messages, retained_from);
+        assert!(!projection.evicted.is_empty());
+        assert!(
+            projection
+                .evicted
+                .iter()
+                .all(|handle| handle.message >= retained_from)
+        );
+        assert!(projection.apply(&messages).is_ok());
     }
 }

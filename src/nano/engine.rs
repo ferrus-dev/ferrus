@@ -206,36 +206,41 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 Ok(messages) => messages,
                 Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
             };
-            let mut input_estimate = self
-                .input_estimate(&messages, &descriptors, output_reservation)
-                .ok();
-            if !self.fits(
+            let mut admitted = match self.admit(
                 &messages,
                 &descriptors,
                 output_reservation,
                 remaining,
                 window,
-                input_estimate,
             ) {
-                let mut projection = Projection::deterministic(&base);
+                Ok(admitted) => admitted,
+                Err(reason) => return reason,
+            };
+            if admitted.is_none() {
+                let mut projection = Projection::deterministic(
+                    &base,
+                    self.summary
+                        .as_ref()
+                        .map_or(1, |summary| summary.retained_from),
+                );
                 projection.summary = self.summary.clone();
                 preparation.projection = Some(projection);
                 messages = match preparation.apply(&self.messages) {
                     Ok(messages) => messages,
                     Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
                 };
-                input_estimate = self
-                    .input_estimate(&messages, &descriptors, output_reservation)
-                    .ok();
+                admitted = match self.admit(
+                    &messages,
+                    &descriptors,
+                    output_reservation,
+                    remaining,
+                    window,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(reason) => return reason,
+                };
             }
-            if !self.fits(
-                &messages,
-                &descriptors,
-                output_reservation,
-                remaining,
-                window,
-                input_estimate,
-            ) {
+            if admitted.is_none() {
                 let summary = match self
                     .compact(
                         &base,
@@ -259,33 +264,31 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     return EndReason::Limit(LimitKind::Tokens);
                 }
                 let mut projection = preparation.projection.take().unwrap_or_default();
+                projection.evicted =
+                    Projection::deterministic(&base, summary.retained_from).evicted;
                 projection.summary = Some(summary);
-                projection.evicted.retain(|handle| {
-                    handle.message >= projection.summary.as_ref().unwrap().retained_from
-                });
                 preparation.projection = Some(projection);
                 messages = match preparation.apply(&self.messages) {
                     Ok(messages) => messages,
                     Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
                 };
-                input_estimate = self
-                    .input_estimate(&messages, &descriptors, output_reservation)
-                    .ok();
+                admitted = match self.admit(
+                    &messages,
+                    &descriptors,
+                    output_reservation,
+                    remaining,
+                    window,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(reason) => return reason,
+                };
             }
-            if !self.fits(
-                &messages,
-                &descriptors,
-                output_reservation,
-                remaining,
-                window,
-                input_estimate,
-            ) {
+            let Some((input_estimate, output_reservation)) = admitted else {
                 return EndReason::Limit(LimitKind::ContextTokens);
-            }
+            };
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
-            let input_estimate = input_estimate.expect("fit requires an estimate");
             if let Some(projection) = &mut preparation.projection {
                 projection.original_bytes =
                     serde_json::to_vec(&base).map_or(0, |bytes| bytes.len());
@@ -600,12 +603,24 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         messages: &[Message],
         tools: &[super::tools::ToolDescriptor],
         output: u64,
-    ) -> Result<u64, super::provider::ProviderError> {
-        self.provider.estimate_input_tokens(&ModelRequest {
+    ) -> Result<Option<u64>, EndReason> {
+        match self.provider.estimate_input_tokens(&ModelRequest {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             max_output_tokens: output,
-        })
+        }) {
+            Ok(estimate) => Ok(Some(estimate)),
+            Err(error) if error.kind == ProviderErrorKind::ContextOverflow => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind,
+                    ProviderErrorKind::Protocol | ProviderErrorKind::Unsupported
+                ) =>
+            {
+                Err(EndReason::ProviderProtocol)
+            }
+            Err(_) => Err(EndReason::ProviderFailed),
+        }
     }
 
     fn fits(
@@ -622,6 +637,36 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         encode(&(&messages, &tools), self.limits.context_bytes).is_ok()
             && input.saturating_add(output).saturating_add(margin) <= window
             && input.saturating_add(output) <= remaining
+    }
+
+    fn admit(
+        &self,
+        messages: &[Message],
+        tools: &[super::tools::ToolDescriptor],
+        mut output: u64,
+        remaining: u64,
+        window: u64,
+    ) -> Result<Option<(u64, u64)>, EndReason> {
+        if encode(&(&messages, &tools), self.limits.context_bytes).is_err() {
+            return Ok(None);
+        }
+        // Reduce output only for the remaining session budget. Context-window
+        // pressure should compact history instead of starving the response.
+        // The serialized max-output field can change size as the cap shrinks.
+        for _ in 0..8 {
+            let Some(input) = self.input_estimate(messages, tools, output)? else {
+                return Ok(None);
+            };
+            if self.fits(messages, tools, output, remaining, window, Some(input)) {
+                return Ok(Some((input, output)));
+            }
+            let reduced = output.min(remaining.saturating_sub(input));
+            if reduced == 0 || reduced >= output {
+                return Ok(None);
+            }
+            output = reduced;
+        }
+        Ok(None)
     }
 
     async fn compact(
@@ -663,36 +708,27 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             };
             let projection = Projection {
                 summary: Some(candidate.clone()),
-                evicted: Projection::deterministic(base)
-                    .evicted
-                    .into_iter()
-                    .filter(|handle| handle.message >= cut)
-                    .collect(),
+                evicted: Projection::deterministic(base, cut).evicted,
                 ..Default::default()
             };
-            if let Ok(projected) = projection.apply(base) {
-                let estimate = self
-                    .input_estimate(&projected, descriptors, capacity.output)
-                    .ok();
-                if self.fits(
-                    &projected,
-                    descriptors,
-                    capacity.output,
-                    capacity.remaining,
-                    capacity.window,
-                    estimate,
-                ) {
-                    selected = Some(candidate);
-                    break;
-                }
+            if let Ok(projected) = projection.apply(base)
+                && self
+                    .admit(
+                        &projected,
+                        descriptors,
+                        capacity.output,
+                        capacity.remaining,
+                        capacity.window,
+                    )?
+                    .is_some()
+            {
+                selected = Some(candidate);
+                break;
             }
         }
         let mut summary = selected.ok_or(EndReason::Limit(LimitKind::ContextTokens))?;
-        let first = self
-            .summary
-            .as_ref()
-            .map_or(1, |previous| previous.retained_from);
-        let compacted = Projection::deterministic(base)
+        let first = existing;
+        let compacted = Projection::deterministic(base, first)
             .apply(base)
             .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
         let old = &compacted[first..summary.retained_from];
@@ -709,9 +745,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             max_output_tokens: summary_output,
         };
         let input = self
-            .provider
-            .estimate_input_tokens(&request)
-            .map_err(|_| EndReason::ProviderProtocol)?;
+            .input_estimate(&request.messages, &[], summary_output)?
+            .ok_or(EndReason::Limit(LimitKind::ContextTokens))?;
         if !self.fits(
             &request.messages,
             &[],

@@ -1034,6 +1034,76 @@ impl Provider for CompactionProvider {
     }
 }
 
+struct UnsupportedEstimate;
+
+impl Provider for UnsupportedEstimate {
+    fn estimate_input_tokens(&self, _: &ModelRequest) -> Result<u64, ProviderError> {
+        Err(ProviderError::new(ProviderErrorKind::Unsupported, false))
+    }
+
+    async fn start(&mut self, _: ModelRequest) -> Result<(), ProviderError> {
+        panic!("unsupported request must not reach the provider")
+    }
+
+    async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderError> {
+        panic!("unsupported request must not start a stream")
+    }
+}
+
+#[tokio::test]
+async fn unsupported_provider_projection_fails_without_attempting_compaction() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        UnsupportedEstimate,
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ProviderProtocol);
+    assert_eq!(end.budget.model_turns, 0);
+    assert!(
+        !engine
+            .host
+            .records
+            .iter()
+            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
+    );
+}
+
+#[tokio::test]
+async fn remaining_token_budget_can_reduce_output_without_compaction() {
+    let provider = scripted(vec![response("Done", vec![])]);
+    let tools = FakeTools::default().descriptors();
+    let input = provider
+        .estimate_input_tokens(&ModelRequest {
+            messages: vec![Message::User {
+                text: "Implement a fixture task".into(),
+            }],
+            tools,
+            max_output_tokens: 12,
+        })
+        .unwrap();
+    let mut bounds = limits();
+    bounds.tokens = input + 12;
+    let (_dir, mut engine) = setup(provider, bounds);
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(engine.provider.requests.len(), 1);
+    assert_eq!(engine.provider.requests[0].max_output_tokens, 12);
+    assert!(
+        !engine
+            .host
+            .records
+            .iter()
+            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
+    );
+}
+
 #[tokio::test]
 async fn canceled_compaction_is_charged_and_never_replays_tools() {
     let dir = TempDir::new().unwrap();
