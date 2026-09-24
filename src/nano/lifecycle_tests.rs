@@ -1360,7 +1360,7 @@ async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
     let before = session.status().await.unwrap();
     std::fs::write(f.root.join("src/lib.rs"), "pub struct WorkingSetEdit;\n").unwrap();
     let mut refresh = Refresh::default();
-    refresh.elapse_debounce();
+    refresh.invalidate();
     assert_eq!(
         refresh.prepare(&session, false).await[0]["status"],
         "scheduled"
@@ -1393,6 +1393,65 @@ async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
         Some(result.snapshot_id),
         after.repository_view.view_snapshot_id
     );
+}
+
+#[tokio::test]
+async fn quick_patch_schedules_refresh_before_the_next_graph_query() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "quick-patch-refresh");
+    let digest = tools
+        .coding
+        .workspace
+        .read_file(
+            serde_json::from_value(json!({
+                "path":"src/lib.rs"
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .source
+        .digest;
+    let patch = call(
+        "apply_patch",
+        json!({"edits":[{
+            "operation":"update", "path":"src/lib.rs", "expected_digest":digest,
+            "hunks":[{"start_line":1, "old_text":"pub struct Baseline;\n",
+                "new_text":"pub struct QuickPatch;\n"}]
+        }]}),
+    );
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    // A graph lookup in the same tool group waits for the already scheduled
+    // refresh. No further model turn or second prepare_context is needed.
+    let query = call("repository_search", json!({"query":"QuickPatch"}));
+    let ToolOutcome::Success(value) = tools.execute(&query, &Cancellation::default()).await else {
+        panic!("query failed before the scheduled refresh completed");
+    };
+    assert!(
+        serde_json::to_string(&value)
+            .unwrap()
+            .contains("QuickPatch")
+    );
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
 }
 
 #[tokio::test]

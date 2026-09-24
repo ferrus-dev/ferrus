@@ -50,13 +50,18 @@ revisions invalidate old packets. External edits are detected when referenced co
 there is no claim to detect every new file or to prove repository-wide freshness. Without a reliable
 comparison, freshness remains `unknown`; absent graph relationships remain unknown.
 
-Mutations also clear structural query reuse and mark the overlay dirty. A host scheduler coalesces
-changes for 250 ms, defers while owned commands may write, and starts at most four refresh attempts
-per session. It uses the existing explicit refresh coordinator and sidecar leases outside retrieval.
-The host waits for its refresh before another mutation or shutdown. Results are bounded host
-observations. Failed refresh preserves the last snapshot/overlay identities and may mark that view
-stale under the existing contract; it does not fail or complete the task. No Git baseline or a
-disabled graph skips maintenance. Read-only retrieval never invokes refresh.
+Mutations also clear structural query reuse and mark the overlay dirty. A host scheduler waits up
+to 250 ms from the first pending edit, defers while owned commands may write, and starts at most
+four refresh attempts per session. It uses the existing explicit refresh coordinator and sidecar
+leases outside retrieval.
+The first pending edit fixes the debounce deadline. A completed mutation arms a timer, so refresh
+does not depend on another model turn. Bound graph queries wait for an armed refresh; while an
+owned writer keeps the overlay dirty, they return a bounded pending result and the current
+workspace fallback remains available. The host waits for its refresh before another mutation or
+shutdown. Results are bounded host observations. Failed refresh preserves the last snapshot and
+overlay identities and may mark that view stale under the existing contract; it does not fail or
+complete the task. No Git baseline or a disabled graph skips maintenance. Read-only retrieval
+never invokes refresh.
 
 Graph-disabled and unavailable-memory sessions can still use ordinary workspace tools. Stale,
 ambiguous, missing, or unsupported graph coverage retains the explicit `repository_fallback` path.

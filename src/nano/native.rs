@@ -238,8 +238,32 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if !context::NAMES.contains(&call.name.as_str()) && call.name != "load_instructions" {
             if matches!(call.name.as_str(), "exec" | "apply_patch") {
                 self.invalidate_unknown().await;
+                let outcome = self.coding.execute(call, cancellation).await;
+                let writers = self.coding.commands.potentially_active_writers() > 0;
+                self.observations
+                    .extend(self.refresh.prepare(&self.session, writers).await);
+                return outcome;
             }
             return self.coding.execute(call, cancellation).await;
+        }
+
+        let needs_graph = matches!(
+            call.name.as_str(),
+            "repository_graph_status" | "repository_search" | "repository_context"
+        ) || matches!(
+            call.name.as_str(),
+            "project_context_search" | "project_context"
+        ) && call.arguments["domain"] != "memory";
+        if needs_graph {
+            if let Some(observation) = self.refresh.settle().await {
+                self.observations.push(observation);
+            }
+            if let Some(reason) = self.refresh.pending_reason() {
+                return ToolOutcome::Failed(ToolError::Context(json!({
+                    "code":reason, "canonical_fallback":false,
+                    "message":"The bound repository overlay needs a refresh; use repository_fallback for current workspace evidence"
+                })));
+            }
         }
 
         let result: Result<Value> = async {

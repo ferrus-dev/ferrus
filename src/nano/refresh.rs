@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
 #[derive(Default)]
 pub(super) struct Refresh {
     dirty: Option<Instant>,
@@ -14,7 +16,18 @@ pub(super) struct Refresh {
 
 impl Refresh {
     pub fn invalidate(&mut self) {
-        self.dirty = Some(Instant::now());
+        // Repeated edits must not move the first pending refresh deadline.
+        self.dirty.get_or_insert_with(Instant::now);
+    }
+
+    pub fn pending_reason(&self) -> Option<&'static str> {
+        self.dirty.map(|_| {
+            if self.attempts >= 4 {
+                "overlay_refresh_limit"
+            } else {
+                "overlay_refresh_pending"
+            }
+        })
     }
 
     pub async fn settle(&mut self) -> Option<Value> {
@@ -34,11 +47,12 @@ impl Refresh {
         {
             observations.push(value);
         }
-        if !self.take_due(Instant::now(), writers) {
+        let Some(dirty) = self.take_pending(writers) else {
             return observations;
-        }
+        };
         let session = session.clone();
         self.task = Some(tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(dirty + DEBOUNCE)).await;
             let result = async {
                 let runtime = session.authorize().await?;
                 let Some(baseline) = session.baseline_tree() else {
@@ -79,24 +93,18 @@ impl Refresh {
         observations
     }
 
-    fn take_due(&mut self, now: Instant, writers: bool) -> bool {
-        if writers
-            || self.task.is_some()
-            || self.attempts >= 4
-            || self.dirty.is_none_or(|dirty| {
-                now.saturating_duration_since(dirty) < Duration::from_millis(250)
-            })
-        {
-            return false;
+    fn take_pending(&mut self, writers: bool) -> Option<Instant> {
+        if writers || self.task.is_some() || self.attempts >= 4 {
+            return None;
         }
-        self.dirty = None;
+        let dirty = self.dirty.take()?;
         self.attempts += 1;
-        true
+        Some(dirty)
     }
 
     #[cfg(test)]
     pub(super) fn elapse_debounce(&mut self) {
-        self.dirty = Some(Instant::now() - Duration::from_millis(250));
+        self.dirty = Some(Instant::now() - DEBOUNCE);
     }
 }
 
@@ -113,23 +121,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debounce_coalesces_changes_and_defers_owned_writers_under_a_hard_cap() {
-        let now = Instant::now();
+    fn debounce_keeps_the_first_deadline_and_defers_owned_writers_under_a_hard_cap() {
         let mut refresh = Refresh::default();
-        assert!(!refresh.take_due(now, false));
-        refresh.dirty = Some(now);
-        assert!(!refresh.take_due(now + Duration::from_millis(249), false));
-        refresh.dirty = Some(now + Duration::from_millis(200));
-        assert!(!refresh.take_due(now + Duration::from_millis(300), false));
-        assert!(!refresh.take_due(now + Duration::from_secs(1), true));
-        assert!(refresh.take_due(now + Duration::from_secs(1), false));
-        assert!(!refresh.take_due(now + Duration::from_secs(1), false));
-        for _ in 0..3 {
-            refresh.dirty = Some(now);
-            assert!(refresh.take_due(now + Duration::from_secs(1), false));
+        assert!(refresh.take_pending(false).is_none());
+        refresh.invalidate();
+        let first = refresh.dirty.unwrap();
+        for _ in 0..8 {
+            refresh.invalidate();
         }
-        refresh.dirty = Some(now);
-        assert!(!refresh.take_due(now + Duration::from_secs(1), false));
+        assert_eq!(refresh.dirty, Some(first));
+        assert!(refresh.take_pending(true).is_none());
+        assert_eq!(refresh.take_pending(false), Some(first));
+        assert!(refresh.take_pending(false).is_none());
+        for _ in 0..3 {
+            refresh.invalidate();
+            assert!(refresh.take_pending(false).is_some());
+        }
+        refresh.invalidate();
+        assert!(refresh.take_pending(false).is_none());
+        assert_eq!(refresh.pending_reason(), Some("overlay_refresh_limit"));
     }
 
     #[tokio::test]
