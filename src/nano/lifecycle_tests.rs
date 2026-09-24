@@ -1435,6 +1435,70 @@ async fn quick_patch_schedules_refresh_before_the_next_graph_query() {
     assert!(tools.shutdown().await);
 }
 
+#[tokio::test]
+async fn working_set_settles_refresh_before_reusing_graph_evidence_without_prefetch() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "working-set-after-patch");
+    let query = call("repository_search", json!({"query":"Baseline"}));
+    let result = tools.execute(&query, &Cancellation::default()).await;
+    assert!(
+        matches!(&result, ToolOutcome::Success(value) if serde_json::to_string(value).unwrap().contains("Baseline"))
+    );
+    let messages = vec![
+        Message::Assistant {
+            response: ModelResponse {
+                finish: FinishReason::ToolCalls,
+                text: String::new(),
+                calls: vec![ToolCall {
+                    provider_call_id: query.provider_call_id.clone(),
+                    name: query.name.clone(),
+                    arguments: query.arguments.to_string(),
+                }],
+                continuation: None,
+            },
+        },
+        Message::Tool {
+            provider_call_id: query.provider_call_id,
+            outcome: result,
+        },
+    ];
+    let patch = baseline_patch(&tools, "CurrentSymbol");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.replacements.iter().any(|replacement| {
+        replacement.message == 1 && replacement.value["kind"] == "evidence_unavailable"
+    }));
+    assert!(
+        !serde_json::to_string(&prepared.apply(&messages).unwrap())
+            .unwrap()
+            .contains("pub struct Baseline;")
+    );
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+}
+
 fn baseline_patch(tools: &NativeTools<TrustedLocal>, symbol: &str) -> ValidatedCall {
     let digest = tools
         .coding
@@ -1558,6 +1622,67 @@ async fn prefetch_waits_for_the_new_overlay_after_a_quick_patch() {
         previous
     );
     assert!(tools.shutdown().await);
+}
+
+#[tokio::test]
+async fn shutdown_refreshes_an_overlay_deferred_by_an_active_writer() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, true).await;
+    let previous = session
+        .status()
+        .await
+        .unwrap()
+        .repository_view
+        .view_snapshot_id;
+    let (mut tools, _journal) = native(&f, session.clone(), "writer-at-shutdown");
+    let command = if cfg!(windows) {
+        r"echo pub struct ShutdownEdit;> src\lib.rs & ping -n 30 127.0.0.1 > nul"
+    } else {
+        "printf 'pub struct ShutdownEdit;\\n' > src/lib.rs; sleep 30"
+    };
+    let started = tools
+        .execute(
+            &call(
+                "exec",
+                json!({"command":command, "cwd":".", "timeout_ms":30_000}),
+            ),
+            &Cancellation::default(),
+        )
+        .await;
+    assert!(matches!(started, ToolOutcome::Success(_)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if std::fs::read_to_string(f.root.join("src/lib.rs"))
+                .is_ok_and(|source| source.contains("ShutdownEdit"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command must write before shutdown");
+    assert!(tools.coding.commands.potentially_active_writers() > 0);
+    assert_eq!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
+    assert!(tools.shutdown().await);
+    assert_ne!(
+        session
+            .status()
+            .await
+            .unwrap()
+            .repository_view
+            .view_snapshot_id,
+        previous
+    );
 }
 
 #[tokio::test]

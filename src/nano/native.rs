@@ -162,9 +162,14 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if cancellation.is_cancelled() {
             return Err(ToolError::Interrupted);
         }
-        if self.working_set_enabled && !self.prefetch.is_empty() {
-            // Prefetch shares the graph-read barrier: never assemble a prompt
-            // from the prior task view while a refresh is armed or running.
+        let writers = self.coding.commands.potentially_active_writers() > 0;
+        if self.working_set_enabled {
+            // Resolve the task view before selecting prior graph packets or
+            // prefetching new ones for the next model request. A writer may
+            // have deferred scheduling and exited since the last tool call.
+            for observation in self.refresh.prepare(&self.session, writers).await {
+                self.record_refresh(observation);
+            }
             if let Some(observation) = self.refresh.settle().await {
                 self.record_refresh(observation);
             }
@@ -174,7 +179,6 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             .revisions()
             .await
             .map_err(|_| ToolError::Denied)?;
-        let writers = self.coding.commands.potentially_active_writers() > 0;
         let binding = json!({"project":self.session.project_id(), "task":self.session.scope.task_id,
             "run":self.session.scope.run_id, "workspace":self.session.workspace()});
         let mut prepared = if self.working_set_enabled {
@@ -345,7 +349,18 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
     }
 
     async fn shutdown(&mut self) -> bool {
-        self.before_mutation().await;
-        self.coding.shutdown().await
+        // A running command can leave the overlay dirty without a scheduled
+        // refresh. Stop and join owned writers before publishing their bytes.
+        if !self.coding.shutdown().await {
+            return false;
+        }
+        if self.working_set_enabled {
+            self.before_mutation().await;
+            for observation in self.refresh.prepare(&self.session, false).await {
+                self.record_refresh(observation);
+            }
+            self.before_mutation().await;
+        }
+        true
     }
 }

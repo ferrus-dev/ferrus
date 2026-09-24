@@ -57,8 +57,10 @@ leases outside retrieval.
 The first pending edit fixes the debounce deadline. A completed mutation arms a timer, so refresh
 does not depend on another model turn. Bound graph queries wait for an armed refresh; while an
 owned writer keeps the overlay dirty, they return a bounded pending result and the current
-workspace fallback remains available. The host waits for its refresh before another mutation or
-shutdown. Results are bounded host observations. Failed refresh preserves the last snapshot and
+workspace fallback remains available. Before each working-set assembly, the host schedules any
+refresh deferred by a finished writer and waits before selecting graph evidence or prefetch.
+Shutdown stops and joins owned writers before scheduling and settling a remaining dirty refresh.
+Results are bounded host observations. Failed refresh preserves the last snapshot and
 overlay identities and may mark that view stale under the existing contract; it does not fail or
 complete the task. No Git baseline or a disabled graph skips maintenance. Read-only retrieval
 never invokes refresh.
