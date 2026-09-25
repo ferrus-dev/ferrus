@@ -293,6 +293,32 @@ fn advertised_tools_are_bounded_by_context_not_generated_call_count() {
 }
 
 #[test]
+fn context_estimate_counts_the_actual_openai_wire_body() {
+    let provider = OpenAi::new(config("http://127.0.0.1:1234/v1")).unwrap();
+    let mut request = request();
+    request.messages.push(Message::Assistant {
+        response: ModelResponse {
+            finish: FinishReason::ToolCalls,
+            text: String::new(),
+            calls: vec![ToolCall {
+                provider_call_id: "opaque-1".into(),
+                name: "lookup".into(),
+                arguments: "{\"value\":1}".into(),
+            }],
+            continuation: Some(json!({"reasoning_content":"opaque"})),
+        },
+    });
+    request.messages.push(Message::Tool {
+        provider_call_id: "opaque-1".into(),
+        outcome: ToolOutcome::Success(json!({"value":1})),
+    });
+    assert_eq!(
+        provider.estimate_input_tokens(&request).unwrap() as usize,
+        provider.body(request).unwrap().len()
+    );
+}
+
+#[test]
 fn configuration_and_transport_bounds_fail_explicitly() {
     for url in [
         "http://example.com/v1",

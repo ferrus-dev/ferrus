@@ -124,6 +124,14 @@ pub(crate) trait Provider {
         None
     }
 
+    /// Conservative provider-wire input estimate, including tool schemas and framing.
+    /// Reported usage remains separate from this admission estimate.
+    fn estimate_input_tokens(&self, request: &ModelRequest) -> Result<u64, ProviderError> {
+        let bytes = serde_json::to_vec(&(&request.messages, &request.tools))
+            .map_err(|_| ProviderError::new(ProviderErrorKind::Protocol, false))?;
+        Ok((bytes.len() as u64).saturating_add(128))
+    }
+
     /// Close any retained stream, including cancellation between buffered events.
     fn cancel(&mut self) {}
 

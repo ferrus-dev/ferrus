@@ -5,6 +5,7 @@ mod checks;
 pub(crate) mod cli;
 pub(crate) mod coding;
 pub(crate) mod commands;
+pub(crate) mod compaction;
 pub(crate) mod context;
 pub(crate) mod instructions;
 mod lifecycle;

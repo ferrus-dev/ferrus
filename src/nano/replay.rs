@@ -17,10 +17,13 @@ pub(crate) struct Replay {
     pub budget: Budget,
     pub messages: Vec<Message>,
     pub projection: Option<super::working_set::Preparation>,
+    pub summary: Option<super::compaction::Summary>,
     pub end: Option<EndReason>,
     pub pending_effect: Option<String>,
     pub unknown_effects: Vec<String>,
     model_active: bool,
+    compaction_active: bool,
+    compaction_cut: Option<usize>,
     final_response_ready: bool,
     submitted: bool,
     calls: VecDeque<ToolCall>,
@@ -89,7 +92,7 @@ impl Replay {
         expected.no_progress = after.no_progress;
 
         match &record.event {
-            SessionEvent::ModelStarted { .. } => {
+            SessionEvent::ModelStarted { .. } | SessionEvent::CompactionStarted { .. } => {
                 ensure!(
                     before.reserved_input_tokens == 0
                         && before.reserved_output_tokens == 0
@@ -102,6 +105,7 @@ impl Replay {
                 expected.reserved_output_tokens = after.reserved_output_tokens;
             }
             SessionEvent::ModelCompleted { usage, .. }
+            | SessionEvent::CompactionCompleted { usage, .. }
             | SessionEvent::ModelFailed { usage, .. } => {
                 expected.reserved_input_tokens = 0;
                 expected.reserved_output_tokens = 0;
@@ -141,7 +145,30 @@ impl Replay {
                     "Context prepared inside an unfinished group"
                 );
                 preparation.apply(&self.messages)?;
+                ensure!(
+                    preparation
+                        .projection
+                        .as_ref()
+                        .and_then(|value| value.summary.as_ref())
+                        == self.summary.as_ref(),
+                    "Context projection does not match the compacted history"
+                );
                 self.projection = Some(preparation.clone());
+            }
+            SessionEvent::ContextComposed { composition } => {
+                ensure!(
+                    self.checkpoint_ready()
+                        && composition.history_messages == self.messages.len()
+                        && composition.request_messages > 0
+                        && composition.stable_prefix_messages <= composition.request_messages
+                        && composition.input_tokens_estimated > 0
+                        && composition.output_tokens_reserved > 0
+                        && composition
+                            .input_tokens_estimated
+                            .saturating_add(composition.output_tokens_reserved)
+                            <= composition.context_window_tokens,
+                    "Invalid context composition"
+                );
             }
             SessionEvent::ModelStarted { turn } => {
                 ensure!(
@@ -155,9 +182,29 @@ impl Replay {
                 self.model_active = true;
                 self.final_response_ready = false;
             }
+            SessionEvent::CompactionStarted {
+                turn,
+                retained_from,
+            } => {
+                ensure!(
+                    self.checkpoint_ready(),
+                    "Compaction inside an unfinished group"
+                );
+                ensure!(
+                    *turn == before.model_turns + 1
+                        && after.model_turns == *turn
+                        && super::compaction::boundaries(&self.messages)?.contains(retained_from)
+                        && *retained_from > 1,
+                    "Invalid compaction boundary"
+                );
+                self.model_active = true;
+                self.compaction_active = true;
+                self.compaction_cut = Some(*retained_from);
+                self.final_response_ready = false;
+            }
             SessionEvent::ModelCompleted { response, .. } => {
                 ensure!(
-                    self.model_active && self.calls.is_empty(),
+                    self.model_active && !self.compaction_active && self.calls.is_empty(),
                     "Unexpected model response"
                 );
                 self.model_active = false;
@@ -167,9 +214,40 @@ impl Replay {
                     response: response.clone(),
                 });
             }
+            SessionEvent::CompactionCompleted { summary, .. } => {
+                ensure!(
+                    self.model_active
+                        && self.compaction_active
+                        && self.compaction_cut == Some(summary.retained_from)
+                        && self
+                            .summary
+                            .as_ref()
+                            .is_none_or(|old| summary.retained_from > old.retained_from)
+                        && summary.handles.len() <= 16,
+                    "Unexpected compaction result"
+                );
+                ensure!(
+                    summary
+                        .handles
+                        .iter()
+                        .all(|handle| super::compaction::handles(&self.messages).contains(handle)),
+                    "Compaction handle does not match the journal"
+                );
+                super::compaction::Projection {
+                    summary: Some(summary.clone()),
+                    ..Default::default()
+                }
+                .apply(&self.messages)?;
+                self.model_active = false;
+                self.compaction_active = false;
+                self.compaction_cut = None;
+                self.summary = Some(summary.clone());
+            }
             SessionEvent::ModelFailed { .. } => {
                 ensure!(self.model_active, "Unexpected provider failure");
                 self.model_active = false;
+                self.compaction_active = false;
+                self.compaction_cut = None;
                 self.final_response_ready = false;
             }
             SessionEvent::ToolIntent { call_id, call } => {
