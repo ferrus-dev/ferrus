@@ -1,9 +1,9 @@
 ---
 name: neva
-description: Build, review and debug MCP (Model Context Protocol) servers and clients in Rust with the neva crate — tools, prompts, resources, elicitation and multi round-trip requests, Streamable HTTP and stdio transports, auth, DI and deployment. Use whenever Rust code imports `neva`, whenever the task is to expose something as an MCP server or to talk to one from Rust, and when upgrading such code across neva or MCP-spec versions.
+description: Build, review and debug MCP (Model Context Protocol) servers and clients in Rust with the neva crate — tools, prompts, resources, elicitation and multi round-trip requests, MCP Apps (`ui://` UI resources), Streamable HTTP and stdio transports, OAuth 2.1 auth, DI, deployment and publishing to the MCP Registry. Use whenever Rust code imports `neva`, whenever the task is to expose something as an MCP server or to talk to one from Rust, and when upgrading such code across neva or MCP-spec versions.
 license: MIT
 metadata:
-  neva-version: "0.5.2"
+  neva-version: "0.6.1"
   mcp-protocol: "2026-07-28"
   docs: "https://romanemreis.github.io/neva-docs/"
   api-reference: "https://docs.rs/neva"
@@ -15,7 +15,7 @@ metadata:
 sides: `App` builds servers, `Client` builds clients, and a single process
 can run both.
 
-**This skill describes neva 0.5.x, which speaks MCP `2026-07-28` by
+**This skill describes neva 0.6.x, which speaks MCP `2026-07-28` by
 default.** That protocol generation broke compatibility with everything
 before it. Most MCP knowledge in circulation — and every other MCP SDK —
 describes the *older* generation, so the failure mode here is not "you
@@ -37,7 +37,9 @@ In an existing project, read `Cargo.toml`:
 
 | What you find | What it means |
 |---|---|
-| `neva = "0.5"` and no `legacy-spec` | Default profile, MCP 2026-07-28. This skill applies as written |
+| `neva = "0.6"` and no `legacy-spec` | Default profile, MCP 2026-07-28. This skill applies as written |
+| `neva = "0.6.0"` exactly | Same API, minus the `registry` feature and a retryable `Client::connect` — both 0.6.1. Prefer 0.6.1; it is drop-in |
+| `neva = "0.5"` and no `legacy-spec` | Same protocol and same API, minus synchronous handlers and per-request extensions. Everything here still applies; see [Handler shapes](#handler-shapes) for what 0.6 added |
 | `features = [… "legacy-spec" …]` | **Legacy profile**, MCP 2024-11-05 … 2025-11-25. A *different* API. Read `references/legacy.md` before touching anything |
 | `neva = "0.4"` or older | Pre-2026-07-28 by default. Read `references/legacy.md` for the upgrade |
 | `proto-2026-07-28-rc` | A flag that no longer exists — remove it |
@@ -55,12 +57,17 @@ Load only what the task calls for; each file is self-contained.
 | The task | Read |
 |---|---|
 | Tools, prompts, resources, schemas, content types, completion | `references/server.md` |
+| Whether a handler should be `async fn`, a plain `fn`, or `blocking` | [Handler shapes](#handler-shapes), then `references/server.md` |
 | DI, middleware, logging, progress, subscriptions on the server | `references/server.md` |
 | Connecting, calling tools, batching, subscribing, client handlers | `references/client.md` |
 | Asking the user for input mid-handler; `input_required`; re-run safety | `references/mrtr.md` |
 | Long-running work, `tasks/get` polling | `references/mrtr.md` |
-| Transport choice, TLS, JWT/OAuth, DNS-rebinding, multi-instance deploy | `references/http.md` |
+| Transport choice, TLS, JWT auth, DNS-rebinding, multi-instance deploy | `references/http.md` |
+| OAuth 2.1 — protecting a server, authorizing a client, DPoP, CIMD, grants | `references/http.md` |
+| Stopping a server from code; graceful shutdown; draining subscriptions | `references/http.md` |
 | A custom HTTP stack (axum, hyper, actix-web) | `references/http.md` |
+| Publishing a server: `server.json`, the MCP Registry, `mcp-publisher` | `references/http.md` |
+| Giving a tool a UI; `ui://` resources; `_meta.ui`; MCP Apps | `references/apps.md` |
 | An error code, a `-320xx` on the wire, or "why is this rejected" | `references/troubleshooting.md` |
 | `legacy-spec`, MCP ≤ 2025-11-25, upgrading from 0.4.x | `references/legacy.md` |
 
@@ -115,6 +122,69 @@ async fn main() -> Result<(), Error> {
 }
 ```
 
+## Handler shapes
+
+Every registration point accepts a handler in one of two shapes, and the
+shape is read off the signature. Pick by **what the body does with the
+thread**, not by how short it is:
+
+| The body | Write | Runs |
+|---|---|---|
+| **Awaits** — HTTP, an async driver, another peer through `Context` | `async fn` | On the runtime |
+| **Computes** on data in hand — arithmetic, formatting, a map lookup | plain `fn` | Inline, no spawn, no yield |
+| **Blocks** — `std::fs`, a sync DB or HTTP driver, `Command::output` | plain `fn` + `blocking` | Tokio's blocking pool |
+
+```rust
+use neva::{prelude::*, blocking};
+
+#[tool(descr = "Greets a person")]
+fn greet(name: String) -> String {
+    format!("Hello, {name}!")
+}
+
+#[tool(descr = "Reads a text file", blocking)]
+fn read_file(path: String) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+#[tokio::main]
+async fn main() {
+    let mut app = App::new()
+        .with_options(|opt| opt.with_stdio());
+
+    // The function form, for closures and non-macro registration.
+    app.map_tool("read_other", blocking(|path: String| {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }))
+    .with_arg_names(["path"]);
+
+    app.run().await;
+}
+```
+
+Four things to get right:
+
+* **Synchronous handlers are new in 0.6.0.** On 0.5.x every handler must
+  return a future. If the crate in front of you is 0.5.x, write `async fn`.
+* **`blocking` on an `async fn` is a compile error** — there is nothing to
+  offload. It is also a pessimization on a short body: handing `a + b` to
+  another thread costs more than the addition.
+* **The published schema is identical either way.** Argument slots, the
+  `inputSchema`, the `outputSchema` and the response do not depend on the
+  shape, and `Result` works the same in both.
+* **A `blocking` body is never cancelled** when the request is; it runs to
+  completion and its result is discarded. A panic inside it propagates to the
+  awaiting task, as it would inline.
+
+Both shapes work on the client too: `Client::map_sampling`,
+`Client::map_elicitation`, `#[sampling]` and `#[elicitation]`.
+
+The shape rides as a defaulted type-level marker (`neva::marker::Async` /
+`marker::Immediate`) on the handler traits, inferred at the registration
+site. It never appears in handler code. The one place it surfaces: a call
+site that spells its generics out needs one more argument on 0.6 —
+`map_tool::<_, _, (String,), _>(..)` — and fails with E0107 until it gets one.
+
 ## Non-negotiables
 
 Each of these is a real difference between MCP 2026-07-28 and the
@@ -163,10 +233,14 @@ that compiles and then fails on the wire.
    without `required`. An `Option<T>` parameter is published as its inner
    type, left out of `required`, and arrives as `None` when omitted.
 
-9. **Capabilities are declared per request, not once per connection.** Ask
-   `ctx.client_capabilities()` before requesting input; asking for a kind
-   the caller did not declare ends the call with
+9. **Capabilities are declared per request, not once per connection.** They
+   ride each request's `_meta` under
+   `io.modelcontextprotocol/clientCapabilities`, because there is no
+   handshake to hold them. Ask `ctx.client_capabilities()` before requesting
+   input; asking for a kind the caller did not declare ends the call with
    `MissingRequiredClientCapability` (`-32021`) rather than degrading.
+   Extensions ride the same channel since **0.6.0** — `ctx.client_extension(id)`
+   for any extension, `ctx.supports_apps()` for MCP Apps.
 
 10. **A tool handler's `Err` is not a protocol error.** For `#[tool]`, any
     error becomes a *tool error* — a successful response with
@@ -200,8 +274,9 @@ For HTTP, start the server and point the Inspector at
 
 * `use neva::prelude::*;` is the intended import — it carries `App`,
   `Client`, `Context`, the macros, the types and the error model.
-* Handlers are `async fn`. Returning a plain `String`, `&str`, `Json<T>`,
-  `Content` or `CallToolResponse` all work; prefer the simplest that fits.
+* A handler is an `async fn` or a plain `fn` — see [Handler shapes](#handler-shapes).
+  Returning a plain `String`, `&str`, `Json<T>`, `Content` or
+  `CallToolResponse` all work; prefer the simplest that fits.
 * Registration order does not matter, and listings are sorted by name —
   the registries are `BTreeMap`-backed, which is what makes cursor
   pagination safe.

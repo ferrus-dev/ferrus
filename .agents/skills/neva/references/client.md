@@ -44,6 +44,11 @@ async fn main() -> Result<(), Error> {
 
 `with_default_http()` is the shorthand for `127.0.0.1:3000` + `/mcp`.
 
+Against a protected server, add `.with_oauth(|oauth| oauth)` inside
+`with_http(..)` and the client handles the whole authorization flow off the
+first `401` — see `http.md`. Raise the timeout well past the default 10
+seconds if the flow opens a browser.
+
 `Client::discover()` is the explicit call behind `connect()`;
 `Client::init()` survives as a back-compat alias. `Client::server_info` is
 read from `_meta["io.modelcontextprotocol/serverInfo"]`, which every result
@@ -51,6 +56,45 @@ carries.
 
 `disconnect()` is **local** — it shuts down the transport and sends
 nothing. There is no goodbye message in the protocol.
+
+### A `connect` that failed
+
+`connect()` starts the transport, so a transport that will not start reports
+there: a stdio command that cannot be spawned, a rejected OAuth or TLS
+configuration, a failed bind. Before 0.6.1 both HTTP `start` implementations
+answered `Ok` after logging the failure, and the real cause surfaced as a
+request timeout — if you are debugging exactly that against 0.6.0, upgrade
+before reading any further into it.
+
+A failure on the way up leaves the client's configuration intact, so the same
+client can be retried or pointed elsewhere (0.6.1+; on 0.6.0 the second attempt
+reports `Transport protocol must be specified`, and needs a fresh `Client`):
+
+```rust
+use neva::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let mut client = Client::new()
+        .with_options(|opt| opt.with_stdio("weather-mcp", ["--stdio"]));
+
+    if client.connect().await.is_err() {
+        client = client.with_options(|opt| opt
+            .with_stdio("cargo", ["run", "-p", "weather-mcp"]));
+        client.connect().await?;
+    }
+
+    client.disconnect().await
+}
+```
+
+Retryable is exactly what the transport refuses **as a whole** — nothing has
+been consumed, so the next attempt is a real one. Once the transport is
+running, a later failure is not undone by retrying: build a new `Client`, since
+a stdio server needs a fresh child process anyway.
+
+A client that was never given a transport is told so by `connect`, not by its
+first call.
 
 ### Talking to an older server
 
@@ -213,6 +257,16 @@ async fn main() -> Result<(), Error> {
 Listings are ordered by name and stable across calls, which is what makes
 cursor pagination safe.
 
+`ResourceContents`'s accessors — `uri`, `text`, `blob`, `json`, `mime`,
+`title`, `annotations` — are available to a client build.
+Before it they were server-only and a client had to match on the enum's
+variants. The builders are still server-side.
+
+A tool may carry MCP Apps metadata: `tool.ui()` reads the block, and
+`tool.is_model_visible()` says whether the agent may see the tool at all —
+a host has to filter, because the server lists app-only tools like any
+other. See `apps.md`.
+
 ## Batching
 
 ```rust
@@ -305,6 +359,12 @@ client), `Graceful(result)` (the server closed it), or `Abrupt` (stream
 went away). Subscriptions are not resumable — call `listen` again.
 Dropping the handle, or `disconnect()`, ends the subscription too.
 
+A server shutting down owes you `Graceful`, and a neva server delivers it. Not
+every peer does, so an `Abrupt` at shutdown reads as "the peer stopped" rather
+than as a fault on this side. Over HTTP your own `cancel()` is always `Cancelled`, never
+`Graceful`: cancelling closes the listen `POST`'s body, which *is* the
+spec's cancellation mechanism there, and leaves no channel for a result.
+
 Logging and progress need no subscription; they are request-scoped.
 
 ## Answering the server's input requests
@@ -364,6 +424,55 @@ Declaring a handler without `with_elicitation` enables **form** mode by
 default. A mode you do not declare is one the server must not send — it
 gets `MissingRequiredClientCapability` instead. Cap the retry loop with
 `McpOptions::with_max_mrtr_rounds`.
+
+### Handler shapes
+
+Since **0.6.0** `Client::map_sampling`, `Client::map_elicitation`,
+`#[sampling]` and `#[elicitation]` take a plain `fn` as well as an
+`async fn`. A handler that puts a **blocking** dialog in front of a person —
+a terminal prompt, a native modal — is what `blocking` is for: it runs on
+Tokio's blocking pool instead of holding a runtime worker for as long as the
+person takes to answer.
+
+```rust
+use neva::prelude::*;
+
+#[elicitation(blocking)]
+fn ask(params: ElicitRequestParams) -> ElicitResult {
+    match params {
+        ElicitRequestParams::Url(_url) => ElicitResult::accept(),
+        ElicitRequestParams::Form(_form) => {
+            let mut answer = String::new();
+            // Blocks this thread until the user presses enter.
+            let _ = std::io::stdin().read_line(&mut answer);
+            ElicitResult::accept()
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let mut client = Client::new()
+        .with_options(|opt| opt.with_default_http());
+
+    client.connect().await?;
+    client.disconnect().await
+}
+```
+
+`blocking` on an `async fn` is a compile error. The two methods keep their
+arity across 0.5 → 0.6, but their second generic parameter is now the shape
+marker rather than the handler's future type.
+
+### What this client declares, per request
+
+There is no handshake on 2026-07-28, so the client stamps its capabilities
+onto **every request**'s `_meta` under
+`io.modelcontextprotocol/clientCapabilities` — the MRTR modes above, and
+since 0.6.0 the `extensions` map too. Nothing to call: declaring a handler
+or calling `with_apps()` is what fills it in. A server reads it back with
+`ctx.client_capabilities()`, `ctx.client_extension(id)` and
+`ctx.supports_apps()`.
 
 ## Tasks
 
