@@ -1602,24 +1602,16 @@ async fn prefetch_waits_for_the_new_overlay_after_a_quick_patch() {
         .iter()
         .find(|item| item["kind"] == "prefetch")
         .expect("prefetch should use the new task view");
-    assert!(
-        serde_json::to_string(prefetched)
-            .unwrap()
-            .contains("PrefetchedEdit")
+    let view = session.status().await.unwrap().repository_view;
+    assert_ne!(view.view_snapshot_id, previous);
+    assert_eq!(
+        prefetched["evidence"]["provenance"]["snapshot_id"],
+        json!(view.view_snapshot_id)
     );
     assert!(
         !serde_json::to_string(prefetched)
             .unwrap()
             .contains("pub struct Baseline;")
-    );
-    assert_ne!(
-        session
-            .status()
-            .await
-            .unwrap()
-            .repository_view
-            .view_snapshot_id,
-        previous
     );
     assert!(tools.shutdown().await);
 }

@@ -1233,6 +1233,36 @@ async fn remaining_token_budget_can_reduce_output_without_compaction() {
 }
 
 #[tokio::test]
+async fn uncompactable_request_reports_session_token_limit() {
+    let provider = scripted(vec![response("Done", vec![])]);
+    let input = provider
+        .estimate_input_tokens(&ModelRequest {
+            messages: vec![Message::User {
+                text: "Implement a fixture task".into(),
+            }],
+            tools: FakeTools::default().descriptors(),
+            max_output_tokens: 12,
+        })
+        .unwrap();
+    let mut bounds = limits();
+    bounds.tokens = input - 1;
+    let (_dir, mut engine) = setup(provider, bounds);
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
+    assert!(engine.provider.requests.is_empty());
+}
+
+#[tokio::test]
+async fn uncompactable_request_reports_serialized_context_limit() {
+    let mut bounds = limits();
+    bounds.context_bytes = 64;
+    let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), bounds);
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::ContextBytes));
+    assert!(engine.provider.requests.is_empty());
+}
+
+#[tokio::test]
 async fn canceled_compaction_is_charged_and_never_replays_tools() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().canonicalize().unwrap();

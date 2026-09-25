@@ -231,7 +231,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 Ok(admitted) => admitted,
                 Err(reason) => return reason,
             };
-            if admitted.is_none() {
+            if admitted.is_err() {
                 let mut projection = Projection::deterministic(
                     &base,
                     self.summary
@@ -255,7 +255,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     Err(reason) => return reason,
                 };
             }
-            if admitted.is_none() {
+            if admitted.is_err() {
+                let limit = admitted.as_ref().unwrap_err().clone();
                 let summary = match self
                     .compact(
                         &base,
@@ -265,6 +266,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                             remaining,
                             window,
                         },
+                        limit,
                         cancellation,
                         deadline,
                     )
@@ -298,8 +300,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     Err(reason) => return reason,
                 };
             }
-            let Some((input_estimate, output_reservation)) = admitted else {
-                return EndReason::Limit(LimitKind::ContextTokens);
+            let (input_estimate, output_reservation) = match admitted {
+                Ok(value) => value,
+                Err(limit) => return EndReason::Limit(limit),
             };
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
@@ -662,27 +665,30 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         mut output: u64,
         remaining: u64,
         window: u64,
-    ) -> Result<Option<(u64, u64)>, EndReason> {
+    ) -> Result<Result<(u64, u64), LimitKind>, EndReason> {
         if encode(&(&messages, &tools), self.limits.context_bytes).is_err() {
-            return Ok(None);
+            return Ok(Err(LimitKind::ContextBytes));
         }
         // Reduce output only for the remaining session budget. Context-window
         // pressure should compact history instead of starving the response.
         // The serialized max-output field can change size as the cap shrinks.
         for _ in 0..8 {
             let Some(input) = self.input_estimate(messages, tools, output)? else {
-                return Ok(None);
+                return Ok(Err(LimitKind::ContextTokens));
             };
             if self.fits(messages, tools, output, remaining, window, Some(input)) {
-                return Ok(Some((input, output)));
+                return Ok(Ok((input, output)));
             }
             let reduced = output.min(remaining.saturating_sub(input));
-            if reduced == 0 || reduced >= output {
-                return Ok(None);
+            if reduced == 0 {
+                return Ok(Err(LimitKind::Tokens));
+            }
+            if reduced >= output {
+                return Ok(Err(LimitKind::ContextTokens));
             }
             output = reduced;
         }
-        Ok(None)
+        Ok(Err(LimitKind::ContextTokens))
     }
 
     async fn compact(
@@ -690,6 +696,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         base: &[Message],
         descriptors: &[super::tools::ToolDescriptor],
         capacity: Capacity,
+        mut limit: LimitKind,
         cancellation: &Cancellation,
         deadline: Instant,
     ) -> Result<Summary, EndReason> {
@@ -727,22 +734,23 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 evicted: Projection::deterministic(base, cut).evicted,
                 ..Default::default()
             };
-            if let Ok(projected) = projection.apply(base)
-                && self
-                    .admit(
-                        &projected,
-                        descriptors,
-                        capacity.output,
-                        capacity.remaining,
-                        capacity.window,
-                    )?
-                    .is_some()
-            {
-                selected = Some(candidate);
-                break;
+            if let Ok(projected) = projection.apply(base) {
+                match self.admit(
+                    &projected,
+                    descriptors,
+                    capacity.output,
+                    capacity.remaining,
+                    capacity.window,
+                )? {
+                    Ok(_) => {
+                        selected = Some(candidate);
+                        break;
+                    }
+                    Err(reason) => limit = reason,
+                }
             }
         }
-        let mut summary = selected.ok_or(EndReason::Limit(LimitKind::ContextTokens))?;
+        let mut summary = selected.ok_or(EndReason::Limit(limit))?;
         let first = existing;
         let compacted = Projection::deterministic(base, first)
             .apply(base)
