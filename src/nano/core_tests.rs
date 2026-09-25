@@ -978,7 +978,9 @@ struct CompactionProvider {
     normal_turns: usize,
     summaries: usize,
     read_calls: bool,
+    normal_text_bytes: usize,
     fail_summary: bool,
+    summary_stream_error: Option<ProviderErrorKind>,
     stall_summary: bool,
     active_summary: bool,
     summary_started: Arc<AtomicBool>,
@@ -1021,7 +1023,11 @@ impl Provider for CompactionProvider {
             } else {
                 call(&id, self.normal_turns as i64)
             };
-            response("", vec![call])
+            let mut event = response("", vec![call]);
+            if let ProviderEvent::Completed { response, .. } = &mut event {
+                response.text = "x".repeat(self.normal_text_bytes);
+            }
+            event
         } else {
             self.active_summary = false;
             response("Done", vec![])
@@ -1034,6 +1040,11 @@ impl Provider for CompactionProvider {
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderError> {
         if self.active_summary && self.stall_summary {
             std::future::pending::<()>().await;
+        }
+        if self.active_summary {
+            if let Some(kind) = self.summary_stream_error.take() {
+                return Err(ProviderError::new(kind, false));
+            }
         }
         Ok(self.active.pop_front())
     }
@@ -1363,6 +1374,133 @@ async fn failed_compaction_charges_reservation_and_recovers_without_replaying_ef
     assert_eq!(replay.end, Some(EndReason::ProviderFailed));
     assert_eq!(replay.budget, end.budget);
     assert!(effects > 0);
+}
+
+#[tokio::test]
+async fn compaction_stream_preserves_provider_error_kinds() {
+    for (kind, reason) in [
+        (
+            ProviderErrorKind::ResponseLimit,
+            EndReason::Limit(LimitKind::ResponseBytes),
+        ),
+        (ProviderErrorKind::Protocol, EndReason::ProviderProtocol),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut bounds = limits();
+        bounds.context_bytes = 4 * 1024;
+        bounds.response_bytes = 1024;
+        let mut engine = Engine::new(
+            identity(),
+            bounds,
+            CompactionProvider {
+                summary_stream_error: Some(kind.clone()),
+                ..Default::default()
+            },
+            FakeTools::default(),
+            FakeHost::default(),
+            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+        )
+        .unwrap();
+        let end = run(&mut engine, &Cancellation::default()).await;
+        assert_eq!(end.reason, reason);
+        assert!(engine.host.records.iter().any(|record| {
+            matches!(&record.event, SessionEvent::ModelFailed { error: Some(actual), .. } if actual == &kind)
+        }));
+        let replay = Replay::from_records(&engine.host.records).unwrap();
+        assert_eq!(replay.end, Some(reason));
+        assert_eq!(replay.budget, end.budget);
+    }
+}
+
+#[tokio::test]
+async fn compaction_does_not_spend_the_last_normal_turn_reservation() {
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline_root = baseline_dir.path().canonicalize().unwrap();
+    let mut bounds = limits();
+    bounds.context_bytes = 4 * 1024;
+    bounds.response_bytes = 1024;
+    let mut baseline = Engine::new(
+        identity(),
+        bounds.clone(),
+        CompactionProvider {
+            normal_text_bytes: 400,
+            ..Default::default()
+        },
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&baseline_root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut baseline, &Cancellation::default()).await.reason,
+        EndReason::ModelFinished
+    );
+    let records = &baseline.host.records;
+    let started = records
+        .iter()
+        .position(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+        .unwrap();
+    let completed = records
+        .iter()
+        .position(|record| matches!(record.event, SessionEvent::CompactionCompleted { .. }))
+        .unwrap();
+    let cost = |record: &Record| match &record.event {
+        SessionEvent::ContextComposed { composition } => {
+            composition.input_tokens_estimated + composition.output_tokens_reserved
+        }
+        _ => unreachable!(),
+    };
+    let summary_cost = cost(
+        records[..started]
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, SessionEvent::ContextComposed { .. }))
+            .unwrap(),
+    );
+    let normal_cost = cost(
+        records[completed + 1..]
+            .iter()
+            .find(|record| matches!(record.event, SessionEvent::ContextComposed { .. }))
+            .unwrap(),
+    );
+    let consumed = records[started].budget.tokens()
+        - records[started].budget.reserved_input_tokens
+        - records[started].budget.reserved_output_tokens;
+    bounds.tokens = consumed + summary_cost.max(normal_cost) + 1;
+    assert!(bounds.tokens < consumed + summary_cost + normal_cost);
+    let normal_turns_before_summary = baseline
+        .provider
+        .requests
+        .iter()
+        .take_while(|request| !request.tools.is_empty())
+        .count();
+
+    let limited_dir = TempDir::new().unwrap();
+    let limited_root = limited_dir.path().canonicalize().unwrap();
+    let mut limited = Engine::new(
+        identity(),
+        bounds,
+        CompactionProvider {
+            normal_text_bytes: 400,
+            ..Default::default()
+        },
+        FakeTools::default(),
+        FakeHost::default(),
+        FileJournal::create(&limited_root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    let end = run(&mut limited, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
+    assert_eq!(limited.provider.normal_turns, normal_turns_before_summary);
+    assert_eq!(limited.provider.summaries, 0);
+    assert!(
+        !limited
+            .host
+            .records
+            .iter()
+            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
+    );
 }
 
 #[tokio::test]
