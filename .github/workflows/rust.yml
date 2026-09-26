@@ -34,6 +34,9 @@ jobs:
         run: cargo fmt --check
 
       - name: Run clippy
+        # Lint the feature variants once on Linux. Cross-platform compilation
+        # remains covered by the all-feature test suite and the smoke build.
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --locked -- -D warnings
 
       - name: Run tests
@@ -44,18 +47,12 @@ jobs:
         run: cargo test --locked
 
       - name: Check build without update notifications
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --locked --no-default-features -- -D warnings
 
-      - name: Test build without update notifications
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --locked --no-default-features
-
       - name: Check native inference provider without update notifications
-        run: cargo clippy --locked --no-default-features --features nano-openai -- -D warnings
-
-      - name: Test native inference provider
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --locked --features nano-openai
+        run: cargo clippy --locked --no-default-features --features nano-openai -- -D warnings
 
       - name: Test native inference provider without update notifications
         if: matrix.os == 'ubuntu-latest'

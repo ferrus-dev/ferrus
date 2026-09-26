@@ -31,6 +31,7 @@ const STATE_BYTES: u64 = 2048;
 const MAX_PAGE: usize = 2048;
 const MAX_WAIT_MS: u64 = 1000;
 const CLEANUP_MS: u64 = 2000;
+const EXITED_CLEANUP_MS: u64 = 5000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Limits {
