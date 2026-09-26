@@ -329,6 +329,66 @@ fn headless_process_calls_isolated_external_stdio_tool() {
 
 #[cfg(feature = "nano-mcp")]
 #[test]
+fn mcp_peer_rejects_oversized_stdout_before_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = root.join("mcp.toml");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
+    private_config(
+        &config,
+        &format!(
+            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+            toml::Value::String(find_python().display().to_string()),
+            serde_json::to_string(&[script.display().to_string(), "oversize-startup".into()])
+                .unwrap(),
+        ),
+    );
+
+    let output = ferrus(&root)
+        .args(["nano", "mcp-peer", "--config"])
+        .arg(&config)
+        .args(["--server", "local"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
+
+    let call_config = root.join("call-mcp.toml");
+    private_config(
+        &call_config,
+        &format!(
+            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+            toml::Value::String(find_python().display().to_string()),
+            serde_json::to_string(&[script.display().to_string(), "oversize".into()]).unwrap(),
+        ),
+    );
+    let mut child = ferrus(&root)
+        .args(["nano", "mcp-peer", "--config"])
+        .arg(&call_config)
+        .args(["--server", "local"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}}\n",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
 fn mcp_discovery_keeps_the_claim_alive_and_observes_cancel() {
     let fixture = Fixture::new();
     let mut config = fs::OpenOptions::new()

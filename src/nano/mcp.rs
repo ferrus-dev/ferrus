@@ -8,9 +8,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::Read,
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,6 +24,11 @@ const MAX_SCHEMA_BYTES: usize = 4 * 1024;
 // Leave room for ToolOutcome framing in the engine's 32 KiB journal cap.
 const MAX_RESULT_BYTES: usize = 24 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
+// Catalog pages can contain up to 32 tool schemas; calls need only the
+// bounded result plus the JSON-RPC envelope.
+const MAX_CATALOG_FRAME_BYTES: usize = 512 * 1024;
+const MAX_CALL_FRAME_BYTES: usize = MAX_RESULT_BYTES + 1024;
+const MAX_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,8 +139,8 @@ pub(crate) fn validate_config(path: &Path) -> Result<()> {
 }
 
 /// neva 0.6.1 owns process creation and inherits the caller environment. This
-/// private peer replaces that environment before running the configured server.
-/// On Unix, exec also gives neva direct ownership of the real server process.
+/// private peer replaces that environment and bounds stdout frames before
+/// neva's stdio transport reads and deserializes them.
 pub(crate) fn run_peer(config_path: &Path, server_id: &str) -> Result<()> {
     let config = Config::load(config_path)?;
     let server = config
@@ -144,22 +153,95 @@ pub(crate) fn run_peer(config_path: &Path, server_id: &str) -> Result<()> {
         .args(&server.args)
         .env_clear()
         .envs(&server.env)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(cwd) = &server.cwd {
         command.current_dir(cwd);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        Err(command.exec().into())
+    let mut child = command.spawn()?;
+    let child_stdin = child.stdin.take().expect("piped MCP stdin");
+    let child_stdout = child.stdout.take().expect("piped MCP stdout");
+    let frame_limit = Arc::new(AtomicUsize::new(MAX_CATALOG_FRAME_BYTES));
+    let input_limit = Arc::clone(&frame_limit);
+    std::thread::spawn(move || {
+        let _ = forward_peer_requests(io::stdin(), child_stdin, input_limit);
+    });
+    let output = forward_peer_responses(child_stdout, io::stdout().lock(), &frame_limit);
+    if output.is_err() {
+        let _ = child.kill();
     }
-    #[cfg(windows)]
-    {
-        let status = command.status()?;
-        ensure!(status.success(), "MCP peer exited unsuccessfully");
-        Ok(())
+    let status = child.wait()?;
+    output?;
+    ensure!(status.success(), "MCP peer exited unsuccessfully");
+    Ok(())
+}
+
+fn read_frame(reader: &mut impl BufRead, limit: impl Fn() -> usize) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete MCP stdio frame",
+                ))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if take > limit().saturating_sub(frame.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP stdio frame exceeds limit",
+            ));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if frame.last() == Some(&b'\n') {
+            return Ok(Some(frame));
+        }
+    }
+}
+
+fn forward_peer_requests(
+    input: impl Read,
+    mut peer: impl Write,
+    frame_limit: Arc<AtomicUsize>,
+) -> io::Result<()> {
+    let mut input = io::BufReader::new(input);
+    while let Some(frame) = read_frame(&mut input, || MAX_REQUEST_FRAME_BYTES)? {
+        let request: Value = serde_json::from_slice(&frame)?;
+        match request.get("method").and_then(Value::as_str) {
+            Some("tools/call") => frame_limit.store(MAX_CALL_FRAME_BYTES, Ordering::Release),
+            Some("initialize" | "server/discover" | "tools/list") => {
+                frame_limit.store(MAX_CATALOG_FRAME_BYTES, Ordering::Release);
+            }
+            _ => {}
+        }
+        peer.write_all(&frame)?;
+        peer.flush()?;
+    }
+    Ok(())
+}
+
+fn forward_peer_responses(
+    peer: impl Read,
+    mut output: impl Write,
+    frame_limit: &AtomicUsize,
+) -> io::Result<()> {
+    let mut peer = io::BufReader::new(peer);
+    loop {
+        let Some(frame) = read_frame(&mut peer, || frame_limit.load(Ordering::Acquire))? else {
+            return Ok(());
+        };
+        output.write_all(&frame)?;
+        output.flush()?;
     }
 }
 
@@ -765,6 +847,41 @@ mod tests {
             name: "mcp_local_echo".into(),
             arguments: json!({"text":"hello"}),
         }
+    }
+
+    #[test]
+    fn stdio_frames_are_bounded_before_the_client_receives_them() {
+        let limit = Arc::new(AtomicUsize::new(MAX_CATALOG_FRAME_BYTES));
+        let mut request = Vec::new();
+        forward_peer_requests(
+            io::Cursor::new(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n",
+            ),
+            &mut request,
+            Arc::clone(&limit),
+        )
+        .unwrap();
+        assert_eq!(limit.load(Ordering::Acquire), MAX_CALL_FRAME_BYTES);
+
+        let mut forwarded = Vec::new();
+        let mut oversized = vec![b'x'; MAX_CALL_FRAME_BYTES];
+        oversized.push(b'\n');
+        let error =
+            forward_peer_responses(io::Cursor::new(oversized), &mut forwarded, &limit).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(forwarded.is_empty());
+
+        let exact = vec![b'x'; MAX_CALL_FRAME_BYTES - 1];
+        let mut exact = [exact, vec![b'\n']].concat();
+        forward_peer_responses(io::Cursor::new(&exact), &mut forwarded, &limit).unwrap();
+        assert_eq!(forwarded, exact);
+        exact.pop();
+        assert_eq!(
+            read_frame(&mut io::Cursor::new(exact), || MAX_CALL_FRAME_BYTES)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[tokio::test]

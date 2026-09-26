@@ -8,6 +8,11 @@ import time
 mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
 listings = 0
 
+if mode == "oversize-startup":
+    sys.stdout.write("x" * (1024 * 1024) + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
 
 def reply(request_id, result):
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\n")
