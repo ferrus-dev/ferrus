@@ -229,6 +229,8 @@ fn pending(records: &[Record], workspace: &Workspace) -> Option<Pending> {
         },
         (
             "read_file"
+            | "read_process"
+            | "read_output"
             | "search_text"
             | "load_instructions"
             | "repository_fallback"
@@ -418,11 +420,13 @@ pub(crate) async fn recover_previous(
     );
     let mut description = "The previous run ended before its next model turn.".to_string();
     let mut delivered_answer = false;
+    let mut submitted = false;
     if let Some(pending) = pending(&records, workspace) {
-        let (pending, detail, submitted, delivered) =
+        let (pending, detail, reconciled_submit, delivered) =
             reconcile_pending(session, &previous, pending).await?;
         description = detail;
         delivered_answer = delivered;
+        submitted = reconciled_submit;
         let unknown = matches!(pending.outcome, ToolOutcome::Unknown(_));
         if journal.state().end.is_none() {
             records.push(journal.append(
@@ -432,7 +436,7 @@ pub(crate) async fn recover_previous(
                 },
                 &journal.state().budget.clone(),
             )?);
-            if submitted {
+            if reconciled_submit {
                 journal.seal_with(&mut records, EndReason::Submitted)?;
             } else {
                 journal.seal_interrupted(&mut records)?;
@@ -467,6 +471,17 @@ pub(crate) async fn recover_previous(
         anyhow::bail!("Previous Nano command may still have effects; task requires reconciliation");
     }
     session.authorize().await?;
+    if journal.state().end == Some(EndReason::Submitted) && !submitted {
+        ensure!(
+            session.previous_submit_committed(previous.clone()).await?,
+            "Previous Nano submission has no committed handoff"
+        );
+    }
+    // A rejected submission starts a new work phase. Reconcile the handoff and
+    // command spools first, but do not carry its context or budget into Addressing.
+    if submitted || journal.state().end == Some(EndReason::Submitted) {
+        return Ok(None);
+    }
     if !delivered_answer {
         description.push_str(&retained_responses(session, &records).await?);
     }
@@ -679,13 +694,23 @@ mod tests {
             pending(&records, &workspace).unwrap().outcome,
             ToolOutcome::Unknown(_)
         ));
+        for name in ["repository_search", "read_process", "read_output"] {
+            let SessionEvent::ToolIntent { call, .. } = &mut records[0].event else {
+                unreachable!()
+            };
+            call.name = name.into();
+            assert!(matches!(
+                pending(&records, &workspace).unwrap().outcome,
+                ToolOutcome::Failed(ToolError::Interrupted)
+            ));
+        }
         let SessionEvent::ToolIntent { call, .. } = &mut records[0].event else {
             unreachable!()
         };
-        call.name = "repository_search".into();
+        call.name = "stop_process".into();
         assert!(matches!(
             pending(&records, &workspace).unwrap().outcome,
-            ToolOutcome::Failed(ToolError::Interrupted)
+            ToolOutcome::Unknown(ToolError::Interrupted)
         ));
         let SessionEvent::ToolIntent { call, .. } = &mut records[0].event else {
             unreachable!()

@@ -138,14 +138,18 @@ over runs that never wrote a Started record. The prior journal
 must match that project's task/run identity and pass ordinary recovery validation. Nano does not
 reuse the prior lease or automatically execute any recorded call. It seals the old elapsed budget,
 then gives the new run a bounded continuity note with the old usage counters and last assistant
-text. Old graph and source evidence is not carried over; the model must inspect current files.
+text. A confirmed submission ends that work phase, so a rejected task starts Addressing with a
+fresh Nano budget after any pending handoff is reconciled. Old graph and source evidence is not
+carried over; the model must inspect current files.
 
 An unfinished `apply_patch` records full-batch before/after SHA-256 digests before execution.
 Recovery reads each path through the confined workspace adapter: a complete before-state proves
 the edit absent, a complete after-state confirms the edit, and a mixed/changed/unsafe state is
 unknown. A lost `submit` response is confirmed only when its run has a committed `submitted`
 event and the scoped `SUBMISSION.md` matches the recorded call; an inconsistent handoff is unknown.
-Unknown shell, check, and external MCP effects fail the task for manual reconciliation. A paused
+Unknown shell, check, and external MCP effects fail the task for manual reconciliation. Interrupted
+`read_process` and `read_output` calls are read-only; their lost results are not replayed, and
+command spool validation still rejects unfinished processes. A paused
 human or consultation request stays in Ferrus state and is not issued again. Scoped response files
 remain available across a crash between task restoration and durable answer delivery. Neither
 recovery nor pure replay reads prior tool output as current source evidence.

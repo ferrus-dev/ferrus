@@ -156,6 +156,28 @@ fn previous_intent(f: &Fixture, id: &str, name: &str, plan: Option<EffectPlan>, 
     }
 }
 
+fn finish_previous_submit(f: &Fixture, id: &str) {
+    let directory = f.data.join("nano/sessions").join(id);
+    let (mut journal, mut records) =
+        FileJournal::recover_open(&directory, Quotas::default()).unwrap();
+    records.push(
+        journal
+            .append(
+                SessionEvent::ToolResult {
+                    call_id: "call-1".into(),
+                    outcome: ToolOutcome::Success(json!({
+                        "status":"submitted", "task_state":"reviewing", "task_id":TASK
+                    })),
+                },
+                &journal.state().budget.clone(),
+            )
+            .unwrap(),
+    );
+    journal
+        .seal_with(&mut records, EndReason::Submitted)
+        .unwrap();
+}
+
 fn call(name: &str, args: Value) -> ValidatedCall {
     ValidatedCall {
         call_id: "call-1".into(),
@@ -728,6 +750,48 @@ async fn stale_answer_without_a_matching_prior_question_is_not_reused() {
 }
 
 #[tokio::test]
+async fn completed_submit_starts_a_new_phase_without_inheriting_usage() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-submitted");
+    previous_intent(&f, "old-submitted", "submit", None, true);
+    finish_previous_submit(&f, "old-submitted");
+    f.connection()
+        .execute(
+            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
+            [TASK],
+        )
+        .unwrap();
+    let journal = f.data.join("nano/sessions/old-submitted/events.jsonl");
+    let before = std::fs::read(&journal).unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    f.connection()
+        .execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) \
+             VALUES ('old-submitted', 'submitted', '{}', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read(journal).unwrap(), before);
+    assert_eq!(session.status().await.unwrap().status, "addressing");
+}
+
+#[tokio::test]
 async fn committed_submit_with_lost_response_is_confirmed_after_rejection() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
@@ -754,11 +818,12 @@ async fn committed_submit_with_lost_response_is_confirmed_after_rejection() {
     let workspace =
         workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
 
-    let note = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(note.note.contains("committed in SQLite"));
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(session.status().await.unwrap().status, "addressing");
     let (_, records) =
         FileJournal::recover(&f.data.join("nano/sessions/old-submit"), Quotas::default()).unwrap();
@@ -806,11 +871,12 @@ async fn committed_submit_can_be_reconciled_after_legacy_journal_sealing() {
     let workspace =
         workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
 
-    let note = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(note.note.contains("historical journal was already sealed"));
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(session.status().await.unwrap().status, "addressing");
 }
 
