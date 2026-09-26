@@ -769,42 +769,45 @@ mod tests {
 
     #[tokio::test]
     async fn peer_results_fail_closed_and_keep_native_names_reserved() {
-        let mut normal = direct_peer("normal", 1000, &[]).await.unwrap();
+        let mut normal = direct_peer("normal", 5000, &[]).await.unwrap();
         let result = normal.execute(&call(), &Cancellation::default()).await;
         assert!(
             matches!(result, ToolOutcome::Success(value) if value["structuredContent"]["echo"] == "hello")
         );
         assert!(normal.shutdown().await);
 
-        let mut error = direct_peer("error", 1000, &[]).await.unwrap();
+        let mut error = direct_peer("error", 5000, &[]).await.unwrap();
         assert!(
             matches!(error.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "remote_error")
         );
         assert!(error.shutdown().await);
 
-        let mut changed = direct_peer("schema-change", 1000, &[]).await.unwrap();
+        let mut changed = direct_peer("schema-change", 5000, &[]).await.unwrap();
         assert!(
             matches!(changed.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "schema_changed")
         );
         assert!(changed.shutdown().await);
 
-        let mut oversized = direct_peer("oversize", 1000, &[]).await.unwrap();
+        let mut oversized = direct_peer("oversize", 5000, &[]).await.unwrap();
         assert!(matches!(
             oversized.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::OutputLimit)
         ));
         assert!(oversized.shutdown().await);
 
-        let mut timeout = direct_peer("timeout", 1000, &[]).await.unwrap();
+        let mut timeout = direct_peer("timeout", 5000, &[]).await.unwrap();
+        // Startup under a loaded Windows runner can exceed one second. Only
+        // the tool call itself needs the short timeout under test.
+        timeout.servers[0].timeout = Duration::from_millis(1000);
         assert!(matches!(
             timeout.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Unknown(_)
         ));
         assert!(timeout.shutdown().await);
 
-        let mut cancelled = direct_peer("timeout", 1000, &[]).await.unwrap();
+        let mut cancelled = direct_peer("timeout", 5000, &[]).await.unwrap();
         let cancellation = Cancellation::default();
         let trigger = cancellation.clone();
         tokio::spawn(async move {
@@ -822,6 +825,6 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type":"object"}),
         }];
-        assert!(direct_peer("normal", 1000, &native).await.is_err());
+        assert!(direct_peer("normal", 5000, &native).await.is_err());
     }
 }
