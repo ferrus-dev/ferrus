@@ -275,7 +275,10 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         self.stop.cancel();
 
-        let result = self.pending.take()?.await;
+        let Some(task) = self.pending.take() else {
+            return self.native.interrupted().await;
+        };
+        let result = task.await;
         if let Ok(Ok(value)) = &result {
             self.observe(value);
         }
@@ -404,11 +407,24 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if cancellation.is_cancelled() {
         stop.cancel();
     }
+    #[cfg(feature = "nano-mcp")]
+    let mut native = native;
     let mut input = native
         .instructions
         .load(&[], &[])
         .await?
         .constraint_text(limits.context_bytes)?;
+    #[cfg(feature = "nano-mcp")]
+    if let Some(path) = native.mcp_config.take()
+        && !stop.is_cancelled()
+    {
+        use super::tools::Tools;
+        match super::mcp::McpTools::connect(&path, &native.descriptors(), &stop).await {
+            Ok(mcp) => native.mcp = Some(mcp),
+            Err(_) if stop.is_cancelled() => {}
+            Err(error) => return Err(error),
+        }
+    }
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
     if waiting {
         // HQ relaunches an answered waiter in a fresh process. Derive this mode

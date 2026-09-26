@@ -134,20 +134,20 @@ Both use separate machine-local SQLite sidecars. They are read-only from agent r
 overlays; review uses a frozen submitted view. The same contracts also define a vendor-neutral path to distributed
 storage and workers.
 
-Start with [repository graph architecture](docs/repository-graph-architecture.md),
-[project memory architecture](docs/project-memory-architecture.md), and
-[distributed indexing architecture](docs/distributed-indexing-architecture.md).
+Start with [repository graph architecture](docs/repository_graph/repository-graph-architecture.md),
+[project memory architecture](docs/project_memory/project-memory-architecture.md), and
+[distributed indexing architecture](docs/repository_graph/distributed-indexing-architecture.md).
 
 ## Documentation
 
 - [CLI, HQ, configuration, and runtime reference](docs/cli-and-runtime.md)
 - [Roadmap and milestones](docs/milestones.md)
-- [Repository graph retrieval](docs/repository-graph-retrieval.md)
-- [Repository graph benchmarks](docs/repository-graph-benchmarks.md)
-- [Repository graph evaluation](docs/repository-graph-evaluations.md)
-- [Project memory operations](docs/project-memory.md)
-- [Project memory evaluation](docs/project-memory-evaluations.md)
-- [Semantic retrieval and embeddings](docs/semantic-retrieval.md)
+- [Repository graph retrieval](docs/repository_graph/repository-graph-retrieval.md)
+- [Repository graph benchmarks](docs/repository_graph/repository-graph-benchmarks.md)
+- [Repository graph evaluation](docs/repository_graph/repository-graph-evaluations.md)
+- [Project memory operations](docs/project_memory/project-memory.md)
+- [Project memory evaluation](docs/project_memory/project-memory-evaluations.md)
+- [Semantic retrieval and embeddings](docs/repository_graph/semantic-retrieval.md)
 - [Feature specifications](docs/specs/)
 
 ## Dogfooding

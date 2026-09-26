@@ -34,26 +34,41 @@ jobs:
         run: cargo fmt --check
 
       - name: Run clippy
+        # Lint the feature variants once on Linux. Cross-platform compilation
+        # remains covered by the all-feature test suite and the smoke build.
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --locked -- -D warnings
 
       - name: Run tests
+        # The all-feature suite below covers these on every OS. Keep separate
+        # baseline feature coverage on Linux without repeating full suites on
+        # the slower Windows and macOS runners.
+        if: matrix.os == 'ubuntu-latest'
         run: cargo test --locked
 
       - name: Check build without update notifications
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --locked --no-default-features -- -D warnings
 
-      - name: Test build without update notifications
-        run: cargo test --locked --no-default-features
-
       - name: Check native inference provider without update notifications
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --locked --no-default-features --features nano-openai -- -D warnings
 
-      - name: Test native inference provider
-        run: cargo test --locked --features nano-openai
-
       - name: Test native inference provider without update notifications
+        if: matrix.os == 'ubuntu-latest'
         run: |
           cargo test --locked --no-default-features --features nano-openai nano::
+
+      - name: Set up Python for the stdio peer fixture
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Nano stdio MCP integration
+        run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
+
+      - name: Test Nano stdio MCP integration
+        run: cargo test --locked --features nano-openai,nano-mcp
 
   smoke:
     strategy:

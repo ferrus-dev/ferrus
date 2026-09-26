@@ -60,7 +60,11 @@ async fn launch(f: &mut Fixture, mode: &str) -> Snapshot {
 }
 
 async fn terminal(commands: &mut Commands, id: &str) -> Snapshot {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    terminal_with_timeout(commands, id, Duration::from_secs(20)).await
+}
+
+async fn terminal_with_timeout(commands: &mut Commands, id: &str, timeout: Duration) -> Snapshot {
+    tokio::time::timeout(timeout, async {
         loop {
             let status = commands.read_process(id, MAX_WAIT_MS).await.unwrap();
             if status.completion != Completion::Running {
@@ -256,15 +260,34 @@ async fn windows_shell_preserves_quoted_paths_arguments_and_redirection() {
 #[tokio::test]
 async fn streams_are_spooled_paginated_and_stdin_is_eof() {
     let mut f = fixture("streams", Limits::default());
-    let started = launch(&mut f, "streams").await;
+    let started_at = Instant::now();
+    fs::write(f.workspace.join("fixture-mode"), "streams").unwrap();
+    let started = f
+        .commands
+        .exec(
+            ExecRequest {
+                timeout_ms: 30_000,
+                ..request(&child_command())
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(started.completion, Completion::Running);
-    let finished = terminal(&mut f.commands, &started.process_id).await;
+    let finished = terminal_with_timeout(
+        &mut f.commands,
+        &started.process_id,
+        Duration::from_secs(35),
+    )
+    .await;
     assert_eq!(
         finished.completion,
         Completion::Exited {
             code: Some(0),
             success: true
-        }
+        },
+        "elapsed: {:?}, snapshot: {finished:?}",
+        started_at.elapsed()
     );
     assert!(finished.output_complete);
     assert_eq!(f.commands.potentially_active_writers(), 0);

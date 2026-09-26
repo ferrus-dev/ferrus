@@ -34,6 +34,10 @@ pub(crate) fn load_config(path: &Path, model: Option<&str>) -> Result<super::con
     }
     config.validate()?;
     config.authorization()?;
+    #[cfg(feature = "nano-mcp")]
+    if let Some(path) = &config.mcp_config_file {
+        super::mcp::validate_config(path)?;
+    }
     Ok(config)
 }
 

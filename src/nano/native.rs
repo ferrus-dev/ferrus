@@ -22,6 +22,10 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     prefetch_invalidated: bool,
     refresh: super::refresh::Refresh,
     observations: Vec<Value>,
+    #[cfg(feature = "nano-mcp")]
+    pub(crate) mcp: Option<super::mcp::McpTools>,
+    #[cfg(feature = "nano-mcp")]
+    pub(crate) mcp_config: Option<std::path::PathBuf>,
 }
 
 impl<B: ExecutionBackend> NativeTools<B> {
@@ -47,6 +51,10 @@ impl<B: ExecutionBackend> NativeTools<B> {
             prefetch_invalidated: false,
             refresh: Default::default(),
             observations: Vec::new(),
+            #[cfg(feature = "nano-mcp")]
+            mcp: None,
+            #[cfg(feature = "nano-mcp")]
+            mcp_config: None,
         })
     }
 
@@ -245,10 +253,20 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         let mut tools = self.coding.descriptors();
         tools.extend(context::NAMES.iter().map(|name| descriptor(name)));
         tools.push(descriptor("load_instructions"));
+        #[cfg(feature = "nano-mcp")]
+        if let Some(mcp) = &self.mcp {
+            tools.extend(mcp.descriptors());
+        }
         tools
     }
 
     fn validate(&self, name: &str, arguments: &Value) -> std::result::Result<(), ToolError> {
+        #[cfg(feature = "nano-mcp")]
+        if let Some(mcp) = &self.mcp
+            && mcp.contains(name)
+        {
+            return mcp.validate(name, arguments);
+        }
         let valid = if name == "load_instructions" {
             serde_json::from_value::<Selection>(arguments.clone())
                 .is_ok_and(|s| s.paths.len() <= 16 && s.skills.len() <= 8)
@@ -274,6 +292,22 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
 
         if self.session.status().await.is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
+        }
+
+        #[cfg(feature = "nano-mcp")]
+        if self
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.contains(&call.name))
+        {
+            self.invalidate_unknown().await;
+            let outcome = self.mcp.as_mut().unwrap().execute(call, cancellation).await;
+            if self.working_set_enabled {
+                let writers = self.coding.commands.potentially_active_writers() > 0;
+                self.observations
+                    .extend(self.refresh.prepare(&self.session, writers).await);
+            }
+            return outcome;
         }
 
         if !context::NAMES.contains(&call.name.as_str()) && call.name != "load_instructions" {
@@ -351,7 +385,14 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
     async fn shutdown(&mut self) -> bool {
         // A running command can leave the overlay dirty without a scheduled
         // refresh. Stop and join owned writers before publishing their bytes.
-        if !self.coding.shutdown().await {
+        let coding_clean = self.coding.shutdown().await;
+        #[cfg(feature = "nano-mcp")]
+        if let Some(mcp) = &mut self.mcp
+            && !mcp.shutdown().await
+        {
+            return false;
+        }
+        if !coding_clean {
             return false;
         }
         if self.working_set_enabled {
@@ -362,5 +403,13 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             self.before_mutation().await;
         }
         true
+    }
+
+    async fn interrupted(&mut self) -> Option<ToolOutcome> {
+        #[cfg(feature = "nano-mcp")]
+        if let Some(mcp) = &mut self.mcp {
+            return mcp.interrupted().await;
+        }
+        None
     }
 }

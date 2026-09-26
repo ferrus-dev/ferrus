@@ -10,6 +10,8 @@ pub(crate) mod context;
 pub(crate) mod instructions;
 mod lifecycle;
 pub(crate) mod managed;
+#[cfg(feature = "nano-mcp")]
+pub(crate) mod mcp;
 pub(crate) mod native;
 mod private;
 mod refresh;

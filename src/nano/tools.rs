@@ -44,6 +44,8 @@ pub(crate) enum ToolError {
     Context(serde_json::Value),
     /// Bounded managed operation failure; SQLite remains authoritative.
     Lifecycle(serde_json::Value),
+    /// Bounded diagnostic from an explicitly configured external MCP peer.
+    Mcp(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

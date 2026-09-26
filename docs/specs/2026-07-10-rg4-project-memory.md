@@ -130,7 +130,7 @@ Depends on: none
 Specify memory entities and relationships, independent revision identity, authorized source categories, privacy
 defaults, link evidence, store/query interfaces, freshness, and federation semantics.
 
-Normative contract: [Project Memory and Federation Contracts](../project-memory-architecture.md).
+Normative contract: [Project Memory and Federation Contracts](../project_memory/project-memory-architecture.md).
 
 Implemented in `src/project_memory/` as backend-neutral domain, policy, diagnostics, store/query ports, bounded
 wire DTOs, and explicit repository/memory federation targets. Storage and ingestion remain in later milestones.

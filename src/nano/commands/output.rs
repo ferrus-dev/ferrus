@@ -203,6 +203,13 @@ pub(super) async fn supervise(
 
     process.tree.lock().unwrap().stop();
     snapshot.completion = reason;
+    // An already-exited child cannot keep writing. Give its bounded pipe drain
+    // and spool sync more time on slow filesystems without delaying cancellation.
+    let cleanup_ms = if matches!(snapshot.completion, Completion::Exited { .. }) {
+        EXITED_CLEANUP_MS
+    } else {
+        CLEANUP_MS
+    };
     let cleanup = async {
         let exit = process.child.wait().await?;
         if matches!(snapshot.completion, Completion::Exited { .. }) {
@@ -251,7 +258,7 @@ pub(super) async fn supervise(
         writer.finish(&mut snapshot).await
     };
     if !matches!(
-        tokio::time::timeout(Duration::from_millis(CLEANUP_MS), cleanup).await,
+        tokio::time::timeout(Duration::from_millis(cleanup_ms), cleanup).await,
         Ok(Ok(()))
     ) {
         snapshot.completion = Completion::Unknown;

@@ -225,6 +225,7 @@ impl Fixture {
 fn serve(
     listener: TcpListener,
     resumed: Option<(PathBuf, &'static str)>,
+    external_mcp: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
@@ -278,16 +279,29 @@ fn serve(
                 assert_eq!(&restored, state);
             }
             let calls = match turn {
-                0 => vec![
-                    (
-                        "apply_patch",
-                        json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]}),
-                    ),
-                    (
-                        "exec",
-                        json!({"command":"echo not-a-json-event", "cwd":".", "timeout_ms":1000}),
-                    ),
-                ],
+                0 => {
+                    let mut calls = vec![
+                        (
+                            "apply_patch",
+                            json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]}),
+                        ),
+                        (
+                            "exec",
+                            json!({"command":"echo not-a-json-event", "cwd":".", "timeout_ms":1000}),
+                        ),
+                    ];
+                    if external_mcp {
+                        assert!(
+                            request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|tool| tool["function"]["name"] == "mcp_local_echo")
+                        );
+                        calls.insert(0, ("mcp_local_echo", json!({"text":"from-mcp"})));
+                    }
+                    calls
+                }
                 1 => vec![("check", json!({}))],
                 _ => vec![(
                     "submit",
@@ -304,24 +318,209 @@ fn serve(
 
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
-    run_headless_task(None);
+    run_headless_task(None, false);
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn headless_process_calls_isolated_external_stdio_tool() {
+    run_headless_task(None, true);
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn mcp_peer_rejects_oversized_stdout_before_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = root.join("mcp.toml");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
+    private_config(
+        &config,
+        &format!(
+            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+            toml::Value::String(find_python().display().to_string()),
+            serde_json::to_string(&[script.display().to_string(), "oversize-startup".into()])
+                .unwrap(),
+        ),
+    );
+
+    let output = ferrus(&root)
+        .args(["nano", "mcp-peer", "--config"])
+        .arg(&config)
+        .args(["--server", "local"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
+
+    let call_config = root.join("call-mcp.toml");
+    private_config(
+        &call_config,
+        &format!(
+            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+            toml::Value::String(find_python().display().to_string()),
+            serde_json::to_string(&[script.display().to_string(), "oversize".into()]).unwrap(),
+        ),
+    );
+    let mut child = ferrus(&root)
+        .args(["nano", "mcp-peer", "--config"])
+        .arg(&call_config)
+        .args(["--server", "local"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}}\n",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn mcp_discovery_keeps_the_claim_alive_and_observes_cancel() {
+    let fixture = Fixture::new();
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.root.join("ferrus.toml"))
+        .unwrap();
+    write!(
+        config,
+        "\n[lease]\nttl_secs = 6\nheartbeat_interval_secs = 1\n"
+    )
+    .unwrap();
+    drop(config);
+
+    let marker = fixture.data.join("listing-started");
+    let peer = fixture.data.join("mcp.toml");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
+    private_config(
+        &peer,
+        &format!(
+            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\ntimeout_ms = 120000\n",
+            toml::Value::String(find_python().display().to_string()),
+            serde_json::to_string(&[
+                script.display().to_string(),
+                "stall-list".into(),
+                marker.display().to_string(),
+            ])
+            .unwrap(),
+        ),
+    );
+    let settings = fixture.data.join("provider.toml");
+    private_config(
+        &settings,
+        &format!(
+            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'configured-model'\nmcp_config_file = {}\n",
+            toml::Value::String(peer.display().to_string()),
+        ),
+    );
+
+    let mut child = Process::spawn(&mut fixture.command(&settings));
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+        json!({"version":1,"event":{"type":"ready"}})
+    );
+    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+
+    let database = fixture.data.join("ferrus.db");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let initial_heartbeat = loop {
+        let db = Connection::open(&database).unwrap();
+        let (claimed_by, heartbeat): (Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT claimed_by, last_heartbeat FROM tasks WHERE id='t-001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if marker.exists() {
+            assert_eq!(claimed_by.as_deref(), Some("executor:nano:1"));
+            break heartbeat.unwrap();
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let db = Connection::open(&database).unwrap();
+        let heartbeat: String = db
+            .query_row(
+                "SELECT last_heartbeat FROM tasks WHERE id='t-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if heartbeat != initial_heartbeat {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let cancelled_at = Instant::now();
+    writeln!(stdin, "{{\"version\":1,\"command\":\"cancel\"}}").unwrap();
+    let mut ended = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(event) = rx.recv_timeout(Duration::from_millis(20))
+            && event["event"]["type"] == "ended"
+        {
+            ended = Some(event);
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{}", child.stderr());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+    }
+    assert!(cancelled_at.elapsed() < Duration::from_secs(10));
+    reader.join().unwrap();
+    for event in rx.try_iter() {
+        if event["event"]["type"] == "ended" {
+            ended = Some(event);
+        }
+    }
+    let ended = ended.expect("cancelled discovery must record a terminal event");
+    assert_eq!(ended["event"]["reason"]["reason"], "cancelled");
+    assert_eq!(ended["event"]["durable"], true);
 }
 
 #[test]
 fn relaunched_human_waiter_delivers_the_answer_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, true)));
+        run_headless_task(Some((state, true)), false);
     }
 }
 
 #[test]
 fn relaunched_consultation_delivers_the_response_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, false)));
+        run_headless_task(Some((state, false)), false);
     }
 }
 
-fn run_headless_task(resume: Option<(&'static str, bool)>) {
+fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
     let fixture = Fixture::new();
     let (request_file, response_file, restored_event) = match resume {
         Some((_, false)) => (
@@ -365,18 +564,46 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let settings = fixture.data.join("provider.toml");
+    #[cfg(feature = "nano-mcp")]
+    let mcp_setting = if external_mcp {
+        let peer = fixture.data.join("mcp.toml");
+        let python = find_python();
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
+        private_config(
+            &peer,
+            &format!(
+                "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+                toml::Value::String(python.display().to_string()),
+                serde_json::to_string(&[script.display().to_string()]).unwrap(),
+            ),
+        );
+        format!(
+            "mcp_config_file = {}\n",
+            toml::Value::String(peer.display().to_string())
+        )
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "nano-mcp"))]
+    let mcp_setting = String::new();
     private_config(
         &settings,
         &format!(
-            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\n",
-            listener.local_addr().unwrap()
+            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\n{mcp_setting}",
+            listener.local_addr().unwrap(),
         ),
     );
     let server = serve(
         listener,
         resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
+        external_mcp,
     );
-    let mut child = Process::spawn(&mut fixture.command(&settings));
+    let mut launch = fixture.command(&settings);
+    if external_mcp {
+        launch.env("FERRUS_NANO_SECRET", "must-not-reach-peer");
+    }
+    let mut child = Process::spawn(&mut launch);
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -467,9 +694,15 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|record| record["event"]["event"] == "tool_result")
         .collect();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), if external_mcp { 5 } else { 4 });
     for result in results {
         assert_eq!(result["event"]["outcome"]["status"], "success", "{result}");
+    }
+    if external_mcp {
+        assert!(journal.contains("from-mcp"));
+        assert!(journal.contains("inherited_provider_secret"));
+        assert!(journal.contains("null"));
+        assert!(!journal.contains("must-not-reach-peer"));
     }
     if resume.is_some() {
         assert!(journal.contains("Use forty-two."));
@@ -491,6 +724,19 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
         }
     }
     drop(stdin);
+}
+
+#[cfg(feature = "nano-mcp")]
+fn find_python() -> PathBuf {
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for executable in ["python3", "python", "python.exe"] {
+            let path = directory.join(executable);
+            if path.is_file() {
+                return path.canonicalize().unwrap();
+            }
+        }
+    }
+    panic!("Python 3 is required for the Nano MCP peer integration fixture");
 }
 
 #[test]

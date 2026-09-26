@@ -2,7 +2,7 @@
 
 Status: accepted for Repository Graph Phase 0 (`rg0.0`).
 
-Related specification: [Repository Graph Phase 0](specs/2026-07-10-rg0-contracts-foundation.md).
+Related specification: [Repository Graph Phase 0](../specs/2026-07-10-rg0-contracts-foundation.md).
 
 ## Purpose
 
