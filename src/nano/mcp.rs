@@ -186,8 +186,8 @@ pub(crate) struct McpTools {
 
 impl Drop for McpTools {
     fn drop(&mut self) {
-        // Managed startup can fail before Engine owns the tools (for example,
-        // when the task claim is no longer available). Still close peers
+        // Managed startup can fail after discovery but before Engine owns the
+        // tools (for example, while restoring an answer). Still close peers
         // before the Nano process and its Tokio runtime exit.
         let clients: Vec<_> = self
             .servers
@@ -197,19 +197,23 @@ impl Drop for McpTools {
         if clients.is_empty() {
             return;
         }
-        let _ = std::thread::spawn(move || {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
-                runtime.block_on(async move {
-                    for client in clients {
-                        let _ = client.disconnect().await;
-                    }
-                });
+                let _ =
+                    runtime.block_on(tokio::time::timeout(Duration::from_secs(2), async move {
+                        for client in clients {
+                            let _ = client.disconnect().await;
+                        }
+                    }));
             }
-        })
-        .join();
+            let _ = done.send(());
+        });
+        // A stalled transport or runtime teardown must not block managed exit.
+        let _ = finished.recv_timeout(Duration::from_secs(2));
     }
 }
 
@@ -223,7 +227,11 @@ enum Launch {
 }
 
 impl McpTools {
-    pub(crate) async fn connect(config_path: &Path, native: &[ToolDescriptor]) -> Result<Self> {
+    pub(crate) async fn connect(
+        config_path: &Path,
+        native: &[ToolDescriptor],
+        cancellation: &Cancellation,
+    ) -> Result<Self> {
         let config = Config::load(config_path)?;
         let mut this = Self {
             servers: Vec::new(),
@@ -231,7 +239,7 @@ impl McpTools {
             active: None,
         };
         let result = this
-            .discover(config_path, config, native, Launch::Peer)
+            .discover(config_path, config, native, Launch::Peer, cancellation)
             .await;
         if result.is_err() {
             let _ = this.shutdown().await;
@@ -245,10 +253,12 @@ impl McpTools {
         config: Config,
         native: &[ToolDescriptor],
         launch: Launch,
+        cancellation: &Cancellation,
     ) -> Result<()> {
         let mut reserved: BTreeSet<_> = native.iter().map(|tool| tool.name.as_str()).collect();
         reserved.extend(super::lifecycle::NAMES.iter().copied());
         for peer in config.servers {
+            ensure!(!cancellation.is_cancelled(), "MCP discovery interrupted");
             // neva's stdio API takes static strings. These bounded, non-secret
             // launcher arguments live until this Nano process exits.
             let (command, args): (&'static str, Vec<&'static str>) = match &launch {
@@ -272,7 +282,14 @@ impl McpTools {
             let timeout = Duration::from_millis(peer.timeout_ms);
             let mut client = Client::new()
                 .with_options(|options| options.with_stdio(command, args).with_timeout(timeout));
-            let connected = tokio::time::timeout(timeout, client.connect()).await;
+            let connected = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+                    anyhow::bail!("MCP discovery interrupted");
+                }
+                result = tokio::time::timeout(timeout, client.connect()) => result,
+            };
             if !matches!(connected, Ok(Ok(()))) {
                 let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
                 anyhow::bail!("Cannot connect MCP server {}", peer.id);
@@ -288,15 +305,14 @@ impl McpTools {
             let mut cursor = None;
             let mut cursors = BTreeSet::new();
             for _ in 0..8 {
-                let page = tokio::time::timeout(
-                    timeout,
-                    self.servers[index]
-                        .client
-                        .as_mut()
-                        .unwrap()
-                        .list_tools(cursor),
-                )
-                .await??;
+                let page = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => anyhow::bail!("MCP discovery interrupted"),
+                    result = tokio::time::timeout(
+                        timeout,
+                        self.servers[index].client.as_mut().unwrap().list_tools(cursor),
+                    ) => result??,
+                };
                 ensure!(page.tools.len() <= MAX_TOOLS, "MCP catalog exceeds limit");
                 for tool in page.tools {
                     if !allowed.contains(&tool.name) {
@@ -733,6 +749,7 @@ mod tests {
                     command: python(),
                     args: vec!["-u", script, mode],
                 },
+                &Cancellation::default(),
             )
             .await;
         if result.is_err() {

@@ -75,8 +75,6 @@ async fn launch(
     working_set: bool,
     seeds: Vec<serde_json::Value>,
 ) -> Result<()> {
-    #[cfg(feature = "nano-mcp")]
-    use super::tools::Tools;
     use super::{
         coding::CodingTools,
         commands,
@@ -155,8 +153,8 @@ async fn launch(
         let mut native =
             NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
         #[cfg(feature = "nano-mcp")]
-        if let Some(path) = mcp_config {
-            native.mcp = Some(super::mcp::McpTools::connect(&path, &native.descriptors()).await?);
+        {
+            native.mcp_config = mcp_config;
         }
         native.working_set_enabled = working_set;
         native.context.cache_enabled = working_set;

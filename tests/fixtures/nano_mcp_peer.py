@@ -26,6 +26,11 @@ for line in sys.stdin:
             "serverInfo": {"name": "nano-test-peer", "version": "1"},
         })
     elif method == "tools/list":
+        if mode == "stall-list":
+            with open(sys.argv[2], "w", encoding="utf-8") as marker:
+                marker.write("waiting")
+            sys.stdin.readline()
+            break
         listings += 1
         required = ["text"]
         if mode == "schema-change" and listings > 1:

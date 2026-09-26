@@ -24,6 +24,8 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     observations: Vec<Value>,
     #[cfg(feature = "nano-mcp")]
     pub(crate) mcp: Option<super::mcp::McpTools>,
+    #[cfg(feature = "nano-mcp")]
+    pub(crate) mcp_config: Option<std::path::PathBuf>,
 }
 
 impl<B: ExecutionBackend> NativeTools<B> {
@@ -51,6 +53,8 @@ impl<B: ExecutionBackend> NativeTools<B> {
             observations: Vec::new(),
             #[cfg(feature = "nano-mcp")]
             mcp: None,
+            #[cfg(feature = "nano-mcp")]
+            mcp_config: None,
         })
     }
 
