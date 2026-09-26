@@ -468,10 +468,10 @@ impl McpTools {
                         Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= MAX_RESULT_BYTES) => {
                             if response.is_error { ToolOutcome::Failed(ToolError::Mcp(json!({"code":"remote_error", "result":value}))) }
                             else if self.entries[&call.name].output.as_ref().is_some_and(|schema| response.struct_content.as_ref().is_none_or(|v| !schema.is_valid(v))) {
-                                ToolOutcome::Failed(ToolError::Mcp(json!({"code":"invalid_output"})))
+                                ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_output"})))
                             } else { ToolOutcome::Success(value) }
                         },
-                        _ => ToolOutcome::Failed(ToolError::OutputLimit),
+                        _ => ToolOutcome::Unknown(ToolError::OutputLimit),
                     }
                 },
                 Ok(Err(outcome)) => outcome,
@@ -793,9 +793,18 @@ mod tests {
         let mut oversized = direct_peer("oversize", 5000, &[]).await.unwrap();
         assert!(matches!(
             oversized.execute(&call(), &Cancellation::default()).await,
-            ToolOutcome::Failed(ToolError::OutputLimit)
+            ToolOutcome::Unknown(ToolError::OutputLimit)
         ));
+        assert!(oversized.servers[0].client.is_none());
         assert!(oversized.shutdown().await);
+
+        let mut invalid_output = direct_peer("invalid-output", 5000, &[]).await.unwrap();
+        assert!(matches!(
+            invalid_output.execute(&call(), &Cancellation::default()).await,
+            ToolOutcome::Unknown(ToolError::Mcp(value)) if value["code"] == "invalid_output"
+        ));
+        assert!(invalid_output.servers[0].client.is_none());
+        assert!(invalid_output.shutdown().await);
 
         let mut timeout = direct_peer("timeout", 5000, &[]).await.unwrap();
         // Startup under a loaded Windows runner can exceed one second. Only

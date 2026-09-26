@@ -94,8 +94,8 @@ What remains:
 - evaluate native nano working-set policy (#81) on realistic coding tasks;
 - keep graph failures independent of task lifecycle, and retain explicit fallback when context is unavailable.
 
-See [graph architecture](repository-graph-architecture.md),
-[retrieval](repository-graph-retrieval.md), and [evaluations](repository-graph-evaluations.md).
+See [graph architecture](repository_graph/repository-graph-architecture.md),
+[retrieval](repository_graph/repository-graph-retrieval.md), and [evaluations](repository_graph/repository-graph-evaluations.md).
 Missing graph relationships remain unknown, not proof that no relationship exists.
 
 ### Distributed context data plane
@@ -110,7 +110,7 @@ indexing, and retrieval do not initialize cloud clients or implicitly upload sou
 Production network/storage adapters, deployment, credentials, enforced worker isolation, and
 operational validation remain separate work. The prototype's secure worker requirements are a
 contract for such adapters, not evidence of a deployed sandbox or cloud service.
-See [distributed contracts](distributed-indexing-architecture.md).
+See [distributed contracts](repository_graph/distributed-indexing-architecture.md).
 
 ## Milestone 4: Multi-Agent Flow
 
@@ -257,8 +257,8 @@ Remaining work:
 - wider evaluation of retrieval quality and stale/unresolved cross-links;
 - comparative nano evaluation (#85), following the working set (#81) and compaction (#82).
 
-See [project memory](project-memory.md), [architecture](project-memory-architecture.md), and
-[evaluations](project-memory-evaluations.md).
+See [project memory](project_memory/project-memory.md), [architecture](project_memory/project-memory-architecture.md), and
+[evaluations](project_memory/project-memory-evaluations.md).
 
 ## Proposed order
 

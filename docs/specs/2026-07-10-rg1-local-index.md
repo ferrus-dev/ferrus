@@ -165,7 +165,7 @@ the index on Ferrus, and record cold-build, no-op update, changed-file update, a
 
 Implemented in `src/cli/commands/graph.rs` and `src/repository_graph/query_sqlite.rs`, with indexed and bounded
 SQLite lookup/traversal, human and JSON output, an explicit Criterion medium-fixture harness in
-`benches/repository_graph.rs`, Ferrus dogfood results in `docs/repository-graph-benchmarks.md`, and user-facing
+`benches/repository_graph.rs`, Ferrus dogfood results in `docs/repository_graph/repository-graph-benchmarks.md`, and user-facing
 command documentation in `README.md`.
 
 ## Acceptance Criteria

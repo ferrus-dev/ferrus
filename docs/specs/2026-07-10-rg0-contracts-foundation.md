@@ -104,7 +104,7 @@ Document the separation between repository graph, task graph, and project memory
 revision, snapshot, build, node, and task-view identities; specify canonical, dirty, and worktree freshness; and
 define normalized semantic versus operational repository-graph configuration.
 
-Normative contract: [Repository Graph Architecture and Identity Contracts](../repository-graph-architecture.md).
+Normative contract: [Repository Graph Architecture and Identity Contracts](../repository_graph/repository-graph-architecture.md).
 
 - [x] #0.1 Introduce repository graph domain types and module boundaries
 

@@ -152,14 +152,14 @@ explicit; an unavailable task view never falls back to canonical data.
 
 Further reading:
 
-- [Repository graph architecture](repository-graph-architecture.md)
-- [Repository retrieval contract](repository-graph-retrieval.md)
-- [Repository graph benchmarks](repository-graph-benchmarks.md)
-- [Repository graph evaluation](repository-graph-evaluations.md)
-- [Project memory architecture](project-memory-architecture.md)
-- [Project memory operations](project-memory.md)
-- [Project memory evaluation](project-memory-evaluations.md)
-- [Distributed indexing architecture](distributed-indexing-architecture.md)
+- [Repository graph architecture](repository_graph/repository-graph-architecture.md)
+- [Repository retrieval contract](repository_graph/repository-graph-retrieval.md)
+- [Repository graph benchmarks](repository_graph/repository-graph-benchmarks.md)
+- [Repository graph evaluation](repository_graph/repository-graph-evaluations.md)
+- [Project memory architecture](project_memory/project-memory-architecture.md)
+- [Project memory operations](project_memory/project-memory.md)
+- [Project memory evaluation](project_memory/project-memory-evaluations.md)
+- [Distributed indexing architecture](repository_graph/distributed-indexing-architecture.md)
 
 ## Configuration
 

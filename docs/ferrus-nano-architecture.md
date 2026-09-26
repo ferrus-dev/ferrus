@@ -9,8 +9,8 @@ No measured performance claim.
 
 Working product name: `ferrus-nano`. Ferrus backend name: `nano`.
 
-Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [command sessions](ferrus-nano-commands.md), [native context](ferrus-nano-context.md), [managed lifecycle](ferrus-nano-lifecycle.md), [roadmap](milestones.md), [repository graph](repository-graph-architecture.md),
-[project memory](project-memory-architecture.md).
+Related documents: [session engine and journal](ferrus-nano-sessions.md), [first provider](ferrus-nano-provider.md), [command sessions](ferrus-nano-commands.md), [native context](ferrus-nano-context.md), [managed lifecycle](ferrus-nano-lifecycle.md), [roadmap](milestones.md), [repository graph](repository_graph/repository-graph-architecture.md),
+[project memory](project_memory/project-memory-architecture.md).
 
 ## 1. Decision
 

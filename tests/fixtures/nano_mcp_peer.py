@@ -60,7 +60,7 @@ for line in sys.stdin:
         reply(message["id"], {
             "content": [{"type": "text", "text": text}],
             "structuredContent": {
-                "echo": text,
+                "echo": 42 if mode == "invalid-output" else text,
                 "inherited_provider_secret": os.getenv("FERRUS_NANO_SECRET"),
             },
             "isError": mode == "error",

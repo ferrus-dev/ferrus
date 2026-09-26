@@ -121,7 +121,7 @@ Depends on: none
 Finalize MCP request/response schemas, freshness and error states, deterministic ordering, evidence rules,
 pagination, and hard budget behavior using the Phase 1 CLI queries as executable reference behavior.
 
-Normative contract: [Repository Graph Retrieval Contract](../repository-graph-retrieval.md). Implemented in
+Normative contract: [Repository Graph Retrieval Contract](../repository_graph/repository-graph-retrieval.md). Implemented in
 `src/repository_graph/query.rs` and `src/repository_graph/query_sqlite.rs`, including typed context seeds, explicit
 source-revision envelopes, orthogonal index/build/freshness states, deterministic match classification,
 snapshot-bound pagination, bounded diagnostics, and valid truncation responses for hard budget exhaustion.

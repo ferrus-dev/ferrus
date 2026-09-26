@@ -140,7 +140,7 @@ Specify versioned control/query/fact contracts, tenant and repository identity, 
 publication consistency, authorization matrix, data classification, retention, deletion, and worker threat model.
 
 Implemented by the vendor-neutral contracts under `src/distributed/` and the normative consistency, tenancy,
-data-lifecycle, and threat-model decisions in `docs/distributed-indexing-architecture.md`. This milestone adds no
+data-lifecycle, and threat-model decisions in `docs/repository_graph/distributed-indexing-architecture.md`. This milestone adds no
 remote backend, network dependency, cloud SDK, or change to the local SQLite execution path.
 
 - [x] #5.1 Implement privacy-filtered repository and memory packaging and source storage
