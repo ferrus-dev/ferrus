@@ -159,6 +159,10 @@ fn descriptor(name: &str) -> ToolDescriptor {
 }
 
 impl<B: ExecutionBackend> Tools for NativeTools<B> {
+    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
+        self.coding.effect_plan(call)
+    }
+
     async fn prepare_context(
         &mut self,
         messages: &[super::provider::Message],

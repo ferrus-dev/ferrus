@@ -105,6 +105,10 @@ struct Submission {
 }
 
 impl<B: ExecutionBackend> Tools for ManagedTools<B> {
+    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
+        self.native.effect_plan(call)
+    }
+
     async fn prepare_context(
         &mut self,
         messages: &[Message],
@@ -409,11 +413,14 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     }
     #[cfg(feature = "nano-mcp")]
     let mut native = native;
+    let recovery = super::resume::recover_previous(&session, &native.coding.workspace).await?;
+    let recovery_note = recovery.as_ref().map_or("", |value| value.note.as_str());
     let mut input = native
         .instructions
         .load(&[], &[])
         .await?
-        .constraint_text(limits.context_bytes)?;
+        .constraint_text(limits.context_bytes.saturating_sub(recovery_note.len()))?;
+    input.push_str(recovery_note);
     #[cfg(feature = "nano-mcp")]
     if let Some(path) = native.mcp_config.take()
         && !stop.is_cancelled()
@@ -466,6 +473,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         stop: stop.clone(),
     };
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
+    if let Some(recovery) = recovery {
+        engine.inherit_budget(recovery.budget)?;
+    }
     let execution = engine.run(SessionCommand::Start { input }, &stop);
     tokio::pin!(execution);
     // External cancellation must not wait behind a busy heartbeat transaction.

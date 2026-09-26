@@ -15,6 +15,7 @@ pub(crate) mod mcp;
 pub(crate) mod native;
 mod private;
 mod refresh;
+mod resume;
 pub(crate) mod wire;
 
 #[cfg(feature = "nano-openai")]
