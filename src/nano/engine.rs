@@ -71,6 +71,18 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         })
     }
 
+    pub(crate) fn inherit_budget(&mut self, budget: Budget) -> Result<()> {
+        ensure!(
+            self.started.is_none()
+                && budget.elapsed_ms == 0
+                && budget.reserved_input_tokens == 0
+                && budget.reserved_output_tokens == 0,
+            "Invalid recovered budget"
+        );
+        self.budget = budget;
+        Ok(())
+    }
+
     /// One attempt per engine. Live resume and interactive steering are separate adapters.
     pub(crate) async fn run(
         &mut self,
@@ -106,6 +118,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
             input: input.clone(),
+            inherited_budget: (self.budget != Budget::default()).then(|| self.budget.clone()),
             provider: self.provider.settings().map(Box::new),
         }) {
             return Ok(self.journal_failure());
@@ -515,10 +528,16 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
 
                 let call_id = format!("call-{}", self.budget.tool_calls);
                 let validated = self.validate(&call_id, &call, &names);
+                let effect_plan = validated
+                    .as_ref()
+                    .ok()
+                    .and_then(|validated| self.tools.effect_plan(validated));
 
                 if !self.commit(SessionEvent::ToolIntent {
                     call_id: call_id.clone(),
                     call: call.clone(),
+                    effect_plan,
+                    start_recorded: true,
                 }) {
                     return EndReason::JournalFailed;
                 }
@@ -535,22 +554,29 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                                 ToolOutcome::Failed(ToolError::Interrupted)
                             }
                             Ok(Err(error)) => ToolOutcome::Failed(error),
-                            Ok(Ok(())) => match interrupt(
-                                self.tools.execute(validated, cancellation),
-                                cancellation,
-                                deadline,
-                            )
-                            .await
-                            {
-                                Ok(outcome) => outcome,
-                                Err(reason) => {
-                                    interrupted = Some(reason);
-                                    self.tools
-                                        .interrupted()
-                                        .await
-                                        .unwrap_or(ToolOutcome::Unknown(ToolError::Interrupted))
+                            Ok(Ok(())) => {
+                                if !self.commit(SessionEvent::ToolStarted {
+                                    call_id: call_id.clone(),
+                                }) {
+                                    return EndReason::JournalFailed;
                                 }
-                            },
+                                match interrupt(
+                                    self.tools.execute(validated, cancellation),
+                                    cancellation,
+                                    deadline,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(reason) => {
+                                        interrupted = Some(reason);
+                                        self.tools
+                                            .interrupted()
+                                            .await
+                                            .unwrap_or(ToolOutcome::Unknown(ToolError::Interrupted))
+                                    }
+                                }
+                            }
                         }
                     }
                 };

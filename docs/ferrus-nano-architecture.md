@@ -392,7 +392,8 @@ ending the session. A stop request cannot simply forget an in-flight submit tran
 ## 9. Session journal and crash recovery
 
 The #74 implementation and current defaults are documented in [session storage](ferrus-nano-sessions.md).
-Recorded replay is implemented; live resume and reconciliation remain #84.
+Managed redispatch recovery and effect reconciliation are implemented in #84; interactive
+same-process resume remains a later UI feature.
 
 Use one versioned, single-writer JSONL journal per nano session plus bounded output artifacts.
 Managed location proposal:

@@ -2,7 +2,7 @@
 
 Status: implemented foundation for #74. #75 adds an opt-in
 [Chat Completions provider](ferrus-nano-provider.md); #80 adds
-[CLI/HQ launch](ferrus-nano-launch.md). Automatic effect resume remains later work.
+[CLI/HQ launch](ferrus-nano-launch.md). #84 adds managed crash reconciliation on HQ redispatch.
 See the [architecture and PR index](ferrus-nano-architecture.md).
 
 ## Boundaries
@@ -29,8 +29,8 @@ The engine imports transport-neutral provider, tool, host, and journal interface
 
 Tool adapters must clean up owned processes when execution is interrupted. Dropping an effect
 future does not prove rollback: cancellation or deadline during execution records `Unknown` and
-ends the attempt. No subsequent effect runs. Native critical sections and later resume adapters
-must reconcile the outcome against the effect's authority; #79 and #84 provide that integration.
+ends the attempt. No subsequent effect runs. Native critical sections and managed redispatch
+reconcile the outcome against current Ferrus authority.
 The #77 [command adapter](ferrus-nano-commands.md) implements bounded background supervision
 and cleanup without blocking provider or host control work.
 
@@ -38,14 +38,16 @@ and cleanup without blocking provider or host control work.
 
 ```text
 Started -> ModelStarted -> ModelCompleted
-  -> ToolIntent -> ToolResult
+  -> ToolIntent -> ToolStarted -> ToolResult
   -> ... remaining calls in model order ...
   -> checkpoint -> next model turn or Ended
 ```
 
 `ModelFailed` terminates a failed model attempt before a bounded retry. Unknown/malformed calls
 also receive an intent/result pair, but never reach execution. The journal flushes intent before
-calling the tool, and flushes the result before notifying the host. A write, quota, or checkpoint
+authorization and `ToolStarted` immediately before execution. An intent without this marker is
+known not to have started; legacy intents without the marker contract remain uncertain. The
+journal flushes the result before notifying the host. A write, quota, or checkpoint
 failure stops the engine. If an effect ran but its result could not be committed, the previous
 intent remains pending and no completion notification is emitted. `SessionEnd.durable = false`
 means the returned ending itself could not be persisted.
@@ -86,6 +88,9 @@ and durably ends an unfinished attempt with `Limit(Elapsed)`, including one at a
 checkpoint. This charge is a recovery bound, not a measured duration. Pending effects and token
 reservations remain available for reconciliation. Continuing work requires a new session;
 reopening an already ended session preserves its recorded duration and reason.
+The new managed run inherits the prior token, model-turn, tool-call, retry, and no-progress
+counters. Unfinished provider reservations become conservative estimated usage. Elapsed time
+starts a new run allowance after the previous attempt has been sealed.
 
 ## Storage and recovery
 
@@ -97,6 +102,7 @@ The host passes the registered machine-local project data directory:
   events.jsonl
   outputs/<output-id>
   checkpoints/<sequence>.json
+  commands/<process-output-or-state>
 ```
 
 Session identity contains the project and optional task/run pair. IDs are bounded path-safe
@@ -108,12 +114,15 @@ Per-session defaults are 512 KiB per JSON record, 16 MiB journal, 1 MiB per arti
 storage, and 256 files. Artifacts and checkpoints share the byte/file quota. Serialization is
 bounded while writing into memory. Artifact writes are immutable; this slice performs no automatic
 retention/deletion or raw-session ingestion into project memory.
+Command spools use their separate session disk allowance and are not charged against journal
+storage on reopen; recovery validates that the spool directory remains private.
 
 Checkpoints identify a complete journal prefix by sequence, SHA-256 digest, and budget snapshot.
 They cannot split a model response's tool-call/result group. Files are flushed before atomic
 publication; Unix also syncs directories, and Windows uses write-through rename. Storage durability
 ultimately depends on the filesystem. Checkpoints are prefix markers, not compacted conversation
-copies; #82 adds a separately journaled context projection and #84 covers live recovery.
+copies; #82 adds a separately journaled context projection, while #84 reconciles an interrupted
+attempt before the next managed run.
 
 `FileJournal::recover` acquires the writer lock, enforces quotas, validates version/identity/order,
 and removes only an unterminated final line. A malformed newline-terminated record is an error.
@@ -122,6 +131,29 @@ For an unfinished attempt it appends the elapsed-budget charge and ending before
 that write fails, recovery fails. Repeated recovery preserves the same ending and budget.
 `Replay::from_records` is pure and reconstructs messages, ordering, and budget state from recorded
 inputs; it has no external effect ports.
+
+On managed redispatch, Nano first claims the new run and renews its lease. It scans backward
+through bounded, contiguous runs of the same Executor, task, and canonical workspace, passing
+over runs that never wrote a Started record. The prior journal
+must match that project's task/run identity and pass ordinary recovery validation. Nano does not
+reuse the prior lease or automatically execute any recorded call. It seals the old elapsed budget,
+then gives the new run a bounded continuity note with the old usage counters and last assistant
+text. Old graph and source evidence is not carried over; the model must inspect current files.
+
+An unfinished `apply_patch` records full-batch before/after SHA-256 digests before execution.
+Recovery reads each path through the confined workspace adapter: a complete before-state proves
+the edit absent, a complete after-state confirms the edit, and a mixed/changed/unsafe state is
+unknown. A lost `submit` response is confirmed only when its run has a committed `submitted`
+event and the scoped `SUBMISSION.md` matches the recorded call; an inconsistent handoff is unknown.
+Unknown shell, check, and external MCP effects fail the task for manual reconciliation. A paused
+human or consultation request stays in Ferrus state and is not issued again. Scoped response files
+remain available across a crash between task restoration and durable answer delivery. Neither
+recovery nor pure replay reads prior tool output as current source evidence.
+Command status files are checked separately from journal quotas. A process whose final state is
+missing or not a confirmed exit blocks automatic redispatch even if its initial `exec` call already
+recorded a result. Stored answers are carried forward only when the recovered journal contains
+the corresponding question. A submitted tree pin is not released while its SQLite commit is still
+unsettled; uncertain cancellation may retain an orphan pin rather than lose a committed tree.
 
 An oversized initial command is rejected before its body is journaled. Other limits produce typed
 end reasons when the journal remains writable. Session files contain operational context and must

@@ -32,6 +32,7 @@ fn started(journal: &mut FileJournal) -> Record {
                 },
                 limits: Limits::default(),
                 input: "task".into(),
+                inherited_budget: None,
             },
             &Budget::default(),
         )
@@ -87,6 +88,49 @@ fn model_group(journal: &mut FileJournal) -> (Budget, Vec<ToolCall>) {
         )
         .unwrap();
     (budget, calls)
+}
+
+#[test]
+fn interrupted_intent_can_be_reconciled_once_before_sealing() {
+    let (_dir, mut journal) = create(Quotas::default());
+    started(&mut journal);
+    let (mut budget, calls) = model_group(&mut journal);
+    budget.tool_calls = 1;
+    journal
+        .append(
+            SessionEvent::ToolIntent {
+                call_id: "call-1".into(),
+                call: calls[0].clone(),
+                effect_plan: None,
+                start_recorded: false,
+            },
+            &budget,
+        )
+        .unwrap();
+    let directory = journal.directory().to_path_buf();
+    drop(journal);
+
+    let (mut recovered, mut records) =
+        FileJournal::recover_open(&directory, Quotas::default()).unwrap();
+    assert_eq!(recovered.state().pending_effect.as_deref(), Some("call-1"));
+    records.push(
+        recovered
+            .append(
+                SessionEvent::ToolResult {
+                    call_id: "call-1".into(),
+                    outcome: ToolOutcome::Unknown(ToolError::Interrupted),
+                },
+                &budget,
+            )
+            .unwrap(),
+    );
+    recovered.seal_interrupted(&mut records).unwrap();
+    assert_eq!(recovered.state().unknown_effects, vec!["call-1"]);
+    drop(recovered);
+
+    let (again, records_again) = FileJournal::recover(&directory, Quotas::default()).unwrap();
+    assert_eq!(records_again.len(), records.len());
+    assert_eq!(again.state().unknown_effects, vec!["call-1"]);
 }
 
 #[test]
@@ -208,6 +252,8 @@ fn checkpoints_require_whole_model_tool_groups_and_verified_prefixes() {
                 SessionEvent::ToolIntent {
                     call_id: call_id.clone(),
                     call,
+                    effect_plan: None,
+                    start_recorded: false,
                 },
                 &budget,
             )
@@ -305,6 +351,8 @@ fn recovery_charges_unfinished_elapsed_budget_once_and_preserves_pending_work() 
                         SessionEvent::ToolIntent {
                             call_id: "call-1".into(),
                             call: calls[0].clone(),
+                            effect_plan: None,
+                            start_recorded: false,
                         },
                         &budget,
                     )
@@ -475,6 +523,41 @@ fn recovery_enforces_per_file_quotas_for_outputs_and_checkpoints() {
 }
 
 #[test]
+fn recovery_accepts_private_command_spools_under_their_separate_quota() {
+    let quotas = Quotas {
+        artifact_bytes: 4,
+        ..Default::default()
+    };
+    let (_dir, mut journal) = create(quotas.clone());
+    started(&mut journal);
+    let directory = journal.directory().to_path_buf();
+    let commands = directory.join("commands");
+    super::private::directory(&commands, true).unwrap();
+    let mut output = super::private::file(&commands.join("s-1-p1-stdout"), true).unwrap();
+    output.write_all(b"command output").unwrap();
+    output.sync_all().unwrap();
+    drop(output);
+    drop(journal);
+
+    let (recovered, records) = FileJournal::recover(&directory, quotas).unwrap();
+    assert_eq!(records.len(), 2);
+    drop(recovered);
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_a_redirected_command_spool() {
+    use std::os::unix::fs::symlink;
+
+    let (root, mut journal) = create(Quotas::default());
+    started(&mut journal);
+    let directory = journal.directory().to_path_buf();
+    drop(journal);
+    symlink(root.path(), directory.join("commands")).unwrap();
+    assert!(FileJournal::recover(&directory, Quotas::default()).is_err());
+}
+
+#[test]
 fn record_and_total_byte_quotas_fail_before_writing() {
     for quotas in [
         Quotas {
@@ -503,7 +586,8 @@ fn record_and_total_byte_quotas_fail_before_writing() {
                             run_id: None
                         },
                         limits: Limits::default(),
-                        input: "task".into()
+                        input: "task".into(),
+                        inherited_budget: None,
                     },
                     &Budget::default()
                 )

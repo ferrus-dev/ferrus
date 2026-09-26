@@ -5,7 +5,7 @@ use crate::nano::{
     coding::CodingTools,
     commands::{self, TrustedLocal},
     instructions,
-    journal::{FileJournal, Quotas},
+    journal::{FileJournal, Journal, Quotas},
     lifecycle,
     managed::{self, ManagedTools},
     native::NativeTools,
@@ -64,6 +64,95 @@ fn identity(id: &str) -> SessionIdentity {
         project_id: "test-project".into(),
         task_id: Some(TASK.into()),
         run_id: Some(RUN.into()),
+    }
+}
+
+fn previous_run(f: &Fixture, id: &str) {
+    f.connection().execute(
+        "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+         VALUES (0, ?1, ?2, 'executor', ?3, 'failed', '2026-01-01', '2026-01-01', ?4)",
+        rusqlite::params![id, TASK, AGENT, f.root.to_string_lossy()],
+    ).unwrap();
+}
+
+fn previous_intent(f: &Fixture, id: &str, name: &str, plan: Option<EffectPlan>, started: bool) {
+    let mut journal = FileJournal::create(&f.data, id, Quotas::default()).unwrap();
+    let mut budget = Budget::default();
+    journal
+        .append(
+            SessionEvent::Started {
+                identity: SessionIdentity {
+                    session_id: id.into(),
+                    project_id: "test-project".into(),
+                    task_id: Some(TASK.into()),
+                    run_id: Some(id.into()),
+                },
+                limits: Limits::default(),
+                input: "task".into(),
+                inherited_budget: None,
+                provider: None,
+            },
+            &budget,
+        )
+        .unwrap();
+    budget.model_turns = 1;
+    budget.reserved_input_tokens = 10;
+    budget.reserved_output_tokens = 10;
+    journal
+        .append(SessionEvent::ModelStarted { turn: 1 }, &budget)
+        .unwrap();
+    budget.reserved_input_tokens = 0;
+    budget.reserved_output_tokens = 0;
+    budget.reported_input_tokens = 1;
+    budget.reported_output_tokens = 1;
+    let call = ToolCall {
+        provider_call_id: "provider-1".into(),
+        name: name.into(),
+        arguments: if name == "submit" {
+            serde_json::json!({"content":"Ready for review."}).to_string()
+        } else {
+            "{}".into()
+        },
+    };
+    journal
+        .append(
+            SessionEvent::ModelCompleted {
+                response: ModelResponse {
+                    finish: FinishReason::ToolCalls,
+                    text: String::new(),
+                    calls: vec![call.clone()],
+                    continuation: None,
+                },
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    reported: true,
+                },
+            },
+            &budget,
+        )
+        .unwrap();
+    budget.tool_calls = 1;
+    journal
+        .append(
+            SessionEvent::ToolIntent {
+                call_id: "call-1".into(),
+                call,
+                effect_plan: plan,
+                start_recorded: true,
+            },
+            &budget,
+        )
+        .unwrap();
+    if started {
+        journal
+            .append(
+                SessionEvent::ToolStarted {
+                    call_id: "call-1".into(),
+                },
+                &budget,
+            )
+            .unwrap();
     }
 }
 
@@ -214,9 +303,563 @@ async fn managed_waits_restore_addressing_once_and_deliver_actual_answers() {
             .unwrap();
         assert_eq!(result["answer"], "Use the bounded implementation.");
         assert_eq!(result["resumed_state"], "addressing");
+        assert!(
+            directory
+                .join(if human {
+                    "ANSWER.md"
+                } else {
+                    "CONSULT_RESPONSE.md"
+                })
+                .exists()
+        );
         assert!(lifecycle::poll_answer(&session, human).await.is_err());
         assert_eq!(session.status().await.unwrap().status, "addressing");
     }
+}
+
+#[tokio::test]
+async fn previous_patch_is_reconciled_from_the_bound_workspace_once() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+    let plan = workspace
+        .patch_effect_plan(workspace::patch::PatchRequest {
+            edits: vec![workspace::patch::Edit::Create {
+                path: "recovered.txt".into(),
+                content: "recovered\n".into(),
+            }],
+        })
+        .unwrap();
+    previous_run(&f, "old-patch");
+    previous_intent(&f, "old-patch", "apply_patch", Some(plan), true);
+    std::fs::write(f.root.join("recovered.txt"), "recovered\n").unwrap();
+
+    let first = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.note.contains("matches its full recorded after-state"));
+    assert_eq!(first.budget.model_turns, 1);
+    assert_eq!(first.budget.tool_calls, 1);
+    assert_eq!(first.budget.tokens(), 2);
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    let old_dir = f.data.join("nano/sessions/old-patch");
+    let old_size = std::fs::metadata(old_dir.join("events.jsonl"))
+        .unwrap()
+        .len();
+    let second = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second.note.contains("old-patch"));
+    assert_eq!(
+        std::fs::metadata(old_dir.join("events.jsonl"))
+            .unwrap()
+            .len(),
+        old_size
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("recovered.txt")).unwrap(),
+        "recovered\n"
+    );
+
+    let (tools, journal) = native(&f, session.clone(), RUN);
+    let end = managed::run(
+        session.clone(),
+        identity(RUN),
+        Limits::default(),
+        script(vec![]),
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 2);
+    assert_eq!(end.budget.tool_calls, 1);
+    assert_eq!(end.budget.reported_input_tokens, 11);
+    let (_, records) =
+        FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
+    assert!(
+        matches!(&records[0].event, SessionEvent::Started { inherited_budget: Some(budget), .. } if budget.model_turns == 1 && budget.tool_calls == 1)
+    );
+}
+
+#[tokio::test]
+async fn unknown_previous_command_fails_the_exact_owned_task() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-command");
+    previous_intent(&f, "old-command", "exec", None, true);
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+    let reason: String = f
+        .connection()
+        .query_row(
+            "SELECT failure_reason FROM tasks WHERE id = ?1",
+            [TASK],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "nano_effect_unknown");
+}
+
+#[tokio::test]
+async fn empty_intermediate_run_cannot_hide_an_unknown_command() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-command");
+    previous_intent(&f, "old-command", "exec", None, true);
+    f.connection()
+        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-command'", [])
+        .unwrap();
+    f.connection()
+        .execute(
+            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+             VALUES (0, 'empty-run', ?1, 'executor', ?2, 'failed', '2026-01-02', '2026-01-02', ?3)",
+            rusqlite::params![TASK, AGENT, f.root.to_string_lossy()],
+        )
+        .unwrap();
+    drop(FileJournal::create(&f.data, "empty-run", Quotas::default()).unwrap());
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+}
+
+#[tokio::test]
+async fn historical_runs_after_the_latest_started_journal_do_not_exhaust_the_scan() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-read");
+    previous_intent(&f, "old-read", "read_file", None, true);
+    let connection = f.connection();
+    for ordinal in 1..=64 {
+        connection.execute(
+            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+             VALUES (?1, ?2, ?3, 'executor', ?4, 'failed', '2026-01-01', '2026-01-01', ?5)",
+            rusqlite::params![-ordinal, format!("older-{ordinal}"), TASK, AGENT, f.root.to_string_lossy()],
+        ).unwrap();
+    }
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let recovered = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered.note.contains("old-read"));
+}
+
+#[tokio::test]
+async fn completed_exec_intent_with_running_command_blocks_redispatch() {
+    use std::io::Write;
+
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-running");
+    previous_intent(&f, "old-running", "exec", None, true);
+    let directory = f.data.join("nano/sessions/old-running");
+    let (mut journal, _) = FileJournal::recover_open(&directory, Quotas::default()).unwrap();
+    journal
+        .append(
+            SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                outcome: ToolOutcome::Success(json!({"process_id":"old-running-p1"})),
+            },
+            &journal.state().budget.clone(),
+        )
+        .unwrap();
+    drop(journal);
+    let commands_dir = directory.join("commands");
+    crate::nano::private::directory(&commands_dir, true).unwrap();
+    let snapshot = commands::Snapshot {
+        process_id: "old-running-p1".into(),
+        backend: "trusted_local".into(),
+        completion: commands::Completion::Running,
+        stdout: commands::OutputRef {
+            handle: "old-running-p1-stdout".into(),
+            bytes: 0,
+        },
+        stderr: commands::OutputRef {
+            handle: "old-running-p1-stderr".into(),
+            bytes: 0,
+        },
+        output_complete: false,
+        mutation_scope: "unknown".into(),
+    };
+    let mut state =
+        crate::nano::private::file(&commands_dir.join("old-running-p1.json"), true).unwrap();
+    state
+        .write_all(&serde_json::to_vec(&snapshot).unwrap())
+        .unwrap();
+    state.sync_all().unwrap();
+    drop(state);
+    for stream in ["stdout", "stderr"] {
+        drop(
+            crate::nano::private::file(
+                &commands_dir.join(format!("old-running-p1-{stream}")),
+                true,
+            )
+            .unwrap(),
+        );
+    }
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+}
+
+#[tokio::test]
+async fn previously_sealed_pending_intent_cannot_be_ignored() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-sealed");
+    previous_intent(&f, "old-sealed", "exec", None, true);
+    let directory = f.data.join("nano/sessions/old-sealed");
+    FileJournal::recover(&directory, Quotas::default()).unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+}
+
+#[tokio::test]
+async fn crash_before_execution_boundary_never_runs_or_marks_an_effect_unknown() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-unstarted");
+    previous_intent(&f, "old-unstarted", "exec", None, false);
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.data.join("nano/sessions/old-unstarted/events.jsonl"))
+            .unwrap()
+            .write_all(b"{\"interrupted\":")
+            .unwrap();
+    }
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let note = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.note.contains("no effect was started"));
+    assert_eq!(session.status().await.unwrap().status, "executing");
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_stolen_lease_before_touching_the_old_journal() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-stale");
+    previous_intent(&f, "old-stale", "exec", None, true);
+    let old = f.data.join("nano/sessions/old-stale/events.jsonl");
+    let bytes = std::fs::read(&old).unwrap();
+    f.connection()
+        .execute(
+            "UPDATE tasks SET claimed_by = 'executor:other:1' WHERE id = ?1",
+            [TASK],
+        )
+        .unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(old).unwrap(), bytes);
+    assert_eq!(session.status().await.unwrap().status, "executing");
+}
+
+#[tokio::test]
+async fn recovery_does_not_skip_a_newer_run_from_another_workspace() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-matching");
+    previous_intent(&f, "old-matching", "exec", None, true);
+    f.connection()
+        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-matching'", [])
+        .unwrap();
+    f.connection().execute(
+        "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+         VALUES (0, 'newer-elsewhere', ?1, 'executor', ?2, 'failed', '2026-01-02', '2026-01-02', '/elsewhere')",
+        rusqlite::params![TASK, AGENT],
+    ).unwrap();
+    let journal = f.data.join("nano/sessions/old-matching/events.jsonl");
+    let bytes = std::fs::read(&journal).unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read(journal).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn recovery_does_not_skip_a_newer_run_from_another_executor() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-matching");
+    previous_intent(&f, "old-matching", "exec", None, true);
+    f.connection()
+        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-matching'", [])
+        .unwrap();
+    f.connection()
+        .execute(
+            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+             VALUES (0, 'newer-agent', ?1, 'executor', 'other-agent', 'failed', '2026-01-02', '2026-01-02', ?2)",
+            rusqlite::params![TASK, f.root.to_string_lossy()],
+        )
+        .unwrap();
+    let journal = f.data.join("nano/sessions/old-matching/events.jsonl");
+    let bytes = std::fs::read(&journal).unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read(journal).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn restored_answer_is_carried_into_the_new_run_without_reasking() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-human");
+    previous_intent(&f, "old-human", "ask_human", None, true);
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("ANSWER.md"), "Use the bounded implementation.").unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let note = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.note.contains("Use the bounded implementation."));
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    assert!(
+        !f.events()
+            .iter()
+            .any(|(kind, _)| kind == "task_human_question")
+    );
+}
+
+#[tokio::test]
+async fn stale_answer_without_a_matching_prior_question_is_not_reused() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-read");
+    previous_intent(&f, "old-read", "read_file", None, true);
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("ANSWER.md"), "stale instruction").unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let recovered = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!recovered.note.contains("stale instruction"));
+    assert_eq!(session.status().await.unwrap().status, "executing");
+}
+
+#[tokio::test]
+async fn committed_submit_with_lost_response_is_confirmed_after_rejection() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-submit");
+    previous_intent(&f, "old-submit", "submit", None, true);
+    f.connection()
+        .execute(
+            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
+            [TASK],
+        )
+        .unwrap();
+    f.connection()
+        .execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) \
+         VALUES ('old-submit', 'submitted', '{}', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("SUBMISSION.md"), "Ready for review.").unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let note = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.note.contains("committed in SQLite"));
+    assert_eq!(session.status().await.unwrap().status, "addressing");
+    let (_, records) =
+        FileJournal::recover(&f.data.join("nano/sessions/old-submit"), Quotas::default()).unwrap();
+    assert!(matches!(
+        &records.last().unwrap().event,
+        SessionEvent::Ended {
+            reason: EndReason::Submitted
+        }
+    ));
+    assert_eq!(
+        f.events()
+            .iter()
+            .filter(|(kind, _)| kind == "submitted")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn committed_submit_can_be_reconciled_after_legacy_journal_sealing() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-submit-sealed");
+    previous_intent(&f, "old-submit-sealed", "submit", None, true);
+    f.connection()
+        .execute(
+            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
+            [TASK],
+        )
+        .unwrap();
+    f.connection()
+        .execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) \
+         VALUES ('old-submit-sealed', 'submitted', '{}', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("SUBMISSION.md"), "Ready for review.").unwrap();
+    let directory = f.data.join("nano/sessions/old-submit-sealed");
+    FileJournal::recover(&directory, Quotas::default()).unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let note = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.note.contains("historical journal was already sealed"));
+    assert_eq!(session.status().await.unwrap().status, "addressing");
+}
+
+#[tokio::test]
+async fn inconsistent_submitted_artifact_is_not_certified() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-mismatch");
+    previous_intent(&f, "old-mismatch", "submit", None, true);
+    f.connection()
+        .execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) \
+         VALUES ('old-mismatch', 'submitted', '{}', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("SUBMISSION.md"), "changed after commit").unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+}
+
+#[tokio::test]
+async fn uncommitted_submit_cannot_hide_interrupted_check_commands() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-submit");
+    previous_intent(&f, "old-submit", "submit", None, true);
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
 }
 
 #[tokio::test]
