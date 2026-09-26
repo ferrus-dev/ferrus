@@ -275,7 +275,10 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         self.stop.cancel();
 
-        let result = self.pending.take()?.await;
+        let Some(task) = self.pending.take() else {
+            return self.native.interrupted().await;
+        };
+        let result = task.await;
         if let Ok(Ok(value)) = &result {
             self.observe(value);
         }

@@ -15,6 +15,9 @@ pub(crate) struct Config {
     pub base_url: String,
     pub model: String,
     pub api_key_file: Option<PathBuf>,
+    /// Explicit owner-only stdio MCP configuration. Never sent to the provider.
+    #[cfg(feature = "nano-mcp")]
+    pub mcp_config_file: Option<PathBuf>,
     #[serde(default = "default_context")]
     pub context_tokens: u64,
     #[serde(default = "default_output")]

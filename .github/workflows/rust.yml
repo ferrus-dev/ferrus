@@ -55,6 +55,17 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features nano-openai nano::
 
+      - name: Set up Python for the stdio peer fixture
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Nano stdio MCP integration
+        run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
+
+      - name: Test Nano stdio MCP integration
+        run: cargo test --locked --features nano-openai,nano-mcp
+
   smoke:
     strategy:
       fail-fast: false

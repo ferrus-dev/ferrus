@@ -23,16 +23,34 @@ pub(crate) enum Command {
         #[arg(long)]
         prefetch_symbol: Vec<String>,
     },
+    #[cfg(feature = "nano-mcp")]
+    #[command(hide = true)]
+    McpPeer {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        server: String,
+    },
 }
 
 pub(crate) async fn run(command: Command) -> Result<()> {
-    let Command::Run {
-        config,
-        model,
-        no_working_set,
-        prefetch_path,
-        prefetch_symbol,
-    } = command;
+    let (config, model, no_working_set, prefetch_path, prefetch_symbol) = match command {
+        Command::Run {
+            config,
+            model,
+            no_working_set,
+            prefetch_path,
+            prefetch_symbol,
+        } => (
+            config,
+            model,
+            no_working_set,
+            prefetch_path,
+            prefetch_symbol,
+        ),
+        #[cfg(feature = "nano-mcp")]
+        Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
+    };
     let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
     super::agent::validate_config(config.as_deref(), model.as_deref())?;
     #[cfg(feature = "nano-openai")]
@@ -57,6 +75,8 @@ async fn launch(
     working_set: bool,
     seeds: Vec<serde_json::Value>,
 ) -> Result<()> {
+    #[cfg(feature = "nano-mcp")]
+    use super::tools::Tools;
     use super::{
         coding::CodingTools,
         commands,
@@ -75,7 +95,10 @@ async fn launch(
         sync::{Arc, Mutex},
         time::Duration,
     };
-    let provider = OpenAi::new(super::agent::load_config(&config, model.as_deref())?)?;
+    let settings = super::agent::load_config(&config, model.as_deref())?;
+    #[cfg(feature = "nano-mcp")]
+    let mcp_config = settings.mcp_config_file.clone();
+    let provider = OpenAi::new(settings)?;
     let launch = LaunchContext::from_env()?;
     let stop = Cancellation::default();
     let error = Arc::new(Mutex::new(None::<String>));
@@ -131,6 +154,10 @@ async fn launch(
         };
         let mut native =
             NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
+        #[cfg(feature = "nano-mcp")]
+        if let Some(path) = mcp_config {
+            native.mcp = Some(super::mcp::McpTools::connect(&path, &native.descriptors()).await?);
+        }
         native.working_set_enabled = working_set;
         native.context.cache_enabled = working_set;
         native.prefetch = seeds;

@@ -225,6 +225,7 @@ impl Fixture {
 fn serve(
     listener: TcpListener,
     resumed: Option<(PathBuf, &'static str)>,
+    external_mcp: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
@@ -278,16 +279,29 @@ fn serve(
                 assert_eq!(&restored, state);
             }
             let calls = match turn {
-                0 => vec![
-                    (
-                        "apply_patch",
-                        json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]}),
-                    ),
-                    (
-                        "exec",
-                        json!({"command":"echo not-a-json-event", "cwd":".", "timeout_ms":1000}),
-                    ),
-                ],
+                0 => {
+                    let mut calls = vec![
+                        (
+                            "apply_patch",
+                            json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]}),
+                        ),
+                        (
+                            "exec",
+                            json!({"command":"echo not-a-json-event", "cwd":".", "timeout_ms":1000}),
+                        ),
+                    ];
+                    if external_mcp {
+                        assert!(
+                            request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|tool| tool["function"]["name"] == "mcp_local_echo")
+                        );
+                        calls.insert(0, ("mcp_local_echo", json!({"text":"from-mcp"})));
+                    }
+                    calls
+                }
                 1 => vec![("check", json!({}))],
                 _ => vec![(
                     "submit",
@@ -304,24 +318,30 @@ fn serve(
 
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
-    run_headless_task(None);
+    run_headless_task(None, false);
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn headless_process_calls_isolated_external_stdio_tool() {
+    run_headless_task(None, true);
 }
 
 #[test]
 fn relaunched_human_waiter_delivers_the_answer_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, true)));
+        run_headless_task(Some((state, true)), false);
     }
 }
 
 #[test]
 fn relaunched_consultation_delivers_the_response_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, false)));
+        run_headless_task(Some((state, false)), false);
     }
 }
 
-fn run_headless_task(resume: Option<(&'static str, bool)>) {
+fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
     let fixture = Fixture::new();
     let (request_file, response_file, restored_event) = match resume {
         Some((_, false)) => (
@@ -365,18 +385,46 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let settings = fixture.data.join("provider.toml");
+    #[cfg(feature = "nano-mcp")]
+    let mcp_setting = if external_mcp {
+        let peer = fixture.data.join("mcp.toml");
+        let python = find_python();
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
+        private_config(
+            &peer,
+            &format!(
+                "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
+                toml::Value::String(python.display().to_string()),
+                serde_json::to_string(&[script.display().to_string()]).unwrap(),
+            ),
+        );
+        format!(
+            "mcp_config_file = {}\n",
+            toml::Value::String(peer.display().to_string())
+        )
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "nano-mcp"))]
+    let mcp_setting = String::new();
     private_config(
         &settings,
         &format!(
-            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\n",
-            listener.local_addr().unwrap()
+            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\n{mcp_setting}",
+            listener.local_addr().unwrap(),
         ),
     );
     let server = serve(
         listener,
         resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
+        external_mcp,
     );
-    let mut child = Process::spawn(&mut fixture.command(&settings));
+    let mut launch = fixture.command(&settings);
+    if external_mcp {
+        launch.env("FERRUS_NANO_SECRET", "must-not-reach-peer");
+    }
+    let mut child = Process::spawn(&mut launch);
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -467,9 +515,15 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|record| record["event"]["event"] == "tool_result")
         .collect();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), if external_mcp { 5 } else { 4 });
     for result in results {
         assert_eq!(result["event"]["outcome"]["status"], "success", "{result}");
+    }
+    if external_mcp {
+        assert!(journal.contains("from-mcp"));
+        assert!(journal.contains("inherited_provider_secret"));
+        assert!(journal.contains("null"));
+        assert!(!journal.contains("must-not-reach-peer"));
     }
     if resume.is_some() {
         assert!(journal.contains("Use forty-two."));
@@ -491,6 +545,19 @@ fn run_headless_task(resume: Option<(&'static str, bool)>) {
         }
     }
     drop(stdin);
+}
+
+#[cfg(feature = "nano-mcp")]
+fn find_python() -> PathBuf {
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for executable in ["python3", "python", "python.exe"] {
+            let path = directory.join(executable);
+            if path.is_file() {
+                return path.canonicalize().unwrap();
+            }
+        }
+    }
+    panic!("Python 3 is required for the Nano MCP peer integration fixture");
 }
 
 #[test]
