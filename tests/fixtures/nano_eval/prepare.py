@@ -24,7 +24,7 @@ def main():
     if destination.exists():
         raise SystemExit(f"destination already exists: {destination}")
     shutil.copytree(fixture / "cases" / case, destination)
-    git(destination, "init", "-q")
+    git(destination, "init", "-q", "--object-format=sha1")
     git(destination, "config", "core.autocrlf", "false")
     git(destination, "add", "-A")
     tree = git(destination, "write-tree")

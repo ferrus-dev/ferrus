@@ -175,7 +175,7 @@ struct Group {
     total_ms: Distribution,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GroupKey {
     case_id: String,
     variant: Variant,
@@ -488,13 +488,15 @@ fn build(manifest: Manifest) -> Result<Report> {
                 || matches!(attempt.cache, CacheState::Disabled),
             "Graph-disabled attempt must report disabled cache state"
         );
+        let group_key = GroupKey {
+            case_id: attempt.case_id.clone(),
+            variant: attempt.variant.clone(),
+            cache: attempt.cache.clone(),
+            model: attempt.model.clone(),
+            settings_sha256: attempt.settings_sha256.clone(),
+        };
         ensure!(
-            seen.insert((
-                attempt.case_id.clone(),
-                attempt.variant.clone(),
-                attempt.cache.clone(),
-                attempt.sample
-            )),
+            seen.insert((group_key.clone(), attempt.sample)),
             "Duplicate evaluation sample"
         );
         ensure!(
@@ -525,15 +527,7 @@ fn build(manifest: Manifest) -> Result<Report> {
         let accepted = task_status == "complete"
             && final_gate_passed
             && (!attempt.variant.needs_journal() || nano_end_reason == Some(EndReason::Submitted));
-        let entry = groups
-            .entry(GroupKey {
-                case_id: attempt.case_id.clone(),
-                variant: attempt.variant.clone(),
-                cache: attempt.cache.clone(),
-                model: attempt.model.clone(),
-                settings_sha256: attempt.settings_sha256.clone(),
-            })
-            .or_default();
+        let entry = groups.entry(group_key).or_default();
         entry.accepted += usize::from(accepted);
         entry.times.push(attempt.timing.total_ms);
         rows.push(ResultRow {
@@ -628,7 +622,8 @@ mod tests {
             copy_tree(&root.join(case), temp.path())?;
             ensure!(
                 Command::new("git")
-                    .args(["init", "-q"])
+                    .args(["init", "-q", "--object-format=sha1"])
+                    .env("GIT_DEFAULT_HASH", "sha256")
                     .current_dir(temp.path())
                     .status()?
                     .success()
@@ -651,6 +646,7 @@ mod tests {
             }
             let output = Command::new("git")
                 .arg("write-tree")
+                .env("GIT_DEFAULT_HASH", "sha256")
                 .current_dir(temp.path())
                 .output()?;
             ensure!(output.status.success());
@@ -799,6 +795,22 @@ mod tests {
             harness_notes: vec![],
         };
         let accepted_attempt = attempt.clone();
+        let mut other_model = attempt.clone();
+        other_model.model = "other-model".into();
+        let mut other_settings = attempt.clone();
+        other_settings.settings_sha256 = "1".repeat(64);
+        let report = build(Manifest {
+            version: 1,
+            attempts: vec![attempt.clone(), other_model, other_settings],
+        })?;
+        assert_eq!(report.groups.len(), 3);
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![attempt.clone(), attempt.clone()],
+            })
+            .is_err()
+        );
         let report = build(Manifest {
             version: 1,
             attempts: vec![attempt],
