@@ -117,7 +117,12 @@ fn unresolved_commands(
             || state.backend != "trusted_local"
             || state.stdout.handle != format!("{id}-stdout")
             || state.stderr.handle != format!("{id}-stderr")
-            || !matches!(state.completion, super::commands::Completion::Exited { .. })
+            || !matches!(
+                state.completion,
+                super::commands::Completion::Exited { .. }
+                    | super::commands::Completion::Cancelled
+                    | super::commands::Completion::TimedOut
+            )
             || !state.output_complete
         {
             return Ok(true);
@@ -584,6 +589,34 @@ mod tests {
         }
         assert!(!unresolved_commands(&session, "old-run", &expected).unwrap());
         snapshot.completion = super::super::commands::Completion::Cancelled;
+        fs::write(
+            commands.join("old-run-p1.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert!(!unresolved_commands(&session, "old-run", &expected).unwrap());
+        snapshot.completion = super::super::commands::Completion::TimedOut;
+        fs::write(
+            commands.join("old-run-p1.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert!(!unresolved_commands(&session, "old-run", &expected).unwrap());
+        for completion in [
+            super::super::commands::Completion::Running,
+            super::super::commands::Completion::Unknown,
+            super::super::commands::Completion::OutputLimit,
+        ] {
+            snapshot.completion = completion;
+            fs::write(
+                commands.join("old-run-p1.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            assert!(unresolved_commands(&session, "old-run", &expected).unwrap());
+        }
+        snapshot.completion = super::super::commands::Completion::Cancelled;
+        snapshot.output_complete = false;
         fs::write(
             commands.join("old-run-p1.json"),
             serde_json::to_vec(&snapshot).unwrap(),

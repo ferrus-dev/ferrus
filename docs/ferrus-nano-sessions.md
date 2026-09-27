@@ -149,15 +149,16 @@ unknown. A lost `submit` response is confirmed only when its run has a committed
 event and the scoped `SUBMISSION.md` matches the recorded call; an inconsistent handoff is unknown.
 Unknown shell, check, and external MCP effects fail the task for manual reconciliation. Interrupted
 `read_process` and `read_output` calls are read-only; their lost results are not replayed, and
-command spool validation still rejects unfinished processes. A paused
-human or consultation request stays in Ferrus state and is not issued again. Scoped response files
+command spool validation still rejects unfinished processes. A paused human or consultation
+request stays in Ferrus state and is not issued again. Scoped response files
 remain available across a crash between task restoration and durable answer delivery. Neither
 recovery nor pure replay reads prior tool output as current source evidence.
-Command status files are checked separately from journal quotas. A process whose final state is
-missing or not a confirmed exit blocks automatic redispatch even if its initial `exec` call already
-recorded a result. Stored answers are carried forward only when the recovered journal contains
-the corresponding question. A submitted tree pin is not released while its SQLite commit is still
-unsettled; uncertain cancellation may retain an orphan pin rather than lose a committed tree.
+Command status files are checked separately from journal quotas. A process blocks automatic
+redispatch unless its output is complete and its state is `Exited`, `Cancelled`, or `TimedOut`,
+even if its initial `exec` call already recorded a result. Stored answers are carried forward only
+when the recovered journal contains the corresponding question. A submitted tree pin is not
+released while its SQLite commit is still unsettled; uncertain cancellation may retain an orphan
+pin rather than lose a committed tree.
 
 An oversized initial command is rejected before its body is journaled. Other limits produce typed
 end reasons when the journal remains writable. Session files contain operational context and must
