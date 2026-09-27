@@ -34,6 +34,15 @@ pub(crate) struct Config {
     pub max_tool_calls: usize,
     #[serde(default = "default_usage")]
     pub include_usage: bool,
+    /// Evaluation ablations; neither changes provider credentials or model settings.
+    #[serde(default = "default_enabled")]
+    pub native_context_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub working_set_enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_context() -> u64 {

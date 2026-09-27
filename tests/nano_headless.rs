@@ -226,6 +226,8 @@ fn serve(
     listener: TcpListener,
     resumed: Option<(PathBuf, &'static str)>,
     external_mcp: bool,
+    graph_peer: bool,
+    native_context: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
@@ -266,6 +268,14 @@ fn serve(
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(request["model"], "override-model");
+            assert_eq!(
+                request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "repository_search"),
+                native_context
+            );
             if turn == 0
                 && let Some((database, state)) = &resumed
             {
@@ -300,6 +310,33 @@ fn serve(
                         );
                         calls.insert(0, ("mcp_local_echo", json!({"text":"from-mcp"})));
                     }
+                    if graph_peer {
+                        for name in [
+                            "mcp_graph_repository_graph_status",
+                            "mcp_graph_repository_search",
+                            "mcp_graph_repository_context",
+                        ] {
+                            assert!(
+                                request["tools"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|tool| tool["function"]["name"] == name)
+                            );
+                        }
+                        calls.insert(
+                            0,
+                            (
+                                "mcp_graph_repository_context",
+                                json!({"seeds":[{"type":"path","value":"ferrus.toml"}]}),
+                            ),
+                        );
+                        calls.insert(
+                            0,
+                            ("mcp_graph_repository_search", json!({"query":"ferrus"})),
+                        );
+                        calls.insert(0, ("mcp_graph_repository_graph_status", json!({})));
+                    }
                     calls
                 }
                 1 => vec![("check", json!({}))],
@@ -318,13 +355,25 @@ fn serve(
 
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
-    run_headless_task(None, false);
+    run_headless_task(None, false, false, true, true);
+}
+
+#[test]
+fn headless_native_context_and_working_set_can_be_disabled_separately() {
+    run_headless_task(None, false, false, false, true);
+    run_headless_task(None, false, false, true, false);
 }
 
 #[cfg(feature = "nano-mcp")]
 #[test]
 fn headless_process_calls_isolated_external_stdio_tool() {
-    run_headless_task(None, true);
+    run_headless_task(None, true, false, true, true);
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn headless_process_calls_bound_ferrus_graph_over_mcp() {
+    run_headless_task(None, false, true, false, false);
 }
 
 #[cfg(feature = "nano-mcp")]
@@ -509,18 +558,24 @@ fn mcp_discovery_keeps_the_claim_alive_and_observes_cancel() {
 #[test]
 fn relaunched_human_waiter_delivers_the_answer_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, true)), false);
+        run_headless_task(Some((state, true)), false, false, true, true);
     }
 }
 
 #[test]
 fn relaunched_consultation_delivers_the_response_before_inference_and_submits() {
     for state in ["executing", "addressing"] {
-        run_headless_task(Some((state, false)), false);
+        run_headless_task(Some((state, false)), false, false, true, true);
     }
 }
 
-fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
+fn run_headless_task(
+    resume: Option<(&'static str, bool)>,
+    external_mcp: bool,
+    graph_peer: bool,
+    native_context: bool,
+    working_set: bool,
+) {
     let fixture = Fixture::new();
     let (request_file, response_file, restored_event) = match resume {
         Some((_, false)) => (
@@ -582,6 +637,19 @@ fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
             "mcp_config_file = {}\n",
             toml::Value::String(peer.display().to_string())
         )
+    } else if graph_peer {
+        let peer = fixture.data.join("graph-mcp.toml");
+        private_config(
+            &peer,
+            &format!(
+                "[[servers]]\nid = 'graph'\ncommand = {}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_graph_status', 'repository_search', 'repository_context']\ninherit_managed_binding = true\n",
+                toml::Value::String(env!("CARGO_BIN_EXE_ferrus").to_string()),
+            ),
+        );
+        format!(
+            "mcp_config_file = {}\n",
+            toml::Value::String(peer.display().to_string())
+        )
     } else {
         String::new()
     };
@@ -590,7 +658,7 @@ fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
     private_config(
         &settings,
         &format!(
-            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\n{mcp_setting}",
+            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\nnative_context_enabled = {native_context}\nworking_set_enabled = {working_set}\n{mcp_setting}",
             listener.local_addr().unwrap(),
         ),
     );
@@ -598,6 +666,8 @@ fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
         listener,
         resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
         external_mcp,
+        graph_peer,
+        native_context,
     );
     let mut launch = fixture.command(&settings);
     if external_mcp {
@@ -688,13 +758,37 @@ fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
     );
     let journal =
         fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    assert_eq!(journal.contains("context_prepared"), working_set);
     assert!(journal.contains("not-a-json-event"));
     let results: Vec<Value> = journal
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|record| record["event"]["event"] == "tool_result")
         .collect();
-    assert_eq!(results.len(), if external_mcp { 5 } else { 4 });
+    assert_eq!(
+        results.len(),
+        if graph_peer {
+            7
+        } else if external_mcp {
+            5
+        } else {
+            4
+        }
+    );
+    if graph_peer {
+        assert!(
+            results
+                .iter()
+                .any(|result| result["event"]["outcome"]["content"]["kind"] == "repository_status")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result["event"]["outcome"]["content"]["kind"] == "repository_search")
+        );
+        assert!(results.iter().any(|result|
+            result["event"]["outcome"]["content"]["kind"] == "repository_context"));
+    }
     for result in results {
         assert_eq!(result["event"]["outcome"]["status"], "success", "{result}");
     }

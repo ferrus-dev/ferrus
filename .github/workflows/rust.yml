@@ -59,6 +59,10 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features nano-openai nano::
 
+      - name: Check Nano evaluation feature combination without update notifications
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --locked --no-default-features --features nano-openai,nano-mcp -- -D warnings
+
       - name: Set up Python for the stdio peer fixture
         uses: actions/setup-python@v5
         with:
@@ -67,7 +71,7 @@ jobs:
       - name: Check Nano stdio MCP integration
         run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
 
-      - name: Test Nano stdio MCP integration
+      - name: Test Nano stdio MCP integration and headless release gates
         run: cargo test --locked --features nano-openai,nano-mcp
 
   smoke:

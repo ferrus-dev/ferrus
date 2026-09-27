@@ -1,7 +1,8 @@
 # Nano headless launch and HQ events
 
-Status: implemented for #80. Nano is an opt-in headless Executor backend. Interactive
-sessions, Supervisor support, standalone packaging, and live crash resume are deferred.
+Status: Nano is an opt-in headless Executor backend. Interactive sessions,
+Supervisor support, and standalone packaging are deferred. Live crash recovery
+and reconciliation are implemented for #84.
 The process lifecycle is tested with a local mock API; live LM Studio validation remains opt-in.
 
 ## Configure and select
@@ -89,9 +90,11 @@ Executor; neither wait can take another agent's live lease or resume a non-Execu
 The host checks cancellation and context capacity before consuming the answer, then restores
 Executing or Addressing and includes the human answer or Supervisor response in the first model input.
 Missing answers or failed delivery checks leave the task waiting. This starts a fresh session;
-replaying interrupted tool effects remains deferred to #84.
+recovery uses the #84 journal/effect reconciliation path when a prior run was interrupted.
 
-Working-set selection is enabled by default. The managed `nano run` entry point accepts
-`--no-working-set` and optional explicit `--prefetch-path` / `--prefetch-symbol` seeds for evaluation;
+Working-set selection and native context tools are enabled by default. The owner-only provider
+file accepts `working_set_enabled` and `native_context_enabled` for managed evaluations. The
+managed `nano run` entry point also accepts `--no-working-set`, `--no-native-context`, and
+optional explicit `--prefetch-path` / `--prefetch-symbol` seeds;
 see the [working-set contract](ferrus-nano-working-set.md). These options do not change HQ task
 ownership, provider configuration, or the start/cancel protocol.

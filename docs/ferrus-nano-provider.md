@@ -25,6 +25,10 @@ temperature = 0.0
 request_timeout_ms = 120000
 include_usage = true
 
+# Independent evaluation ablations; both default to true.
+# native_context_enabled = false
+# working_set_enabled = false
+
 # Optional: omit entirely when LM Studio authentication is disabled.
 # This file contains only the token, not a shell assignment or JSON object.
 # api_key_file = "/absolute/private/host/path/lm-studio-token"

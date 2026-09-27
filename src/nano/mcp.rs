@@ -46,6 +46,9 @@ struct ServerConfig {
     cwd: Option<PathBuf>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// Explicit test-only Ferrus graph peer with the current managed binding.
+    #[serde(default)]
+    inherit_managed_binding: bool,
     /// Names explicitly granted by the host. MCP annotations grant nothing.
     allow: Vec<String>,
     #[serde(default = "default_timeout")]
@@ -54,6 +57,43 @@ struct ServerConfig {
 
 fn default_timeout() -> u64 {
     10_000
+}
+
+/// The opt-in Ferrus graph peer uses MCP as transport while the model sees
+/// the same typed graph result shape as the native adapter.
+fn graph_response(name: &str, value: &Value) -> Result<Value> {
+    use crate::repository_graph::query;
+    let content = value["content"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Missing graph content"))?;
+    ensure!(content.len() == 1, "Expected one Ferrus graph response");
+    let text = content[0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing graph text"))?;
+    ensure!(
+        text.len() <= MAX_RESULT_BYTES,
+        "Graph response exceeds limit"
+    );
+    let parsed: Value = serde_json::from_str(text)?;
+    let response = match name {
+        "repository_graph_status" => {
+            super::context::Response::RepositoryStatus(serde_json::from_value(parsed)?)
+        }
+        "repository_search" => {
+            let result = serde_json::from_value::<query::SearchResponse>(parsed.clone())
+                .map(Ok)
+                .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
+            super::context::Response::RepositorySearch(result)
+        }
+        "repository_context" => {
+            let result = serde_json::from_value::<query::ContextResponse>(parsed.clone())
+                .map(Ok)
+                .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
+            super::context::Response::RepositoryContext(result)
+        }
+        _ => anyhow::bail!("Unsupported graph peer tool"),
+    };
+    Ok(serde_json::to_value(response)?)
 }
 
 impl Config {
@@ -117,6 +157,27 @@ impl Config {
                     }),
                 "Invalid MCP environment"
             );
+            if server.inherit_managed_binding {
+                ensure!(
+                    server.command.canonicalize()? == std::env::current_exe()?.canonicalize()?
+                        && server.args == ["serve", "--role", "executor"]
+                        && server.cwd.is_none()
+                        && server.allow.iter().all(|name| matches!(
+                            name.as_str(),
+                            "repository_graph_status" | "repository_search" | "repository_context"
+                        ))
+                        && [
+                            crate::agent_id::ENV_PROJECT_ROOT,
+                            crate::agent_id::ENV_AGENT_ID,
+                            crate::agent_id::ENV_TASK_ID,
+                            crate::agent_id::ENV_RUN_ID,
+                            crate::agent_id::ENV_BASELINE_TREE
+                        ]
+                        .iter()
+                        .all(|name| !server.env.contains_key(*name)),
+                    "Managed binding is only available to the read-only Ferrus graph peer"
+                );
+            }
             ensure!(
                 !server.allow.is_empty() && server.allow.len() <= MAX_TOOLS,
                 "MCP tools must be explicitly allowed"
@@ -156,6 +217,23 @@ pub(crate) fn run_peer(config_path: &Path, server_id: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if server.inherit_managed_binding {
+        for name in [
+            crate::agent_id::ENV_PROJECT_ROOT,
+            crate::agent_id::ENV_AGENT_ID,
+            crate::agent_id::ENV_TASK_ID,
+            crate::agent_id::ENV_RUN_ID,
+        ] {
+            command.env(
+                name,
+                std::env::var_os(name)
+                    .ok_or_else(|| anyhow::anyhow!("Missing managed graph peer binding"))?,
+            );
+        }
+        if let Some(tree) = std::env::var_os(crate::agent_id::ENV_BASELINE_TREE) {
+            command.env(crate::agent_id::ENV_BASELINE_TREE, tree);
+        }
+    }
     if let Some(cwd) = &server.cwd {
         command.current_dir(cwd);
     }
@@ -252,6 +330,7 @@ struct Entry {
     input: jsonschema::Validator,
     output: Option<jsonschema::Validator>,
     schemas: (Value, Option<Value>),
+    graph_equivalence: bool,
 }
 
 struct Server {
@@ -417,7 +496,18 @@ impl McpTools {
                             && safe_schema(&schema, 0),
                         "Invalid MCP input schema"
                     );
-                    let input = jsonschema::validator_for(&schema)
+                    let provider_descriptor = if peer.inherit_managed_binding {
+                        let mut descriptor = super::native::descriptor(&tool.name);
+                        descriptor.name = name.clone();
+                        descriptor
+                    } else {
+                        ToolDescriptor {
+                            name: name.clone(),
+                            description: tool.descr.clone().unwrap_or_default(),
+                            input_schema: schema.clone(),
+                        }
+                    };
+                    let input = jsonschema::validator_for(&provider_descriptor.input_schema)
                         .map_err(|_| anyhow::anyhow!("Invalid MCP input schema"))?;
                     let output_schema = tool
                         .output_schema
@@ -438,7 +528,7 @@ impl McpTools {
                         }
                         None => None,
                     };
-                    let description = tool.descr.unwrap_or_default();
+                    let description = provider_descriptor.description.as_str();
                     ensure!(
                         description.len() <= 1024 && self.entries.len() < MAX_TOOLS,
                         "MCP catalog exceeds limit"
@@ -448,14 +538,11 @@ impl McpTools {
                         Entry {
                             server: index,
                             remote_name: tool.name,
-                            descriptor: ToolDescriptor {
-                                name,
-                                description,
-                                input_schema: schema.clone(),
-                            },
+                            descriptor: provider_descriptor,
                             input,
                             output,
                             schemas: (schema, output_schema),
+                            graph_equivalence: peer.inherit_managed_binding,
                         },
                     );
                 }
@@ -529,16 +616,24 @@ impl McpTools {
                     json!({"code":"schema_changed"}),
                 )));
             }
-            let args: HashMap<String, Value> = call
-                .arguments
-                .as_object()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .collect();
-            client.call_tool(remote_name, args).await.map_err(|_| {
-                ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"call_unconfirmed"})))
-            })
+            let args: HashMap<String, Value> = if self.entries[&call.name].graph_equivalence
+                && remote_name != "repository_graph_status"
+            {
+                [("input".into(), call.arguments.clone())].into()
+            } else {
+                call.arguments
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect()
+            };
+            client
+                .call_tool(remote_name.clone(), args)
+                .await
+                .map_err(|_| {
+                    ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"call_unconfirmed"})))
+                })
         };
         let outcome = tokio::select! {
             biased;
@@ -551,6 +646,11 @@ impl McpTools {
                             if response.is_error { ToolOutcome::Failed(ToolError::Mcp(json!({"code":"remote_error", "result":value}))) }
                             else if self.entries[&call.name].output.as_ref().is_some_and(|schema| response.struct_content.as_ref().is_none_or(|v| !schema.is_valid(v))) {
                                 ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_output"})))
+                            } else if self.entries[&call.name].graph_equivalence {
+                                match graph_response(&remote_name, &value) {
+                                    Ok(value) => ToolOutcome::Success(value),
+                                    Err(_) => ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_graph_response"}))),
+                                }
                             } else { ToolOutcome::Success(value) }
                         },
                         _ => ToolOutcome::Unknown(ToolError::OutputLimit),
@@ -738,6 +838,30 @@ mod tests {
     }
 
     #[test]
+    fn managed_graph_binding_rejects_other_commands_and_tools() {
+        let temporary = tempfile::tempdir().unwrap();
+        let command = toml::Value::String(std::env::current_exe().unwrap().display().to_string());
+        let directory = temporary.path().join("private");
+        private::directory(&directory, true).unwrap();
+        let cases = [
+            (
+                "['serve', '--role', 'executor']",
+                "['repository_search']",
+                true,
+            ),
+            ("['serve']", "['repository_search']", false),
+            ("['serve', '--role', 'executor']", "['exec']", false),
+        ];
+        for (index, (args, allow, expected)) in cases.into_iter().enumerate() {
+            let path = directory.join(format!("peer-{index}.toml"));
+            let mut file = private::file(&path, true).unwrap();
+            write!(file, "[[servers]]\nid = 'graph'\ncommand = {command}\nargs = {args}\nallow = {allow}\ninherit_managed_binding = true\n").unwrap();
+            drop(file);
+            assert_eq!(Config::load(&path).is_ok(), expected);
+        }
+    }
+
+    #[test]
     fn arguments_follow_pinned_schema() {
         let schema = json!({"type":"object", "properties":{"text":{"type":"string"}}, "required":["text"], "additionalProperties":false});
         let descriptor = ToolDescriptor {
@@ -752,6 +876,7 @@ mod tests {
             input: jsonschema::validator_for(&schema).unwrap(),
             output: None,
             schemas: (schema, None),
+            graph_equivalence: false,
         };
         let tools = McpTools {
             servers: Vec::new(),
@@ -813,6 +938,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
+                inherit_managed_binding: false,
                 allow: vec!["echo".into()],
                 timeout_ms,
             }],

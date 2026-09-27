@@ -18,6 +18,7 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     pub instructions: Instructions,
     session: FerrusSession,
     pub(super) working_set_enabled: bool,
+    pub(super) native_context_enabled: bool,
     pub(super) prefetch: Vec<Value>,
     prefetch_invalidated: bool,
     refresh: super::refresh::Refresh,
@@ -47,6 +48,7 @@ impl<B: ExecutionBackend> NativeTools<B> {
             instructions: Instructions::new(session.clone(), limits)?,
             session,
             working_set_enabled: true,
+            native_context_enabled: true,
             prefetch: Vec::new(),
             prefetch_invalidated: false,
             refresh: Default::default(),
@@ -91,7 +93,7 @@ struct Selection {
     skills: Vec<String>,
 }
 
-fn descriptor(name: &str) -> ToolDescriptor {
+pub(super) fn descriptor(name: &str) -> ToolDescriptor {
     let schema = if name == "load_instructions" {
         json!({"type":"object","properties":{
             "paths":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":256}},
@@ -208,7 +210,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         let prefetch_ready = !writers
             && !self.prefetch_invalidated
             && (!self.working_set_enabled || self.refresh.pending_reason().is_none());
-        if !self.prefetch.is_empty() && prefetch_ready {
+        if self.native_context_enabled && !self.prefetch.is_empty() && prefetch_ready {
             // Explicit host seeds only; no task-text heuristic or hidden planner.
             let request = json!({"seeds":self.prefetch, "max_results":8, "max_bytes":8192,
                 "max_depth":1, "max_duration_ms":250, "max_snippet_bytes":4096, "include_snippets":true});
@@ -255,7 +257,9 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
     }
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.coding.descriptors();
-        tools.extend(context::NAMES.iter().map(|name| descriptor(name)));
+        if self.native_context_enabled {
+            tools.extend(context::NAMES.iter().map(|name| descriptor(name)));
+        }
         tools.push(descriptor("load_instructions"));
         #[cfg(feature = "nano-mcp")]
         if let Some(mcp) = &self.mcp {
@@ -271,7 +275,9 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         {
             return mcp.validate(name, arguments);
         }
-        let valid = if name == "load_instructions" {
+        let valid = if context::NAMES.contains(&name) && !self.native_context_enabled {
+            return Err(ToolError::UnknownTool);
+        } else if name == "load_instructions" {
             serde_json::from_value::<Selection>(arguments.clone())
                 .is_ok_and(|s| s.paths.len() <= 16 && s.skills.len() <= 8)
         } else if name == "repository_fallback" {
@@ -296,6 +302,9 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
 
         if self.session.status().await.is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
+        }
+        if context::NAMES.contains(&call.name.as_str()) && !self.native_context_enabled {
+            return ToolOutcome::Failed(ToolError::UnknownTool);
         }
 
         #[cfg(feature = "nano-mcp")]
