@@ -851,6 +851,7 @@ async fn replay_rejects_a_submitted_end_without_a_confirmed_handoff() {
 struct EvidenceTools {
     workspace: super::workspace::Workspace,
     enabled: bool,
+    preparation_delay: Duration,
 }
 impl Tools for EvidenceTools {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
@@ -867,6 +868,9 @@ impl Tools for EvidenceTools {
         messages: &[Message],
         _: &Cancellation,
     ) -> Result<Option<super::working_set::Preparation>, ToolError> {
+        if !self.preparation_delay.is_zero() {
+            tokio::time::sleep(self.preparation_delay).await;
+        }
         if !self.enabled {
             return Ok(None);
         }
@@ -874,6 +878,43 @@ impl Tools for EvidenceTools {
             .map(Some)
             .map_err(|_| ToolError::OutputLimit)
     }
+}
+
+#[tokio::test]
+async fn context_assembly_includes_preparation_time() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        scripted(vec![response("done", vec![])]),
+        EvidenceTools {
+            workspace: super::workspace::Workspace::new(&root, super::workspace::Limits::default())
+                .unwrap(),
+            enabled: true,
+            preparation_delay: Duration::from_millis(40),
+        },
+        FakeHost::default(),
+        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut engine, &Cancellation::default()).await.reason,
+        EndReason::ModelFinished
+    );
+    let assembly = engine
+        .host
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            SessionEvent::ContextComposed { composition } => composition.assembly_elapsed_ms,
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        assembly >= 40,
+        "assembly time omitted preparation: {assembly}"
+    );
 }
 
 #[tokio::test]
@@ -902,6 +943,7 @@ async fn working_set_projection_is_durable_replayable_and_independently_disabled
                 )
                 .unwrap(),
                 enabled,
+                preparation_delay: Duration::ZERO,
             },
             FakeHost::default(),
             FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
@@ -964,6 +1006,7 @@ async fn uncommitted_projection_never_reaches_the_provider() {
             workspace: super::workspace::Workspace::new(&root, super::workspace::Limits::default())
                 .unwrap(),
             enabled: true,
+            preparation_delay: Duration::ZERO,
         },
         FakeHost::default(),
         RejectPreparation(FileJournal::create(&root, "session-1", Quotas::default()).unwrap()),

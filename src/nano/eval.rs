@@ -3,7 +3,7 @@
 
 use super::{
     replay::Replay,
-    session::{EndReason, GraphPeerMode, Record, SessionEvent},
+    session::{EndReason, GraphPeerMode, Record, SessionEvent, effective_settings_sha256},
     tools::ToolOutcome,
 };
 use anyhow::{Context, Result, ensure};
@@ -347,6 +347,7 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
             inherited_budget,
             launch_evidence,
             provider,
+            limits,
             ..
         } => {
             let evidence = launch_evidence
@@ -372,10 +373,21 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 evidence.graph_peer_mode == Some(expected_peer_mode),
                 "Nano journal graph peer mode does not match variant"
             );
+            let provider = provider
+                .as_ref()
+                .context("Nano journal lacks provider settings")?;
             ensure!(
-                provider.as_ref().map(|settings| settings.model.as_str())
-                    == Some(attempt.model.as_str()),
+                provider.model == attempt.model,
                 "Nano journal model does not match manifest"
+            );
+            let settings_sha256 = effective_settings_sha256(provider, limits, evidence)?;
+            ensure!(
+                evidence.settings_sha256.as_deref() == Some(settings_sha256.as_str()),
+                "Nano journal settings digest does not match effective settings"
+            );
+            ensure!(
+                attempt.settings_sha256 == settings_sha256,
+                "Nano settings digest does not match manifest"
             );
             inherited_budget.clone().unwrap_or_default()
         }
@@ -389,7 +401,6 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
     let mut seen_reads = BTreeSet::new();
     let mut calls = BTreeMap::new();
     let mut active_tools = BTreeMap::new();
-    let mut active_context = None;
     let mut tool_latencies = Vec::new();
     let mut context_latencies = Vec::new();
     for record in &records {
@@ -436,16 +447,15 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 }
             }
             SessionEvent::ContextPrepared { preparation } => {
-                active_context = Some(record.budget.elapsed_ms);
                 stale_events += preparation
                     .observations
                     .iter()
                     .filter(|item| stale_observation(item))
                     .count() as u64;
             }
-            SessionEvent::ContextComposed { .. } => {
-                if let Some(start) = active_context.take() {
-                    context_latencies.push(record.budget.elapsed_ms.saturating_sub(start));
+            SessionEvent::ContextComposed { composition } => {
+                if let Some(elapsed) = composition.assembly_elapsed_ms {
+                    context_latencies.push(elapsed);
                 }
             }
             _ => (),
@@ -513,7 +523,7 @@ fn build(manifest: Manifest) -> Result<Report> {
     );
     let suite = suite()?;
     let mut seen = BTreeSet::new();
-    let mut seen_runs = BTreeSet::new();
+    let mut seen_databases = BTreeSet::new();
     let mut rows = Vec::new();
     let mut groups: BTreeMap<GroupKey, GroupCount> = BTreeMap::new();
     for attempt in manifest.attempts {
@@ -553,13 +563,10 @@ fn build(manifest: Manifest) -> Result<Report> {
             seen.insert((group_key.clone(), attempt.sample)),
             "Duplicate evaluation sample"
         );
+        let database = std::fs::canonicalize(&attempt.database)?;
         ensure!(
-            seen_runs.insert((
-                std::fs::canonicalize(&attempt.database)?,
-                attempt.task_id.clone(),
-                attempt.run_id.clone(),
-            )),
-            "Evaluation run reused as another sample"
+            seen_databases.insert(database.clone()),
+            "Evaluation database reused across samples"
         );
         ensure!(
             attempt.variant.needs_journal() == attempt.journal.is_some(),
@@ -669,6 +676,44 @@ mod tests {
         Ok(())
     }
 
+    fn set_settings_digest(records: &mut [Record]) -> Result<String> {
+        let SessionEvent::Started {
+            provider: Some(provider),
+            limits,
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        else {
+            anyhow::bail!("Expected a Nano start with launch evidence");
+        };
+        let digest = effective_settings_sha256(provider, limits, evidence)?;
+        evidence.settings_sha256 = Some(digest.clone());
+        Ok(digest)
+    }
+
+    fn accepted_external_database(path: &Path, task: &str, run: &str, tree: &str) -> Result<()> {
+        let db = Connection::open(path)?;
+        db.execute_batch(
+            "CREATE TABLE tasks(id TEXT, status TEXT, review_cycles INTEGER);
+             CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT, role TEXT);
+             CREATE TABLE events(id INTEGER PRIMARY KEY, type TEXT, run_id TEXT, payload_json TEXT);",
+        )?;
+        db.execute("INSERT INTO tasks VALUES (?1, 'complete', 0)", [task])?;
+        db.execute(
+            "INSERT INTO runs VALUES (?1, ?2, 'completed', 'executor')",
+            params![run, task],
+        )?;
+        db.execute(
+            "INSERT INTO events(type, run_id, payload_json) VALUES ('run_started', ?1, ?2)",
+            params![run, serde_json::json!({"baseline_tree": tree}).to_string()],
+        )?;
+        db.execute(
+            "INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', ?1, ?2)",
+            params![run, serde_json::json!({"task_id": task, "check_gate": "passed", "review_cycles": 0}).to_string()],
+        )?;
+        Ok(())
+    }
+
     fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         fs::create_dir_all(to)?;
         for item in fs::read_dir(from)? {
@@ -769,6 +814,7 @@ mod tests {
                         native_context_enabled: true,
                         working_set_enabled: false,
                         graph_peer_mode: Some(GraphPeerMode::Absent),
+                        settings_sha256: None,
                     }),
                     inherited_budget: None,
                     provider: Some(Box::new(ProviderSettings {
@@ -796,11 +842,8 @@ mod tests {
                 },
             },
         ];
-        let mut file = File::create(&journal)?;
-        for record in &records {
-            serde_json::to_writer(&mut file, record)?;
-            writeln!(file)?;
-        }
+        let nano_digest = set_settings_digest(&mut records)?;
+        write_records(&journal, &records)?;
         let attempt = Attempt {
             case_id: "local_bug_fix".into(),
             variant: Variant::NanoNative,
@@ -808,7 +851,7 @@ mod tests {
             sample: 1,
             start_tree: suite()?.cases["local_bug_fix"].clone(),
             model: "mock-model".into(),
-            settings_sha256: "0".repeat(64),
+            settings_sha256: nano_digest.clone(),
             native_context_enabled: Some(true),
             working_set_enabled: Some(false),
             database: db_path,
@@ -832,6 +875,38 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         assert_eq!(report.groups[0].samples, 1);
+        let mut wrong_settings = baseline_attempt.clone();
+        wrong_settings.settings_sha256 = "0".repeat(64);
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![wrong_settings]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            provider: Some(provider),
+            ..
+        } = &mut records[0].event
+        {
+            provider.temperature = 0.5;
+        }
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![baseline_attempt.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            provider: Some(provider),
+            ..
+        } = &mut records[0].event
+        {
+            provider.temperature = 0.0;
+        }
+        write_records(&journal, &records)?;
         let mut wrong_model = baseline_attempt.clone();
         wrong_model.model = "other-model".into();
         assert!(
@@ -851,6 +926,7 @@ mod tests {
         {
             evidence.native_context_enabled = false;
         }
+        mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
         assert!(
             build(Manifest {
@@ -866,11 +942,12 @@ mod tests {
         {
             evidence.graph_peer_mode = Some(GraphPeerMode::Complete);
         }
+        mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
         assert!(
             build(Manifest {
                 version: 1,
-                attempts: vec![mcp_attempt]
+                attempts: vec![mcp_attempt.clone()]
             })
             .is_ok()
         );
@@ -878,6 +955,7 @@ mod tests {
         disabled_attempt.variant = Variant::NanoGraphDisabled;
         disabled_attempt.cache = CacheState::Disabled;
         disabled_attempt.native_context_enabled = Some(false);
+        disabled_attempt.settings_sha256 = mcp_attempt.settings_sha256.clone();
         assert!(
             build(Manifest {
                 version: 1,
@@ -892,6 +970,7 @@ mod tests {
         {
             evidence.graph_peer_mode = Some(GraphPeerMode::Absent);
         }
+        disabled_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
         assert!(
             build(Manifest {
@@ -907,6 +986,7 @@ mod tests {
         {
             evidence.native_context_enabled = true;
         }
+        assert_eq!(set_settings_digest(&mut records)?, nano_digest);
         write_records(&journal, &records)?;
         let mut wrong_flags = baseline_attempt.clone();
         wrong_flags.variant = Variant::NanoMcp;
@@ -1006,6 +1086,17 @@ mod tests {
         other_model.run_id = "run-2".into();
         other_settings.task_id = "task-3".into();
         other_settings.run_id = "run-3".into();
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![attempt.clone(), other_model.clone()],
+            })
+            .is_err()
+        );
+        other_model.database = temp.path().join("sample-2.db");
+        other_settings.database = temp.path().join("sample-3.db");
+        accepted_external_database(&other_model.database, "task-2", "run-2", &start_tree)?;
+        accepted_external_database(&other_settings.database, "task-3", "run-3", &start_tree)?;
         let report = build(Manifest {
             version: 1,
             attempts: vec![attempt.clone(), other_model, other_settings],

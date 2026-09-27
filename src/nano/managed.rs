@@ -447,6 +447,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         native_context_enabled: native.native_context_enabled,
         working_set_enabled: native.working_set_enabled,
         graph_peer_mode: Some(graph_peer_mode),
+        settings_sha256: None,
     });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
     if waiting {

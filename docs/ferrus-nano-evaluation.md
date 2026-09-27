@@ -118,9 +118,15 @@ Example manifest for one Nano attempt (repeat `attempts` for other samples):
 }
 ```
 
-Compute `settings_sha256` from the effective non-secret settings record you
-archive for the run, including the ablation flags. Do not hash or publish an
-API key. For `external_mcp`, set both ablation fields and `journal` to `null`.
+For Nano, copy `settings_sha256` from the journal's `Started.launch_evidence`.
+Nano hashes a versioned serialization of the effective provider settings,
+session limits, native-context and working-set flags, and graph-peer mode.
+The baseline tree and API key are excluded. The reporter recomputes the hash
+from the journal before grouping samples. For external runs, compute the digest
+from an archived non-secret effective settings record; the reporter cannot
+verify external settings. For `external_mcp`, set both ablation fields and
+`journal` to `null`. Use a fresh Ferrus project database for every sample;
+the reporter rejects database reuse even with different task or run IDs.
 `external_usage` may be `null`, or may contain `source`, `input_tokens`,
 `output_tokens`, `cached_tokens`, `cost_usd`, `model_turns`, and `tool_calls`
 from the external harness. The reporter does not treat self-reported external
@@ -135,8 +141,10 @@ amounts, with any inherited budget excluded from the current attempt. Cached
 tokens, cost, and peak RSS remain `null` unless measured by
 the chosen provider/process wrapper. Duplicate source bytes count only exact
 repeat `read_file` text ranges in one Nano journal; overlapping ranges and
-external-tool source bytes are not inferred. Tool and context latency are
-bounded journal elapsed-time deltas, not independent wall-clock probes.
+external-tool source bytes are not inferred. Tool latency uses bounded journal
+elapsed-time deltas. Context assembly latency is measured from before Nano
+prepares the working set through request composition and is persisted with the
+composition event. Older journals without that measurement report it as `null`.
 Missing data stays `null`, and no percentage improvement is computed.
 
 ## Release gates and recovery

@@ -1,6 +1,7 @@
 //! Transport-neutral session protocol and persisted resource accounting.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::provider::{ModelResponse, ProviderErrorKind, ProviderSettings, Usage};
 use super::tools::{EffectPlan, ToolCall, ToolOutcome};
@@ -76,6 +77,8 @@ pub(crate) struct LaunchEvidence {
     pub working_set_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_peer_mode: Option<GraphPeerMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +87,38 @@ pub(crate) enum GraphPeerMode {
     Absent,
     Partial,
     Complete,
+}
+
+pub(crate) fn effective_settings_sha256(
+    provider: &ProviderSettings,
+    limits: &Limits,
+    evidence: &LaunchEvidence,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct EffectiveSettings<'a> {
+        version: u8,
+        provider: &'a ProviderSettings,
+        limits: &'a Limits,
+        native_context_enabled: bool,
+        working_set_enabled: bool,
+        graph_peer_mode: GraphPeerMode,
+    }
+
+    let graph_peer_mode = evidence
+        .graph_peer_mode
+        .ok_or_else(|| anyhow::anyhow!("Graph peer mode is missing"))?;
+    let settings = EffectiveSettings {
+        version: 1,
+        provider,
+        limits,
+        native_context_enabled: evidence.native_context_enabled,
+        working_set_enabled: evidence.working_set_enabled,
+        graph_peer_mode,
+    };
+    Ok(Sha256::digest(serde_json::to_vec(&settings)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +274,8 @@ pub(crate) struct ContextComposition {
     pub context_window_tokens: u64,
     pub evicted_outputs: usize,
     pub summary_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
