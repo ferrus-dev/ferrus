@@ -9,7 +9,8 @@ use super::{
     native::NativeTools,
     provider::{Message, Provider},
     session::{
-        EndReason, LaunchEvidence, Limits, Record, SessionCommand, SessionEnd, SessionIdentity,
+        EndReason, GraphPeerMode, LaunchEvidence, Limits, Record, SessionCommand, SessionEnd,
+        SessionIdentity,
     },
     tools::*,
 };
@@ -434,10 +435,18 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             Err(error) => return Err(error),
         }
     }
+    #[cfg(feature = "nano-mcp")]
+    let graph_peer_mode = native
+        .mcp
+        .as_ref()
+        .map_or(GraphPeerMode::Absent, super::mcp::McpTools::graph_peer_mode);
+    #[cfg(not(feature = "nano-mcp"))]
+    let graph_peer_mode = GraphPeerMode::Absent;
     let launch_evidence = session.baseline_tree().map(|baseline_tree| LaunchEvidence {
         baseline_tree: baseline_tree.to_owned(),
         native_context_enabled: native.native_context_enabled,
         working_set_enabled: native.working_set_enabled,
+        graph_peer_mode: Some(graph_peer_mode),
     });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
     if waiting {

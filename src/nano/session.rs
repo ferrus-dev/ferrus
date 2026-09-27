@@ -74,6 +74,16 @@ pub(crate) struct LaunchEvidence {
     pub baseline_tree: String,
     pub native_context_enabled: bool,
     pub working_set_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_peer_mode: Option<GraphPeerMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GraphPeerMode {
+    Absent,
+    Partial,
+    Complete,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

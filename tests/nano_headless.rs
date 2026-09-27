@@ -771,6 +771,11 @@ fn run_headless_task(
         started["event"]["launch_evidence"]["working_set_enabled"],
         working_set
     );
+    assert_eq!(
+        started["event"]["launch_evidence"]["graph_peer_mode"],
+        if graph_peer { "complete" } else { "absent" }
+    );
+    assert_eq!(started["event"]["provider"]["model"], "override-model");
     assert_eq!(journal.contains("context_prepared"), working_set);
     assert!(journal.contains("not-a-json-event"));
     let results: Vec<Value> = journal

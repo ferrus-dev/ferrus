@@ -71,8 +71,11 @@ journal. The reporter reads the database in read-only mode and replays the
 bounded Nano journal. It requires the Executor's persisted run-start baseline
 to match the case tree and rejects tasks with multiple Executor runs, whose
 later worktree state may no longer match the pinned start. For Nano, the
-journal's launch baseline and effective native-context and working-set flags
-must also match the manifest. Older runs without this evidence cannot be used
+journal's launch baseline, effective native-context and working-set flags,
+discovered graph-peer mode, and provider model must also match the manifest.
+`nano_mcp` requires all three Ferrus graph tools from the managed MCP peer;
+the other Nano variants require that peer to be absent. Older runs without
+this evidence cannot be used
 as pinned samples. The reporter rejects reuse of a database/task/run as another
 sample, including under a different model or settings group. It reports
 acceptance only when the task is `complete`

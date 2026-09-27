@@ -3,7 +3,7 @@
 
 use super::{
     replay::Replay,
-    session::{EndReason, Record, SessionEvent},
+    session::{EndReason, GraphPeerMode, Record, SessionEvent},
     tools::ToolOutcome,
 };
 use anyhow::{Context, Result, ensure};
@@ -346,6 +346,7 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
         SessionEvent::Started {
             inherited_budget,
             launch_evidence,
+            provider,
             ..
         } => {
             let evidence = launch_evidence
@@ -361,6 +362,20 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                     Some(evidence.working_set_enabled)
                 ) == (attempt.native_context_enabled, attempt.working_set_enabled),
                 "Nano journal ablation flags do not match manifest"
+            );
+            let expected_peer_mode = if matches!(attempt.variant, Variant::NanoMcp) {
+                GraphPeerMode::Complete
+            } else {
+                GraphPeerMode::Absent
+            };
+            ensure!(
+                evidence.graph_peer_mode == Some(expected_peer_mode),
+                "Nano journal graph peer mode does not match variant"
+            );
+            ensure!(
+                provider.as_ref().map(|settings| settings.model.as_str())
+                    == Some(attempt.model.as_str()),
+                "Nano journal model does not match manifest"
             );
             inherited_budget.clone().unwrap_or_default()
         }
@@ -645,6 +660,15 @@ mod tests {
     };
     use std::{fs, process::Command};
 
+    fn write_records(path: &Path, records: &[Record]) -> Result<()> {
+        let mut file = File::create(path)?;
+        for record in records {
+            serde_json::to_writer(&mut file, record)?;
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
     fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         fs::create_dir_all(to)?;
         for item in fs::read_dir(from)? {
@@ -744,9 +768,22 @@ mod tests {
                         baseline_tree: start_tree.clone(),
                         native_context_enabled: true,
                         working_set_enabled: false,
+                        graph_peer_mode: Some(GraphPeerMode::Absent),
                     }),
                     inherited_budget: None,
-                    provider: None::<Box<ProviderSettings>>,
+                    provider: Some(Box::new(ProviderSettings {
+                        api: "openai_chat_completions_v1".into(),
+                        base_url: "http://127.0.0.1:1234/v1".into(),
+                        model: "mock-model".into(),
+                        context_tokens: 32768,
+                        max_output_tokens: 4096,
+                        temperature: 0.0,
+                        request_timeout_ms: 120000,
+                        wire_bytes: 4 * 1024 * 1024,
+                        event_bytes: 256 * 1024,
+                        max_tool_calls: 64,
+                        include_usage: true,
+                    })),
                 },
             },
             Record {
@@ -795,6 +832,82 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         assert_eq!(report.groups[0].samples, 1);
+        let mut wrong_model = baseline_attempt.clone();
+        wrong_model.model = "other-model".into();
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![wrong_model]
+            })
+            .is_err()
+        );
+        let mut mcp_attempt = baseline_attempt.clone();
+        mcp_attempt.variant = Variant::NanoMcp;
+        mcp_attempt.native_context_enabled = Some(false);
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.native_context_enabled = false;
+        }
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.graph_peer_mode = Some(GraphPeerMode::Complete);
+        }
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt]
+            })
+            .is_ok()
+        );
+        let mut disabled_attempt = baseline_attempt.clone();
+        disabled_attempt.variant = Variant::NanoGraphDisabled;
+        disabled_attempt.cache = CacheState::Disabled;
+        disabled_attempt.native_context_enabled = Some(false);
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![disabled_attempt.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.graph_peer_mode = Some(GraphPeerMode::Absent);
+        }
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![disabled_attempt]
+            })
+            .is_ok()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.native_context_enabled = true;
+        }
+        write_records(&journal, &records)?;
         let mut wrong_flags = baseline_attempt.clone();
         wrong_flags.variant = Variant::NanoMcp;
         wrong_flags.native_context_enabled = Some(false);

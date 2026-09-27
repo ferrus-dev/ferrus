@@ -1,6 +1,6 @@
 //! Explicit external stdio tools. Ferrus tools stay native and retain their names.
 
-use super::{private, tools::*};
+use super::{private, session::GraphPeerMode, tools::*};
 use anyhow::{Result, ensure};
 use neva::client::Client;
 use serde::Deserialize;
@@ -388,6 +388,34 @@ enum Launch {
 }
 
 impl McpTools {
+    pub(crate) fn graph_peer_mode(&self) -> GraphPeerMode {
+        let graph_tools: Vec<_> = self
+            .entries
+            .values()
+            .filter(|entry| entry.graph_equivalence)
+            .collect();
+        if graph_tools.is_empty() {
+            GraphPeerMode::Absent
+        } else if graph_tools.len() == 3
+            && graph_tools
+                .iter()
+                .all(|entry| entry.server == graph_tools[0].server)
+            && graph_tools
+                .iter()
+                .map(|entry| entry.remote_name.as_str())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([
+                    "repository_graph_status",
+                    "repository_search",
+                    "repository_context",
+                ])
+        {
+            GraphPeerMode::Complete
+        } else {
+            GraphPeerMode::Partial
+        }
+    }
+
     pub(crate) async fn connect(
         config_path: &Path,
         native: &[ToolDescriptor],
