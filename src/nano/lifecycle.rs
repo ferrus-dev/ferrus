@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 pub(super) const NAMES: &[&str] = &["check", "submit", "consult", "ask_human"];
@@ -152,14 +153,87 @@ async fn run_check(
 struct Pin {
     workspace: PathBuf,
     task: String,
+    database: PathBuf,
+    run: String,
     armed: bool,
+    commit_attempted: bool,
+    commit_started: bool,
 }
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        if self.armed {
+        if self.should_release() {
             let _ = release_submitted_tree_pin(&self.workspace, &self.task);
         }
+    }
+}
+
+impl Pin {
+    fn should_release(&self) -> bool {
+        self.armed
+            && !self.commit_started
+            && (!self.commit_attempted || self.submission_committed() == Some(false))
+    }
+
+    fn submission_committed(&self) -> Option<bool> {
+        use rusqlite::{OpenFlags, TransactionBehavior};
+
+        // The async caller can be dropped while the SQLite transaction is still
+        // committing on a blocking worker. Serialize with that writer before
+        // deleting the ref; a busy/unreadable database leaves a safe orphan.
+        let mut connection = rusqlite::Connection::open_with_flags(
+            &self.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .ok()?;
+        connection.busy_timeout(Duration::from_millis(100)).ok()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .ok()?;
+        transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND type = 'submitted')",
+                [&self.run],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn pin_survives_an_unsettled_commit_and_an_authoritative_submission() {
+        let root = tempfile::TempDir::new().unwrap();
+        let database = root.path().join("ferrus.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE events (run_id TEXT, type TEXT)")
+            .unwrap();
+        let mut pin = Pin {
+            workspace: root.path().into(),
+            task: "task".into(),
+            database,
+            run: "run".into(),
+            armed: true,
+            commit_attempted: true,
+            commit_started: true,
+        };
+        assert!(!pin.should_release());
+        pin.commit_started = false;
+        assert!(pin.should_release());
+        pin.commit_attempted = false;
+        assert!(pin.should_release());
+        pin.commit_attempted = true;
+        connection
+            .execute(
+                "INSERT INTO events (run_id, type) VALUES ('run', 'submitted')",
+                [],
+            )
+            .unwrap();
+        assert!(!pin.should_release());
     }
 }
 
@@ -219,7 +293,11 @@ pub(super) async fn submit(
     let mut pin = Pin {
         workspace: session.workspace().into(),
         task: context.task_id.clone(),
+        database: session.scope.database_path.clone(),
+        run: session.scope.run_id.clone(),
         armed: false,
+        commit_attempted: false,
+        commit_started: false,
     };
 
     let mut freeze_failed = false;
@@ -302,7 +380,11 @@ pub(super) async fn submit(
     let task_id = context.task_id.clone();
     let stop = stop.clone();
 
-    session
+    // If this future is dropped, the blocking transaction may still commit.
+    // Preserve the pin until a later authoritative cleanup can decide.
+    pin.commit_attempted = true;
+    pin.commit_started = true;
+    let publication = session
         .mutate(move |tx, scope, context| {
             working(&context)?;
 
@@ -338,7 +420,9 @@ pub(super) async fn submit(
 
             project::executor_event(tx, scope, "submitted", json!({"content_bytes":content.len(), "check_gate":if skipped { "skipped" } else { "passed" }}))
         })
-        .await?;
+        .await;
+    pin.commit_started = false;
+    publication?;
 
     if keep_pin {
         pin.armed = false;
@@ -394,7 +478,8 @@ pub(super) async fn poll_answer(session: &FerrusSession, human: bool) -> Result<
     poll_answer_checked(session, human, |_| Ok(())).await
 }
 
-/// Validate delivery before committing restoration or clearing the answer artifacts.
+/// Validate delivery before committing restoration. Keep the response until a
+/// durable Nano record can prove delivery across a process crash.
 pub(super) async fn poll_answer_checked(
     session: &FerrusSession,
     human: bool,
@@ -481,7 +566,6 @@ pub(super) async fn poll_answer_checked(
 
             let result = json!({"status":"answered", "answer":text.trim(), "resumed_state":status});
             validate(&result)?;
-            clear(&directory, name)?;
             clear(
                 &directory,
                 if human {

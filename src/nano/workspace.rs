@@ -643,6 +643,14 @@ impl SearchResult {
 }
 
 impl Tools for Workspace {
+    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
+        if call.name != "apply_patch" {
+            return None;
+        }
+        let request: PatchRequest = serde_json::from_value(call.arguments.clone()).ok()?;
+        self.patch_effect_plan(request)
+    }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let string = json!({"type":"string"});
         let positive = json!({"type":"integer","minimum":1});

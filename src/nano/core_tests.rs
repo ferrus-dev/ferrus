@@ -297,6 +297,7 @@ async fn multiple_tools_keep_call_result_order_and_continuation_data() {
         .iter()
         .filter_map(|record| match &record.event {
             SessionEvent::ToolIntent { call_id, .. } => Some(format!("intent:{call_id}")),
+            SessionEvent::ToolStarted { call_id } => Some(format!("started:{call_id}")),
             SessionEvent::ToolResult { call_id, .. } => Some(format!("result:{call_id}")),
             _ => None,
         })
@@ -305,8 +306,10 @@ async fn multiple_tools_keep_call_result_order_and_continuation_data() {
         order,
         [
             "intent:call-1",
+            "started:call-1",
             "result:call-1",
             "intent:call-2",
+            "started:call-2",
             "result:call-2"
         ]
     );

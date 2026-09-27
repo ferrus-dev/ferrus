@@ -27,7 +27,8 @@ use tokio::{
     time::{Duration, Instant},
 };
 
-const STATE_BYTES: u64 = 2048;
+pub(crate) const STATE_BYTES: u64 = 2048;
+pub(crate) const MAX_PROCESSES: usize = 256;
 const MAX_PAGE: usize = 2048;
 const MAX_WAIT_MS: u64 = 1000;
 const CLEANUP_MS: u64 = 2000;
@@ -183,7 +184,7 @@ impl<B: ExecutionBackend> Commands<B> {
         ensure!(
             (1..=16).contains(&limits.concurrent)
                 && limits.concurrent <= limits.processes
-                && limits.processes <= 256
+                && limits.processes <= MAX_PROCESSES
                 && (1..=3_600_000).contains(&limits.duration_ms)
                 && (1..=64 * 1024 * 1024).contains(&limits.process_output_bytes)
                 && limits.total_bytes >= STATE_BYTES + limits.process_output_bytes

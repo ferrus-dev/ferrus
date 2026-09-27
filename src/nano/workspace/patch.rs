@@ -78,6 +78,34 @@ struct Plan {
 }
 
 impl Workspace {
+    pub(crate) fn patch_effect_plan(&self, request: PatchRequest) -> Option<EffectPlan> {
+        let plans = self
+            .prepare(request, Instant::now(), &Cancellation::default())
+            .ok()?;
+        Some(EffectPlan::Patch {
+            files: plans
+                .into_iter()
+                .map(|plan| PlannedFile {
+                    path: plan.path,
+                    before_digest: plan.before,
+                    after_digest: plan.after.as_deref().map(|text| digest(text.as_bytes())),
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn current_digest(&self, value: &str) -> Result<Option<String>> {
+        let name = path(value)?;
+        let parent = self.root.parent(&name).map_err(|e| Failure::io(&name, e))?;
+        match parent.open() {
+            Ok(file) => self
+                .read_content(file, &name)
+                .map(|content| Some(content.digest)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Failure::io(&name, error)),
+        }
+    }
+
     pub(crate) async fn apply_patch(
         &mut self,
         request: PatchRequest,

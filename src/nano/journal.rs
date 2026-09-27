@@ -181,6 +181,14 @@ impl FileJournal {
     /// Charge the remaining elapsed budget and end any interrupted attempt durably.
     /// Opening a journal never executes or resumes recorded effects.
     pub(crate) fn recover(directory: &Path, quotas: Quotas) -> Result<(Self, Vec<Record>)> {
+        let (mut journal, mut records) = Self::recover_open(directory, quotas)?;
+        journal.seal_interrupted(&mut records)?;
+        Ok((journal, records))
+    }
+
+    /// The caller must reconcile a pending intent and seal the interrupted
+    /// attempt before it releases the writer lock.
+    pub(crate) fn recover_open(directory: &Path, quotas: Quotas) -> Result<(Self, Vec<Record>)> {
         private::check(directory, true)?;
         let session_id = directory
             .file_name()
@@ -248,7 +256,7 @@ impl FileJournal {
 
         file.seek(SeekFrom::End(0))?;
 
-        let mut journal = Self {
+        let journal = Self {
             directory: directory.to_path_buf(),
             _lock: lock,
             file,
@@ -262,7 +270,15 @@ impl FileJournal {
             poisoned: false,
         };
 
-        if journal.state.end.is_none()
+        Ok((journal, records))
+    }
+
+    pub(crate) fn seal_interrupted(&mut self, records: &mut Vec<Record>) -> Result<()> {
+        self.seal_with(records, EndReason::Limit(LimitKind::Elapsed))
+    }
+
+    pub(crate) fn seal_with(&mut self, records: &mut Vec<Record>, reason: EndReason) -> Result<()> {
+        if self.state.end.is_none()
             && let Some(Record {
                 event: SessionEvent::Started { limits, .. },
                 ..
@@ -271,18 +287,12 @@ impl FileJournal {
             // The process-local clock cannot account for an uncommitted wait.
             // Exhaust the remaining allowance even at a complete checkpoint;
             // keep pending effects and token reservations for reconciliation.
-            let mut budget = journal.state.budget.clone();
+            let mut budget = self.state.budget.clone();
             budget.elapsed_ms = budget.elapsed_ms.max(limits.elapsed_ms);
 
-            records.push(journal.append(
-                SessionEvent::Ended {
-                    reason: EndReason::Limit(LimitKind::Elapsed),
-                },
-                &budget,
-            )?);
+            records.push(self.append(SessionEvent::Ended { reason }, &budget)?);
         }
-
-        Ok((journal, records))
+        Ok(())
     }
 
     pub(crate) fn state(&self) -> &Replay {
@@ -454,13 +464,17 @@ fn measure(directory: &Path, quotas: &Quotas) -> Result<(u64, usize)> {
         private::check(&dir, true)?;
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            if dir == directory
-                && matches!(
-                    path.file_name().and_then(|n| n.to_str()),
-                    Some("outputs" | "checkpoints")
-                )
-            {
-                continue;
+            if dir == directory {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("outputs" | "checkpoints") => continue,
+                    Some("commands") => {
+                        // Command spools have their own session quota. Validate the
+                        // private directory, but do not charge its files twice.
+                        private::check(&path, true)?;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             private::check(&path, false)?;
 

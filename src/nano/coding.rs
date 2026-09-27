@@ -12,6 +12,10 @@ pub(crate) struct CodingTools<B: ExecutionBackend> {
 }
 
 impl<B: ExecutionBackend> Tools for CodingTools<B> {
+    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
+        self.workspace.effect_plan(call)
+    }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.workspace.descriptors();
         tools.extend(self.commands.descriptors());

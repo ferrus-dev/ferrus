@@ -715,13 +715,16 @@ fn run_headless_task(resume: Option<(&'static str, bool)>, external_mcp: bool) {
             .unwrap(),
             1
         );
-        for name in [request_file, response_file] {
-            assert!(
-                fs::read_to_string(fixture.root.join(".ferrus/runs/t-001").join(name))
-                    .unwrap_or_default()
-                    .is_empty()
-            );
-        }
+        let run_dir = fixture.root.join(".ferrus/runs/t-001");
+        assert!(
+            fs::read_to_string(run_dir.join(request_file))
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_to_string(run_dir.join(response_file)).unwrap(),
+            "Use forty-two."
+        );
     }
     drop(stdin);
 }

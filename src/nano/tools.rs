@@ -30,6 +30,20 @@ pub(crate) struct ValidatedCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlannedFile {
+    pub path: String,
+    pub before_digest: Option<String>,
+    pub after_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum EffectPlan {
+    Patch { files: Vec<PlannedFile> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolError {
     UnknownTool,
@@ -99,6 +113,11 @@ pub(crate) trait Tools {
 
     /// The adapter owns schema validation; execution receives only the validated object.
     fn validate(&self, name: &str, arguments: &serde_json::Value) -> Result<(), ToolError>;
+
+    /// Record deterministic file preconditions before a potentially partial edit.
+    fn effect_plan(&self, _call: &ValidatedCall) -> Option<EffectPlan> {
+        None
+    }
 
     /// Implementations must clean up owned processes on drop and reconcile effects whose
     /// completion cannot be observed. Cancellation/deadline may drop this future.

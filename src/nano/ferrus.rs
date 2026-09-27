@@ -180,6 +180,82 @@ impl FerrusSession {
         .await
     }
 
+    /// Inspect only the contiguous prior Executor runs for this agent, task,
+    /// and workspace. Empty runs may be skipped, but a different owner or
+    /// workspace is a hard history boundary. No prior lease is inherited.
+    pub(crate) async fn previous_nano_runs(&self) -> Result<Vec<String>> {
+        let workspace = self.workspace().to_string_lossy().into_owned();
+        self.mutate(move |tx, scope, _| {
+            let mut statement = tx.prepare(
+                "SELECT id, agent, workspace_path, status FROM runs \
+                 WHERE rowid < (SELECT rowid FROM runs WHERE id = ?1) \
+                 AND task_id = ?2 AND role = 'executor' \
+                 ORDER BY rowid DESC LIMIT 65",
+            )?;
+            let rows =
+                statement.query_map(rusqlite::params![scope.run_id, scope.task_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+            let mut runs = Vec::new();
+            for row in rows {
+                let (id, agent, path, status) = row?;
+                if agent != scope.agent_id || path != workspace {
+                    break;
+                }
+                ensure!(
+                    matches!(status.as_str(), "failed" | "interrupted" | "completed"),
+                    "Previous Executor run is still active"
+                );
+                runs.push(id);
+            }
+            Ok(runs)
+        })
+        .await
+    }
+
+    pub(crate) async fn fail_unknown_effect(&self) -> Result<()> {
+        self.mutate(|tx, scope, context| {
+            ensure!(
+                matches!(
+                    context.status.as_str(),
+                    "executing" | "addressing" | "consultation" | "awaiting_human"
+                ),
+                "Unknown effect cannot fail a terminal task"
+            );
+            let updated = tx.execute(
+                "UPDATE tasks SET status = 'failed', failure_reason = 'nano_effect_unknown', \
+                 claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL WHERE id = ?1",
+                [&scope.task_id],
+            )?;
+            ensure!(updated == 1, "Bound task disappeared");
+            project::executor_event(
+                tx,
+                scope,
+                "nano_effect_unknown",
+                serde_json::json!({"task_id":scope.task_id}),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn previous_submit_committed(&self, run_id: String) -> Result<bool> {
+        self.mutate(move |tx, _, _| {
+            let committed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND type = 'submitted')",
+                [run_id],
+                |row| row.get(0),
+            )?;
+            Ok(committed)
+        })
+        .await
+    }
+
     pub(super) async fn mutate<T: Send + 'static>(
         &self,
         operation: impl FnOnce(

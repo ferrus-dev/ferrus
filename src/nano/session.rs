@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::provider::{ModelResponse, ProviderErrorKind, ProviderSettings, Usage};
-use super::tools::{ToolCall, ToolOutcome};
+use super::tools::{EffectPlan, ToolCall, ToolOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +152,8 @@ pub(crate) enum SessionEvent {
         limits: Limits,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_budget: Option<Budget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<Box<ProviderSettings>>,
     },
     ModelStarted {
@@ -184,6 +186,14 @@ pub(crate) enum SessionEvent {
     ToolIntent {
         call_id: String,
         call: ToolCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect_plan: Option<EffectPlan>,
+        /// Legacy records had no separate execution boundary.
+        #[serde(default, skip_serializing_if = "is_false")]
+        start_recorded: bool,
+    },
+    ToolStarted {
+        call_id: String,
     },
     ToolResult {
         call_id: String,
@@ -192,6 +202,10 @@ pub(crate) enum SessionEvent {
     Ended {
         reason: EndReason,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

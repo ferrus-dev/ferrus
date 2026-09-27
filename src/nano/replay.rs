@@ -10,6 +10,13 @@ use std::collections::VecDeque;
 
 pub(crate) const JOURNAL_VERSION: u32 = 1;
 
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Replay {
     pub sequence: u64,
@@ -20,6 +27,8 @@ pub(crate) struct Replay {
     pub summary: Option<super::compaction::Summary>,
     pub end: Option<EndReason>,
     pub pending_effect: Option<String>,
+    pending_requires_start: bool,
+    effect_started: bool,
     pub unknown_effects: Vec<String>,
     model_active: bool,
     compaction_active: bool,
@@ -92,6 +101,19 @@ impl Replay {
         expected.no_progress = after.no_progress;
 
         match &record.event {
+            SessionEvent::Started {
+                inherited_budget: Some(inherited),
+                ..
+            } => {
+                ensure!(
+                    before == &Budget::default()
+                        && inherited.elapsed_ms == 0
+                        && inherited.reserved_input_tokens == 0
+                        && inherited.reserved_output_tokens == 0,
+                    "Invalid inherited session budget"
+                );
+                expected = inherited.clone();
+            }
             SessionEvent::ModelStarted { .. } | SessionEvent::CompactionStarted { .. } => {
                 ensure!(
                     before.reserved_input_tokens == 0
@@ -129,9 +151,17 @@ impl Replay {
         );
 
         match &record.event {
-            SessionEvent::Started { limits, input, .. } => {
+            SessionEvent::Started {
+                limits,
+                input,
+                inherited_budget,
+                ..
+            } => {
                 ensure!(
-                    self.sequence == 0 && after == &Budget::default(),
+                    self.sequence == 0
+                        && inherited_budget
+                            .as_ref()
+                            .map_or(after == &Budget::default(), |inherited| after == inherited),
                     "Duplicate or charged session start"
                 );
                 limits.validate()?;
@@ -250,7 +280,12 @@ impl Replay {
                 self.compaction_cut = None;
                 self.final_response_ready = false;
             }
-            SessionEvent::ToolIntent { call_id, call } => {
+            SessionEvent::ToolIntent {
+                call_id,
+                call,
+                effect_plan,
+                start_recorded,
+            } => {
                 ensure!(
                     self.pending_effect.is_none() && self.calls.front() == Some(call),
                     "Tool intent out of model order"
@@ -260,13 +295,43 @@ impl Replay {
                         && *call_id == format!("call-{}", after.tool_calls),
                     "Invalid tool call ID"
                 );
+                if let Some(super::tools::EffectPlan::Patch { files }) = effect_plan {
+                    ensure!(
+                        call.name == "apply_patch"
+                            && !files.is_empty()
+                            && files.len() <= 16
+                            && files.iter().all(|file| {
+                                !file.path.is_empty()
+                                    && file.before_digest.as_deref().is_none_or(valid_digest)
+                                    && file.after_digest.as_deref().is_none_or(valid_digest)
+                            }),
+                        "Invalid patch effect plan"
+                    );
+                }
                 self.pending_effect = Some(call_id.clone());
+                self.pending_requires_start = *start_recorded;
+                self.effect_started = false;
                 self.submitted = false;
+            }
+            SessionEvent::ToolStarted { call_id } => {
+                ensure!(
+                    self.pending_effect.as_ref() == Some(call_id)
+                        && self.pending_requires_start
+                        && !self.effect_started,
+                    "Tool start has no matching unstarted intent"
+                );
+                self.effect_started = true;
             }
             SessionEvent::ToolResult { call_id, outcome } => {
                 ensure!(
                     self.pending_effect.as_ref() == Some(call_id),
                     "Tool result has no matching intent"
+                );
+                ensure!(
+                    !self.pending_requires_start
+                        || self.effect_started
+                        || matches!(outcome, ToolOutcome::Failed(_)),
+                    "Unstarted tool cannot succeed or have an unknown effect"
                 );
                 let call = self.calls.pop_front().expect("intent checked call queue");
                 self.submitted = call.name == "submit"
@@ -279,6 +344,8 @@ impl Replay {
                     self.unknown_effects.push(call_id.clone());
                 }
                 self.pending_effect = None;
+                self.pending_requires_start = false;
+                self.effect_started = false;
             }
             SessionEvent::Ended { reason } => {
                 if *reason == EndReason::Submitted {
