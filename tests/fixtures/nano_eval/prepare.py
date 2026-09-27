@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -30,13 +31,20 @@ def main():
     tree = git(destination, "write-tree")
     if tree != suite["cases"][case]:
         raise SystemExit(f"fixture tree changed: {tree}")
-    git(
-        destination,
-        "-c", "user.name=Nano Eval",
-        "-c", "user.email=nano-eval@example.invalid",
-        "-c", "commit.gpgsign=false",
-        "commit", "-q", "-m", f"nano eval {case}",
-    )
+    # An empty hooks path disables pre- and post-commit hooks from host config.
+    with tempfile.TemporaryDirectory(prefix="nano-eval-hooks-") as hooks:
+        git(
+            destination,
+            "-c", f"core.hooksPath={hooks}",
+            "-c", "user.name=Nano Eval",
+            "-c", "user.email=nano-eval@example.invalid",
+            "-c", "commit.gpgsign=false",
+            "commit", "-q", "-m", f"nano eval {case}",
+        )
+    if git(destination, "rev-parse", "HEAD^{tree}") != tree:
+        raise SystemExit("committed fixture tree changed")
+    if git(destination, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise SystemExit("prepared fixture workspace is not clean")
     print(json.dumps({"case_id": case, "start_tree": tree, "directory": str(destination)}))
 
 
