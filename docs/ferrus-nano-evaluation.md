@@ -68,9 +68,11 @@ in `harness_notes`; exclude mismatched samples from a transport-only claim.
 After each attempt, record the database path, task and Executor run IDs,
 measured wall time, and (for Nano) its `nano/sessions/<run-id>/events.jsonl`
 journal. The reporter reads the database in read-only mode and replays the
-bounded Nano journal. It reports acceptance only when the task is `complete`,
-the task's latest submission belongs to that attempt with `check_gate: passed`,
-and its latest review decision is approval after that submission.
+bounded Nano journal. It reports acceptance only when the task is `complete`
+and the latest submission committed with the Reviewing transition belongs to
+that attempt, in the current review cycle, with `check_gate: passed`. The
+`submitted` and `approved` diagnostic events are best-effort and do not gate
+acceptance.
 Its grouped output includes sample counts and total-time min/p50/p95/max;
 groups separate case, variant, cache state, model, and settings digest.
 

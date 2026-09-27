@@ -416,6 +416,7 @@ pub(super) async fn submit(
                 Some(scope.run_id.clone()),
                 frozen,
                 freeze_failed,
+                !skipped,
             )?;
 
             project::executor_event(tx, scope, "submitted", json!({"content_bytes":content.len(), "check_gate":if skipped { "skipped" } else { "passed" }}))

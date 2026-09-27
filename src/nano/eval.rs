@@ -242,7 +242,7 @@ fn stale_observation(value: &serde_json::Value) -> bool {
     })
 }
 
-fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64, bool)> {
+fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64)> {
     let db = Connection::open_with_flags(&attempt.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let (task_status, cycles): (String, u32) = db.query_row(
         "SELECT status, review_cycles FROM tasks WHERE id = ?1",
@@ -268,38 +268,26 @@ fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64,
         [&attempt.task_id],
         |row| row.get(0),
     )?;
-    let final_submission: Option<(i64, String, String)> = db
+    let final_submission: Option<(String, String)> = db
         .query_row(
-            "SELECT e.id, e.run_id, e.payload_json FROM events e
+            "SELECT e.run_id, e.payload_json FROM events e
              JOIN runs r ON r.id = e.run_id
-             WHERE r.task_id = ?1 AND e.type = 'submitted'
-             ORDER BY e.id DESC LIMIT 1",
-            [&attempt.task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let final_gate_passed = if let Some((_, run_id, payload)) = &final_submission {
-        ensure!(payload.len() <= 8192, "Submit event payload exceeds limit");
-        let value: serde_json::Value = serde_json::from_str(payload)?;
-        run_id == &attempt.run_id && value["check_gate"] == "passed"
-    } else {
-        false
-    };
-    let final_decision: Option<(i64, String)> = db
-        .query_row(
-            "SELECT e.id, e.type FROM events e
-             JOIN runs r ON r.id = e.run_id
-             WHERE r.task_id = ?1 AND e.type IN ('approved', 'rejected')
+             WHERE r.task_id = ?1 AND e.type = 'submission_committed'
              ORDER BY e.id DESC LIMIT 1",
             [&attempt.task_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let approved_latest = matches!(
-        (final_submission, final_decision),
-        (Some((submission_id, _, _)), Some((decision_id, decision)))
-            if decision == "approved" && decision_id > submission_id
-    );
+    let final_gate_passed = if let Some((run_id, payload)) = &final_submission {
+        ensure!(payload.len() <= 8192, "Submit event payload exceeds limit");
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        run_id == &attempt.run_id
+            && value["task_id"] == attempt.task_id
+            && value["review_cycles"].as_u64() == Some(u64::from(cycles))
+            && value["check_gate"] == "passed"
+    } else {
+        false
+    };
     Ok((
         task_status,
         run_status,
@@ -307,7 +295,6 @@ fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64,
         count_run("check_passed")?,
         final_gate_passed,
         approvals.try_into()?,
-        approved_latest,
     ))
 }
 
@@ -528,15 +515,8 @@ fn build(manifest: Manifest) -> Result<Report> {
             (attempt.native_context_enabled, attempt.working_set_enabled) == expected_flags,
             "Variant/ablation flags mismatch"
         );
-        let (
-            task_status,
-            run_status,
-            review_cycles,
-            checks,
-            final_gate_passed,
-            approvals,
-            approved_latest,
-        ) = task_state(&attempt)?;
+        let (task_status, run_status, review_cycles, checks, final_gate_passed, approvals) =
+            task_state(&attempt)?;
         let (metrics, nano_end_reason) = if attempt.variant.needs_journal() {
             nano_metrics(&attempt)?
         } else {
@@ -544,7 +524,6 @@ fn build(manifest: Manifest) -> Result<Report> {
         };
         let accepted = task_status == "complete"
             && final_gate_passed
-            && approved_latest
             && (!attempt.variant.needs_journal() || nano_end_reason == Some(EndReason::Submitted));
         let entry = groups
             .entry(GroupKey {
@@ -692,6 +671,7 @@ mod tests {
             INSERT INTO tasks VALUES ('task', 'reviewing', 0);
             INSERT INTO runs VALUES ('run', 'task', 'completed');
             INSERT INTO events(type, run_id, payload_json) VALUES ('check_passed', 'run', '{}');
+            INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'run', '{"task_id":"task","check_gate":"passed","review_cycles":0}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('submitted', 'run', '{"check_gate":"passed"}');"#,
         )?;
         let identity = SessionIdentity {
@@ -793,10 +773,7 @@ mod tests {
         assert!(report.attempts.iter().all(|row| !row.accepted));
         assert!(serde_json::to_value(report)?.is_object());
         db.execute("UPDATE tasks SET status='complete'", [])?;
-        db.execute(
-            "INSERT INTO events(type, run_id, payload_json) VALUES ('approved','run','{}')",
-            [],
-        )?;
+        db.execute("DELETE FROM events WHERE type = 'submitted'", [])?;
         let attempt = Attempt {
             case_id: "local_bug_fix".into(),
             variant: Variant::ExternalMcp,
@@ -827,10 +804,30 @@ mod tests {
             attempts: vec![attempt],
         })?;
         assert!(report.attempts[0].accepted);
+        assert_eq!(report.attempts[0].approved_events, 0);
+        db.execute(
+            "UPDATE events SET payload_json = '{\"task_id\":\"task\",\"check_gate\":\"skipped\",\"review_cycles\":0}' WHERE type = 'submission_committed'",
+            [],
+        )?;
+        let report = build(Manifest {
+            version: 1,
+            attempts: vec![accepted_attempt.clone()],
+        })?;
+        assert!(!report.attempts[0].accepted);
+        db.execute(
+            "UPDATE events SET payload_json = '{\"task_id\":\"task\",\"check_gate\":\"passed\",\"review_cycles\":0}' WHERE type = 'submission_committed'",
+            [],
+        )?;
+        db.execute("UPDATE tasks SET review_cycles=1", [])?;
+        let report = build(Manifest {
+            version: 1,
+            attempts: vec![accepted_attempt.clone()],
+        })?;
+        assert!(!report.attempts[0].accepted);
         db.execute_batch(
             r#"INSERT INTO runs VALUES ('later', 'task', 'completed');
             INSERT INTO events(type, run_id, payload_json) VALUES ('rejected', 'run', '{}');
-            INSERT INTO events(type, run_id, payload_json) VALUES ('submitted', 'later', '{"check_gate":"passed"}');
+            INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'later', '{"task_id":"task","check_gate":"passed","review_cycles":1}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('approved', 'later', '{}');"#,
         )?;
         let report = build(Manifest {

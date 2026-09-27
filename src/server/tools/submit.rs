@@ -92,7 +92,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         info!("No check commands configured; treating final check gate as pass");
         let frozen_view =
             crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
-        persist_submission(&context, &content, frozen_view).await?;
+        persist_submission(&context, &content, frozen_view, false).await?;
         project::record_runtime_event_best_effort(
             context.run_id.clone(),
             "submitted",
@@ -117,7 +117,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
         CheckGateResult::Passed => {
             let frozen_view =
                 crate::repository_graph_runtime::prepare_submitted_repository_view(&context).await;
-            persist_submission(&context, &content, frozen_view).await?;
+            persist_submission(&context, &content, frozen_view, true).await?;
             project::record_runtime_event_best_effort(
                 context.run_id.clone(),
                 "submitted",
@@ -545,6 +545,7 @@ fn temporary_file_path(prefix: &str) -> PathBuf {
 async fn record_submission(
     context: &RuntimeTaskContext,
     freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
+    checks_passed: bool,
 ) -> Result<()> {
     let (frozen_view, failed) = match &freeze {
         crate::repository_graph_runtime::RepositoryViewFreeze::NotAttempted => (None, false),
@@ -557,6 +558,7 @@ async fn record_submission(
         context.run_id.as_deref(),
         frozen_view,
         failed,
+        checks_passed,
     )
     .await
 }
@@ -565,6 +567,7 @@ async fn persist_submission(
     context: &RuntimeTaskContext,
     content: &str,
     freeze: crate::repository_graph_runtime::RepositoryViewFreeze,
+    checks_passed: bool,
 ) -> Result<()> {
     // Keep the tree reachable only if artifacts and the Reviewing handoff succeed.
     // The guard also releases the pin if this future is dropped before the handoff.
@@ -572,7 +575,7 @@ async fn persist_submission(
     project::record_task_check_passed(&context.task_id).await?;
     write_submission(context, content).await?;
     write_submission_patch(context, &freeze).await?;
-    record_submission(context, freeze).await?;
+    record_submission(context, freeze, checks_passed).await?;
     pin_cleanup.disarm();
     Ok(())
 }

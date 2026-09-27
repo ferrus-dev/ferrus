@@ -219,6 +219,7 @@ pub async fn record_task_submitted(
     run_id: Option<&str>,
     frozen_view: Option<&RepositoryViewReference>,
     freeze_failed: bool,
+    checks_passed: bool,
 ) -> Result<()> {
     if let Some(view) = frozen_view {
         view.validate()?;
@@ -243,6 +244,7 @@ pub async fn record_task_submitted(
             run_id,
             frozen_view,
             freeze_failed,
+            checks_passed,
         )?;
         transaction.commit()?;
         Ok(())
@@ -257,6 +259,7 @@ pub(crate) fn task_submitted_in_transaction(
     run_id: Option<String>,
     frozen_view: Option<RepositoryViewReference>,
     freeze_failed: bool,
+    checks_passed: bool,
 ) -> Result<()> {
     if let Some(view) = &frozen_view {
         view.validate()?;
@@ -300,6 +303,17 @@ pub(crate) fn task_submitted_in_transaction(
             &serde_json::json!({ "task_id": task_id }),
         )?;
     }
+
+    insert_event_in_transaction(
+        transaction,
+        run_id.as_deref(),
+        "submission_committed",
+        &serde_json::json!({
+            "task_id": task_id,
+            "check_gate": if checks_passed { "passed" } else { "skipped" },
+            "review_cycles": task_review_cycles(transaction, &task_id)?,
+        }),
+    )?;
 
     insert_event_in_transaction(
         transaction,
