@@ -32,6 +32,7 @@ fn started(journal: &mut FileJournal) -> Record {
                 },
                 limits: Limits::default(),
                 input: "task".into(),
+                launch_evidence: None,
                 inherited_budget: None,
             },
             &Budget::default(),
@@ -587,6 +588,7 @@ fn record_and_total_byte_quotas_fail_before_writing() {
                         },
                         limits: Limits::default(),
                         input: "task".into(),
+                        launch_evidence: None,
                         inherited_budget: None,
                     },
                     &Budget::default()

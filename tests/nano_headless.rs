@@ -758,6 +758,19 @@ fn run_headless_task(
     );
     let journal =
         fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    let started: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        started["event"]["launch_evidence"]["baseline_tree"],
+        fixture.baseline
+    );
+    assert_eq!(
+        started["event"]["launch_evidence"]["native_context_enabled"],
+        native_context
+    );
+    assert_eq!(
+        started["event"]["launch_evidence"]["working_set_enabled"],
+        working_set
+    );
     assert_eq!(journal.contains("context_prepared"), working_set);
     assert!(journal.contains("not-a-json-event"));
     let results: Vec<Value> = journal

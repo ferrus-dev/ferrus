@@ -244,16 +244,36 @@ fn stale_observation(value: &serde_json::Value) -> bool {
 
 fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64)> {
     let db = Connection::open_with_flags(&attempt.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let baseline: String = db.query_row(
+        "SELECT payload_json FROM events WHERE type = 'run_started' AND run_id = ?1",
+        [&attempt.run_id],
+        |row| row.get(0),
+    )?;
+    ensure!(baseline.len() <= 8192, "Run start payload exceeds limit");
+    let baseline: serde_json::Value = serde_json::from_str(&baseline)?;
+    ensure!(
+        baseline["baseline_tree"].as_str() == Some(attempt.start_tree.as_str()),
+        "Run baseline does not match pinned case tree"
+    );
     let (task_status, cycles): (String, u32) = db.query_row(
         "SELECT status, review_cycles FROM tasks WHERE id = ?1",
         [&attempt.task_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let run_status: String = db.query_row(
-        "SELECT status FROM runs WHERE id = ?1 AND task_id = ?2",
+        "SELECT status FROM runs WHERE id = ?1 AND task_id = ?2 AND lower(role) = 'executor'",
         params![attempt.run_id, attempt.task_id],
         |row| row.get(0),
     )?;
+    let other_executor_runs: i64 = db.query_row(
+        "SELECT count(*) FROM runs WHERE task_id = ?1 AND id != ?2 AND lower(role) = 'executor'",
+        params![attempt.task_id, attempt.run_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        other_executor_runs == 0,
+        "Evaluation task has multiple Executor runs"
+    );
     let count_run = |kind: &str| -> Result<u64> {
         let count: i64 = db.query_row(
             "SELECT count(*) FROM events WHERE type = ?1 AND run_id = ?2",
@@ -324,8 +344,26 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
     );
     let inherited = match &records[0].event {
         SessionEvent::Started {
-            inherited_budget, ..
-        } => inherited_budget.clone().unwrap_or_default(),
+            inherited_budget,
+            launch_evidence,
+            ..
+        } => {
+            let evidence = launch_evidence
+                .as_ref()
+                .context("Nano journal lacks launch evidence")?;
+            ensure!(
+                evidence.baseline_tree == attempt.start_tree,
+                "Nano journal baseline does not match pinned case tree"
+            );
+            ensure!(
+                (
+                    Some(evidence.native_context_enabled),
+                    Some(evidence.working_set_enabled)
+                ) == (attempt.native_context_enabled, attempt.working_set_enabled),
+                "Nano journal ablation flags do not match manifest"
+            );
+            inherited_budget.clone().unwrap_or_default()
+        }
         _ => unreachable!("Replay accepted only a Started first record"),
     };
 
@@ -460,6 +498,7 @@ fn build(manifest: Manifest) -> Result<Report> {
     );
     let suite = suite()?;
     let mut seen = BTreeSet::new();
+    let mut seen_runs = BTreeSet::new();
     let mut rows = Vec::new();
     let mut groups: BTreeMap<GroupKey, GroupCount> = BTreeMap::new();
     for attempt in manifest.attempts {
@@ -498,6 +537,14 @@ fn build(manifest: Manifest) -> Result<Report> {
         ensure!(
             seen.insert((group_key.clone(), attempt.sample)),
             "Duplicate evaluation sample"
+        );
+        ensure!(
+            seen_runs.insert((
+                std::fs::canonicalize(&attempt.database)?,
+                attempt.task_id.clone(),
+                attempt.run_id.clone(),
+            )),
+            "Evaluation run reused as another sample"
         );
         ensure!(
             attempt.variant.needs_journal() == attempt.journal.is_some(),
@@ -594,7 +641,7 @@ mod tests {
     use super::*;
     use crate::nano::{
         provider::ProviderSettings,
-        session::{Budget, EndReason, Limits, SessionIdentity},
+        session::{Budget, EndReason, LaunchEvidence, Limits, SessionIdentity},
     };
     use std::{fs, process::Command};
 
@@ -662,10 +709,11 @@ mod tests {
         let db = Connection::open(&db_path)?;
         db.execute_batch(
             r#"CREATE TABLE tasks(id TEXT, status TEXT, review_cycles INTEGER);
-            CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT);
+            CREATE TABLE runs(id TEXT, task_id TEXT, status TEXT, role TEXT);
             CREATE TABLE events(id INTEGER PRIMARY KEY, type TEXT, run_id TEXT, payload_json TEXT);
             INSERT INTO tasks VALUES ('task', 'reviewing', 0);
-            INSERT INTO runs VALUES ('run', 'task', 'completed');
+            INSERT INTO runs VALUES ('run', 'task', 'completed', 'executor');
+            INSERT INTO events(type, run_id, payload_json) VALUES ('run_started', 'run', '{}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('check_passed', 'run', '{}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'run', '{"task_id":"task","check_gate":"passed","review_cycles":0}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('submitted', 'run', '{"check_gate":"passed"}');"#,
@@ -677,6 +725,11 @@ mod tests {
             run_id: Some("run".into()),
         };
         let journal = temp.path().join("events.jsonl");
+        let start_tree = suite()?.cases["local_bug_fix"].clone();
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [serde_json::json!({"baseline_tree": start_tree}).to_string()],
+        )?;
         let mut records = [
             Record {
                 version: 1,
@@ -687,6 +740,11 @@ mod tests {
                     identity,
                     limits: Limits::default(),
                     input: "task".into(),
+                    launch_evidence: Some(LaunchEvidence {
+                        baseline_tree: start_tree.clone(),
+                        native_context_enabled: true,
+                        working_set_enabled: false,
+                    }),
                     inherited_budget: None,
                     provider: None::<Box<ProviderSettings>>,
                 },
@@ -719,7 +777,7 @@ mod tests {
             database: db_path,
             task_id: "task".into(),
             run_id: "run".into(),
-            journal: Some(journal),
+            journal: Some(journal.clone()),
             external_usage: None,
             timing: Timing {
                 source: "fixture".into(),
@@ -737,37 +795,50 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         assert_eq!(report.groups[0].samples, 1);
-        let variants = [
-            (Variant::ExternalMcp, None, None),
-            (Variant::NanoMcp, Some(false), Some(false)),
-            (Variant::NanoNative, Some(true), Some(false)),
-            (Variant::NanoWorkingSet, Some(true), Some(true)),
-            (Variant::NanoGraphDisabled, Some(false), Some(false)),
-        ];
-        let attempts = variants
-            .into_iter()
-            .map(|(variant, native, working_set)| {
-                let mut attempt = baseline_attempt.clone();
-                attempt.variant = variant;
-                attempt.native_context_enabled = native;
-                attempt.working_set_enabled = working_set;
-                if native.is_none() {
-                    attempt.journal = None;
-                }
-                if matches!(attempt.variant, Variant::NanoGraphDisabled) {
-                    attempt.cache = CacheState::Disabled;
-                }
-                attempt
+        let mut wrong_flags = baseline_attempt.clone();
+        wrong_flags.variant = Variant::NanoMcp;
+        wrong_flags.native_context_enabled = Some(false);
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![wrong_flags]
             })
-            .collect();
-        let report = build(Manifest {
-            version: 1,
-            attempts,
-        })?;
-        assert_eq!(report.groups.len(), 5);
-        assert_eq!(report.attempts.len(), 5);
-        assert!(report.attempts.iter().all(|row| !row.accepted));
-        assert!(serde_json::to_value(report)?.is_object());
+            .is_err()
+        );
+        let wrong_tree = baseline_attempt.clone();
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.baseline_tree = "0".repeat(40);
+        }
+        let mut file = File::create(&journal)?;
+        for record in &records {
+            serde_json::to_writer(&mut file, record)?;
+            writeln!(file)?;
+        }
+        drop(file);
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![wrong_tree.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.baseline_tree = start_tree.clone();
+        }
+        let mut file = File::create(&journal)?;
+        for record in &records {
+            serde_json::to_writer(&mut file, record)?;
+            writeln!(file)?;
+        }
+        drop(file);
         db.execute("UPDATE tasks SET status='complete'", [])?;
         db.execute("DELETE FROM events WHERE type = 'submitted'", [])?;
         let attempt = Attempt {
@@ -799,11 +870,35 @@ mod tests {
         other_model.model = "other-model".into();
         let mut other_settings = attempt.clone();
         other_settings.settings_sha256 = "1".repeat(64);
+        db.execute_batch(
+            "INSERT INTO tasks VALUES ('task-2', 'complete', 0);
+             INSERT INTO runs VALUES ('run-2', 'task-2', 'completed', 'executor');
+             INSERT INTO tasks VALUES ('task-3', 'complete', 0);
+             INSERT INTO runs VALUES ('run-3', 'task-3', 'completed', 'executor');",
+        )?;
+        for (task_id, run_id) in [("task-2", "run-2"), ("task-3", "run-3")] {
+            db.execute(
+                "INSERT INTO events(type, run_id, payload_json) VALUES ('run_started', ?1, ?2)",
+                params![
+                    run_id,
+                    serde_json::json!({"baseline_tree": start_tree}).to_string()
+                ],
+            )?;
+            db.execute(
+                "INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', ?1, ?2)",
+                params![run_id, serde_json::json!({"task_id": task_id, "check_gate": "passed", "review_cycles": 0}).to_string()],
+            )?;
+        }
+        other_model.task_id = "task-2".into();
+        other_model.run_id = "run-2".into();
+        other_settings.task_id = "task-3".into();
+        other_settings.run_id = "run-3".into();
         let report = build(Manifest {
             version: 1,
             attempts: vec![attempt.clone(), other_model, other_settings],
         })?;
         assert_eq!(report.groups.len(), 3);
+        assert!(report.attempts.iter().all(|row| row.accepted));
         assert!(
             build(Manifest {
                 version: 1,
@@ -811,6 +906,30 @@ mod tests {
             })
             .is_err()
         );
+        let mut repeated = attempt.clone();
+        repeated.sample = 2;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![attempt.clone(), repeated],
+            })
+            .is_err()
+        );
+        db.execute(
+            "UPDATE events SET payload_json = '{\"baseline_tree\":\"wrong\"}' WHERE type = 'run_started'",
+            [],
+        )?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![attempt.clone()],
+            })
+            .is_err()
+        );
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [serde_json::json!({"baseline_tree": start_tree}).to_string()],
+        )?;
         let report = build(Manifest {
             version: 1,
             attempts: vec![attempt],
@@ -837,11 +956,19 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         db.execute_batch(
-            r#"INSERT INTO runs VALUES ('later', 'task', 'completed');
+            r#"INSERT INTO runs VALUES ('later', 'task', 'completed', 'executor');
             INSERT INTO events(type, run_id, payload_json) VALUES ('rejected', 'run', '{}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'later', '{"task_id":"task","check_gate":"passed","review_cycles":1}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('approved', 'later', '{}');"#,
         )?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![accepted_attempt.clone()],
+            })
+            .is_err()
+        );
+        db.execute("UPDATE runs SET role='reviewer' WHERE id='later'", [])?;
         let report = build(Manifest {
             version: 1,
             attempts: vec![accepted_attempt],

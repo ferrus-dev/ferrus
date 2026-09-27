@@ -7,8 +7,8 @@ use super::{
         FinishReason, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Usage,
     },
     session::{
-        Budget, ContextComposition, EndReason, LimitKind, Limits, SessionCommand, SessionEnd,
-        SessionEvent, SessionIdentity,
+        Budget, ContextComposition, EndReason, LaunchEvidence, LimitKind, Limits, SessionCommand,
+        SessionEnd, SessionEvent, SessionIdentity,
     },
     tools::{Cancellation, Host, ToolCall, ToolError, ToolOutcome, Tools, ValidatedCall},
 };
@@ -29,6 +29,7 @@ pub(crate) struct Engine<P, T, H, J> {
     last_request: Vec<Message>,
     previous_call: Option<(String, serde_json::Value)>,
     started: Option<Instant>,
+    launch_evidence: Option<LaunchEvidence>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +69,12 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             last_request: Vec::new(),
             previous_call: None,
             started: None,
+            launch_evidence: None,
         })
+    }
+
+    pub(crate) fn set_launch_evidence(&mut self, evidence: LaunchEvidence) {
+        self.launch_evidence = Some(evidence);
     }
 
     pub(crate) fn inherit_budget(&mut self, budget: Budget) -> Result<()> {
@@ -118,6 +124,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
             input: input.clone(),
+            launch_evidence: self.launch_evidence.clone(),
             inherited_budget: (self.budget != Budget::default()).then(|| self.budget.clone()),
             provider: self.provider.settings().map(Box::new),
         }) {

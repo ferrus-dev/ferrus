@@ -59,6 +59,7 @@ pub async fn record_run_started_with_workspace(
     record_run_started_for_task_with_workspace(run_id, role, agent, pid, None, workspace_path).await
 }
 
+#[cfg(test)]
 pub async fn record_run_started_for_task_with_workspace(
     run_id: &str,
     role: &str,
@@ -67,12 +68,34 @@ pub async fn record_run_started_for_task_with_workspace(
     task_id: Option<&str>,
     workspace_path: String,
 ) -> Result<RunRecord> {
+    record_run_started_for_task_with_baseline(
+        run_id,
+        role,
+        agent,
+        pid,
+        task_id,
+        workspace_path,
+        None,
+    )
+    .await
+}
+
+pub async fn record_run_started_for_task_with_baseline(
+    run_id: &str,
+    role: &str,
+    agent: &str,
+    pid: u32,
+    task_id: Option<&str>,
+    workspace_path: String,
+    baseline_tree: Option<&str>,
+) -> Result<RunRecord> {
     let database_path = current_database_path().await?;
     let (task_id, task_path) = match task_id.map(str::trim).filter(|task_id| !task_id.is_empty()) {
         Some(task_id) => (task_id.to_string(), default_task_path_for_id(task_id)),
         None => current_task_identity().await,
     };
     let run_id = run_id.to_string();
+    let baseline_tree = baseline_tree.map(str::to_owned);
     let role = role.to_string();
     let agent = agent.to_string();
     let started_at = timestamp();
@@ -139,6 +162,7 @@ pub async fn record_run_started_for_task_with_workspace(
                 "role": record_for_insert.role,
                 "agent": record_for_insert.agent,
                 "pid": record_for_insert.pid,
+                "baseline_tree": baseline_tree,
             }),
         )?;
         Ok(())
@@ -154,14 +178,16 @@ pub async fn record_run_started_for_task_with_id_best_effort(
     pid: u32,
     task_id: Option<&str>,
     workspace_path: String,
+    baseline_tree: Option<&str>,
 ) -> Option<String> {
-    match record_run_started_for_task_with_workspace(
+    match record_run_started_for_task_with_baseline(
         run_id,
         role,
         agent,
         pid,
         task_id,
         workspace_path,
+        baseline_tree,
     )
     .await
     {

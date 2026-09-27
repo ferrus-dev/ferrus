@@ -68,7 +68,14 @@ in `harness_notes`; exclude mismatched samples from a transport-only claim.
 After each attempt, record the database path, task and Executor run IDs,
 measured wall time, and (for Nano) its `nano/sessions/<run-id>/events.jsonl`
 journal. The reporter reads the database in read-only mode and replays the
-bounded Nano journal. It reports acceptance only when the task is `complete`
+bounded Nano journal. It requires the Executor's persisted run-start baseline
+to match the case tree and rejects tasks with multiple Executor runs, whose
+later worktree state may no longer match the pinned start. For Nano, the
+journal's launch baseline and effective native-context and working-set flags
+must also match the manifest. Older runs without this evidence cannot be used
+as pinned samples. The reporter rejects reuse of a database/task/run as another
+sample, including under a different model or settings group. It reports
+acceptance only when the task is `complete`
 and the latest submission committed with the Reviewing transition belongs to
 that attempt, in the current review cycle, with `check_gate: passed`. The
 `submitted` and `approved` diagnostic events are best-effort and do not gate

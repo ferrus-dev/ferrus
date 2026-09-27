@@ -8,7 +8,9 @@ use super::{
     lifecycle,
     native::NativeTools,
     provider::{Message, Provider},
-    session::{EndReason, Limits, Record, SessionCommand, SessionEnd, SessionIdentity},
+    session::{
+        EndReason, LaunchEvidence, Limits, Record, SessionCommand, SessionEnd, SessionIdentity,
+    },
     tools::*,
 };
 use crate::{
@@ -432,6 +434,11 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             Err(error) => return Err(error),
         }
     }
+    let launch_evidence = session.baseline_tree().map(|baseline_tree| LaunchEvidence {
+        baseline_tree: baseline_tree.to_owned(),
+        native_context_enabled: native.native_context_enabled,
+        working_set_enabled: native.working_set_enabled,
+    });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
     if waiting {
         // HQ relaunches an answered waiter in a fresh process. Derive this mode
@@ -473,6 +480,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         stop: stop.clone(),
     };
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
+    if let Some(evidence) = launch_evidence {
+        engine.set_launch_evidence(evidence);
+    }
     if let Some(recovery) = recovery {
         engine.inherit_budget(recovery.budget)?;
     }

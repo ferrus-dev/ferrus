@@ -68,6 +68,14 @@ impl Limits {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchEvidence {
+    pub baseline_tree: String,
+    pub native_context_enabled: bool,
+    pub working_set_enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Budget {
@@ -151,6 +159,8 @@ pub(crate) enum SessionEvent {
         identity: SessionIdentity,
         limits: Limits,
         input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_evidence: Option<LaunchEvidence>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inherited_budget: Option<Budget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

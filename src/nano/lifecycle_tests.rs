@@ -89,6 +89,7 @@ fn previous_intent(f: &Fixture, id: &str, name: &str, plan: Option<EffectPlan>, 
                 },
                 limits: Limits::default(),
                 input: "task".into(),
+                launch_evidence: None,
                 inherited_budget: None,
                 provider: None,
             },
@@ -1422,6 +1423,40 @@ async fn git_session(f: &Fixture, index: bool) -> FerrusSession {
         .unwrap();
     }
     session
+}
+
+#[tokio::test]
+async fn managed_journal_records_effective_launch_flags_and_baseline() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, false).await;
+    let (mut tools, journal) = native(&f, session.clone(), "launch-evidence");
+    tools.native_context_enabled = false;
+    tools.working_set_enabled = false;
+    let end = managed::run(
+        session.clone(),
+        identity("launch-evidence"),
+        Limits::default(),
+        script(vec![]),
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    let (_, records) = FileJournal::recover(
+        &f.data.join("nano/sessions/launch-evidence"),
+        Quotas::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &records[0].event,
+        SessionEvent::Started { launch_evidence: Some(evidence), .. }
+            if evidence.baseline_tree == session.baseline_tree().unwrap()
+                && !evidence.native_context_enabled
+                && !evidence.working_set_enabled
+    ));
 }
 
 #[tokio::test]

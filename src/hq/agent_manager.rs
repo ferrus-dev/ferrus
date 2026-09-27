@@ -1,6 +1,8 @@
 //! Build role prompts, launch agent processes, and manage headless session logs and shutdown.
 
-use crate::agent_id::{ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR};
+use crate::agent_id::{
+    ENV_BASELINE_TREE, ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR,
+};
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent};
 use crate::platform::{self, ShutdownSignal};
 use crate::state::agents::{AgentEntry, AgentStatus, read_agents, write_agents};
@@ -504,6 +506,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .find_map(|(key, value)| (*key == ENV_TASK_ID).then_some(value.trim()))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let baseline_tree = request
+        .env
+        .iter()
+        .find_map(|(key, value)| (*key == ENV_BASELINE_TREE).then_some(value.as_str()))
+        .map(str::to_owned);
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
     let log_path = headless_log_path(log_dir, request.role, task_id.as_deref(), &run_id, &ts);
 
@@ -604,6 +611,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         pid,
         task_id.as_deref(),
         workspace_path,
+        baseline_tree.as_deref(),
     )
     .await;
     if native && db_run_id.is_none() {
