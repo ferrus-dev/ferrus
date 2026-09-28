@@ -775,6 +775,29 @@ fn run_headless_task(
         started["event"]["launch_evidence"]["graph_peer_mode"],
         if graph_peer { "complete" } else { "absent" }
     );
+    let (peer_count, tool_count) = if graph_peer {
+        (1, 3)
+    } else if external_mcp {
+        (1, 1)
+    } else {
+        (0, 0)
+    };
+    assert_eq!(
+        started["event"]["launch_evidence"]["mcp_peer_count"],
+        peer_count
+    );
+    assert_eq!(
+        started["event"]["launch_evidence"]["mcp_tool_count"],
+        tool_count
+    );
+    assert_eq!(
+        started["event"]["launch_evidence"]["graph_peer_id"],
+        if graph_peer {
+            Value::String("graph".into())
+        } else {
+            Value::Null
+        }
+    );
     assert_eq!(started["event"]["provider"]["model"], "override-model");
     assert_eq!(journal.contains("context_prepared"), working_set);
     assert!(journal.contains("not-a-json-event"));

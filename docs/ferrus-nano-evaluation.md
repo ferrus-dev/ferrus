@@ -84,8 +84,8 @@ discovered graph-peer mode and ID, and provider model must also match the manife
 Every attempt needs the pre-spawn HQ record with the pinned task digest,
 check-command digest, and observed cache condition. The submission transaction
 records the final gate's command digest, which must match the pinned workload.
-`nano_mcp` requires all three Ferrus graph tools from the managed MCP peer;
-the other Nano variants require that peer to be absent. Older runs without
+`nano_mcp` requires exactly one managed MCP peer exposing only the three Ferrus
+graph tools; the other Nano variants require no MCP peers. Older runs without
 this evidence cannot be used as pinned samples. The reporter rejects reuse of a database as another
 sample, including under a different model or settings group. It reports
 acceptance only when the task is `complete`

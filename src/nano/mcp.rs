@@ -389,6 +389,10 @@ enum Launch {
 }
 
 impl McpTools {
+    pub(crate) fn catalog_counts(&self) -> (usize, usize) {
+        (self.servers.len(), self.entries.len())
+    }
+
     pub(crate) fn graph_peer_id(&self) -> Option<&str> {
         if self.graph_peer_mode() != GraphPeerMode::Complete {
             return None;
@@ -875,7 +879,7 @@ mod tests {
             )
         })
         .collect();
-        let tools = McpTools {
+        let mut tools = McpTools {
             servers: vec![Server {
                 id: "repo".into(),
                 client: None,
@@ -887,6 +891,31 @@ mod tests {
         };
         assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
         assert_eq!(tools.graph_peer_id(), Some("repo"));
+        assert_eq!(tools.catalog_counts(), (1, 3));
+        tools.servers.push(Server {
+            id: "extra".into(),
+            client: None,
+            closing: None,
+            timeout: Duration::from_secs(1),
+        });
+        tools.entries.insert(
+            "mcp_extra_echo".into(),
+            Entry {
+                server: 1,
+                remote_name: "echo".into(),
+                descriptor: ToolDescriptor {
+                    name: "mcp_extra_echo".into(),
+                    description: String::new(),
+                    input_schema: schema.clone(),
+                },
+                input: jsonschema::validator_for(&schema).unwrap(),
+                output: None,
+                schemas: (schema, None),
+                graph_equivalence: false,
+            },
+        );
+        assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
+        assert_eq!(tools.catalog_counts(), (2, 4));
     }
 
     #[test]

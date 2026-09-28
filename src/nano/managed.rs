@@ -450,12 +450,21 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         .map(str::to_owned);
     #[cfg(not(feature = "nano-mcp"))]
     let graph_peer_id = None;
+    #[cfg(feature = "nano-mcp")]
+    let (mcp_peer_count, mcp_tool_count) = native
+        .mcp
+        .as_ref()
+        .map_or((0, 0), super::mcp::McpTools::catalog_counts);
+    #[cfg(not(feature = "nano-mcp"))]
+    let (mcp_peer_count, mcp_tool_count) = (0, 0);
     let launch_evidence = session.baseline_tree().map(|baseline_tree| LaunchEvidence {
         baseline_tree: baseline_tree.to_owned(),
         native_context_enabled: native.native_context_enabled,
         working_set_enabled: native.working_set_enabled,
         graph_peer_mode: Some(graph_peer_mode),
         graph_peer_id,
+        mcp_peer_count: Some(mcp_peer_count),
+        mcp_tool_count: Some(mcp_tool_count),
         settings_sha256: None,
     });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());

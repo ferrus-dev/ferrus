@@ -558,6 +558,17 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 evidence.graph_peer_mode == Some(expected_peer_mode),
                 "Nano journal graph peer mode does not match variant"
             );
+            // Complete identifies the three graph tools, while these counts
+            // exclude every additional peer or advertised tool.
+            let expected_catalog = if matches!(attempt.variant, Variant::NanoMcp) {
+                (Some(1), Some(3))
+            } else {
+                (Some(0), Some(0))
+            };
+            ensure!(
+                (evidence.mcp_peer_count, evidence.mcp_tool_count) == expected_catalog,
+                "Nano journal MCP catalog does not match variant"
+            );
             ensure!(
                 match expected_peer_mode {
                     GraphPeerMode::Complete =>
@@ -1096,6 +1107,8 @@ mod tests {
                         working_set_enabled: false,
                         graph_peer_mode: Some(GraphPeerMode::Absent),
                         graph_peer_id: None,
+                        mcp_peer_count: Some(0),
+                        mcp_tool_count: Some(0),
                         settings_sha256: None,
                     })),
                     inherited_budget: None,
@@ -1300,6 +1313,25 @@ mod tests {
         } = &mut records[0].event
         {
             evidence.graph_peer_id = Some("repo".into());
+            evidence.mcp_peer_count = Some(2);
+            evidence.mcp_tool_count = Some(4);
+        }
+        mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.mcp_peer_count = Some(1);
+            evidence.mcp_tool_count = Some(3);
         }
         mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
@@ -1329,6 +1361,8 @@ mod tests {
         {
             evidence.graph_peer_mode = Some(GraphPeerMode::Absent);
             evidence.graph_peer_id = None;
+            evidence.mcp_peer_count = Some(1);
+            evidence.mcp_tool_count = Some(1);
         }
         disabled_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
@@ -1336,6 +1370,23 @@ mod tests {
             "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
             [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Disabled)?}).to_string()],
         )?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![disabled_attempt.clone()]
+            })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.mcp_peer_count = Some(0);
+            evidence.mcp_tool_count = Some(0);
+        }
+        disabled_attempt.settings_sha256 = set_settings_digest(&mut records)?;
+        write_records(&journal, &records)?;
         assert!(
             build(Manifest {
                 version: 1,

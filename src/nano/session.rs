@@ -80,6 +80,10 @@ pub(crate) struct LaunchEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_peer_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_sha256: Option<String>,
 }
 
@@ -106,13 +110,19 @@ pub(crate) fn effective_settings_sha256(
         graph_peer_mode: GraphPeerMode,
         #[serde(skip_serializing_if = "Option::is_none")]
         graph_peer_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_peer_count: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_tool_count: Option<usize>,
     }
 
     let graph_peer_mode = evidence
         .graph_peer_mode
         .ok_or_else(|| anyhow::anyhow!("Graph peer mode is missing"))?;
     let settings = EffectiveSettings {
-        version: if evidence.graph_peer_id.is_some() {
+        version: if evidence.mcp_peer_count.is_some() || evidence.mcp_tool_count.is_some() {
+            3
+        } else if evidence.graph_peer_id.is_some() {
             2
         } else {
             1
@@ -123,6 +133,8 @@ pub(crate) fn effective_settings_sha256(
         working_set_enabled: evidence.working_set_enabled,
         graph_peer_mode,
         graph_peer_id: evidence.graph_peer_id.as_deref(),
+        mcp_peer_count: evidence.mcp_peer_count,
+        mcp_tool_count: evidence.mcp_tool_count,
     };
     Ok(Sha256::digest(serde_json::to_vec(&settings)?)
         .iter()
