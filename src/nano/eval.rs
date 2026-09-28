@@ -6,6 +6,13 @@ use super::{
     session::{EndReason, GraphPeerMode, Record, SessionEvent, effective_settings_sha256},
     tools::ToolOutcome,
 };
+use crate::{
+    config::Config,
+    project::{self, CanonicalGraphStatus},
+    repository_graph::config::RepositoryGraphConfig,
+    repository_graph::domain::{Availability, Freshness},
+    repository_graph_runtime::LocalGraphContext,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -203,16 +210,146 @@ struct Report {
 struct Suite {
     version: u32,
     cases: BTreeMap<String, String>,
+    workloads: BTreeMap<String, Workload>,
+}
+
+#[derive(Deserialize)]
+struct Workload {
+    task: String,
+    checks: Vec<String>,
+    #[serde(default)]
+    windows_checks: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LaunchWorkloadEvidence {
+    case_id: String,
+    task_sha256: String,
+    check_commands_sha256: String,
+    cache: Option<CacheState>,
+    graph_snapshot_id: Option<String>,
 }
 
 fn suite() -> Result<Suite> {
     let suite: Suite =
         serde_json::from_str(include_str!("../../tests/fixtures/nano_eval/suite.json"))?;
     ensure!(
-        suite.version == 1 && suite.cases.len() == 7,
+        suite.version == 2
+            && suite.cases.len() == 7
+            && suite.cases.keys().eq(suite.workloads.keys())
+            && suite.workloads.values().all(|workload| {
+                !workload.task.is_empty()
+                    && !workload.checks.is_empty()
+                    && workload
+                        .windows_checks
+                        .as_ref()
+                        .is_none_or(|checks| !checks.is_empty())
+            }),
         "Invalid pinned suite"
     );
     Ok(suite)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn task_sha256(workload: &Workload) -> String {
+    sha256(format!("{}\n", workload.task).as_bytes())
+}
+
+fn expected_check_digests(workload: &Workload) -> Result<Vec<String>> {
+    let mut digests = vec![crate::checks::commands_sha256(&workload.checks)?];
+    if let Some(windows) = &workload.windows_checks {
+        digests.push(crate::checks::commands_sha256(windows)?);
+    }
+    Ok(digests)
+}
+
+fn launch_cache(
+    enabled: bool,
+    status: CanonicalGraphStatus,
+    has_snapshot: bool,
+) -> Option<CacheState> {
+    if !enabled {
+        return Some(CacheState::Disabled);
+    }
+    match (status, has_snapshot) {
+        (CanonicalGraphStatus::Unknown, false) => Some(CacheState::Cold),
+        (CanonicalGraphStatus::Fresh, true) => Some(CacheState::Warm),
+        _ => None,
+    }
+}
+
+pub(crate) async fn capture_launch(
+    case_id: &str,
+    project_root: &Path,
+    task_id: &str,
+) -> Result<serde_json::Value> {
+    let suite = suite()?;
+    ensure!(suite.cases.contains_key(case_id), "Unknown evaluation case");
+    ensure!(
+        tokio::fs::canonicalize(project_root).await? == project::canonical_project_root().await?,
+        "Evaluation project root does not match HQ project"
+    );
+    ensure!(
+        !task_id.is_empty()
+            && task_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "Invalid evaluation task ID"
+    );
+    let task_path = project_root.join(format!(".ferrus/tasks/{task_id}.md"));
+    let task = bounded_file(&task_path, 64 * 1024)?;
+    let config = Config::load_from(project_root).await?;
+    let graph_toml = tokio::fs::read_to_string(project_root.join("ferrus.toml")).await?;
+    let graph = RepositoryGraphConfig::from_ferrus_toml(&graph_toml)?;
+    let reference = project::canonical_graph_reference().await?;
+    let sidecar = if graph.enabled {
+        Some(
+            LocalGraphContext::load(false)
+                .await?
+                .status_with_freshness_comparison()
+                .await?,
+        )
+    } else {
+        None
+    };
+    let graph_snapshot_id = if graph.enabled {
+        reference
+            .snapshot_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+    } else {
+        None
+    };
+    let mut cache = launch_cache(graph.enabled, reference.status, graph_snapshot_id.is_some());
+    if let Some(sidecar) = sidecar {
+        let consistent = match cache {
+            Some(CacheState::Cold) => {
+                sidecar.data.availability == Availability::NotBuilt && sidecar.snapshot_id.is_none()
+            }
+            Some(CacheState::Warm) => {
+                sidecar.data.availability == Availability::Available
+                    && sidecar.snapshot_id == reference.snapshot_id
+                    && sidecar.freshness.freshness == Freshness::Fresh
+            }
+            _ => false,
+        };
+        if !consistent {
+            cache = None;
+        }
+    }
+    Ok(serde_json::to_value(LaunchWorkloadEvidence {
+        case_id: case_id.to_owned(),
+        task_sha256: sha256(&task),
+        check_commands_sha256: crate::checks::commands_sha256(&config.checks.commands)?,
+        cache,
+        graph_snapshot_id,
+    })?)
 }
 
 fn bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -242,7 +379,10 @@ fn stale_observation(value: &serde_json::Value) -> bool {
     })
 }
 
-fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64)> {
+fn task_state(
+    attempt: &Attempt,
+    workload: &Workload,
+) -> Result<(String, String, u32, u64, bool, u64)> {
     let db = Connection::open_with_flags(&attempt.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let baseline: String = db.query_row(
         "SELECT payload_json FROM events WHERE type = 'run_started' AND run_id = ?1",
@@ -254,6 +394,20 @@ fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64)
     ensure!(
         baseline["baseline_tree"].as_str() == Some(attempt.start_tree.as_str()),
         "Run baseline does not match pinned case tree"
+    );
+    let launch: LaunchWorkloadEvidence = serde_json::from_value(baseline["evaluation"].clone())
+        .context("Run lacks evaluation launch evidence")?;
+    let expected_checks = expected_check_digests(workload)?;
+    ensure!(
+        launch.case_id == attempt.case_id
+            && launch.task_sha256 == task_sha256(workload)
+            && expected_checks.contains(&launch.check_commands_sha256),
+        "Run task or check configuration does not match pinned workload"
+    );
+    ensure!(
+        launch.cache.as_ref() == Some(&attempt.cache)
+            && (matches!(&attempt.cache, CacheState::Warm) == launch.graph_snapshot_id.is_some()),
+        "Run cache condition does not match manifest"
     );
     let (task_status, cycles): (String, u32) = db.query_row(
         "SELECT status, review_cycles FROM tasks WHERE id = ?1",
@@ -301,6 +455,12 @@ fn task_state(attempt: &Attempt) -> Result<(String, String, u32, u64, bool, u64)
     let final_gate_passed = if let Some((run_id, payload)) = &final_submission {
         ensure!(payload.len() <= 8192, "Submit event payload exceeds limit");
         let value: serde_json::Value = serde_json::from_str(payload)?;
+        ensure!(
+            value["check_commands_sha256"]
+                .as_str()
+                .is_some_and(|digest| expected_checks.iter().any(|expected| expected == digest)),
+            "Submitted check commands do not match pinned workload"
+        );
         run_id == &attempt.run_id
             && value["task_id"] == attempt.task_id
             && value["review_cycles"].as_u64() == Some(u64::from(cycles))
@@ -548,9 +708,9 @@ fn build(manifest: Manifest) -> Result<Report> {
             "Missing timing provenance or elapsed time"
         );
         ensure!(
-            !matches!(attempt.variant, Variant::NanoGraphDisabled)
-                || matches!(attempt.cache, CacheState::Disabled),
-            "Graph-disabled attempt must report disabled cache state"
+            matches!(attempt.variant, Variant::NanoGraphDisabled)
+                == matches!(attempt.cache, CacheState::Disabled),
+            "Graph-disabled variant and disabled cache state must agree"
         );
         let group_key = GroupKey {
             case_id: attempt.case_id.clone(),
@@ -586,8 +746,12 @@ fn build(manifest: Manifest) -> Result<Report> {
             (attempt.native_context_enabled, attempt.working_set_enabled) == expected_flags,
             "Variant/ablation flags mismatch"
         );
+        let workload = suite
+            .workloads
+            .get(&attempt.case_id)
+            .context("Missing case workload")?;
         let (task_status, run_status, review_cycles, checks, final_gate_passed, approvals) =
-            task_state(&attempt)?;
+            task_state(&attempt, workload)?;
         let (metrics, nano_end_reason) = if attempt.variant.needs_journal() {
             nano_metrics(&attempt)?
         } else {
@@ -691,6 +855,24 @@ mod tests {
         Ok(digest)
     }
 
+    fn workload_launch(case_id: &str, cache: CacheState) -> Result<serde_json::Value> {
+        let suite = suite()?;
+        let workload = &suite.workloads[case_id];
+        Ok(serde_json::to_value(LaunchWorkloadEvidence {
+            case_id: case_id.to_owned(),
+            task_sha256: task_sha256(workload),
+            check_commands_sha256: crate::checks::commands_sha256(&workload.checks)?,
+            graph_snapshot_id: matches!(&cache, CacheState::Warm).then(|| "snapshot".into()),
+            cache: Some(cache),
+        })?)
+    }
+
+    fn submission_payload(task: &str, gate: &str, cycles: u32, case_id: &str) -> Result<String> {
+        let suite = suite()?;
+        let checks = crate::checks::commands_sha256(&suite.workloads[case_id].checks)?;
+        Ok(serde_json::json!({"task_id": task, "check_gate": gate, "review_cycles": cycles, "check_commands_sha256": checks}).to_string())
+    }
+
     fn accepted_external_database(path: &Path, task: &str, run: &str, tree: &str) -> Result<()> {
         let db = Connection::open(path)?;
         db.execute_batch(
@@ -705,11 +887,11 @@ mod tests {
         )?;
         db.execute(
             "INSERT INTO events(type, run_id, payload_json) VALUES ('run_started', ?1, ?2)",
-            params![run, serde_json::json!({"baseline_tree": tree}).to_string()],
+            params![run, serde_json::json!({"baseline_tree": tree, "evaluation": workload_launch("local_bug_fix", CacheState::Cold)?}).to_string()],
         )?;
         db.execute(
             "INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', ?1, ?2)",
-            params![run, serde_json::json!({"task_id": task, "check_gate": "passed", "review_cycles": 0}).to_string()],
+            params![run, submission_payload(task, "passed", 0, "local_bug_fix")?],
         )?;
         Ok(())
     }
@@ -732,6 +914,19 @@ mod tests {
     #[test]
     fn fixture_git_trees_match_the_pinned_suite() -> Result<()> {
         let suite = suite()?;
+        let task_table = include_str!("../../tests/fixtures/nano_eval/tasks.md");
+        for (case, workload) in &suite.workloads {
+            let row = task_table
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{case}` |")))
+                .context("Missing task table row")?;
+            let cells: Vec<_> = row.split('|').map(str::trim).collect();
+            assert_eq!(cells[2], workload.task);
+            assert!(cells[3].contains(&format!("`{}`", workload.checks[0])));
+            if let Some(windows) = &workload.windows_checks {
+                assert!(cells[3].contains(&format!("`{}`", windows[0])));
+            }
+        }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_eval/cases");
         for (case, expected) in suite.cases {
             let temp = tempfile::tempdir()?;
@@ -772,6 +967,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_label_requires_a_consistent_prelaunch_graph_state() {
+        assert_eq!(
+            launch_cache(false, CanonicalGraphStatus::Fresh, true),
+            Some(CacheState::Disabled)
+        );
+        assert_eq!(
+            launch_cache(true, CanonicalGraphStatus::Unknown, false),
+            Some(CacheState::Cold)
+        );
+        assert_eq!(
+            launch_cache(true, CanonicalGraphStatus::Fresh, true),
+            Some(CacheState::Warm)
+        );
+        assert_eq!(launch_cache(true, CanonicalGraphStatus::Stale, true), None);
+        assert_eq!(
+            launch_cache(true, CanonicalGraphStatus::Unknown, true),
+            None
+        );
+        assert_eq!(launch_cache(true, CanonicalGraphStatus::Fresh, false), None);
+    }
+
+    #[test]
     fn submission_alone_is_not_an_accepted_evaluation() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let db_path = temp.path().join("ferrus.db");
@@ -797,7 +1014,11 @@ mod tests {
         let start_tree = suite()?.cases["local_bug_fix"].clone();
         db.execute(
             "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
-            [serde_json::json!({"baseline_tree": start_tree}).to_string()],
+            [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Cold)?}).to_string()],
+        )?;
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'submission_committed'",
+            [submission_payload("task", "passed", 0, "local_bug_fix")?],
         )?;
         let mut records = [
             Record {
@@ -875,6 +1096,67 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         assert_eq!(report.groups[0].samples, 1);
+        let cold_launch = workload_launch("local_bug_fix", CacheState::Cold)?;
+        for field in ["task_sha256", "check_commands_sha256"] {
+            let mut wrong = cold_launch.clone();
+            wrong[field] = serde_json::json!("0".repeat(64));
+            db.execute(
+                "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+                [
+                    serde_json::json!({"baseline_tree": start_tree, "evaluation": wrong})
+                        .to_string(),
+                ],
+            )?;
+            assert!(
+                build(Manifest {
+                    version: 1,
+                    attempts: vec![baseline_attempt.clone()]
+                })
+                .is_err()
+            );
+        }
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Warm)?}).to_string()],
+        )?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![baseline_attempt.clone()]
+            })
+            .is_err()
+        );
+        let mut warm_attempt = baseline_attempt.clone();
+        warm_attempt.cache = CacheState::Warm;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![warm_attempt]
+            })
+            .is_ok()
+        );
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [
+                serde_json::json!({"baseline_tree": start_tree, "evaluation": cold_launch})
+                    .to_string(),
+            ],
+        )?;
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'submission_committed'",
+            [serde_json::json!({"task_id":"task", "check_gate":"passed", "review_cycles":0, "check_commands_sha256":"0".repeat(64)}).to_string()],
+        )?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![baseline_attempt.clone()]
+            })
+            .is_err()
+        );
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'submission_committed'",
+            [submission_payload("task", "passed", 0, "local_bug_fix")?],
+        )?;
         let mut wrong_settings = baseline_attempt.clone();
         wrong_settings.settings_sha256 = "0".repeat(64);
         assert!(
@@ -972,6 +1254,10 @@ mod tests {
         }
         disabled_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Disabled)?}).to_string()],
+        )?;
         assert!(
             build(Manifest {
                 version: 1,
@@ -979,6 +1265,10 @@ mod tests {
             })
             .is_ok()
         );
+        db.execute(
+            "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
+            [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Cold)?}).to_string()],
+        )?;
         if let SessionEvent::Started {
             launch_evidence: Some(evidence),
             ..
@@ -1074,12 +1364,12 @@ mod tests {
                 "INSERT INTO events(type, run_id, payload_json) VALUES ('run_started', ?1, ?2)",
                 params![
                     run_id,
-                    serde_json::json!({"baseline_tree": start_tree}).to_string()
+                    serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Cold)?}).to_string()
                 ],
             )?;
             db.execute(
                 "INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', ?1, ?2)",
-                params![run_id, serde_json::json!({"task_id": task_id, "check_gate": "passed", "review_cycles": 0}).to_string()],
+                params![run_id, submission_payload(task_id, "passed", 0, "local_bug_fix")?],
             )?;
         }
         other_model.task_id = "task-2".into();
@@ -1132,7 +1422,7 @@ mod tests {
         );
         db.execute(
             "UPDATE events SET payload_json = ?1 WHERE type = 'run_started'",
-            [serde_json::json!({"baseline_tree": start_tree}).to_string()],
+            [serde_json::json!({"baseline_tree": start_tree, "evaluation": workload_launch("local_bug_fix", CacheState::Cold)?}).to_string()],
         )?;
         let report = build(Manifest {
             version: 1,
@@ -1141,8 +1431,8 @@ mod tests {
         assert!(report.attempts[0].accepted);
         assert_eq!(report.attempts[0].approved_events, 0);
         db.execute(
-            "UPDATE events SET payload_json = '{\"task_id\":\"task\",\"check_gate\":\"skipped\",\"review_cycles\":0}' WHERE type = 'submission_committed'",
-            [],
+            "UPDATE events SET payload_json = ?1 WHERE type = 'submission_committed'",
+            [submission_payload("task", "skipped", 0, "local_bug_fix")?],
         )?;
         let report = build(Manifest {
             version: 1,
@@ -1150,8 +1440,8 @@ mod tests {
         })?;
         assert!(!report.attempts[0].accepted);
         db.execute(
-            "UPDATE events SET payload_json = '{\"task_id\":\"task\",\"check_gate\":\"passed\",\"review_cycles\":0}' WHERE type = 'submission_committed'",
-            [],
+            "UPDATE events SET payload_json = ?1 WHERE type = 'submission_committed'",
+            [submission_payload("task", "passed", 0, "local_bug_fix")?],
         )?;
         db.execute("UPDATE tasks SET review_cycles=1", [])?;
         let report = build(Manifest {
@@ -1162,8 +1452,11 @@ mod tests {
         db.execute_batch(
             r#"INSERT INTO runs VALUES ('later', 'task', 'completed', 'executor');
             INSERT INTO events(type, run_id, payload_json) VALUES ('rejected', 'run', '{}');
-            INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'later', '{"task_id":"task","check_gate":"passed","review_cycles":1}');
             INSERT INTO events(type, run_id, payload_json) VALUES ('approved', 'later', '{}');"#,
+        )?;
+        db.execute(
+            "INSERT INTO events(type, run_id, payload_json) VALUES ('submission_committed', 'later', ?1)",
+            [submission_payload("task", "passed", 1, "local_bug_fix")?],
         )?;
         assert!(
             build(Manifest {

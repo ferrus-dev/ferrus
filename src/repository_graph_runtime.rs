@@ -282,6 +282,11 @@ impl LocalGraphContext {
         Ok(response)
     }
 
+    pub(crate) async fn status_with_freshness_comparison(&self) -> Result<StatusResponse> {
+        let path = self.query_sidecar_path().await?;
+        status_response_at(self, &path, self.freshness_comparison()?)
+    }
+
     pub(crate) async fn search(
         &self,
         request: &SearchRequest,

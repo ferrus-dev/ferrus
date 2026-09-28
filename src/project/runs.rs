@@ -75,9 +75,17 @@ pub async fn record_run_started_for_task_with_workspace(
         pid,
         task_id,
         workspace_path,
-        None,
+        RunStartEvidence {
+            baseline_tree: None,
+            evaluation: None,
+        },
     )
     .await
+}
+
+pub struct RunStartEvidence<'a> {
+    pub baseline_tree: Option<&'a str>,
+    pub evaluation: Option<serde_json::Value>,
 }
 
 pub async fn record_run_started_for_task_with_baseline(
@@ -87,7 +95,7 @@ pub async fn record_run_started_for_task_with_baseline(
     pid: u32,
     task_id: Option<&str>,
     workspace_path: String,
-    baseline_tree: Option<&str>,
+    evidence: RunStartEvidence<'_>,
 ) -> Result<RunRecord> {
     let database_path = current_database_path().await?;
     let (task_id, task_path) = match task_id.map(str::trim).filter(|task_id| !task_id.is_empty()) {
@@ -95,7 +103,8 @@ pub async fn record_run_started_for_task_with_baseline(
         None => current_task_identity().await,
     };
     let run_id = run_id.to_string();
-    let baseline_tree = baseline_tree.map(str::to_owned);
+    let baseline_tree = evidence.baseline_tree.map(str::to_owned);
+    let evaluation = evidence.evaluation;
     let role = role.to_string();
     let agent = agent.to_string();
     let started_at = timestamp();
@@ -163,6 +172,7 @@ pub async fn record_run_started_for_task_with_baseline(
                 "agent": record_for_insert.agent,
                 "pid": record_for_insert.pid,
                 "baseline_tree": baseline_tree,
+                "evaluation": evaluation,
             }),
         )?;
         Ok(())
@@ -178,7 +188,7 @@ pub async fn record_run_started_for_task_with_id_best_effort(
     pid: u32,
     task_id: Option<&str>,
     workspace_path: String,
-    baseline_tree: Option<&str>,
+    evidence: RunStartEvidence<'_>,
 ) -> Option<String> {
     match record_run_started_for_task_with_baseline(
         run_id,
@@ -187,7 +197,7 @@ pub async fn record_run_started_for_task_with_id_best_effort(
         pid,
         task_id,
         workspace_path,
-        baseline_tree,
+        evidence,
     )
     .await
     {

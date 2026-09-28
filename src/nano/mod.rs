@@ -22,6 +22,7 @@ pub(crate) mod wire;
 pub(crate) mod config;
 pub(crate) mod engine;
 mod eval;
+pub(crate) use eval::capture_launch as capture_evaluation_launch;
 pub(crate) mod ferrus;
 pub(crate) mod journal;
 pub(crate) mod provider;

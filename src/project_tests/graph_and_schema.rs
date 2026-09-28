@@ -482,7 +482,10 @@ async fn submitted_view_is_frozen_for_reviewer_and_rejection_resumes_mutable_tas
         Some("r-executor"),
         Some(&frozen),
         false,
-        true,
+        SubmissionCheckEvidence {
+            passed: true,
+            commands_sha256: None,
+        },
     )
     .await
     .unwrap();

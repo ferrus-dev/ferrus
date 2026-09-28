@@ -546,6 +546,27 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .to_string(),
     };
 
+    // Capture workload and index state before the child can change either one.
+    let evaluation = if request.role.eq_ignore_ascii_case("executor") {
+        match std::env::var("FERRUS_NANO_EVAL_CASE") {
+            Ok(case_id) => {
+                let task_id = task_id
+                    .as_deref()
+                    .context("Evaluation Executor has no task ID")?;
+                let root = request
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.project_root.as_path())
+                    .context("Evaluation Executor has no project root")?;
+                Some(crate::nano::capture_evaluation_launch(&case_id, root, task_id).await?)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+
     if request.debug {
         append_debug_agent_flags(request.agent_type, &mut request.command);
     }
@@ -611,7 +632,10 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         pid,
         task_id.as_deref(),
         workspace_path,
-        baseline_tree.as_deref(),
+        crate::project::RunStartEvidence {
+            baseline_tree: baseline_tree.as_deref(),
+            evaluation,
+        },
     )
     .await;
     if native && db_run_id.is_none() {

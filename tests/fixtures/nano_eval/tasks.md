@@ -2,9 +2,10 @@
 
 Each `cases/<id>/` directory is the entire starting Git tree. `suite.json` pins its
 `git write-tree` object ID. Use one fresh Ferrus project and database per sample.
-Do not put this task file in the starting tree. Use the task text below as the
-Supervisor's task intent. Keep the configured check command identical across
-variants for a given case.
+Do not put this task file in the starting tree. `suite.json` is the
+machine-readable workload. The task artifact must contain only the task text
+below plus one final newline. Keep the configured check command identical
+across variants for a given case.
 
 | Case | Task intent | Check command |
 | --- | --- | --- |

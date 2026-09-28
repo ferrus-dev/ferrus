@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "cases": {
     "local_bug_fix": "fa7c122d4263bca6d5aa54df8ed7a437409b6237",
     "cross_file_rust": "3bd9c7b83cfea68b457e9f94e6c0bb8d9f410891",
@@ -8,5 +8,14 @@
     "unsupported_language": "18207421fcfaa6f2d61d94761acdb4417f838e81",
     "graph_disabled": "73fa8d2fc7dc64f5cdc05e63e22c4028e5d945fe",
     "stale_context": "d3cbb36203a0c69c36a421378a8fd7166d2d440f"
+  },
+  "workloads": {
+    "local_bug_fix": {"task": "Fix `clamp` so values within the interval stay unchanged and out-of-range values reach the nearest bound.", "checks": ["cargo test"]},
+    "cross_file_rust": {"task": "Make `greeting` trim surrounding whitespace and use `guest` for an empty or whitespace-only name. Preserve the module boundary.", "checks": ["cargo test"]},
+    "refactor": {"task": "Rename the public capacity accessor to `capacity_hint` across the crate, preserving its behavior.", "checks": ["cargo test"]},
+    "config_docs": {"task": "Change the default retry count to three and update the documented policy to match.", "checks": ["cargo test"]},
+    "unsupported_language": {"task": "Fix the Python average function so it preserves fractional results. Use workspace evidence when repository graph coverage is unavailable.", "checks": ["python3 -m unittest"], "windows_checks": ["python -m unittest"]},
+    "graph_disabled": {"task": "Fix the parity predicate while repository graph and native context retrieval are disabled.", "checks": ["cargo test"]},
+    "stale_context": {"task": "Inspect the existing status implementation, then update it to recognize 201 as `created`. After editing, re-read or refresh before relying on earlier repository evidence.", "checks": ["cargo test"]}
   }
 }

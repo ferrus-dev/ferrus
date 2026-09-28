@@ -21,9 +21,13 @@ cd /absolute/new/eval-1
 ferrus init
 ```
 
-Set the case's check command in `ferrus.toml`. Create the task through HQ
-`/task --manual` using the exact task text, and let the configured Executor,
-Reviewer, and approval flow finish. Do not count a submit, process exit, or
+Set the case's check command in `ferrus.toml`. The canonical task artifact must
+contain exactly the case's task sentence from `suite.json`, followed by one
+newline. Start HQ with `FERRUS_NANO_EVAL_CASE=<case-id>` in its environment,
+then create the task through `/task --manual` using that exact content. Ferrus
+records the task and check digests and graph-index condition before spawning
+the Executor. Let the configured Executor, Reviewer, and approval flow finish.
+Do not count a submit, process exit, or
 passing check alone as accepted. Keep each sample's `.ferrus` data directory
 and `ferrus.db` until its report has been collected. The initial check fails
 by design. The reviewer should inspect the resulting patch and run the case
@@ -34,7 +38,11 @@ check independently before approval.
 Keep the model ID/version, context/output limits, temperature, check command,
 task text, permissions, and initial tree aligned. Record any unavoidable
 difference in `harness_notes`. Use the same index and cache condition for
-paired runs. Time initial `ferrus graph index --full`, later overlay refreshes,
+paired runs. `cold` means the enabled graph has no canonical snapshot before
+the Executor starts; `warm` means it has a fresh published snapshot; `disabled`
+means `[repository_graph].enabled = false`. An ambiguous or stale graph state
+does not qualify for any label. Pre-index each fresh warm project before HQ
+dispatch. Time initial `ferrus graph index --full`, later overlay refreshes,
 and the complete task separately where available. Run repeated cold and warm
 samples; use a fresh project for each cold sample. Report failures too.
 
@@ -73,10 +81,12 @@ to match the case tree and rejects tasks with multiple Executor runs, whose
 later worktree state may no longer match the pinned start. For Nano, the
 journal's launch baseline, effective native-context and working-set flags,
 discovered graph-peer mode, and provider model must also match the manifest.
+Every attempt needs the pre-spawn HQ record with the pinned task digest,
+check-command digest, and observed cache condition. The submission transaction
+records the final gate's command digest, which must match the pinned workload.
 `nano_mcp` requires all three Ferrus graph tools from the managed MCP peer;
 the other Nano variants require that peer to be absent. Older runs without
-this evidence cannot be used
-as pinned samples. The reporter rejects reuse of a database/task/run as another
+this evidence cannot be used as pinned samples. The reporter rejects reuse of a database as another
 sample, including under a different model or settings group. It reports
 acceptance only when the task is `complete`
 and the latest submission committed with the Reviewing transition belongs to

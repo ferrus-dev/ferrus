@@ -45,7 +45,14 @@ def main():
         raise SystemExit("committed fixture tree changed")
     if git(destination, "status", "--porcelain=v1", "--untracked-files=all"):
         raise SystemExit("prepared fixture workspace is not clean")
-    print(json.dumps({"case_id": case, "start_tree": tree, "directory": str(destination)}))
+    print(json.dumps({
+        "case_id": case,
+        "start_tree": tree,
+        "directory": str(destination),
+        "task_artifact": suite["workloads"][case]["task"] + "\n",
+        "checks": suite["workloads"][case]["checks"],
+        "windows_checks": suite["workloads"][case].get("windows_checks"),
+    }))
 
 
 if __name__ == "__main__":
