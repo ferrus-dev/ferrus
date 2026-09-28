@@ -78,6 +78,8 @@ pub(crate) struct LaunchEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_peer_mode: Option<GraphPeerMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_sha256: Option<String>,
 }
 
@@ -102,18 +104,25 @@ pub(crate) fn effective_settings_sha256(
         native_context_enabled: bool,
         working_set_enabled: bool,
         graph_peer_mode: GraphPeerMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph_peer_id: Option<&'a str>,
     }
 
     let graph_peer_mode = evidence
         .graph_peer_mode
         .ok_or_else(|| anyhow::anyhow!("Graph peer mode is missing"))?;
     let settings = EffectiveSettings {
-        version: 1,
+        version: if evidence.graph_peer_id.is_some() {
+            2
+        } else {
+            1
+        },
         provider,
         limits,
         native_context_enabled: evidence.native_context_enabled,
         working_set_enabled: evidence.working_set_enabled,
         graph_peer_mode,
+        graph_peer_id: evidence.graph_peer_id.as_deref(),
     };
     Ok(Sha256::digest(serde_json::to_vec(&settings)?)
         .iter()
@@ -205,7 +214,7 @@ pub(crate) enum SessionEvent {
         limits: Limits,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        launch_evidence: Option<LaunchEvidence>,
+        launch_evidence: Option<Box<LaunchEvidence>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inherited_budget: Option<Budget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

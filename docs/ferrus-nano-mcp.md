@@ -61,7 +61,7 @@ The wrapper forwards only the managed project, agent, task, run, and optional
 baseline-tree identifiers. It still clears all other inherited variables and
 uses the explicit tool allowlist. The test adapter presents the native graph
 argument/result shape to the model while the call itself crosses MCP. Its
-provider-visible tool names remain `mcp_graph_*`, so name-token differences
+provider-visible tool names use `mcp_<peer-id>_*` (`mcp_graph_*` in this example), so name-token differences
 must be reported. Ordinary peers cannot request this binding mode.
 
 This first release supports stdio tools only, using Ferrus's existing neva

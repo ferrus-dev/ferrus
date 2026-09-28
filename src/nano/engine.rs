@@ -130,7 +130,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
             input: input.clone(),
-            launch_evidence,
+            launch_evidence: launch_evidence.map(Box::new),
             inherited_budget: (self.budget != Budget::default()).then(|| self.budget.clone()),
             provider: provider_settings.map(Box::new),
         }) {

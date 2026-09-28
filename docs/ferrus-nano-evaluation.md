@@ -67,7 +67,7 @@ MCP graph peers and disable `[repository_graph]` in `ferrus.toml`.
 The `nano_mcp` case uses the explicit Ferrus graph peer in
 [external stdio tools](ferrus-nano-mcp.md). It inherits only the managed
 binding, invokes the same task view through Ferrus MCP, and normalizes the
-three graph tool argument/result shapes for model input. Its `mcp_graph_*`
+three graph tool argument/result shapes for model input. Its `mcp_<peer-id>_*`
 tool names, MCP transport cost, and any output mismatch still need disclosure
 in `harness_notes`; exclude mismatched samples from a transport-only claim.
 
@@ -80,7 +80,7 @@ bounded Nano journal. It requires the Executor's persisted run-start baseline
 to match the case tree and rejects tasks with multiple Executor runs, whose
 later worktree state may no longer match the pinned start. For Nano, the
 journal's launch baseline, effective native-context and working-set flags,
-discovered graph-peer mode, and provider model must also match the manifest.
+discovered graph-peer mode and ID, and provider model must also match the manifest.
 Every attempt needs the pre-spawn HQ record with the pinned task digest,
 check-command digest, and observed cache condition. The submission transaction
 records the final gate's command digest, which must match the pinned workload.

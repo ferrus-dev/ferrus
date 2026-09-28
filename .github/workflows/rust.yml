@@ -64,6 +64,39 @@ jobs:
         run: cargo clippy --locked --no-default-features --features nano-openai,nano-mcp -- -D warnings
 
       - name: Set up Python for the stdio peer fixture
+        if: matrix.os != 'windows-latest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Nano stdio MCP integration
+        if: matrix.os != 'windows-latest'
+        run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
+
+      - name: Test Nano stdio MCP integration and headless release gates
+        if: matrix.os != 'windows-latest'
+        run: cargo test --locked --features nano-openai,nano-mcp
+
+      - name: Test core on Windows
+        if: matrix.os == 'windows-latest'
+        run: "cargo test --locked --features nano-openai,nano-mcp --lib --bin ferrus --test repository_graph_eval -- --skip nano::"
+
+  nano-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python for the stdio peer fixture
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -71,8 +104,11 @@ jobs:
       - name: Check Nano stdio MCP integration
         run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
 
-      - name: Test Nano stdio MCP integration and headless release gates
-        run: cargo test --locked --features nano-openai,nano-mcp
+      - name: Test Nano unit suite
+        run: "cargo test --locked --features nano-openai,nano-mcp --bin ferrus nano::"
+
+      - name: Test Nano headless integration
+        run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless
 
   smoke:
     strategy:

@@ -334,6 +334,7 @@ struct Entry {
 }
 
 struct Server {
+    id: String,
     client: Option<Client>,
     closing: Option<tokio::task::JoinHandle<Result<(), neva::error::Error>>>,
     timeout: Duration,
@@ -388,6 +389,16 @@ enum Launch {
 }
 
 impl McpTools {
+    pub(crate) fn graph_peer_id(&self) -> Option<&str> {
+        if self.graph_peer_mode() != GraphPeerMode::Complete {
+            return None;
+        }
+        self.entries
+            .values()
+            .find(|entry| entry.graph_equivalence)
+            .map(|entry| self.servers[entry.server].id.as_str())
+    }
+
     pub(crate) fn graph_peer_mode(&self) -> GraphPeerMode {
         let graph_tools: Vec<_> = self
             .entries
@@ -479,12 +490,20 @@ impl McpTools {
                 }
                 result = tokio::time::timeout(timeout, client.connect()) => result,
             };
-            if !matches!(connected, Ok(Ok(()))) {
-                let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
-                anyhow::bail!("Cannot connect MCP server {}", peer.id);
+            match connected {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+                    anyhow::bail!("Cannot connect MCP server {} (transport)", peer.id);
+                }
+                Err(_) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+                    anyhow::bail!("Cannot connect MCP server {} (timeout)", peer.id);
+                }
             }
             let index = self.servers.len();
             self.servers.push(Server {
+                id: peer.id.clone(),
                 client: Some(client),
                 closing: None,
                 timeout,
@@ -828,6 +847,49 @@ mod tests {
     }
 
     #[test]
+    fn complete_graph_peer_retains_its_configured_id() {
+        let schema = json!({"type":"object"});
+        let entries = [
+            "repository_graph_status",
+            "repository_search",
+            "repository_context",
+        ]
+        .into_iter()
+        .map(|remote_name| {
+            let name = provider_name("repo", remote_name);
+            (
+                name.clone(),
+                Entry {
+                    server: 0,
+                    remote_name: remote_name.into(),
+                    descriptor: ToolDescriptor {
+                        name,
+                        description: String::new(),
+                        input_schema: schema.clone(),
+                    },
+                    input: jsonschema::validator_for(&schema).unwrap(),
+                    output: None,
+                    schemas: (schema.clone(), None),
+                    graph_equivalence: true,
+                },
+            )
+        })
+        .collect();
+        let tools = McpTools {
+            servers: vec![Server {
+                id: "repo".into(),
+                client: None,
+                closing: None,
+                timeout: Duration::from_secs(1),
+            }],
+            entries,
+            active: None,
+        };
+        assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
+        assert_eq!(tools.graph_peer_id(), Some("repo"));
+    }
+
+    #[test]
     fn config_requires_private_explicit_allowlist() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
@@ -1040,28 +1102,38 @@ mod tests {
 
     #[tokio::test]
     async fn peer_results_fail_closed_and_keep_native_names_reserved() {
-        let mut normal = direct_peer("normal", 5000, &[]).await.unwrap();
+        // Python startup competes with Git/SQLite tests on loaded Windows CI
+        // runners. Keep the connection budget separate from the short call
+        // timeout exercised below.
+        let startup_timeout_ms = 15_000;
+        let mut normal = direct_peer("normal", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         let result = normal.execute(&call(), &Cancellation::default()).await;
         assert!(
             matches!(result, ToolOutcome::Success(value) if value["structuredContent"]["echo"] == "hello")
         );
         assert!(normal.shutdown().await);
 
-        let mut error = direct_peer("error", 5000, &[]).await.unwrap();
+        let mut error = direct_peer("error", startup_timeout_ms, &[]).await.unwrap();
         assert!(
             matches!(error.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "remote_error")
         );
         assert!(error.shutdown().await);
 
-        let mut changed = direct_peer("schema-change", 5000, &[]).await.unwrap();
+        let mut changed = direct_peer("schema-change", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(
             matches!(changed.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "schema_changed")
         );
         assert!(changed.shutdown().await);
 
-        let mut oversized = direct_peer("oversize", 5000, &[]).await.unwrap();
+        let mut oversized = direct_peer("oversize", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(matches!(
             oversized.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Unknown(ToolError::OutputLimit)
@@ -1069,7 +1141,9 @@ mod tests {
         assert!(oversized.servers[0].client.is_none());
         assert!(oversized.shutdown().await);
 
-        let mut invalid_output = direct_peer("invalid-output", 5000, &[]).await.unwrap();
+        let mut invalid_output = direct_peer("invalid-output", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(matches!(
             invalid_output.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Unknown(ToolError::Mcp(value)) if value["code"] == "invalid_output"
@@ -1077,7 +1151,9 @@ mod tests {
         assert!(invalid_output.servers[0].client.is_none());
         assert!(invalid_output.shutdown().await);
 
-        let mut timeout = direct_peer("timeout", 5000, &[]).await.unwrap();
+        let mut timeout = direct_peer("timeout", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         // Startup under a loaded Windows runner can exceed one second. Only
         // the tool call itself needs the short timeout under test.
         timeout.servers[0].timeout = Duration::from_millis(1000);
@@ -1087,7 +1163,9 @@ mod tests {
         ));
         assert!(timeout.shutdown().await);
 
-        let mut cancelled = direct_peer("timeout", 5000, &[]).await.unwrap();
+        let mut cancelled = direct_peer("timeout", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         let cancellation = Cancellation::default();
         let trigger = cancellation.clone();
         tokio::spawn(async move {
@@ -1105,6 +1183,10 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type":"object"}),
         }];
-        assert!(direct_peer("normal", 5000, &native).await.is_err());
+        assert!(
+            direct_peer("normal", startup_timeout_ms, &native)
+                .await
+                .is_err()
+        );
     }
 }

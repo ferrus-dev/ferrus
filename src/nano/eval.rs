@@ -478,6 +478,31 @@ fn task_state(
     ))
 }
 
+fn is_graph_call(name: &str, arguments: &str, graph_peer_id: Option<&str>) -> bool {
+    if matches!(
+        name,
+        "repository_graph_status" | "repository_search" | "repository_context"
+    ) {
+        return true;
+    }
+    if let Some(id) = graph_peer_id {
+        let prefix = format!("mcp_{id}_");
+        if let Some(tool) = name.strip_prefix(&prefix)
+            && matches!(
+                tool,
+                "repository_graph_status" | "repository_search" | "repository_context"
+            )
+        {
+            return true;
+        }
+    }
+    matches!(name, "project_context_search" | "project_context")
+        && serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|args| args["domain"].as_str().map(str::to_owned))
+            .is_some_and(|domain| matches!(domain.as_str(), "repository" | "all"))
+}
+
 fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
     let path = attempt
         .journal
@@ -502,7 +527,7 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 && identity.run_id.as_deref() == Some(&attempt.run_id)),
         "Journal/task mismatch"
     );
-    let inherited = match &records[0].event {
+    let (inherited, graph_peer_id) = match &records[0].event {
         SessionEvent::Started {
             inherited_budget,
             launch_evidence,
@@ -533,6 +558,23 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 evidence.graph_peer_mode == Some(expected_peer_mode),
                 "Nano journal graph peer mode does not match variant"
             );
+            ensure!(
+                match expected_peer_mode {
+                    GraphPeerMode::Complete =>
+                        evidence.graph_peer_id.as_deref().is_some_and(|id| {
+                            !id.is_empty()
+                                && id.len() <= 24
+                                && id.bytes().all(|byte| {
+                                    byte.is_ascii_lowercase()
+                                        || byte.is_ascii_digit()
+                                        || byte == b'_'
+                                })
+                        }),
+                    GraphPeerMode::Absent => evidence.graph_peer_id.is_none(),
+                    GraphPeerMode::Partial => false,
+                },
+                "Nano journal graph peer ID does not match variant"
+            );
             let provider = provider
                 .as_ref()
                 .context("Nano journal lacks provider settings")?;
@@ -549,7 +591,10 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 attempt.settings_sha256 == settings_sha256,
                 "Nano settings digest does not match manifest"
             );
-            inherited_budget.clone().unwrap_or_default()
+            (
+                inherited_budget.clone().unwrap_or_default(),
+                evidence.graph_peer_id.clone(),
+            )
         }
         _ => unreachable!("Replay accepted only a Started first record"),
     };
@@ -569,18 +614,7 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 if call.name == "repository_fallback" {
                     fallback_calls += 1;
                 }
-                if matches!(
-                    call.name.as_str(),
-                    "repository_graph_status" | "repository_search" | "repository_context"
-                ) || call.name.starts_with("mcp_graph_repository_")
-                    || (matches!(
-                        call.name.as_str(),
-                        "project_context_search" | "project_context"
-                    ) && serde_json::from_str::<serde_json::Value>(&call.arguments)
-                        .ok()
-                        .and_then(|args| args["domain"].as_str().map(str::to_owned))
-                        .is_some_and(|domain| matches!(domain.as_str(), "repository" | "all")))
-                {
+                if is_graph_call(&call.name, &call.arguments, graph_peer_id.as_deref()) {
                     graph_tool_calls += 1;
                 }
                 calls.insert(call_id.clone(), call.name.as_str());
@@ -831,6 +865,32 @@ mod tests {
     };
     use std::{fs, process::Command};
 
+    #[test]
+    fn graph_calls_use_the_discovered_peer_id() {
+        for tool in [
+            "repository_graph_status",
+            "repository_search",
+            "repository_context",
+        ] {
+            assert!(is_graph_call(
+                &format!("mcp_repo_{tool}"),
+                "{}",
+                Some("repo")
+            ));
+            assert!(!is_graph_call(
+                &format!("mcp_graph_{tool}"),
+                "{}",
+                Some("repo")
+            ));
+        }
+        assert!(!is_graph_call(
+            "mcp_repo_repository_unrelated",
+            "{}",
+            Some("repo")
+        ));
+        assert!(!is_graph_call("mcp_repo_repository_search", "{}", None));
+    }
+
     fn write_records(path: &Path, records: &[Record]) -> Result<()> {
         let mut file = File::create(path)?;
         for record in records {
@@ -1030,13 +1090,14 @@ mod tests {
                     identity,
                     limits: Limits::default(),
                     input: "task".into(),
-                    launch_evidence: Some(LaunchEvidence {
+                    launch_evidence: Some(Box::new(LaunchEvidence {
                         baseline_tree: start_tree.clone(),
                         native_context_enabled: true,
                         working_set_enabled: false,
                         graph_peer_mode: Some(GraphPeerMode::Absent),
+                        graph_peer_id: None,
                         settings_sha256: None,
-                    }),
+                    })),
                     inherited_budget: None,
                     provider: Some(Box::new(ProviderSettings {
                         api: "openai_chat_completions_v1".into(),
@@ -1231,6 +1292,22 @@ mod tests {
                 version: 1,
                 attempts: vec![mcp_attempt.clone()]
             })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.graph_peer_id = Some("repo".into());
+        }
+        mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
             .is_ok()
         );
         let mut disabled_attempt = baseline_attempt.clone();
@@ -1251,6 +1328,7 @@ mod tests {
         } = &mut records[0].event
         {
             evidence.graph_peer_mode = Some(GraphPeerMode::Absent);
+            evidence.graph_peer_id = None;
         }
         disabled_attempt.settings_sha256 = set_settings_digest(&mut records)?;
         write_records(&journal, &records)?;
