@@ -5,6 +5,12 @@ use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum Command {
+    /// Summarize a pinned, opt-in headless evaluation manifest without inference
+    Eval {
+        /// JSON manifest with attempts and authoritative Ferrus database paths
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     /// Run a managed Executor; HQ sends start/cancel commands over open stdin
     Run {
         /// Absolute owner-only provider settings file (or FERRUS_NANO_CONFIG)
@@ -16,6 +22,9 @@ pub(crate) enum Command {
         /// Disable working-set selection, query reuse, and scheduled overlay refresh
         #[arg(long)]
         no_working_set: bool,
+        /// Disable native graph and memory tools; external MCP tools remain available
+        #[arg(long)]
+        no_native_context: bool,
         /// Prefetch this explicit task path (repeatable; at most eight seeds total)
         #[arg(long)]
         prefetch_path: Vec<String>,
@@ -34,36 +43,45 @@ pub(crate) enum Command {
 }
 
 pub(crate) async fn run(command: Command) -> Result<()> {
-    let (config, model, no_working_set, prefetch_path, prefetch_symbol) = match command {
-        Command::Run {
-            config,
-            model,
-            no_working_set,
-            prefetch_path,
-            prefetch_symbol,
-        } => (
-            config,
-            model,
-            no_working_set,
-            prefetch_path,
-            prefetch_symbol,
-        ),
-        #[cfg(feature = "nano-mcp")]
-        Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
-    };
+    let (config, model, no_working_set, no_native_context, prefetch_path, prefetch_symbol) =
+        match command {
+            Command::Eval { manifest } => return super::eval::report(&manifest),
+            Command::Run {
+                config,
+                model,
+                no_working_set,
+                no_native_context,
+                prefetch_path,
+                prefetch_symbol,
+            } => (
+                config,
+                model,
+                no_working_set,
+                no_native_context,
+                prefetch_path,
+                prefetch_symbol,
+            ),
+            #[cfg(feature = "nano-mcp")]
+            Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
+        };
     let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
+    anyhow::ensure!(
+        !no_native_context || seeds.is_empty(),
+        "Native prefetch requires native context tools"
+    );
     super::agent::validate_config(config.as_deref(), model.as_deref())?;
     #[cfg(feature = "nano-openai")]
     return launch(
         super::agent::config_path(config.as_deref())?,
         model,
         !no_working_set,
+        !no_native_context,
         seeds,
     )
     .await;
     #[cfg(not(feature = "nano-openai"))]
     {
-        let _ = (no_working_set, seeds);
+        let _ = (no_working_set, no_native_context, seeds);
         unreachable!("feature validated above");
     }
 }
@@ -73,6 +91,7 @@ async fn launch(
     config: PathBuf,
     model: Option<String>,
     working_set: bool,
+    native_context: bool,
     seeds: Vec<serde_json::Value>,
 ) -> Result<()> {
     use super::{
@@ -94,6 +113,12 @@ async fn launch(
         time::Duration,
     };
     let settings = super::agent::load_config(&config, model.as_deref())?;
+    let working_set = working_set && settings.working_set_enabled;
+    let native_context = native_context && settings.native_context_enabled;
+    anyhow::ensure!(
+        native_context || seeds.is_empty(),
+        "Native prefetch requires native context tools"
+    );
     #[cfg(feature = "nano-mcp")]
     let mcp_config = settings.mcp_config_file.clone();
     let provider = OpenAi::new(settings)?;
@@ -157,6 +182,7 @@ async fn launch(
             native.mcp_config = mcp_config;
         }
         native.working_set_enabled = working_set;
+        native.native_context_enabled = native_context;
         native.context.cache_enabled = working_set;
         native.prefetch = seeds;
         let journal = ObservedJournal {

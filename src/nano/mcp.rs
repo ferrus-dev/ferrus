@@ -1,6 +1,6 @@
 //! Explicit external stdio tools. Ferrus tools stay native and retain their names.
 
-use super::{private, tools::*};
+use super::{private, session::GraphPeerMode, tools::*};
 use anyhow::{Result, ensure};
 use neva::client::Client;
 use serde::Deserialize;
@@ -23,11 +23,14 @@ const MAX_TOOLS: usize = 32;
 const MAX_SCHEMA_BYTES: usize = 4 * 1024;
 // Leave room for ToolOutcome framing in the engine's 32 KiB journal cap.
 const MAX_RESULT_BYTES: usize = 24 * 1024;
+// Graph results are bounded to 24 KiB before encoding; the MCP envelope
+// escapes that JSON text again and needs separate transport headroom.
+const MAX_GRAPH_TRANSPORT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 // Catalog pages can contain up to 32 tool schemas; calls need only the
 // bounded result plus the JSON-RPC envelope.
 const MAX_CATALOG_FRAME_BYTES: usize = 512 * 1024;
-const MAX_CALL_FRAME_BYTES: usize = MAX_RESULT_BYTES + 1024;
+const MAX_CALL_FRAME_BYTES: usize = MAX_GRAPH_TRANSPORT_BYTES + 1024;
 const MAX_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -46,6 +49,9 @@ struct ServerConfig {
     cwd: Option<PathBuf>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// Explicit test-only Ferrus graph peer with the current managed binding.
+    #[serde(default)]
+    inherit_managed_binding: bool,
     /// Names explicitly granted by the host. MCP annotations grant nothing.
     allow: Vec<String>,
     #[serde(default = "default_timeout")]
@@ -54,6 +60,43 @@ struct ServerConfig {
 
 fn default_timeout() -> u64 {
     10_000
+}
+
+/// The opt-in Ferrus graph peer uses MCP as transport while the model sees
+/// the same typed graph result shape as the native adapter.
+fn graph_response(name: &str, value: &Value) -> Result<Value> {
+    use crate::repository_graph::query;
+    let content = value["content"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Missing graph content"))?;
+    ensure!(content.len() == 1, "Expected one Ferrus graph response");
+    let text = content[0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing graph text"))?;
+    ensure!(
+        text.len() <= MAX_RESULT_BYTES,
+        "Graph response exceeds limit"
+    );
+    let parsed: Value = serde_json::from_str(text)?;
+    let response = match name {
+        "repository_graph_status" => {
+            super::context::Response::RepositoryStatus(serde_json::from_value(parsed)?)
+        }
+        "repository_search" => {
+            let result = serde_json::from_value::<query::SearchResponse>(parsed.clone())
+                .map(Ok)
+                .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
+            super::context::Response::RepositorySearch(result)
+        }
+        "repository_context" => {
+            let result = serde_json::from_value::<query::ContextResponse>(parsed.clone())
+                .map(Ok)
+                .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
+            super::context::Response::RepositoryContext(result)
+        }
+        _ => anyhow::bail!("Unsupported graph peer tool"),
+    };
+    Ok(serde_json::to_value(response)?)
 }
 
 impl Config {
@@ -117,6 +160,27 @@ impl Config {
                     }),
                 "Invalid MCP environment"
             );
+            if server.inherit_managed_binding {
+                ensure!(
+                    server.command.canonicalize()? == std::env::current_exe()?.canonicalize()?
+                        && server.args == ["serve", "--role", "executor"]
+                        && server.cwd.is_none()
+                        && server.allow.iter().all(|name| matches!(
+                            name.as_str(),
+                            "repository_graph_status" | "repository_search" | "repository_context"
+                        ))
+                        && [
+                            crate::agent_id::ENV_PROJECT_ROOT,
+                            crate::agent_id::ENV_AGENT_ID,
+                            crate::agent_id::ENV_TASK_ID,
+                            crate::agent_id::ENV_RUN_ID,
+                            crate::agent_id::ENV_BASELINE_TREE
+                        ]
+                        .iter()
+                        .all(|name| !server.env.contains_key(*name)),
+                    "Managed binding is only available to the read-only Ferrus graph peer"
+                );
+            }
             ensure!(
                 !server.allow.is_empty() && server.allow.len() <= MAX_TOOLS,
                 "MCP tools must be explicitly allowed"
@@ -156,6 +220,23 @@ pub(crate) fn run_peer(config_path: &Path, server_id: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if server.inherit_managed_binding {
+        for name in [
+            crate::agent_id::ENV_PROJECT_ROOT,
+            crate::agent_id::ENV_AGENT_ID,
+            crate::agent_id::ENV_TASK_ID,
+            crate::agent_id::ENV_RUN_ID,
+        ] {
+            command.env(
+                name,
+                std::env::var_os(name)
+                    .ok_or_else(|| anyhow::anyhow!("Missing managed graph peer binding"))?,
+            );
+        }
+        if let Some(tree) = std::env::var_os(crate::agent_id::ENV_BASELINE_TREE) {
+            command.env(crate::agent_id::ENV_BASELINE_TREE, tree);
+        }
+    }
     if let Some(cwd) = &server.cwd {
         command.current_dir(cwd);
     }
@@ -252,9 +333,11 @@ struct Entry {
     input: jsonschema::Validator,
     output: Option<jsonschema::Validator>,
     schemas: (Value, Option<Value>),
+    graph_equivalence: bool,
 }
 
 struct Server {
+    id: String,
     client: Option<Client>,
     closing: Option<tokio::task::JoinHandle<Result<(), neva::error::Error>>>,
     timeout: Duration,
@@ -309,6 +392,65 @@ enum Launch {
 }
 
 impl McpTools {
+    pub(crate) fn catalog_counts(&self) -> (usize, usize) {
+        (self.servers.len(), self.entries.len())
+    }
+
+    pub(crate) fn graph_peer_id(&self) -> Option<&str> {
+        if self.graph_peer_mode() != GraphPeerMode::Complete {
+            return None;
+        }
+        self.entries
+            .values()
+            .find(|entry| entry.graph_equivalence)
+            .map(|entry| self.servers[entry.server].id.as_str())
+    }
+
+    pub(crate) fn graph_peer_timeout_ms(&self) -> Option<u64> {
+        if self.graph_peer_mode() != GraphPeerMode::Complete {
+            return None;
+        }
+        self.entries
+            .values()
+            .find(|entry| entry.graph_equivalence)
+            .map(|entry| self.servers[entry.server].timeout.as_millis() as u64)
+    }
+
+    pub(crate) fn graph_remote_name(&self, name: &str) -> Option<&str> {
+        self.entries
+            .get(name)
+            .filter(|entry| entry.graph_equivalence)
+            .map(|entry| entry.remote_name.as_str())
+    }
+
+    pub(crate) fn graph_peer_mode(&self) -> GraphPeerMode {
+        let graph_tools: Vec<_> = self
+            .entries
+            .values()
+            .filter(|entry| entry.graph_equivalence)
+            .collect();
+        if graph_tools.is_empty() {
+            GraphPeerMode::Absent
+        } else if graph_tools.len() == 3
+            && graph_tools
+                .iter()
+                .all(|entry| entry.server == graph_tools[0].server)
+            && graph_tools
+                .iter()
+                .map(|entry| entry.remote_name.as_str())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([
+                    "repository_graph_status",
+                    "repository_search",
+                    "repository_context",
+                ])
+        {
+            GraphPeerMode::Complete
+        } else {
+            GraphPeerMode::Partial
+        }
+    }
+
     pub(crate) async fn connect(
         config_path: &Path,
         native: &[ToolDescriptor],
@@ -372,12 +514,20 @@ impl McpTools {
                 }
                 result = tokio::time::timeout(timeout, client.connect()) => result,
             };
-            if !matches!(connected, Ok(Ok(()))) {
-                let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
-                anyhow::bail!("Cannot connect MCP server {}", peer.id);
+            match connected {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+                    anyhow::bail!("Cannot connect MCP server {} (transport)", peer.id);
+                }
+                Err(_) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), client.disconnect()).await;
+                    anyhow::bail!("Cannot connect MCP server {} (timeout)", peer.id);
+                }
             }
             let index = self.servers.len();
             self.servers.push(Server {
+                id: peer.id.clone(),
                 client: Some(client),
                 closing: None,
                 timeout,
@@ -417,7 +567,18 @@ impl McpTools {
                             && safe_schema(&schema, 0),
                         "Invalid MCP input schema"
                     );
-                    let input = jsonschema::validator_for(&schema)
+                    let provider_descriptor = if peer.inherit_managed_binding {
+                        let mut descriptor = super::native::descriptor(&tool.name);
+                        descriptor.name = name.clone();
+                        descriptor
+                    } else {
+                        ToolDescriptor {
+                            name: name.clone(),
+                            description: tool.descr.clone().unwrap_or_default(),
+                            input_schema: schema.clone(),
+                        }
+                    };
+                    let input = jsonschema::validator_for(&provider_descriptor.input_schema)
                         .map_err(|_| anyhow::anyhow!("Invalid MCP input schema"))?;
                     let output_schema = tool
                         .output_schema
@@ -438,7 +599,7 @@ impl McpTools {
                         }
                         None => None,
                     };
-                    let description = tool.descr.unwrap_or_default();
+                    let description = provider_descriptor.description.as_str();
                     ensure!(
                         description.len() <= 1024 && self.entries.len() < MAX_TOOLS,
                         "MCP catalog exceeds limit"
@@ -448,14 +609,11 @@ impl McpTools {
                         Entry {
                             server: index,
                             remote_name: tool.name,
-                            descriptor: ToolDescriptor {
-                                name,
-                                description,
-                                input_schema: schema.clone(),
-                            },
+                            descriptor: provider_descriptor,
                             input,
                             output,
                             schemas: (schema, output_schema),
+                            graph_equivalence: peer.inherit_managed_binding,
                         },
                     );
                 }
@@ -529,16 +687,24 @@ impl McpTools {
                     json!({"code":"schema_changed"}),
                 )));
             }
-            let args: HashMap<String, Value> = call
-                .arguments
-                .as_object()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .collect();
-            client.call_tool(remote_name, args).await.map_err(|_| {
-                ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"call_unconfirmed"})))
-            })
+            let args: HashMap<String, Value> = if self.entries[&call.name].graph_equivalence
+                && remote_name != "repository_graph_status"
+            {
+                [("input".into(), call.arguments.clone())].into()
+            } else {
+                call.arguments
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect()
+            };
+            client
+                .call_tool(remote_name.clone(), args)
+                .await
+                .map_err(|_| {
+                    ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"call_unconfirmed"})))
+                })
         };
         let outcome = tokio::select! {
             biased;
@@ -547,10 +713,15 @@ impl McpTools {
                 Ok(Ok(response)) => {
                     let output = serde_json::to_value(&response);
                     match output {
-                        Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= MAX_RESULT_BYTES) => {
+                        Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= if self.entries[&call.name].graph_equivalence { MAX_GRAPH_TRANSPORT_BYTES } else { MAX_RESULT_BYTES }) => {
                             if response.is_error { ToolOutcome::Failed(ToolError::Mcp(json!({"code":"remote_error", "result":value}))) }
                             else if self.entries[&call.name].output.as_ref().is_some_and(|schema| response.struct_content.as_ref().is_none_or(|v| !schema.is_valid(v))) {
                                 ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_output"})))
+                            } else if self.entries[&call.name].graph_equivalence {
+                                match graph_response(&remote_name, &value) {
+                                    Ok(value) => ToolOutcome::Success(value),
+                                    Err(_) => ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_graph_response"}))),
+                                }
                             } else { ToolOutcome::Success(value) }
                         },
                         _ => ToolOutcome::Unknown(ToolError::OutputLimit),
@@ -700,6 +871,79 @@ mod tests {
     }
 
     #[test]
+    fn complete_graph_peer_retains_its_configured_id() {
+        let schema = json!({"type":"object"});
+        let entries = [
+            "repository_graph_status",
+            "repository_search",
+            "repository_context",
+        ]
+        .into_iter()
+        .map(|remote_name| {
+            let name = provider_name("repo", remote_name);
+            (
+                name.clone(),
+                Entry {
+                    server: 0,
+                    remote_name: remote_name.into(),
+                    descriptor: ToolDescriptor {
+                        name,
+                        description: String::new(),
+                        input_schema: schema.clone(),
+                    },
+                    input: jsonschema::validator_for(&schema).unwrap(),
+                    output: None,
+                    schemas: (schema.clone(), None),
+                    graph_equivalence: true,
+                },
+            )
+        })
+        .collect();
+        let mut tools = McpTools {
+            servers: vec![Server {
+                id: "repo".into(),
+                client: None,
+                closing: None,
+                timeout: Duration::from_secs(1),
+            }],
+            entries,
+            active: None,
+        };
+        assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
+        assert_eq!(tools.graph_peer_id(), Some("repo"));
+        assert_eq!(tools.graph_peer_timeout_ms(), Some(1_000));
+        assert_eq!(
+            tools.graph_remote_name("mcp_repo_repository_search"),
+            Some("repository_search")
+        );
+        assert_eq!(tools.catalog_counts(), (1, 3));
+        tools.servers.push(Server {
+            id: "extra".into(),
+            client: None,
+            closing: None,
+            timeout: Duration::from_secs(1),
+        });
+        tools.entries.insert(
+            "mcp_extra_echo".into(),
+            Entry {
+                server: 1,
+                remote_name: "echo".into(),
+                descriptor: ToolDescriptor {
+                    name: "mcp_extra_echo".into(),
+                    description: String::new(),
+                    input_schema: schema.clone(),
+                },
+                input: jsonschema::validator_for(&schema).unwrap(),
+                output: None,
+                schemas: (schema, None),
+                graph_equivalence: false,
+            },
+        );
+        assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
+        assert_eq!(tools.catalog_counts(), (2, 4));
+    }
+
+    #[test]
     fn config_requires_private_explicit_allowlist() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
@@ -738,6 +982,30 @@ mod tests {
     }
 
     #[test]
+    fn managed_graph_binding_rejects_other_commands_and_tools() {
+        let temporary = tempfile::tempdir().unwrap();
+        let command = toml::Value::String(std::env::current_exe().unwrap().display().to_string());
+        let directory = temporary.path().join("private");
+        private::directory(&directory, true).unwrap();
+        let cases = [
+            (
+                "['serve', '--role', 'executor']",
+                "['repository_search']",
+                true,
+            ),
+            ("['serve']", "['repository_search']", false),
+            ("['serve', '--role', 'executor']", "['exec']", false),
+        ];
+        for (index, (args, allow, expected)) in cases.into_iter().enumerate() {
+            let path = directory.join(format!("peer-{index}.toml"));
+            let mut file = private::file(&path, true).unwrap();
+            write!(file, "[[servers]]\nid = 'graph'\ncommand = {command}\nargs = {args}\nallow = {allow}\ninherit_managed_binding = true\n").unwrap();
+            drop(file);
+            assert_eq!(Config::load(&path).is_ok(), expected);
+        }
+    }
+
+    #[test]
     fn arguments_follow_pinned_schema() {
         let schema = json!({"type":"object", "properties":{"text":{"type":"string"}}, "required":["text"], "additionalProperties":false});
         let descriptor = ToolDescriptor {
@@ -752,6 +1020,7 @@ mod tests {
             input: jsonschema::validator_for(&schema).unwrap(),
             output: None,
             schemas: (schema, None),
+            graph_equivalence: false,
         };
         let tools = McpTools {
             servers: Vec::new(),
@@ -813,6 +1082,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
+                inherit_managed_binding: false,
                 allow: vec!["echo".into()],
                 timeout_ms,
             }],
@@ -886,28 +1156,38 @@ mod tests {
 
     #[tokio::test]
     async fn peer_results_fail_closed_and_keep_native_names_reserved() {
-        let mut normal = direct_peer("normal", 5000, &[]).await.unwrap();
+        // Python startup competes with Git/SQLite tests on loaded Windows CI
+        // runners. Keep the connection budget separate from the short call
+        // timeout exercised below.
+        let startup_timeout_ms = 15_000;
+        let mut normal = direct_peer("normal", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         let result = normal.execute(&call(), &Cancellation::default()).await;
         assert!(
             matches!(result, ToolOutcome::Success(value) if value["structuredContent"]["echo"] == "hello")
         );
         assert!(normal.shutdown().await);
 
-        let mut error = direct_peer("error", 5000, &[]).await.unwrap();
+        let mut error = direct_peer("error", startup_timeout_ms, &[]).await.unwrap();
         assert!(
             matches!(error.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "remote_error")
         );
         assert!(error.shutdown().await);
 
-        let mut changed = direct_peer("schema-change", 5000, &[]).await.unwrap();
+        let mut changed = direct_peer("schema-change", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(
             matches!(changed.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Failed(ToolError::Mcp(value)) if value["code"] == "schema_changed")
         );
         assert!(changed.shutdown().await);
 
-        let mut oversized = direct_peer("oversize", 5000, &[]).await.unwrap();
+        let mut oversized = direct_peer("oversize", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(matches!(
             oversized.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Unknown(ToolError::OutputLimit)
@@ -915,7 +1195,9 @@ mod tests {
         assert!(oversized.servers[0].client.is_none());
         assert!(oversized.shutdown().await);
 
-        let mut invalid_output = direct_peer("invalid-output", 5000, &[]).await.unwrap();
+        let mut invalid_output = direct_peer("invalid-output", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         assert!(matches!(
             invalid_output.execute(&call(), &Cancellation::default()).await,
             ToolOutcome::Unknown(ToolError::Mcp(value)) if value["code"] == "invalid_output"
@@ -923,7 +1205,9 @@ mod tests {
         assert!(invalid_output.servers[0].client.is_none());
         assert!(invalid_output.shutdown().await);
 
-        let mut timeout = direct_peer("timeout", 5000, &[]).await.unwrap();
+        let mut timeout = direct_peer("timeout", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         // Startup under a loaded Windows runner can exceed one second. Only
         // the tool call itself needs the short timeout under test.
         timeout.servers[0].timeout = Duration::from_millis(1000);
@@ -933,7 +1217,9 @@ mod tests {
         ));
         assert!(timeout.shutdown().await);
 
-        let mut cancelled = direct_peer("timeout", 5000, &[]).await.unwrap();
+        let mut cancelled = direct_peer("timeout", startup_timeout_ms, &[])
+            .await
+            .unwrap();
         let cancellation = Cancellation::default();
         let trigger = cancellation.clone();
         tokio::spawn(async move {
@@ -951,6 +1237,10 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type":"object"}),
         }];
-        assert!(direct_peer("normal", 5000, &native).await.is_err());
+        assert!(
+            direct_peer("normal", startup_timeout_ms, &native)
+                .await
+                .is_err()
+        );
     }
 }

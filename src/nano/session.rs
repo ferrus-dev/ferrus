@@ -1,6 +1,7 @@
 //! Transport-neutral session protocol and persisted resource accounting.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::provider::{ModelResponse, ProviderErrorKind, ProviderSettings, Usage};
 use super::tools::{EffectPlan, ToolCall, ToolOutcome};
@@ -66,6 +67,86 @@ impl Limits {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchEvidence {
+    pub baseline_tree: String,
+    pub native_context_enabled: bool,
+    pub working_set_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_peer_mode: Option<GraphPeerMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_peer_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_peer_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GraphPeerMode {
+    Absent,
+    Partial,
+    Complete,
+}
+
+pub(crate) fn effective_settings_sha256(
+    provider: &ProviderSettings,
+    limits: &Limits,
+    evidence: &LaunchEvidence,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct EffectiveSettings<'a> {
+        version: u8,
+        provider: &'a ProviderSettings,
+        limits: &'a Limits,
+        native_context_enabled: bool,
+        working_set_enabled: bool,
+        graph_peer_mode: GraphPeerMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph_peer_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_peer_count: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_tool_count: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph_peer_timeout_ms: Option<u64>,
+    }
+
+    let graph_peer_mode = evidence
+        .graph_peer_mode
+        .ok_or_else(|| anyhow::anyhow!("Graph peer mode is missing"))?;
+    let settings = EffectiveSettings {
+        version: if evidence.graph_peer_timeout_ms.is_some() {
+            4
+        } else if evidence.mcp_peer_count.is_some() || evidence.mcp_tool_count.is_some() {
+            3
+        } else if evidence.graph_peer_id.is_some() {
+            2
+        } else {
+            1
+        },
+        provider,
+        limits,
+        native_context_enabled: evidence.native_context_enabled,
+        working_set_enabled: evidence.working_set_enabled,
+        graph_peer_mode,
+        graph_peer_id: evidence.graph_peer_id.as_deref(),
+        mcp_peer_count: evidence.mcp_peer_count,
+        mcp_tool_count: evidence.mcp_tool_count,
+        graph_peer_timeout_ms: evidence.graph_peer_timeout_ms,
+    };
+    Ok(Sha256::digest(serde_json::to_vec(&settings)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +233,8 @@ pub(crate) enum SessionEvent {
         limits: Limits,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_evidence: Option<Box<LaunchEvidence>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         inherited_budget: Option<Budget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<Box<ProviderSettings>>,
@@ -219,6 +302,8 @@ pub(crate) struct ContextComposition {
     pub context_window_tokens: u64,
     pub evicted_outputs: usize,
     pub summary_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

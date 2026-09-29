@@ -1,6 +1,8 @@
 //! Build role prompts, launch agent processes, and manage headless session logs and shutdown.
 
-use crate::agent_id::{ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR};
+use crate::agent_id::{
+    ENV_BASELINE_TREE, ENV_PROJECT_ROOT, ENV_RUN_ID, ENV_TASK_ID, ROLE_EXECUTOR, ROLE_SUPERVISOR,
+};
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport, SupervisorAgent};
 use crate::platform::{self, ShutdownSignal};
 use crate::state::agents::{AgentEntry, AgentStatus, read_agents, write_agents};
@@ -504,6 +506,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .find_map(|(key, value)| (*key == ENV_TASK_ID).then_some(value.trim()))
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let baseline_tree = request
+        .env
+        .iter()
+        .find_map(|(key, value)| (*key == ENV_BASELINE_TREE).then_some(value.as_str()))
+        .map(str::to_owned);
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
     let log_path = headless_log_path(log_dir, request.role, task_id.as_deref(), &run_id, &ts);
 
@@ -537,6 +544,27 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         }
         .display()
         .to_string(),
+    };
+
+    // Capture workload and index state before the child can change either one.
+    let evaluation = if request.role.eq_ignore_ascii_case("executor") {
+        match std::env::var("FERRUS_NANO_EVAL_CASE") {
+            Ok(case_id) => {
+                let task_id = task_id
+                    .as_deref()
+                    .context("Evaluation Executor has no task ID")?;
+                let root = request
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.project_root.as_path())
+                    .context("Evaluation Executor has no project root")?;
+                Some(crate::nano::capture_evaluation_launch(&case_id, root, task_id).await?)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
     };
 
     if request.debug {
@@ -604,6 +632,10 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         pid,
         task_id.as_deref(),
         workspace_path,
+        crate::project::RunStartEvidence {
+            baseline_tree: baseline_tree.as_deref(),
+            evaluation,
+        },
     )
     .await;
     if native && db_run_id.is_none() {

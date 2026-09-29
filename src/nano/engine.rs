@@ -7,8 +7,8 @@ use super::{
         FinishReason, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Usage,
     },
     session::{
-        Budget, ContextComposition, EndReason, LimitKind, Limits, SessionCommand, SessionEnd,
-        SessionEvent, SessionIdentity,
+        Budget, ContextComposition, EndReason, LaunchEvidence, LimitKind, Limits, SessionCommand,
+        SessionEnd, SessionEvent, SessionIdentity, effective_settings_sha256,
     },
     tools::{Cancellation, Host, ToolCall, ToolError, ToolOutcome, Tools, ValidatedCall},
 };
@@ -29,6 +29,7 @@ pub(crate) struct Engine<P, T, H, J> {
     last_request: Vec<Message>,
     previous_call: Option<(String, serde_json::Value)>,
     started: Option<Instant>,
+    launch_evidence: Option<LaunchEvidence>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +69,12 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             last_request: Vec::new(),
             previous_call: None,
             started: None,
+            launch_evidence: None,
         })
+    }
+
+    pub(crate) fn set_launch_evidence(&mut self, evidence: LaunchEvidence) {
+        self.launch_evidence = Some(evidence);
     }
 
     pub(crate) fn inherit_budget(&mut self, budget: Budget) -> Result<()> {
@@ -114,12 +120,19 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             });
         }
 
+        let provider_settings = self.provider.settings();
+        let mut launch_evidence = self.launch_evidence.clone();
+        if let (Some(evidence), Some(provider)) = (&mut launch_evidence, &provider_settings) {
+            evidence.settings_sha256 =
+                Some(effective_settings_sha256(provider, &self.limits, evidence)?);
+        }
         if !self.commit(SessionEvent::Started {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
             input: input.clone(),
+            launch_evidence: launch_evidence.map(Box::new),
             inherited_budget: (self.budget != Budget::default()).then(|| self.budget.clone()),
-            provider: self.provider.settings().map(Box::new),
+            provider: provider_settings.map(Box::new),
         }) {
             return Ok(self.journal_failure());
         }
@@ -165,6 +178,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 return EndReason::Limit(LimitKind::ModelTurns);
             }
 
+            let assembly_start = Instant::now();
             let preparation = match interrupt(
                 self.tools.prepare_context(&self.messages, cancellation),
                 cancellation,
@@ -351,6 +365,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     .projection
                     .as_ref()
                     .is_some_and(|p| p.summary.is_some()),
+                assembly_elapsed_ms: Some(
+                    u64::try_from(assembly_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
             };
             if (had_preparation || preparation.projection.is_some())
                 && committed_preparation.as_ref() != Some(&preparation)
@@ -826,6 +843,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             context_window_tokens: capacity.window,
             evicted_outputs: 0,
             summary_present: self.summary.is_some(),
+            assembly_elapsed_ms: None,
         };
         if !self.commit(SessionEvent::ContextComposed { composition }) {
             return Err(EndReason::JournalFailed);

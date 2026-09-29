@@ -35,6 +35,45 @@ fn configure(f: &Fixture, commands: &[&str], retries: u32) {
     std::fs::write(f.root.join("ferrus.toml"), format!("[checks]\ncommands = {commands}\n[limits]\nmax_check_retries = {retries}\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n[lease]\nttl_secs = 30\nheartbeat_interval_secs = 1\n")).unwrap();
 }
 
+#[tokio::test]
+async fn evaluation_launch_captures_task_checks_and_prelaunch_graph_state() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let suite: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/nano_eval/suite.json")).unwrap();
+    let task = suite["workloads"]["local_bug_fix"]["task"]
+        .as_str()
+        .unwrap();
+    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), format!("{task}\n")).unwrap();
+    configure(&f, &["cargo test"], 3);
+
+    let disabled = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
+        .await
+        .unwrap();
+    assert_eq!(disabled["cache"], "disabled");
+    assert_eq!(
+        disabled["check_commands_sha256"],
+        crate::checks::commands_sha256(&["cargo test".into()]).unwrap()
+    );
+
+    let config = std::fs::read_to_string(f.root.join("ferrus.toml")).unwrap();
+    std::fs::write(
+        f.root.join("ferrus.toml"),
+        format!("{config}\n[repository_graph]\nenabled = true\n"),
+    )
+    .unwrap();
+    let cold = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
+        .await
+        .unwrap();
+    assert_eq!(cold["cache"], "cold");
+    assert_eq!(cold["task_sha256"], disabled["task_sha256"]);
+    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), "trivial task\n").unwrap();
+    let changed = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
+        .await
+        .unwrap();
+    assert_ne!(changed["task_sha256"], cold["task_sha256"]);
+}
+
 fn native(
     f: &Fixture,
     session: FerrusSession,
@@ -89,6 +128,7 @@ fn previous_intent(f: &Fixture, id: &str, name: &str, plan: Option<EffectPlan>, 
                 },
                 limits: Limits::default(),
                 input: "task".into(),
+                launch_evidence: None,
                 inherited_budget: None,
                 provider: None,
             },
@@ -985,6 +1025,14 @@ async fn managed_submit_runs_both_gates_and_never_repeats_a_handoff() {
     );
     assert_eq!(session.status().await.unwrap().status, "reviewing");
     let events = f.events();
+    let committed = events
+        .iter()
+        .find(|(kind, _)| kind == "submission_committed")
+        .unwrap();
+    assert_eq!(
+        committed.1["check_commands_sha256"],
+        crate::checks::commands_sha256(&["echo gate >> .ferrus/gates.txt".into()]).unwrap()
+    );
     assert!(
         lifecycle::submit(&session, "replacement".into(), &Cancellation::default())
             .await
@@ -1422,6 +1470,40 @@ async fn git_session(f: &Fixture, index: bool) -> FerrusSession {
         .unwrap();
     }
     session
+}
+
+#[tokio::test]
+async fn managed_journal_records_effective_launch_flags_and_baseline() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = git_session(&f, false).await;
+    let (mut tools, journal) = native(&f, session.clone(), "launch-evidence");
+    tools.native_context_enabled = false;
+    tools.working_set_enabled = false;
+    let end = managed::run(
+        session.clone(),
+        identity("launch-evidence"),
+        Limits::default(),
+        script(vec![]),
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    let (_, records) = FileJournal::recover(
+        &f.data.join("nano/sessions/launch-evidence"),
+        Quotas::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &records[0].event,
+        SessionEvent::Started { launch_evidence: Some(evidence), .. }
+            if evidence.baseline_tree == session.baseline_tree().unwrap()
+                && !evidence.native_context_enabled
+                && !evidence.working_set_enabled
+    ));
 }
 
 #[tokio::test]

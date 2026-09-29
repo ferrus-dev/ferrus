@@ -67,18 +67,19 @@ async fn refresh(session: &FerrusSession, context: &RuntimeTaskContext) {
 }
 
 pub(super) async fn check(session: &FerrusSession, stop: &Cancellation) -> Result<Value> {
-    run_check(session, stop, false).await
+    Ok(run_check(session, stop, false).await?.0)
 }
 
 async fn run_check(
     session: &FerrusSession,
     stop: &Cancellation,
     final_gate: bool,
-) -> Result<Value> {
+) -> Result<(Value, String)> {
     let context = session.authorize().await?;
     working(&context)?;
 
     let config = Config::load_from(session.project_root()).await?;
+    let check_digest = crate::checks::commands_sha256(&config.checks.commands)?;
     let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -146,7 +147,7 @@ async fn run_check(
         result["log"] = json!(log);
     }
 
-    Ok(result)
+    Ok((result, check_digest))
 }
 
 /// On drop, an uncommitted prepared tree must not leave a submitted-tree pin.
@@ -277,11 +278,16 @@ pub(super) async fn submit(
     };
 
     // Preserve both required gates: /check immediately before the final submit gate.
+    let mut checked_digest = None;
     for final_gate in [false, true] {
-        let result = run_check(session, stop, final_gate).await?;
+        let (result, digest) = run_check(session, stop, final_gate).await?;
         if result["status"] != "passed" {
             return Ok(result);
         }
+        if let Some(first) = &checked_digest {
+            ensure!(first == &digest, "Check commands changed during submit");
+        }
+        checked_digest = Some(digest);
 
         ensure!(
             stamp(session).await? == expected,
@@ -349,11 +355,13 @@ pub(super) async fn submit(
         None
     };
 
-    let skipped = Config::load_from(session.project_root())
-        .await?
-        .checks
-        .commands
-        .is_empty();
+    let submit_config = Config::load_from(session.project_root()).await?;
+    let skipped = submit_config.checks.commands.is_empty();
+    let check_digest = crate::checks::commands_sha256(&submit_config.checks.commands)?;
+    ensure!(
+        checked_digest.as_deref() == Some(check_digest.as_str()),
+        "Check commands changed during submit"
+    );
 
     let keep_pin = frozen.is_some();
     let patch = match (&source, session.baseline_tree()) {
@@ -416,6 +424,10 @@ pub(super) async fn submit(
                 Some(scope.run_id.clone()),
                 frozen,
                 freeze_failed,
+                project::SubmissionCheckEvidence {
+                    passed: !skipped,
+                    commands_sha256: Some(&check_digest),
+                },
             )?;
 
             project::executor_event(tx, scope, "submitted", json!({"content_bytes":content.len(), "check_gate":if skipped { "skipped" } else { "passed" }}))

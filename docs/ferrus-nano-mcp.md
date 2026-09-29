@@ -42,6 +42,28 @@ a changed schema fails the call before execution. Outputs are capped at 24 KiB.
 An unconfirmed call is recorded as an unknown effect and the connection is
 closed, preventing automatic replay.
 
+For the opt-in transport comparison in [Nano evaluation](ferrus-nano-evaluation.md),
+an owner-only peer file may bind the current managed task to the same Ferrus
+executable. This mode accepts exactly `ferrus serve --role executor`, no
+explicit peer `cwd`, and an allowlist drawn only from the three read-only
+repository graph tools:
+
+```toml
+[[servers]]
+id = "graph"
+command = "/absolute/path/to/the/running/ferrus"
+args = ["serve", "--role", "executor"]
+allow = ["repository_graph_status", "repository_search", "repository_context"]
+inherit_managed_binding = true
+```
+
+The wrapper forwards only the managed project, agent, task, run, and optional
+baseline-tree identifiers. It still clears all other inherited variables and
+uses the explicit tool allowlist. The test adapter presents the native graph
+argument/result shape to the model while the call itself crosses MCP. Its
+provider-visible tool names use `mcp_<peer-id>_*` (`mcp_graph_*` in this example), so name-token differences
+must be reported. Ordinary peers cannot request this binding mode.
+
 This first release supports stdio tools only, using Ferrus's existing neva
 legacy protocol profile. Sampling, elicitation, HTTP, OAuth, MCP resources,
 and prompts are unsupported. Peers must handle unsupported client requests

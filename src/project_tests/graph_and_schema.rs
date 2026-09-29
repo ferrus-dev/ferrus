@@ -482,9 +482,26 @@ async fn submitted_view_is_frozen_for_reviewer_and_rejection_resumes_mutable_tas
         Some("r-executor"),
         Some(&frozen),
         false,
+        SubmissionCheckEvidence {
+            passed: true,
+            commands_sha256: None,
+        },
     )
     .await
     .unwrap();
+    let database_path = current_database_path().await.unwrap();
+    let connection = open_runtime_database_for_read(&database_path).unwrap();
+    let committed: String = connection
+        .query_row(
+            "SELECT payload_json FROM events WHERE type = 'submission_committed' AND run_id = 'r-executor'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let committed: serde_json::Value = serde_json::from_str(&committed).unwrap();
+    assert_eq!(committed["task_id"], "t-001");
+    assert_eq!(committed["check_gate"], "passed");
+    assert_eq!(committed["review_cycles"], 0);
     record_run_started_for_task_with_workspace(
         "r-reviewer",
         "supervisor",

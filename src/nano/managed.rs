@@ -8,7 +8,10 @@ use super::{
     lifecycle,
     native::NativeTools,
     provider::{Message, Provider},
-    session::{EndReason, Limits, Record, SessionCommand, SessionEnd, SessionIdentity},
+    session::{
+        EndReason, GraphPeerMode, LaunchEvidence, Limits, Record, SessionCommand, SessionEnd,
+        SessionIdentity,
+    },
     tools::*,
 };
 use crate::{
@@ -432,6 +435,46 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             Err(error) => return Err(error),
         }
     }
+    #[cfg(feature = "nano-mcp")]
+    let graph_peer_mode = native
+        .mcp
+        .as_ref()
+        .map_or(GraphPeerMode::Absent, super::mcp::McpTools::graph_peer_mode);
+    #[cfg(not(feature = "nano-mcp"))]
+    let graph_peer_mode = GraphPeerMode::Absent;
+    #[cfg(feature = "nano-mcp")]
+    let graph_peer_id = native
+        .mcp
+        .as_ref()
+        .and_then(super::mcp::McpTools::graph_peer_id)
+        .map(str::to_owned);
+    #[cfg(not(feature = "nano-mcp"))]
+    let graph_peer_id = None;
+    #[cfg(feature = "nano-mcp")]
+    let graph_peer_timeout_ms = native
+        .mcp
+        .as_ref()
+        .and_then(super::mcp::McpTools::graph_peer_timeout_ms);
+    #[cfg(not(feature = "nano-mcp"))]
+    let graph_peer_timeout_ms = None;
+    #[cfg(feature = "nano-mcp")]
+    let (mcp_peer_count, mcp_tool_count) = native
+        .mcp
+        .as_ref()
+        .map_or((0, 0), super::mcp::McpTools::catalog_counts);
+    #[cfg(not(feature = "nano-mcp"))]
+    let (mcp_peer_count, mcp_tool_count) = (0, 0);
+    let launch_evidence = session.baseline_tree().map(|baseline_tree| LaunchEvidence {
+        baseline_tree: baseline_tree.to_owned(),
+        native_context_enabled: native.native_context_enabled,
+        working_set_enabled: native.working_set_enabled,
+        graph_peer_mode: Some(graph_peer_mode),
+        graph_peer_id,
+        mcp_peer_count: Some(mcp_peer_count),
+        mcp_tool_count: Some(mcp_tool_count),
+        graph_peer_timeout_ms,
+        settings_sha256: None,
+    });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
     if waiting {
         // HQ relaunches an answered waiter in a fresh process. Derive this mode
@@ -473,6 +516,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         stop: stop.clone(),
     };
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
+    if let Some(evidence) = launch_evidence {
+        engine.set_launch_evidence(evidence);
+    }
     if let Some(recovery) = recovery {
         engine.inherit_budget(recovery.budget)?;
     }

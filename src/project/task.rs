@@ -219,6 +219,7 @@ pub async fn record_task_submitted(
     run_id: Option<&str>,
     frozen_view: Option<&RepositoryViewReference>,
     freeze_failed: bool,
+    checks: SubmissionCheckEvidence<'_>,
 ) -> Result<()> {
     if let Some(view) = frozen_view {
         view.validate()?;
@@ -232,6 +233,8 @@ pub async fn record_task_submitted(
     let task_path = task_path.to_string();
     let run_id = run_id.map(str::to_string);
     let frozen_view = frozen_view.cloned();
+    let checks_passed = checks.passed;
+    let check_commands_sha256 = checks.commands_sha256.map(str::to_owned);
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut connection = open_runtime_database(&database_path)?;
@@ -243,11 +246,20 @@ pub async fn record_task_submitted(
             run_id,
             frozen_view,
             freeze_failed,
+            SubmissionCheckEvidence {
+                passed: checks_passed,
+                commands_sha256: check_commands_sha256.as_deref(),
+            },
         )?;
         transaction.commit()?;
         Ok(())
     })
     .await?
+}
+
+pub struct SubmissionCheckEvidence<'a> {
+    pub passed: bool,
+    pub commands_sha256: Option<&'a str>,
 }
 
 pub(crate) fn task_submitted_in_transaction(
@@ -257,6 +269,7 @@ pub(crate) fn task_submitted_in_transaction(
     run_id: Option<String>,
     frozen_view: Option<RepositoryViewReference>,
     freeze_failed: bool,
+    checks: SubmissionCheckEvidence<'_>,
 ) -> Result<()> {
     if let Some(view) = &frozen_view {
         view.validate()?;
@@ -300,6 +313,18 @@ pub(crate) fn task_submitted_in_transaction(
             &serde_json::json!({ "task_id": task_id }),
         )?;
     }
+
+    insert_event_in_transaction(
+        transaction,
+        run_id.as_deref(),
+        "submission_committed",
+        &serde_json::json!({
+            "task_id": task_id,
+            "check_gate": if checks.passed { "passed" } else { "skipped" },
+            "check_commands_sha256": checks.commands_sha256,
+            "review_cycles": task_review_cycles(transaction, &task_id)?,
+        }),
+    )?;
 
     insert_event_in_transaction(
         transaction,

@@ -176,6 +176,7 @@ Implemented foundation:
 - managed claim/heartbeat, native check/submit, host-owned consultation/human waits, and distinct session outcomes ([contract](ferrus-nano-lifecycle.md));
 - headless backend registration, private provider configuration, versioned JSONL launch/events, and HQ process supervision ([contract](ferrus-nano-launch.md));
 - revision-aware evidence selection, bounded query reuse, explicit prefetch, and debounced overlay refresh ([contract](ferrus-nano-working-set.md));
+- external stdio MCP through neva and guarded crash resume with effect reconciliation;
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -186,7 +187,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | --- | --- | --- |
 | N1: headless Executor | #80 implemented; #85 validation | Live model validation and release gates |
 | N2: context efficiency | #81 and #82 implemented | Comparative context-quality and cache measurements (#85) |
-| N3: reliability and extensions | #83-#85 | External MCP via neva, resume/reconciliation, comparative evaluation, and headless release gates |
+| N3: reliability and extensions | #83 and #84 implemented; #85 validation | Comparative evaluation and headless release gates |
 | N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
 
