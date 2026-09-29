@@ -1,6 +1,7 @@
 # Binary size measurements
 
-These are local development measurements for issue #71, not cross-platform size or performance guarantees.
+These local development measurements for issue #71 predate Nano-enabled release archives.
+They are not cross-platform size or performance guarantees.
 Measurements use macOS arm64 and Rust 1.98.0. File sizes include the linked executable, without compression.
 
 ## Measurements recorded 2026-09-05
@@ -41,6 +42,7 @@ executables; stripped release files omit symbol names used in native debugging.
 ```sh
 cargo build --locked --release
 cargo build --locked --profile dist
+cargo build --locked --profile dist --features nano-openai,nano-mcp
 cargo build --locked --profile dist --no-default-features
 cargo build --locked --profile dist --config 'profile.dist.opt-level="s"'
 

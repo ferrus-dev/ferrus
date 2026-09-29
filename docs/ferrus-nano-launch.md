@@ -7,8 +7,17 @@ The process lifecycle is tested with a local mock API; live LM Studio validation
 
 ## Configure and select
 
-Build Ferrus with `cargo build --features nano-openai`. Keep provider settings outside the
-repository in an owner-only file, following the [provider contract](ferrus-nano-provider.md):
+Prebuilt release archives include `nano-openai` and `nano-mcp`. For a Cargo installation from
+crates.io, select the alpha version explicitly:
+
+```sh
+cargo install ferrus --version 0.5.0-alpha.1 --locked --profile dist --features nano-openai,nano-mcp
+```
+
+For a source build, use `cargo build --features nano-openai,nano-mcp` (or only `nano-openai` if
+external MCP tools are not needed). Cargo's default feature set does not include Nano.
+Keep provider settings outside the repository in an owner-only file, following the
+[provider contract](ferrus-nano-provider.md):
 
 ```toml
 base_url = "http://127.0.0.1:1234/v1"

@@ -84,6 +84,14 @@ For a smaller Cargo installation, use the same size profile as release assets:
 cargo install ferrus --locked --profile dist
 ```
 
+Prebuilt release archives include experimental Nano with native context and external MCP tools.
+Cargo installations use the smaller default feature set; to install Nano from crates.io, enable
+both features explicitly:
+
+```sh
+cargo install ferrus --version 0.5.0-alpha.1 --locked --profile dist --features nano-openai,nano-mcp
+```
+
 HQ update notifications are enabled by default. To omit the update-check HTTP/TLS client:
 
 ```sh
