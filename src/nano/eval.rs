@@ -586,6 +586,16 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
                 },
                 "Nano journal graph peer ID does not match variant"
             );
+            ensure!(
+                if matches!(attempt.variant, Variant::NanoMcp) {
+                    evidence
+                        .graph_peer_timeout_ms
+                        .is_some_and(|timeout| (100..=120_000).contains(&timeout))
+                } else {
+                    evidence.graph_peer_timeout_ms.is_none()
+                },
+                "Nano journal graph peer timeout does not match variant"
+            );
             let provider = provider
                 .as_ref()
                 .context("Nano journal lacks provider settings")?;
@@ -1109,6 +1119,7 @@ mod tests {
                         graph_peer_id: None,
                         mcp_peer_count: Some(0),
                         mcp_tool_count: Some(0),
+                        graph_peer_timeout_ms: None,
                         settings_sha256: None,
                     })),
                     inherited_budget: None,
@@ -1340,6 +1351,48 @@ mod tests {
                 version: 1,
                 attempts: vec![mcp_attempt.clone()]
             })
+            .is_err()
+        );
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.graph_peer_timeout_ms = Some(10_000);
+        }
+        mcp_attempt.settings_sha256 = set_settings_digest(&mut records)?;
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
+            .is_ok()
+        );
+        let first_digest = mcp_attempt.settings_sha256.clone();
+        if let SessionEvent::Started {
+            launch_evidence: Some(evidence),
+            ..
+        } = &mut records[0].event
+        {
+            evidence.graph_peer_timeout_ms = Some(11_000);
+        }
+        let second_digest = set_settings_digest(&mut records)?;
+        assert_ne!(first_digest, second_digest);
+        write_records(&journal, &records)?;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
+            .is_err()
+        );
+        mcp_attempt.settings_sha256 = second_digest;
+        assert!(
+            build(Manifest {
+                version: 1,
+                attempts: vec![mcp_attempt.clone()]
+            })
             .is_ok()
         );
         let mut disabled_attempt = baseline_attempt.clone();
@@ -1361,6 +1414,7 @@ mod tests {
         {
             evidence.graph_peer_mode = Some(GraphPeerMode::Absent);
             evidence.graph_peer_id = None;
+            evidence.graph_peer_timeout_ms = None;
             evidence.mcp_peer_count = Some(1);
             evidence.mcp_tool_count = Some(1);
         }

@@ -13,6 +13,7 @@ use crate::{
     },
     project_memory_runtime::LocalProjectContext,
     repository_graph::{
+        config::QueryLimitsConfig,
         domain::{PageCursor, QueryBudget, RepoPath},
         query::{self, ContextPolicy, ContextSeed, PageRequest},
     },
@@ -274,9 +275,8 @@ impl Request {
         Ok(r)
     }
 
-    fn graph_budget(&self, graph: &LocalGraphContext) -> Result<QueryBudget> {
-        let default =
-            crate::repository_graph::query_sqlite::default_budget(&graph.config.query_limits)?;
+    fn graph_budget(&self, limits: &QueryLimitsConfig) -> Result<QueryBudget> {
+        let default = crate::repository_graph::query_sqlite::default_budget(limits)?;
 
         Ok(QueryBudget::new(
             NonZeroU32::new(
@@ -305,6 +305,34 @@ impl Request {
             )
             .unwrap(),
         ))
+    }
+
+    #[cfg(feature = "nano-mcp")]
+    fn with_graph_budget(&self, mut value: Value, limits: &QueryLimitsConfig) -> Result<Value> {
+        let budget = self.graph_budget(limits)?;
+        let fields = value
+            .as_object_mut()
+            .context("Expected graph request object")?;
+        fields.insert("max_results".into(), json!(budget.max_results.get()));
+        fields.insert("max_bytes".into(), json!(budget.max_bytes.get()));
+        fields.insert(
+            "max_duration_ms".into(),
+            json!(budget.max_duration_ms.get()),
+        );
+        fields.insert(
+            "max_diagnostics".into(),
+            json!(budget.max_diagnostics.get()),
+        );
+        if !self.seeds.is_empty() {
+            fields.insert("max_depth".into(), json!(budget.max_depth.get()));
+            if self.include_snippets {
+                fields.insert(
+                    "max_snippet_bytes".into(),
+                    json!(self.max_snippet_bytes.unwrap_or(4096).min(8192)),
+                );
+            }
+        }
+        Ok(value)
     }
 }
 
@@ -391,6 +419,20 @@ impl Context {
         .await
     }
 
+    #[cfg(feature = "nano-mcp")]
+    pub(crate) async fn normalized_graph_arguments(
+        &self,
+        name: &str,
+        value: Value,
+    ) -> Result<Value> {
+        let request = Request::parse(name, value.clone())?;
+        if name == "repository_graph_status" {
+            return Ok(value);
+        }
+        let graph = self.graph().await?;
+        request.with_graph_budget(value, &graph.config.query_limits)
+    }
+
     pub(crate) async fn retrieve(&self, name: &str, input: Request) -> Result<Response> {
         // Revalidate before constructing a view, including memory-only requests.
         let runtime = self.session.status().await?;
@@ -408,7 +450,7 @@ impl Context {
                 return Ok(Response::RepositoryStatus(graph.status().await?));
             }
 
-            let mut scope = graph.scope(input.graph_budget(&graph)?)?;
+            let mut scope = graph.scope(input.graph_budget(&graph.config.query_limits)?)?;
             // Resolve a mutable publication exactly once for this assembly.
             let status = graph.status().await?;
             if let Some(snapshot) = &status.snapshot_id {
@@ -638,4 +680,73 @@ pub(crate) enum Fallback {
         reason: FallbackReason,
         input: workspace::SearchRequest,
     },
+}
+
+#[cfg(all(test, feature = "nano-mcp"))]
+mod graph_peer_tests {
+    use super::*;
+
+    #[test]
+    fn graph_peer_arguments_use_native_defaults_and_caps() {
+        let limits = QueryLimitsConfig::default();
+        let search = json!({"query":"needle"});
+        let normalized = Request::parse("repository_search", search.clone())
+            .unwrap()
+            .with_graph_budget(search, &limits)
+            .unwrap();
+        assert_eq!(normalized["max_results"], 64);
+        assert_eq!(normalized["max_bytes"], 24 * 1024);
+        assert_eq!(normalized["max_duration_ms"], 1000);
+        assert_eq!(normalized["max_diagnostics"], 16);
+
+        let context = json!({
+            "seeds":[{"type":"path","value":"src/lib.rs"}],
+            "include_snippets":true,
+            "max_results":1000,
+            "max_bytes":100_000,
+            "max_depth":100,
+            "max_duration_ms":10_000,
+            "max_diagnostics":100,
+            "max_snippet_bytes":100_000
+        });
+        let normalized = Request::parse("repository_context", context.clone())
+            .unwrap()
+            .with_graph_budget(context, &limits)
+            .unwrap();
+        assert_eq!(normalized["max_results"], 64);
+        assert_eq!(normalized["max_bytes"], 24 * 1024);
+        assert_eq!(normalized["max_depth"], 8);
+        assert_eq!(normalized["max_duration_ms"], 1000);
+        assert_eq!(normalized["max_diagnostics"], 16);
+        assert_eq!(normalized["max_snippet_bytes"], 8192);
+    }
+
+    #[test]
+    fn graph_peer_arguments_preserve_stricter_limits() {
+        let limits = QueryLimitsConfig::default();
+        let context = json!({
+            "seeds":[{"type":"path","value":"src/lib.rs"}],
+            "include_snippets":true,
+            "max_results":2,
+            "max_bytes":4096,
+            "max_depth":1,
+            "max_duration_ms":100,
+            "max_diagnostics":1,
+            "max_snippet_bytes":512
+        });
+        let normalized = Request::parse("repository_context", context.clone())
+            .unwrap()
+            .with_graph_budget(context.clone(), &limits)
+            .unwrap();
+        assert_eq!(normalized, context);
+
+        let defaults =
+            json!({"seeds":[{"type":"path","value":"src/lib.rs"}],"include_snippets":true});
+        let normalized = Request::parse("repository_context", defaults.clone())
+            .unwrap()
+            .with_graph_budget(defaults, &limits)
+            .unwrap();
+        assert_eq!(normalized["max_depth"], limits.max_depth);
+        assert_eq!(normalized["max_snippet_bytes"], 4096);
+    }
 }

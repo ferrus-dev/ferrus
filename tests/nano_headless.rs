@@ -642,7 +642,7 @@ fn run_headless_task(
         private_config(
             &peer,
             &format!(
-                "[[servers]]\nid = 'graph'\ncommand = {}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_graph_status', 'repository_search', 'repository_context']\ninherit_managed_binding = true\n",
+                "[[servers]]\nid = 'graph'\ncommand = {}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_graph_status', 'repository_search', 'repository_context']\ninherit_managed_binding = true\ntimeout_ms = 12000\n",
                 toml::Value::String(env!("CARGO_BIN_EXE_ferrus").to_string()),
             ),
         );
@@ -794,6 +794,14 @@ fn run_headless_task(
         started["event"]["launch_evidence"]["graph_peer_id"],
         if graph_peer {
             Value::String("graph".into())
+        } else {
+            Value::Null
+        }
+    );
+    assert_eq!(
+        started["event"]["launch_evidence"]["graph_peer_timeout_ms"],
+        if graph_peer {
+            Value::from(12_000)
         } else {
             Value::Null
         }

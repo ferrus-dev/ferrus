@@ -23,11 +23,14 @@ const MAX_TOOLS: usize = 32;
 const MAX_SCHEMA_BYTES: usize = 4 * 1024;
 // Leave room for ToolOutcome framing in the engine's 32 KiB journal cap.
 const MAX_RESULT_BYTES: usize = 24 * 1024;
+// Graph results are bounded to 24 KiB before encoding; the MCP envelope
+// escapes that JSON text again and needs separate transport headroom.
+const MAX_GRAPH_TRANSPORT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 // Catalog pages can contain up to 32 tool schemas; calls need only the
 // bounded result plus the JSON-RPC envelope.
 const MAX_CATALOG_FRAME_BYTES: usize = 512 * 1024;
-const MAX_CALL_FRAME_BYTES: usize = MAX_RESULT_BYTES + 1024;
+const MAX_CALL_FRAME_BYTES: usize = MAX_GRAPH_TRANSPORT_BYTES + 1024;
 const MAX_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -403,6 +406,23 @@ impl McpTools {
             .map(|entry| self.servers[entry.server].id.as_str())
     }
 
+    pub(crate) fn graph_peer_timeout_ms(&self) -> Option<u64> {
+        if self.graph_peer_mode() != GraphPeerMode::Complete {
+            return None;
+        }
+        self.entries
+            .values()
+            .find(|entry| entry.graph_equivalence)
+            .map(|entry| self.servers[entry.server].timeout.as_millis() as u64)
+    }
+
+    pub(crate) fn graph_remote_name(&self, name: &str) -> Option<&str> {
+        self.entries
+            .get(name)
+            .filter(|entry| entry.graph_equivalence)
+            .map(|entry| entry.remote_name.as_str())
+    }
+
     pub(crate) fn graph_peer_mode(&self) -> GraphPeerMode {
         let graph_tools: Vec<_> = self
             .entries
@@ -693,7 +713,7 @@ impl McpTools {
                 Ok(Ok(response)) => {
                     let output = serde_json::to_value(&response);
                     match output {
-                        Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= MAX_RESULT_BYTES) => {
+                        Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= if self.entries[&call.name].graph_equivalence { MAX_GRAPH_TRANSPORT_BYTES } else { MAX_RESULT_BYTES }) => {
                             if response.is_error { ToolOutcome::Failed(ToolError::Mcp(json!({"code":"remote_error", "result":value}))) }
                             else if self.entries[&call.name].output.as_ref().is_some_and(|schema| response.struct_content.as_ref().is_none_or(|v| !schema.is_valid(v))) {
                                 ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"invalid_output"})))
@@ -891,6 +911,11 @@ mod tests {
         };
         assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Complete);
         assert_eq!(tools.graph_peer_id(), Some("repo"));
+        assert_eq!(tools.graph_peer_timeout_ms(), Some(1_000));
+        assert_eq!(
+            tools.graph_remote_name("mcp_repo_repository_search"),
+            Some("repository_search")
+        );
         assert_eq!(tools.catalog_counts(), (1, 3));
         tools.servers.push(Server {
             id: "extra".into(),

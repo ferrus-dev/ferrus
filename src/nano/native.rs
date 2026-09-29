@@ -273,7 +273,13 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if let Some(mcp) = &self.mcp
             && mcp.contains(name)
         {
-            return mcp.validate(name, arguments);
+            mcp.validate(name, arguments)?;
+            if let Some(remote_name) = mcp.graph_remote_name(name)
+                && Request::parse(remote_name, arguments.clone()).is_err()
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            return Ok(());
         }
         let valid = if context::NAMES.contains(&name) && !self.native_context_enabled {
             return Err(ToolError::UnknownTool);
@@ -313,8 +319,38 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             .as_ref()
             .is_some_and(|mcp| mcp.contains(&call.name))
         {
+            let remote_name = self
+                .mcp
+                .as_ref()
+                .and_then(|mcp| mcp.graph_remote_name(&call.name));
+            let normalized = if let Some(name) = remote_name {
+                match self
+                    .context
+                    .normalized_graph_arguments(name, call.arguments.clone())
+                    .await
+                {
+                    Ok(arguments) => Some(ValidatedCall {
+                        call_id: call.call_id.clone(),
+                        provider_call_id: call.provider_call_id.clone(),
+                        name: call.name.clone(),
+                        arguments,
+                    }),
+                    Err(_) => {
+                        return ToolOutcome::Failed(ToolError::Context(json!({
+                            "code":"graph_budget_unavailable"
+                        })));
+                    }
+                }
+            } else {
+                None
+            };
             self.invalidate_unknown().await;
-            let outcome = self.mcp.as_mut().unwrap().execute(call, cancellation).await;
+            let outcome = self
+                .mcp
+                .as_mut()
+                .unwrap()
+                .execute(normalized.as_ref().unwrap_or(call), cancellation)
+                .await;
             if self.working_set_enabled {
                 let writers = self.coding.commands.potentially_active_writers() > 0;
                 self.observations

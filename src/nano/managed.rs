@@ -451,6 +451,13 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     #[cfg(not(feature = "nano-mcp"))]
     let graph_peer_id = None;
     #[cfg(feature = "nano-mcp")]
+    let graph_peer_timeout_ms = native
+        .mcp
+        .as_ref()
+        .and_then(super::mcp::McpTools::graph_peer_timeout_ms);
+    #[cfg(not(feature = "nano-mcp"))]
+    let graph_peer_timeout_ms = None;
+    #[cfg(feature = "nano-mcp")]
     let (mcp_peer_count, mcp_tool_count) = native
         .mcp
         .as_ref()
@@ -465,6 +472,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         graph_peer_id,
         mcp_peer_count: Some(mcp_peer_count),
         mcp_tool_count: Some(mcp_tool_count),
+        graph_peer_timeout_ms,
         settings_sha256: None,
     });
     let tools = ManagedTools::new(session.clone(), native, stop.clone());
