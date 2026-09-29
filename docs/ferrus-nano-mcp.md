@@ -1,6 +1,7 @@
 # Nano external stdio tools
 
-Build Ferrus with `--features nano-openai,nano-mcp`. External MCP tools are
+Prebuilt release archives include `nano-openai,nano-mcp`; Cargo source builds and installations
+require `--features nano-openai,nano-mcp`. External MCP tools are
 opt-in through an absolute, owner-only `mcp_config_file` path in Nano's provider
 settings file:
 

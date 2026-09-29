@@ -107,7 +107,8 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
-        run: cargo build --locked --profile dist --target "${{ matrix.target }}"
+        # Keep Cargo defaults unchanged; release archives include experimental Nano.
+        run: cargo build --locked --profile dist --features nano-openai,nano-mcp --target "${{ matrix.target }}"
 
       - name: Package Unix release archive
         if: ${{ matrix.package_format == 'tar.gz' }}
