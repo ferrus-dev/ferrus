@@ -894,7 +894,7 @@ async fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn global_dir() -> Result<PathBuf> {
+pub(crate) fn global_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Cannot determine home directory")?;
     Ok(home.join(".ferrus"))
 }

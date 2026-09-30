@@ -8,7 +8,7 @@ settings file:
 ```toml
 base_url = "http://127.0.0.1:1234/v1"
 model = "local-model"
-mcp_config_file = "/home/user/.config/ferrus/nano-mcp.toml"
+mcp_config_file = "/home/user/.ferrus/nano-mcp.toml"
 ```
 
 The MCP file lists explicit stdio peers and the exact tools Nano may call:

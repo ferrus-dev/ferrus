@@ -56,9 +56,11 @@ pub async fn run(
     if supervisor == Some(Agent::Nano) {
         anyhow::bail!("Nano supports headless Executor sessions only");
     }
-    if executor == Some(Agent::Nano) {
-        crate::nano::agent::validate_config(None, executor_model.as_deref())?;
-    }
+    let created_nano_config = if executor == Some(Agent::Nano) {
+        crate::nano::agent::prepare_registration_config(executor_model.as_deref())?
+    } else {
+        false
+    };
 
     if let Some(agent) = &supervisor {
         register_role(
@@ -86,7 +88,11 @@ pub async fn run(
         update_hq_agent_config(
             HqRole::Executor,
             Some(agent.name()),
-            normalize_model_update(executor_model.as_deref()),
+            if *agent == Agent::Nano && (created_nano_config || executor_model.is_none()) {
+                Some(None)
+            } else {
+                normalize_model_update(executor_model.as_deref())
+            },
         )
         .await?;
     }
