@@ -98,8 +98,10 @@ the concrete CLI, while the Claude Code, Codex, Qwen Code, opencode, and goose a
 overrides, headless prompt transport, and local permission or configuration conventions.
 
 The native Nano adapter stays under `src/nano/` and supports headless Executors only.
-Build with `nano-openai`, set an absolute private `FERRUS_NANO_CONFIG`, and select it with
-`ferrus register --executor nano`. HQ retains worktree and process supervision while Nano
+Build with `nano-openai` and select it with
+`ferrus register --executor nano --executor-model YOUR_LOADED_MODEL_ID`. Registration creates
+private local LM Studio settings if none exist; set an absolute private `FERRUS_NANO_CONFIG`
+for a custom provider file. HQ retains worktree and process supervision while Nano
 exchanges bounded JSONL commands/events instead of connecting back through Ferrus MCP.
 See [Nano launch](ferrus-nano-launch.md) for configuration, protocol, and current limitations.
 

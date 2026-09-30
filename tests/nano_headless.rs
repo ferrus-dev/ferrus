@@ -939,6 +939,71 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn native_registration_provisions_default_local_provider_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let home = f.data.join("home");
+    fs::create_dir(&home).unwrap();
+    let settings = home.join(".ferrus/nano.toml");
+    let before = fs::read(f.root.join("ferrus.toml")).unwrap();
+
+    let missing_model = ferrus(&f.root)
+        .args(["register", "--executor", "nano"])
+        .env_remove("FERRUS_NANO_CONFIG")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!missing_model.status.success());
+    assert!(String::from_utf8_lossy(&missing_model.stderr).contains("--executor-model"));
+    assert_eq!(fs::read(f.root.join("ferrus.toml")).unwrap(), before);
+    assert!(!settings.exists());
+
+    let registered = ferrus(&f.root)
+        .args([
+            "register",
+            "--executor",
+            "nano",
+            "--executor-model",
+            "local/model",
+        ])
+        .env_remove("FERRUS_NANO_CONFIG")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let original = fs::read(&settings).unwrap();
+    assert!(String::from_utf8_lossy(&original).contains("local/model"));
+    private::check(&settings, false).unwrap();
+    private::check(settings.parent().unwrap(), true).unwrap();
+
+    // Existing Ferrus homes may predate Nano and need not have private directory mode.
+    fs::set_permissions(
+        settings.parent().unwrap(),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    success(
+        ferrus(&f.root)
+            .args([
+                "register",
+                "--executor",
+                "nano",
+                "--executor-model",
+                "another-model",
+            ])
+            .env_remove("FERRUS_NANO_CONFIG")
+            .env("HOME", &home),
+    );
+    assert_eq!(fs::read(&settings).unwrap(), original);
+}
+
 #[test]
 fn invalid_start_frames_fail_without_claiming_or_creating_a_journal() {
     let f = Fixture::new();

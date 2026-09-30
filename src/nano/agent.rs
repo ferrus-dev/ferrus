@@ -4,7 +4,11 @@ use crate::agents::{
     AgentDisplayConfig, AgentRunMode, ExecutorAgent, ExecutorCapabilities, HeadlessPromptTransport,
     McpConfigEntry, normalized_model,
 };
+#[cfg(feature = "nano-openai")]
+use anyhow::Context;
 use anyhow::{Result, bail, ensure};
+#[cfg(feature = "nano-openai")]
+use std::{fs, io::Write};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -12,16 +16,84 @@ use std::{
 
 pub(crate) const NAME: &str = "nano";
 pub(crate) const CONFIG_ENV: &str = "FERRUS_NANO_CONFIG";
+#[cfg(feature = "nano-openai")]
+const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+
+fn default_config_path() -> Result<PathBuf> {
+    Ok(crate::project::global_dir()?.join("nano.toml"))
+}
 
 pub(crate) fn config_path(path: Option<&Path>) -> Result<PathBuf> {
     let path = path
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
-        .ok_or_else(|| {
-            anyhow::anyhow!("Set FERRUS_NANO_CONFIG to an absolute private provider settings file")
-        })?;
+        .map(Ok)
+        .unwrap_or_else(default_config_path)?;
     ensure!(path.is_absolute(), "Nano config path must be absolute");
     Ok(path)
+}
+
+/// Provision the LM Studio default only during explicit registration.
+pub(crate) fn prepare_registration_config(model: Option<&str>) -> Result<()> {
+    #[cfg(feature = "nano-openai")]
+    {
+        let path = config_path(None)?;
+        if std::env::var_os(CONFIG_ENV).is_none()
+            && matches!(fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            create_default_config(&path, model)?;
+            eprintln!(
+                "Created private Nano provider settings at {}",
+                path.display()
+            );
+        }
+        validate_config(Some(&path), model)
+    }
+    #[cfg(not(feature = "nano-openai"))]
+    {
+        let _ = model;
+        bail!("Nano requires Ferrus built with --features nano-openai")
+    }
+}
+
+#[cfg(feature = "nano-openai")]
+fn create_default_config(path: &Path, model: Option<&str>) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct InitialConfig<'a> {
+        base_url: &'static str,
+        model: &'a str,
+    }
+
+    let model = normalized_model(model).context(
+        "Nano needs --executor-model <loaded-model-id> to create default provider settings",
+    )?;
+    let contents = toml::to_string(&InitialConfig {
+        base_url: DEFAULT_BASE_URL,
+        model: &model,
+    })?;
+    let config: super::config::Config = toml::from_str(&contents)?;
+    config.validate()?;
+
+    let directory = path
+        .parent()
+        .context("Nano settings path has no parent directory")?;
+    // The shared Ferrus root may predate Nano; the provider file has its own owner-only ACL.
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) => ensure!(
+            metadata.is_dir(),
+            "Nano config directory is not a directory"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::private::directory(directory, true)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = super::private::file(path, true)
+        .with_context(|| format!("Cannot create Nano settings at {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    super::private::sync_directory(directory)?;
+    Ok(())
 }
 
 #[cfg(feature = "nano-openai")]
@@ -130,6 +202,27 @@ impl ExecutorAgent for Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "nano-openai")]
+    #[test]
+    fn default_config_is_private_valid_and_requires_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".ferrus").join("nano.toml");
+        assert!(
+            create_default_config(&path, None)
+                .unwrap_err()
+                .to_string()
+                .contains("--executor-model")
+        );
+        assert!(!path.exists());
+
+        create_default_config(&path, Some(" local/model ")).unwrap();
+        let config = load_config(&path, None).unwrap();
+        assert_eq!(config.base_url, DEFAULT_BASE_URL);
+        assert_eq!(config.model, "local/model");
+        assert!(crate::nano::private::read_only_file(&path).is_ok());
+        assert!(create_default_config(&path, Some("other-model")).is_err());
+        assert_eq!(load_config(&path, None).unwrap().model, "local/model");
+    }
     #[cfg(feature = "nano-openai")]
     #[test]
     fn provider_config_and_overrides_normalize_the_selected_model() {

@@ -57,7 +57,7 @@ pub async fn run(
         anyhow::bail!("Nano supports headless Executor sessions only");
     }
     if executor == Some(Agent::Nano) {
-        crate::nano::agent::validate_config(None, executor_model.as_deref())?;
+        crate::nano::agent::prepare_registration_config(executor_model.as_deref())?;
     }
 
     if let Some(agent) = &supervisor {

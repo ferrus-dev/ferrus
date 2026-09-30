@@ -16,8 +16,27 @@ cargo install ferrus --version 0.5.0-alpha.1 --locked --profile dist --features 
 
 For a source build, use `cargo build --features nano-openai,nano-mcp` (or only `nano-openai` if
 external MCP tools are not needed). Cargo's default feature set does not include Nano.
-Keep provider settings outside the repository in an owner-only file, following the
-[provider contract](ferrus-nano-provider.md):
+
+For a local LM Studio server on `http://127.0.0.1:1234`, register the exact loaded model ID:
+
+```sh
+ferrus register --executor nano --executor-model YOUR_LOADED_MODEL_ID
+ferrus
+```
+
+Replace `YOUR_LOADED_MODEL_ID` with the model ID shown by LM Studio.
+On first registration, Ferrus creates an owner-only provider file at
+`<user-home>/.ferrus/nano.toml`, using the same home-directory resolution as the Ferrus
+project registry. On Windows this is the user profile directory (for example,
+`C:\Users\Alice\.ferrus\nano.toml`), not a literal `~` path; registration prints the
+resolved path.
+It contains the local `/v1` endpoint and the selected model. Ferrus does not contact the
+provider during registration, and it never replaces an existing file. A model ID is required
+when creating the file; omit `--executor-model` on later registrations to use the file's model.
+
+For a different endpoint, credentials, or other provider settings, edit the generated file or
+set `FERRUS_NANO_CONFIG` to an absolute owner-only file before registration and HQ launch.
+The [provider contract](ferrus-nano-provider.md) describes the fields:
 
 ```toml
 base_url = "http://127.0.0.1:1234/v1"
@@ -26,15 +45,20 @@ model = "your-loaded-model"
 # api_key_file = "/absolute/private/path/lm-studio-key"
 ```
 
-Set `FERRUS_NANO_CONFIG` to that file's absolute path in the environment used to start HQ.
-On Unix, use mode 0400 or 0600. Windows requires a protected owner-only DACL. Registration
-and launch validate the settings and optional credential without contacting the provider.
+Replace `your-loaded-model` with the exact ID of the loaded model. Save the file outside the
+repository. On Unix, use mode 0400 or 0600; Windows requires a protected owner-only DACL.
+For an explicit path, set `FERRUS_NANO_CONFIG` in the same shell that runs both registration
+and HQ:
 
 ```sh
+export FERRUS_NANO_CONFIG=/absolute/private/path/nano.toml
 ferrus register --executor nano
-ferrus register --executor nano --executor-model your-loaded-model
 ferrus
 ```
+
+To override an existing file's model, pass `--executor-model <model-id>` during registration.
+The environment variable must remain set when HQ starts. Registration and launch validate the
+settings and optional credential without contacting the provider.
 
 Registration stores `[hq.executor]` in `ferrus.toml`. It creates no Ferrus MCP entry for Nano.
 Existing external adapter registration is unchanged. Model overrides are trimmed; without
