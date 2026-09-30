@@ -923,6 +923,14 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
         toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
     assert_eq!(config["hq"]["executor"]["agent"].as_str(), Some("nano"));
     assert_eq!(config["hq"]["executor"]["model"].as_str(), Some("override"));
+    success(
+        ferrus(&f.root)
+            .args(["register", "--executor", "nano"])
+            .env("FERRUS_NANO_CONFIG", &settings),
+    );
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
     for path in [".codex", ".claude", ".qwen", ".goose", "opencode.json"] {
         assert!(!f.root.join(path).exists());
     }
@@ -982,6 +990,21 @@ fn native_registration_provisions_default_local_provider_once() {
     assert!(String::from_utf8_lossy(&original).contains("local/model"));
     private::check(&settings, false).unwrap();
     private::check(settings.parent().unwrap(), true).unwrap();
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
+
+    let changed_settings = "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'updated/model'\n";
+    fs::write(&settings, changed_settings).unwrap();
+    success(
+        ferrus(&f.root)
+            .args(["register", "--executor", "nano"])
+            .env_remove("FERRUS_NANO_CONFIG")
+            .env("HOME", &home),
+    );
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
 
     // Existing Ferrus homes may predate Nano and need not have private directory mode.
     fs::set_permissions(
@@ -1001,7 +1024,22 @@ fn native_registration_provisions_default_local_provider_once() {
             .env_remove("FERRUS_NANO_CONFIG")
             .env("HOME", &home),
     );
-    assert_eq!(fs::read(&settings).unwrap(), original);
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(
+        config["hq"]["executor"]["model"].as_str(),
+        Some("another-model")
+    );
+    success(
+        ferrus(&f.root)
+            .args(["register", "--executor", "nano"])
+            .env_remove("FERRUS_NANO_CONFIG")
+            .env("HOME", &home),
+    );
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
+    assert_eq!(fs::read_to_string(&settings).unwrap(), changed_settings);
 }
 
 #[test]

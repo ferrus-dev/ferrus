@@ -37,11 +37,11 @@ pub(crate) fn config_path(path: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Provision the LM Studio default only during explicit registration.
-pub(crate) fn prepare_registration_config(model: Option<&str>) -> Result<()> {
+pub(crate) fn prepare_registration_config(model: Option<&str>) -> Result<bool> {
     #[cfg(feature = "nano-openai")]
     {
         let path = config_path(None)?;
-        if std::env::var_os(CONFIG_ENV).is_none()
+        let created = if std::env::var_os(CONFIG_ENV).is_none()
             && matches!(fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
             create_default_config(&path, model)?;
@@ -49,8 +49,12 @@ pub(crate) fn prepare_registration_config(model: Option<&str>) -> Result<()> {
                 "Created private Nano provider settings at {}",
                 path.display()
             );
-        }
-        validate_config(Some(&path), model)
+            true
+        } else {
+            false
+        };
+        validate_config(Some(&path), model)?;
+        Ok(created)
     }
     #[cfg(not(feature = "nano-openai"))]
     {

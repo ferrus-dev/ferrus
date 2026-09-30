@@ -32,7 +32,8 @@ project registry. On Windows this is the user profile directory (for example,
 resolved path.
 It contains the local `/v1` endpoint and the selected model. Ferrus does not contact the
 provider during registration, and it never replaces an existing file. A model ID is required
-when creating the file; omit `--executor-model` on later registrations to use the file's model.
+when creating the file but is not stored as a separate HQ override. On later registrations,
+omit `--executor-model` to clear any Nano override and use the file's model.
 
 For a different endpoint, credentials, or other provider settings, edit the generated file or
 set `FERRUS_NANO_CONFIG` to an absolute owner-only file before registration and HQ launch.
