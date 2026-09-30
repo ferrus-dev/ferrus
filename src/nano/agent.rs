@@ -8,7 +8,10 @@ use crate::agents::{
 use anyhow::Context;
 use anyhow::{Result, bail, ensure};
 #[cfg(feature = "nano-openai")]
-use std::{fs, io::Write};
+use std::{
+    fs,
+    io::{self, Write},
+};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -88,11 +91,34 @@ fn create_default_config(path: &Path, model: Option<&str>) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    write_new_config(path, contents.as_bytes(), |file, bytes| {
+        file.write_all(bytes)
+    })
+}
+
+#[cfg(feature = "nano-openai")]
+fn write_new_config(
+    path: &Path,
+    contents: &[u8],
+    write: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> Result<()> {
+    let directory = path
+        .parent()
+        .context("Nano settings path has no parent directory")?;
     let mut file = super::private::file(path, true)
         .with_context(|| format!("Cannot create Nano settings at {}", path.display()))?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    super::private::sync_directory(directory)?;
+    let result = write(&mut file, contents).and_then(|()| file.sync_all());
+    drop(file);
+    let result = result.and_then(|()| super::private::sync_directory(directory));
+    if let Err(error) = result {
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "Cannot remove incomplete Nano settings at {} after {error}",
+                path.display()
+            )
+        })?;
+        return Err(error).context("Cannot write Nano settings");
+    }
     Ok(())
 }
 
@@ -213,6 +239,15 @@ mod tests {
                 .to_string()
                 .contains("--executor-model")
         );
+        assert!(!path.exists());
+
+        crate::nano::private::directory(path.parent().unwrap(), true).unwrap();
+        let failure = write_new_config(&path, b"complete settings", |file, _| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert!(failure.to_string().contains("Cannot write Nano settings"));
         assert!(!path.exists());
 
         create_default_config(&path, Some(" local/model ")).unwrap();
