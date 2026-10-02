@@ -76,7 +76,11 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
   Failed requests consume their reserved input/output budget as estimates; completed
   provider usage remains separate. No adapter-local retries can duplicate effects.
 - Started records contain the validated model, API identity, base URL, and effective
-  provider settings. Model failure records contain only typed error codes. Existing
+  provider settings. Model failure records contain typed error codes and optional
+  non-secret transport diagnostics: HTTP status, unexpected content type, or SSE failure.
+  The same evidence is logged to stderr and captured in HQ's scoped agent log, without
+  response bodies, headers, or credentials. For HTTP 400/422, check the server's request
+  validation diagnostics, including the selected model and tool schemas. Existing
   version-1 journals without these optional fields remain readable.
 
 Sources: [LM Studio Chat Completions](https://lmstudio.ai/docs/developer/openai-compat/chat-completions),
@@ -106,5 +110,5 @@ FERRUS_NANO_SMOKE_CONFIG=/absolute/private/host/path/nano.toml \
 The test runs a bounded session with a pure `lookup` tool, requires a successful tool
 call before final completion, and reports the configured model and reported/estimated
 usage. The temporary journal is removed after the test. CI never runs this test.
-Live compatibility has not yet been verified; run it against the configured model
+Live compatibility is model-specific; run this test against the configured model
 before enabling that endpoint for managed execution.

@@ -476,6 +476,23 @@ pub(crate) async fn recover_previous(
         anyhow::bail!("Previous Nano command may still have effects; task requires reconciliation");
     }
     session.authorize().await?;
+    if let Some(reason @ (EndReason::ProviderProtocol | EndReason::ProviderFailed)) =
+        &journal.state().end
+        && !records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                SessionEvent::ModelFailed { retryable, .. } => Some(*retryable),
+                SessionEvent::ModelCompleted { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false)
+    {
+        // The process may have exited between journal sealing and task failure.
+        // Reconcile the durable stop without sending the same rejected request again.
+        session.fail_provider(reason).await?;
+        anyhow::bail!("Previous Nano run has a terminal provider failure; inspect its diagnostics");
+    }
     if journal.state().end == Some(EndReason::Submitted) && !submitted {
         ensure!(
             session.previous_submit_committed(previous.clone()).await?,

@@ -4,7 +4,8 @@ use super::{
     compaction::{self, Projection, Summary},
     journal::{Journal, encode, valid_id},
     provider::{
-        FinishReason, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Usage,
+        FinishReason, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind,
+        ProviderEvent, Usage,
     },
     session::{
         Budget, ContextComposition, EndReason, LaunchEvidence, LimitKind, Limits, SessionCommand,
@@ -30,6 +31,7 @@ pub(crate) struct Engine<P, T, H, J> {
     previous_call: Option<(String, serde_json::Value)>,
     started: Option<Instant>,
     launch_evidence: Option<LaunchEvidence>,
+    retryable_provider_failure: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +72,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             previous_call: None,
             started: None,
             launch_evidence: None,
+            retryable_provider_failure: false,
         })
     }
 
@@ -117,6 +120,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 reason: EndReason::Limit(LimitKind::ContextBytes),
                 budget: self.budget.clone(),
                 durable: false,
+                retryable_provider_failure: false,
             });
         }
 
@@ -166,6 +170,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             reason,
             budget: self.budget.clone(),
             durable: true,
+            retryable_provider_failure: self.retryable_provider_failure,
         })
     }
 
@@ -448,7 +453,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if retry {
                         self.budget.retries += 1;
                     }
-                    if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                    if !self.record_failure(error.retryable, Some(error.clone())) {
                         return EndReason::JournalFailed;
                     }
                     if !error.retryable {
@@ -492,6 +497,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             self.budget.reserved_input_tokens = 0;
             self.budget.reserved_output_tokens = 0;
             self.budget.charge(&usage);
+            self.retryable_provider_failure = false;
 
             if response.calls.is_empty() && response.text.trim().is_empty() {
                 self.budget.no_progress += 1;
@@ -861,7 +867,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         match interrupt(self.provider.start(request), cancellation, deadline).await {
             Ok(Ok(())) => (),
             Ok(Err(error)) => {
-                if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                if !self.record_failure(error.retryable, Some(error.clone())) {
                     return Err(EndReason::JournalFailed);
                 }
                 return Err(Self::provider_failure(error.kind));
@@ -891,7 +897,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 Ok(Ok(None)) => break Err(EndReason::ProviderProtocol),
                 Ok(Err(error)) => {
                     self.provider.cancel();
-                    if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                    if !self.record_failure(error.retryable, Some(error.clone())) {
                         return Err(EndReason::JournalFailed);
                     }
                     return Err(Self::provider_failure(error.kind));
@@ -935,6 +941,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.budget.reserved_output_tokens = 0;
         self.budget.charge(&usage);
         summary.text = response.text;
+        self.retryable_provider_failure = false;
         if !self.commit(SessionEvent::CompactionCompleted {
             summary: summary.clone(),
             usage,
@@ -979,7 +986,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.record_failure(retryable, None)
     }
 
-    fn record_failure(&mut self, retryable: bool, error: Option<ProviderErrorKind>) -> bool {
+    fn record_failure(&mut self, retryable: bool, error: Option<ProviderError>) -> bool {
+        self.retryable_provider_failure = retryable;
         let usage = Usage {
             input_tokens: self.budget.reserved_input_tokens,
             output_tokens: self.budget.reserved_output_tokens,
@@ -990,11 +998,17 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.budget.reserved_output_tokens = 0;
         self.budget.charge(&usage);
 
-        self.commit(SessionEvent::ModelFailed {
+        let committed = self.commit(SessionEvent::ModelFailed {
             retryable,
             usage,
-            error,
-        })
+            error: error.as_ref().map(|error| error.kind.clone()),
+            diagnostic: error.as_ref().and_then(|error| error.diagnostic.clone()),
+        });
+        if committed && let Some(error) = error {
+            tracing::warn!(kind = ?error.kind, retryable, diagnostic = ?error.diagnostic,
+                "Nano provider attempt failed");
+        }
+        committed
     }
 
     fn stop(&self, cancellation: &Cancellation, deadline: Instant) -> Option<EndReason> {
@@ -1036,6 +1050,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             reason: EndReason::JournalFailed,
             budget: self.budget.clone(),
             durable: false,
+            retryable_provider_failure: self.retryable_provider_failure,
         }
     }
 }

@@ -103,7 +103,12 @@ pub(super) fn descriptor(name: &str) -> ToolDescriptor {
         let read = json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1},"max_bytes":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false});
         let search = json!({"type":"object","properties":{"query":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"max_results":{"type":"integer","minimum":1}},"required":["query"],"additionalProperties":false});
         let reason = json!({"type":"string","enum":["missing","disabled","stale","ambiguous","unsupported"]});
-        json!({"type":"object","oneOf":[
+        // Chat Completions servers may require properties at the schema root.
+        // Keep the tagged alternatives so operation and input still agree.
+        json!({"type":"object","properties":{
+            "operation":{"type":"string","enum":["read","search"]},
+            "reason":reason,"input":{"type":"object","oneOf":[read,search]}
+        },"required":["operation","reason","input"],"additionalProperties":false,"oneOf":[
             {"type":"object","properties":{"operation":{"const":"read"},"reason":reason,"input":read},"required":["operation","reason","input"],"additionalProperties":false},
             {"type":"object","properties":{"operation":{"const":"search"},"reason":reason,"input":search},"required":["operation","reason","input"],"additionalProperties":false}
         ]})

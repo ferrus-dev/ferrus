@@ -674,6 +674,7 @@ async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
                 next.budget.charge(&usage);
                 next.event = SessionEvent::ModelFailed {
                     error: None,
+                    diagnostic: None,
                     retryable: false,
                     usage,
                 };
@@ -689,6 +690,7 @@ async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
                     "failed" => {
                         record.event = SessionEvent::ModelFailed {
                             error: None,
+                            diagnostic: None,
                             retryable: false,
                             usage: usage.clone(),
                         }
@@ -1026,6 +1028,7 @@ struct CompactionProvider {
     read_calls: bool,
     normal_text_bytes: usize,
     fail_summary: bool,
+    summary_failure_retryable: bool,
     summary_stream_error: Option<ProviderErrorKind>,
     stall_summary: bool,
     active_summary: bool,
@@ -1041,7 +1044,10 @@ impl Provider for CompactionProvider {
             self.active_summary = true;
             self.summary_started.store(true, Ordering::SeqCst);
             if self.fail_summary {
-                return Err(ProviderError::new(ProviderErrorKind::Transport, false));
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    self.summary_failure_retryable,
+                ));
             }
             ProviderEvent::Completed {
                 response: ModelResponse {
@@ -1380,46 +1386,50 @@ async fn canceled_compaction_is_charged_and_never_replays_tools() {
 
 #[tokio::test]
 async fn failed_compaction_charges_reservation_and_recovers_without_replaying_effects() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let mut engine = Engine::new(
-        identity(),
-        bounds,
-        CompactionProvider {
-            fail_summary: true,
-            ..Default::default()
-        },
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ProviderFailed);
-    assert!(end.durable);
-    assert!(end.budget.estimated_input_tokens > 0);
-    let effects = engine.tools.effects.lock().unwrap().len();
-    let records = engine.host.records.clone();
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-    );
-    drop(engine);
-    let (_journal, recovered) =
-        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
-    let replay = Replay::from_records(&recovered).unwrap();
-    assert_eq!(replay.end, Some(EndReason::ProviderFailed));
-    assert_eq!(replay.budget, end.budget);
-    assert!(effects > 0);
+    for retryable in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut bounds = limits();
+        bounds.context_bytes = 4 * 1024;
+        bounds.response_bytes = 1024;
+        let mut engine = Engine::new(
+            identity(),
+            bounds,
+            CompactionProvider {
+                fail_summary: true,
+                summary_failure_retryable: retryable,
+                ..Default::default()
+            },
+            FakeTools::default(),
+            FakeHost::default(),
+            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+        )
+        .unwrap();
+        let end = run(&mut engine, &Cancellation::default()).await;
+        assert_eq!(end.reason, EndReason::ProviderFailed);
+        assert_eq!(end.retryable_provider_failure, retryable);
+        assert!(end.durable);
+        assert!(end.budget.estimated_input_tokens > 0);
+        let effects = engine.tools.effects.lock().unwrap().len();
+        let records = engine.host.records.clone();
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+        );
+        drop(engine);
+        let (_journal, recovered) =
+            FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
+        let replay = Replay::from_records(&recovered).unwrap();
+        assert_eq!(replay.end, Some(EndReason::ProviderFailed));
+        assert_eq!(replay.budget, end.budget);
+        assert!(effects > 0);
+    }
 }
 
 #[tokio::test]

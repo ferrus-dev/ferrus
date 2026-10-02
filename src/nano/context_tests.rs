@@ -2,6 +2,28 @@
 
 use super::*;
 
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn fallback_schema_exposes_properties_and_preserves_operation_constraints() {
+    let descriptor = crate::nano::native::descriptor("repository_fallback");
+    let schema = &descriptor.input_schema;
+    assert!(schema["properties"].is_object());
+    let validator = jsonschema::validator_for(schema).unwrap();
+    for arguments in [
+        serde_json::json!({"operation":"read","reason":"stale","input":{"path":"src/main.rs"}}),
+        serde_json::json!({"operation":"search","reason":"missing","input":{"query":"symbol"}}),
+    ] {
+        assert!(validator.is_valid(&arguments));
+    }
+    for arguments in [
+        serde_json::json!({"operation":"read","reason":"stale","input":{"query":"symbol"}}),
+        serde_json::json!({"operation":"search","reason":"missing","input":{"path":"src/main.rs"}}),
+        serde_json::json!({"operation":"read","reason":"stale","input":{"path":"src/main.rs"},"extra":true}),
+    ] {
+        assert!(!validator.is_valid(&arguments));
+    }
+}
+
 #[tokio::test]
 async fn instructions_are_scoped_lazy_reloaded_and_bounded() {
     use crate::nano::instructions::{Instructions, Limits};

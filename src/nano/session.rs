@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::provider::{ModelResponse, ProviderErrorKind, ProviderSettings, Usage};
+use super::provider::{
+    ModelResponse, ProviderDiagnostic, ProviderErrorKind, ProviderSettings, Usage,
+};
 use super::tools::{EffectPlan, ToolCall, ToolOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +267,8 @@ pub(crate) enum SessionEvent {
         usage: Usage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProviderErrorKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<ProviderDiagnostic>,
     },
     ToolIntent {
         call_id: String,
@@ -322,4 +326,6 @@ pub(crate) struct SessionEnd {
     pub budget: Budget,
     /// False means the final state could not be durably recorded. Never acknowledge it as committed.
     pub durable: bool,
+    /// A compaction attempt can stop its session on a retryable provider error.
+    pub retryable_provider_failure: bool,
 }

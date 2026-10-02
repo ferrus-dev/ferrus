@@ -244,6 +244,36 @@ impl FerrusSession {
         .await
     }
 
+    /// Permanent provider failures must not become fresh HQ dispatch attempts.
+    /// Called only after the engine has stopped owned effects and sealed its journal.
+    pub(crate) async fn fail_provider(&self, reason: &super::session::EndReason) -> Result<()> {
+        let code = match reason {
+            super::session::EndReason::ProviderProtocol => "nano_provider_protocol",
+            super::session::EndReason::ProviderFailed => "nano_provider_failed",
+            _ => anyhow::bail!("Not a terminal provider failure"),
+        };
+        self.mutate(move |tx, scope, context| {
+            ensure!(
+                matches!(context.status.as_str(), "executing" | "addressing"),
+                "Provider failure cannot change a paused or terminal task"
+            );
+            let updated = tx.execute(
+                "UPDATE tasks SET status = 'failed', failure_reason = ?2, \
+                 claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL WHERE id = ?1",
+                rusqlite::params![scope.task_id, code],
+            )?;
+            ensure!(updated == 1, "Bound task disappeared");
+            project::executor_event(
+                tx,
+                scope,
+                code,
+                serde_json::json!({"task_id":scope.task_id}),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn previous_submit_committed(&self, run_id: String) -> Result<bool> {
         self.mutate(move |tx, _, _| {
             let committed: bool = tx.query_row(

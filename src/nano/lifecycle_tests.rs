@@ -273,6 +273,183 @@ fn script(calls: Vec<ToolCall>) -> Script {
     }
 }
 
+struct RejectedProvider(ProviderErrorKind);
+impl Provider for RejectedProvider {
+    async fn start(&mut self, _: ModelRequest) -> std::result::Result<(), ProviderError> {
+        Err(ProviderError::new(self.0.clone(), false))
+    }
+    async fn next_event(&mut self) -> std::result::Result<Option<ProviderEvent>, ProviderError> {
+        panic!("Rejected request cannot have events")
+    }
+}
+
+#[tokio::test]
+async fn permanent_provider_failure_stops_managed_dispatch_without_spending_check_retries() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for (kind, reason, code) in [
+        (
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+            "nano_provider_protocol",
+        ),
+        (
+            ProviderErrorKind::Authentication,
+            EndReason::ProviderFailed,
+            "nano_provider_failed",
+        ),
+    ] {
+        let f = Fixture::new().await;
+        let session = FerrusSession::bind(f.launch()).await.unwrap();
+        let (tools, journal) = native(&f, session.clone(), RUN);
+        let end = managed::run(
+            session.clone(),
+            identity(RUN),
+            Limits::default(),
+            RejectedProvider(kind),
+            tools,
+            journal,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(end.reason, reason);
+        assert!(end.durable);
+        let context = session.status().await.unwrap();
+        assert_eq!(context.status, "failed");
+        assert_eq!(context.check_retries, 0);
+        let state: (String, Option<String>, Option<String>) = f
+            .connection()
+            .query_row(
+                "SELECT failure_reason,claimed_by,lease_until FROM tasks WHERE id=?1",
+                [TASK],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (code.into(), None, None));
+        assert!(f.events().iter().any(|(kind, _)| kind == code));
+        assert!(matches!(
+            session.claim().await.unwrap(),
+            project::ReadyTaskClaim::NoAvailable
+        ));
+        let (_, records) =
+            FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default())
+                .unwrap();
+        assert!(
+            matches!(&records.last().unwrap().event, SessionEvent::Ended {reason: actual} if actual == &reason)
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_provider_failure_requires_current_executor_ownership() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    for update in [
+        "UPDATE tasks SET claimed_by='executor:other:1'",
+        "UPDATE tasks SET claimed_by='executor:nano:1',status='reviewing'",
+        "UPDATE tasks SET status='awaiting_human'",
+    ] {
+        f.connection().execute(update, []).unwrap();
+        let tasks = project::list_tasks().await.unwrap();
+        let events = f.events();
+        assert!(
+            session
+                .fail_provider(&EndReason::ProviderProtocol)
+                .await
+                .is_err()
+        );
+        f.assert_no_effect(tasks, events).await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for (reason, retryable) in [
+        (EndReason::ProviderProtocol, false),
+        (EndReason::ProviderFailed, true),
+    ] {
+        let f = Fixture::new().await;
+        let session = FerrusSession::bind(f.launch()).await.unwrap();
+        session.claim().await.unwrap();
+        let previous = "old-provider-stop";
+        previous_run(&f, previous);
+        let mut journal = FileJournal::create(&f.data, previous, Quotas::default()).unwrap();
+        let mut budget = Budget::default();
+        journal
+            .append(
+                SessionEvent::Started {
+                    identity: SessionIdentity {
+                        session_id: previous.into(),
+                        project_id: "test-project".into(),
+                        task_id: Some(TASK.into()),
+                        run_id: Some(previous.into()),
+                    },
+                    limits: Limits::default(),
+                    input: "task".into(),
+                    launch_evidence: None,
+                    inherited_budget: None,
+                    provider: None,
+                },
+                &budget,
+            )
+            .unwrap();
+        budget.model_turns = 1;
+        budget.reserved_input_tokens = 10;
+        budget.reserved_output_tokens = 10;
+        journal
+            .append(SessionEvent::ModelStarted { turn: 1 }, &budget)
+            .unwrap();
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            reported: false,
+        };
+        budget.reserved_input_tokens = 0;
+        budget.reserved_output_tokens = 0;
+        budget.charge(&usage);
+        journal
+            .append(
+                SessionEvent::ModelFailed {
+                    retryable,
+                    usage,
+                    error: Some(if retryable {
+                        ProviderErrorKind::Transport
+                    } else {
+                        ProviderErrorKind::Unsupported
+                    }),
+                    diagnostic: Some(ProviderDiagnostic::Http {
+                        status: if retryable { 503 } else { 400 },
+                    }),
+                },
+                &budget,
+            )
+            .unwrap();
+        journal
+            .append(SessionEvent::Ended { reason }, &budget)
+            .unwrap();
+        drop(journal);
+        let workspace =
+            workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+        let recovery = crate::nano::resume::recover_previous(&session, &workspace).await;
+        if retryable {
+            assert!(recovery.unwrap().is_some());
+            assert_eq!(session.status().await.unwrap().status, "executing");
+        } else {
+            assert!(recovery.is_err());
+            assert_eq!(session.status().await.unwrap().status, "failed");
+        }
+        let (_, records) = FileJournal::recover(
+            &f.data.join("nano/sessions").join(previous),
+            Quotas::default(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 4);
+    }
+}
+
 #[tokio::test]
 async fn managed_checks_share_retry_counts_and_stop_at_exhaustion() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();

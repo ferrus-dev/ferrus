@@ -118,6 +118,15 @@ sentence never marks a task complete. `/stop` first sends cancel and allows a tw
 cleanup interval, then uses the existing process-group termination fallback. Review, approval,
 consultation scheduling, and crash recovery remain owned by HQ.
 
+A non-retryable provider failure stops owned effects, seals the session journal, and marks the
+bound working task Failed with `nano_provider_protocol` or `nano_provider_failed`. Nano exits
+with a nonzero status while preserving its structured `ended` event. HQ does not respawn that
+task until a new work phase is explicitly created. Recovery reconciles a sealed provider stop
+if the process exited before recording task failure. Transient provider errors retain their
+existing retry behavior; cancellation and paused tasks do not become provider failures.
+Inspect `Nano diagnostic` entries in `.ferrus/logs/executor_<task>_<timestamp>_<run>.log` and
+`nano/sessions/<run>/events.jsonl` under the machine-local project data directory.
+
 When HQ relaunches an answered human or consultation waiter, Nano derives the launch action from
 its bound SQLite task instead of an external-agent prompt. Human waits require the question's
 Executor; neither wait can take another agent's live lease or resume a non-Executor phase.

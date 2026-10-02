@@ -268,6 +268,11 @@ fn serve(
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(request["model"], "override-model");
+            for tool in request["tools"].as_array().unwrap() {
+                let schema = &tool["function"]["parameters"];
+                assert_eq!(schema["type"], "object", "{tool}");
+                assert!(schema["properties"].is_object(), "{tool}");
+            }
             assert_eq!(
                 request["tools"]
                     .as_array()
@@ -356,6 +361,130 @@ fn serve(
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
     run_headless_task(None, false, false, true, true);
+}
+
+#[test]
+fn headless_http_rejection_fails_the_task_and_preserves_safe_diagnostics() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "No provider request");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("mock API: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        assert!((1..=512 * 1024).contains(&length));
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let body = r#"{"error":"secret-server-detail: invalid tool schema"}"#;
+        write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
+    );
+    let mut child = Process::spawn(&mut fixture.command(&config));
+    let mut stdin = child.0.stdin.take().unwrap();
+    let reader = BufReader::new(child.0.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in reader.lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    let ready = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("No ready event: {error}; {}", child.failure_diagnostics()));
+    assert_eq!(ready["event"]["type"], "ready");
+    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    output.join().unwrap();
+    server.join().unwrap();
+    let events: Vec<_> = rx.try_iter().collect();
+    let ended = events
+        .iter()
+        .find(|event| event["event"]["type"] == "ended")
+        .unwrap();
+    assert_eq!(ended["event"]["reason"]["reason"], "provider_protocol");
+    assert_eq!(ended["event"]["durable"], true);
+    assert!(!events.iter().any(|event| event["event"]["type"] == "error"));
+    let stderr = child.stderr();
+    assert!(stderr.contains("Unsupported"), "{stderr}");
+    assert!(stderr.contains("400"), "{stderr}");
+    assert!(!stderr.contains("secret-server-detail"));
+    let journal =
+        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = records
+        .iter()
+        .find(|record| record["event"]["event"] == "model_failed")
+        .unwrap();
+    assert_eq!(
+        failed["event"]["diagnostic"],
+        json!({"source":"http","status":400})
+    );
+    assert_eq!(failed["event"]["retryable"], false);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"]["event"] == "model_started")
+            .count(),
+        1
+    );
+    assert!(!journal.contains("secret-server-detail"));
+    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
+    let state: (String, String, Option<String>, i64) = db
+        .query_row(
+            "SELECT status,failure_reason,claimed_by,check_retries FROM tasks WHERE id='t-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        ("failed".into(), "nano_provider_protocol".into(), None, 0)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join(".ferrus/tasks/t-001.md")).unwrap(),
+        "Create answer.txt, check and submit."
+    );
 }
 
 #[test]

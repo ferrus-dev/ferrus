@@ -511,7 +511,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         input = answered_input(&input, &answer, human);
     }
     let host = ManagedHost {
-        session,
+        session: session.clone(),
         lost: lost.clone(),
         stop: stop.clone(),
     };
@@ -534,6 +534,16 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     // Heartbeat has no detached owner after the engine and all owned effects stop.
     let _ = (&mut heartbeat.task).await;
     drop(heartbeat);
+    if let Ok(end) = &result
+        && end.durable
+        && !end.retryable_provider_failure
+        && matches!(
+            end.reason,
+            EndReason::ProviderProtocol | EndReason::ProviderFailed
+        )
+    {
+        session.fail_provider(&end.reason).await?;
+    }
     result
 }
 

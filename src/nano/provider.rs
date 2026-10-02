@@ -75,6 +75,16 @@ pub(crate) struct ProviderError {
     pub retryable: bool,
     pub kind: ProviderErrorKind,
     pub retry_after_ms: u64,
+    pub diagnostic: Option<ProviderDiagnostic>,
+}
+
+/// Closed, non-secret transport evidence. Never store response bodies or headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProviderDiagnostic {
+    Http { status: u16 },
+    UnexpectedContentType,
+    EventStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +107,13 @@ impl ProviderError {
             kind,
             retryable,
             retry_after_ms: 0,
+            diagnostic: None,
         }
+    }
+
+    pub(crate) fn with_diagnostic(mut self, diagnostic: ProviderDiagnostic) -> Self {
+        self.diagnostic = Some(diagnostic);
+        self
     }
 }
 

@@ -102,7 +102,7 @@ async fn launch(
         journal::{FileJournal, Quotas},
         native::NativeTools,
         providers::openai::OpenAi,
-        session::{Limits, SessionIdentity},
+        session::{EndReason, Limits, SessionIdentity},
         tools::Cancellation,
         wire::{self, CommandKind, Event, ObservedJournal, Output},
         workspace,
@@ -152,6 +152,7 @@ async fn launch(
     });
     let (output, drained) = Output::spawn(wire::stdout_file()?);
     output.publish(Event::Ready);
+    let mut terminal_published = false;
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), start_rx).await???;
         let session_id = launch.run_id.clone();
@@ -200,17 +201,25 @@ async fn launch(
         )
         .await?;
         output.publish(Event::Ended {
-            reason: end.reason,
+            reason: end.reason.clone(),
             durable: end.durable,
         });
+        terminal_published = true;
         anyhow::ensure!(
             end.durable,
             "Nano session could not durably record its outcome"
         );
+        anyhow::ensure!(
+            !matches!(
+                end.reason,
+                EndReason::ProviderProtocol | EndReason::ProviderFailed
+            ),
+            "Nano stopped after a terminal provider failure; inspect provider diagnostics"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if result.is_err() {
+    if result.is_err() && !terminal_published {
         output.publish(Event::Error {
             code: "session_failed".into(),
         });

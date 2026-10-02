@@ -264,6 +264,62 @@ async fn context_overflow_ends_the_session_without_retrying_or_executing_tools()
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn rejected_requests_keep_http_status_without_echoing_server_details() {
+    for (status, kind, reason) in [
+        (
+            400,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            404,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            422,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            401,
+            ProviderErrorKind::Authentication,
+            EndReason::ProviderFailed,
+        ),
+    ] {
+        let (url, server) = server(vec![Reply::failure(status, "secret-code")]).await;
+        let directory = TempDir::new().unwrap();
+        let mut engine = engine(OpenAi::new(config(&url)).unwrap(), &directory);
+        let end = engine
+            .run(
+                SessionCommand::Start {
+                    input: "Use lookup".into(),
+                },
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.reason, reason);
+        assert_eq!(end.budget.model_turns, 1);
+        assert_eq!(end.budget.retries, 0);
+        assert_eq!(engine.tools.calls, 0);
+        let record = engine
+            .host
+            .records
+            .iter()
+            .find(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+            .unwrap();
+        assert!(
+            matches!(&record.event, SessionEvent::ModelFailed { error: Some(actual), diagnostic: Some(ProviderDiagnostic::Http {status: actual_status}), .. } if actual == &kind && *actual_status == status)
+        );
+        let serialized = serde_json::to_string(record).unwrap();
+        assert!(!serialized.contains("secret-code"));
+        assert!(!serialized.contains("secret-server-detail"));
+        server.await.unwrap();
+    }
+}
+
 #[test]
 fn advertised_tools_are_bounded_by_context_not_generated_call_count() {
     for max_tool_calls in [1, 64] {
