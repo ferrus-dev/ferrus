@@ -106,7 +106,7 @@ pub async fn run(debug: bool) -> Result<()> {
                         if !matches!(changed, Ok(false)) {
                             let event = events.borrow_and_update().clone();
                             if changed.is_err() { handle.native_events = None; }
-                            if let Some(event) = event && event.show_in_hq() {
+                            if debug && let Some(event) = event && event.show_in_hq() {
                                 ctx.display.muted(format!("{name}: {}", event.summary()));
                             }
                         }

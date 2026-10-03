@@ -107,8 +107,10 @@ event. A dedicated writer performs stdout I/O without blocking inference, lease 
 commits. Shutdown allows two seconds to drain output after owned effects settle; an unresponsive
 frontend may miss the last event. The journal and SQLite remain authoritative.
 
-HQ shows tool requests, model failures, output-limit continuations, and terminal outcomes. Internal model-start and
-tool-finish markers stay in the scoped agent log instead of filling the HQ transcript.
+HQ shows the usual process-start announcement. With `--debug`, it also shows tool requests,
+model failures, output-limit continuations, and terminal outcomes. The scoped agent log retains
+all progress and terminal events in both modes, including internal model-start and tool-finish
+markers.
 
 ## HQ ownership
 
