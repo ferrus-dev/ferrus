@@ -1,6 +1,9 @@
 //! Explicit, host-local provider configuration. No global client or credential environment.
 
-use super::{private, provider::ProviderSettings};
+use super::{
+    private,
+    provider::{ProviderSettings, ReasoningEffort},
+};
 use anyhow::{Context, Result, ensure};
 use reqwest::{Url, header::HeaderValue};
 use serde::Deserialize;
@@ -24,6 +27,7 @@ pub(crate) struct Config {
     pub max_output_tokens: u64,
     #[serde(default)]
     pub temperature: f64,
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_timeout")]
     pub request_timeout_ms: u64,
     #[serde(default = "default_wire")]
@@ -137,6 +141,7 @@ impl Config {
             context_tokens: self.context_tokens,
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort,
             request_timeout_ms: self.request_timeout_ms,
             wire_bytes: self.wire_bytes,
             event_bytes: self.event_bytes,

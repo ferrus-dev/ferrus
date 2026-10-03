@@ -35,6 +35,62 @@ fn request() -> ModelRequest {
     }
 }
 
+#[test]
+fn reasoning_effort_is_explicit_and_bound_to_effective_settings() {
+    let cfg = config("http://127.0.0.1:1234/v1");
+    let original = cfg.validate().unwrap().1;
+    let encoded = serde_json::to_value(&original).unwrap();
+    assert!(encoded.get("reasoning_effort").is_none());
+    assert_eq!(
+        serde_json::from_value::<ProviderSettings>(encoded).unwrap(),
+        original
+    );
+    let provider = OpenAi::new(cfg).unwrap();
+    let body: Value = serde_json::from_slice(&provider.body(request()).unwrap()).unwrap();
+    assert!(body.get("reasoning_effort").is_none());
+    let evidence = LaunchEvidence {
+        baseline_tree: "fixture".into(),
+        native_context_enabled: true,
+        working_set_enabled: true,
+        graph_peer_mode: Some(GraphPeerMode::Absent),
+        graph_peer_id: None,
+        mcp_peer_count: Some(0),
+        mcp_tool_count: Some(0),
+        graph_peer_timeout_ms: None,
+        settings_sha256: None,
+    };
+    let digest = effective_settings_sha256(&original, &Limits::default(), &evidence).unwrap();
+    for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let cfg: Config = toml::from_str(&format!(
+            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nreasoning_effort = '{level}'\n"
+        ))
+        .unwrap();
+        let provider = OpenAi::new(cfg).unwrap();
+        let settings = provider.settings().unwrap();
+        let body: Value = serde_json::from_slice(&provider.body(request()).unwrap()).unwrap();
+        assert_eq!(body["reasoning_effort"], level);
+        assert_ne!(
+            effective_settings_sha256(&settings, &Limits::default(), &evidence).unwrap(),
+            digest
+        );
+        let record = serde_json::to_value(&settings).unwrap();
+        assert_eq!(record["reasoning_effort"], level);
+        assert_eq!(
+            serde_json::from_value::<ProviderSettings>(record).unwrap(),
+            settings
+        );
+        assert_eq!(
+            provider.estimate_input_tokens(&request()).unwrap(),
+            serde_json::to_vec(&body).unwrap().len() as u64
+        );
+    }
+    for invalid in ["'automatic'", "true", "1"] {
+        assert!(toml::from_str::<Config>(&format!(
+            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nreasoning_effort = {invalid}\n"
+        )).is_err());
+    }
+}
+
 fn decode(wire: &str, stride: usize) -> Result<Vec<ProviderEvent>, ProviderError> {
     let mut decoder = Decoder::new(config("http://127.0.0.1:1234/v1").validate().unwrap().1);
     let mut events = Vec::new();
@@ -418,6 +474,8 @@ struct Reply {
     body: String,
     headers: &'static str,
     stall: bool,
+    stall_headers: bool,
+    line_delay: Option<Duration>,
 }
 impl Reply {
     fn stream(body: &str) -> Self {
@@ -426,6 +484,8 @@ impl Reply {
             body: body.into(),
             headers: "Content-Type: text/event-stream\r\n",
             stall: false,
+            stall_headers: false,
+            line_delay: None,
         }
     }
     fn failure(status: u16, code: &str) -> Self {
@@ -434,6 +494,8 @@ impl Reply {
             body: json!({"error":{"code":code,"message":"secret-server-detail"}}).to_string(),
             headers: "Retry-After: 1\r\n",
             stall: false,
+            stall_headers: false,
+            line_delay: None,
         }
     }
 }
@@ -476,6 +538,10 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
                 }
             };
             requests.push((headers, body));
+            if reply.stall_headers {
+                assert_closed(&mut socket).await;
+                continue;
+            }
             let head = format!(
                 "HTTP/1.1 {} Fixture\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 reply.status,
@@ -485,14 +551,14 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
             socket.write_all(head.as_bytes()).await.unwrap();
             if reply.stall {
                 socket.write_all(reply.body.as_bytes()).await.unwrap();
-                let mut buf = [0; 1];
-                let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
-                    .await
-                    .unwrap();
-                assert!(
-                    matches!(closed, Ok(0) | Err(_)),
-                    "Cancelled stream remained open"
-                );
+                assert_closed(&mut socket).await;
+            } else if let Some(delay) = reply.line_delay {
+                for line in reply.body.split_inclusive('\n') {
+                    if socket.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                }
             } else {
                 for chunk in reply.body.as_bytes().chunks(7) {
                     if socket.write_all(chunk).await.is_err() {
@@ -504,6 +570,17 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
         requests
     });
     (url, task)
+}
+
+async fn assert_closed(socket: &mut tokio::net::TcpStream) {
+    let mut buf = [0; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "Cancelled stream remained open"
+    );
 }
 
 #[derive(Default)]
@@ -766,6 +843,75 @@ async fn cancellation_between_buffered_events_closes_the_stream() {
         Some(ProviderEvent::TextDelta(_))
     ));
     provider.cancel();
+    assert!(provider.next_event().await.unwrap().is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn active_stream_can_outlast_the_provider_idle_timeout() {
+    let body = format!("{}{FINAL}", ": generating\n".repeat(6));
+    let mut reply = Reply::stream(&body);
+    reply.line_delay = Some(Duration::from_millis(250));
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 1000;
+    let mut provider = OpenAi::new(cfg).unwrap();
+    provider.start(request()).await.unwrap();
+    let mut completed = false;
+    while let Some(event) = provider.next_event().await.unwrap() {
+        if let ProviderEvent::Completed { response, .. } = event {
+            assert!(response.is_final());
+            completed = true;
+        }
+    }
+    assert!(completed);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn active_stream_still_consumes_the_engine_elapsed_budget() {
+    let body = format!("{}{FINAL}", ": generating\n".repeat(6));
+    let mut reply = Reply::stream(&body);
+    reply.line_delay = Some(Duration::from_millis(250));
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 10_000;
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine_with_limits(
+        OpenAi::new(cfg).unwrap(),
+        &directory,
+        Limits {
+            elapsed_ms: 1000,
+            ..Default::default()
+        },
+    );
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "lookup".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::Elapsed));
+    assert_eq!(engine.tools.calls, 0);
+    assert!(end.durable);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_headers_remain_bounded_by_the_provider_idle_timeout() {
+    let mut reply = Reply::stream("");
+    reply.stall_headers = true;
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 1000;
+    let mut provider = OpenAi::new(cfg).unwrap();
+    assert_eq!(
+        provider.start(request()).await.unwrap_err().kind,
+        ProviderErrorKind::Timeout
+    );
     assert!(provider.next_event().await.unwrap().is_none());
     server.await.unwrap();
 }

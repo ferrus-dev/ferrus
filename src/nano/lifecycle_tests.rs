@@ -273,10 +273,219 @@ fn script(calls: Vec<ToolCall>) -> Script {
     }
 }
 
-struct RejectedProvider(ProviderErrorKind);
+#[cfg(feature = "nano-openai")]
+#[tokio::test]
+#[ignore = "requires an explicitly selected Nano journal, private config, and local loaded model"]
+async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let config =
+        std::env::var_os("FERRUS_NANO_SMOKE_CONFIG").expect("Set FERRUS_NANO_SMOKE_CONFIG");
+    let journal =
+        std::env::var_os("FERRUS_NANO_SMOKE_JOURNAL").expect("Set FERRUS_NANO_SMOKE_JOURNAL");
+    let config = crate::nano::config::Config::load(std::path::Path::new(&config)).unwrap();
+    let (endpoint, settings) = config.validate().unwrap();
+    assert!(matches!(
+        endpoint.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]")
+    ));
+    let bytes = std::fs::read(journal).unwrap();
+    assert!(bytes.len() <= 16 * 1024 * 1024);
+    let records: Vec<Record> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let failed = records
+        .iter()
+        .position(|record| {
+            matches!(
+                &record.event,
+                SessionEvent::ModelFailed {
+                    error: Some(ProviderErrorKind::Timeout),
+                    ..
+                }
+            )
+        })
+        .expect("No timed-out request");
+    let start = records[..failed]
+        .iter()
+        .rposition(|record| matches!(record.event, SessionEvent::ModelStarted { .. }))
+        .unwrap();
+    let replay = crate::nano::replay::Replay::from_records(&records[..start]).unwrap();
+    let recorded_effort = records[..start]
+        .iter()
+        .find_map(|record| match &record.event {
+            SessionEvent::Started {
+                provider: Some(settings),
+                ..
+            } => Some(settings.reasoning_effort),
+            _ => None,
+        })
+        .expect("Missing recorded provider settings");
+    let composition = records[..start]
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            SessionEvent::ContextComposed { composition } => Some(composition),
+            _ => None,
+        })
+        .unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    let (native, _) = native(&f, session.clone(), RUN);
+    let tools = ManagedTools::new(session, native, Cancellation::default());
+    let mut provider = crate::nano::providers::openai::OpenAi::new(config).unwrap();
+    let request = ModelRequest {
+        messages: replay
+            .projection
+            .unwrap_or_default()
+            .apply(&replay.messages)
+            .unwrap(),
+        tools: tools.descriptors(),
+        max_output_tokens: std::env::var("FERRUS_NANO_SMOKE_OUTPUT_TOKENS")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(composition.output_tokens_reserved),
+    };
+    let effort_bytes = |effort: Option<crate::nano::provider::ReasoningEffort>| {
+        effort.map_or(0, |effort| {
+            serde_json::to_vec(&serde_json::json!({"reasoning_effort":effort}))
+                .unwrap()
+                .len() as i64
+                - 1
+        })
+    };
+    let expected_bytes = composition.input_tokens_estimated as i64
+        + request.max_output_tokens.to_string().len() as i64
+        - composition.output_tokens_reserved.to_string().len() as i64
+        + effort_bytes(settings.reasoning_effort)
+        - effort_bytes(recorded_effort);
+    assert_eq!(
+        provider.estimate_input_tokens(&request).unwrap(),
+        expected_bytes as u64,
+        "Recorded request and current catalog/settings differ; do not treat this as an exact replay"
+    );
+    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_REQUEST_OUTPUT") {
+        use std::io::Write;
+        let mut file = crate::nano::private::file(std::path::Path::new(&path), true).unwrap();
+        file.write_all(&provider.body(request).unwrap()).unwrap();
+        return;
+    }
+    let start = tokio::time::Instant::now();
+    let response = tokio::time::timeout(Duration::from_secs(600), async {
+        provider.start(request).await.unwrap();
+        loop {
+            match provider
+                .next_event()
+                .await
+                .unwrap()
+                .expect("No completed response")
+            {
+                ProviderEvent::Completed { response, usage } => break (response, usage),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("Replay exceeded its elapsed allowance");
+    println!(
+        "model={} elapsed_ms={} finish={:?} calls={:?} usage={:?}",
+        settings.model,
+        start.elapsed().as_millis(),
+        response.0.finish,
+        response
+            .0
+            .calls
+            .iter()
+            .map(|call| &call.name)
+            .collect::<Vec<_>>(),
+        response.1
+    );
+    assert_eq!(response.0.finish, FinishReason::ToolCalls);
+    assert!(!response.0.calls.is_empty());
+    for call in response.0.calls {
+        tools
+            .validate(&call.name, &serde_json::from_str(&call.arguments).unwrap())
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "nano-openai")]
+#[tokio::test]
+#[ignore = "requires a private config and a local model; executes native tools in a temporary project"]
+async fn live_lm_studio_managed_graph_edit_check_and_submit() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let path = std::env::var_os("FERRUS_NANO_SMOKE_CONFIG").expect("Set FERRUS_NANO_SMOKE_CONFIG");
+    let config = crate::nano::config::Config::load(std::path::Path::new(&path)).unwrap();
+    let (endpoint, settings) = config.validate().unwrap();
+    assert!(matches!(
+        endpoint.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]")
+    ));
+    #[cfg(feature = "nano-mcp")]
+    assert!(
+        config.mcp_config_file.is_none(),
+        "This smoke executes only native tools"
+    );
+    let f = Fixture::new().await;
+    configure(&f, &["git diff --check"], 3);
+    let session = git_session(&f, true).await;
+    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"),
+        "First locate Baseline using repository_search. In src/lib.rs rename the Baseline struct to Ready, keeping the rest of the file unchanged. Use native apply_patch for the edit. Run the Ferrus check tool and submit the change using the submit tool. Do not commit or ask for consultation.\n"
+    ).unwrap();
+    let (tools, journal) = native(&f, session.clone(), RUN);
+    let start = tokio::time::Instant::now();
+    let end = managed::run(
+        session.clone(),
+        identity(RUN),
+        Limits {
+            elapsed_ms: 180_000,
+            model_turns: 12,
+            ..Limits::default()
+        },
+        crate::nano::providers::openai::OpenAi::new(config).unwrap(),
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    println!(
+        "model={} elapsed_ms={} end={:?} turns={} tool_calls={} input={} output={}",
+        settings.model,
+        start.elapsed().as_millis(),
+        end.reason,
+        end.budget.model_turns,
+        end.budget.tool_calls,
+        end.budget.reported_input_tokens,
+        end.budget.reported_output_tokens
+    );
+    let (_, records) =
+        FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
+    let calls: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            SessionEvent::ToolIntent { call, .. } => Some(call.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    println!("calls={calls:?}");
+    assert_eq!(end.reason, EndReason::Submitted);
+    assert!(end.durable);
+    assert_eq!(session.status().await.unwrap().status, "reviewing");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "pub struct Ready;\n"
+    );
+    for required in ["repository_search", "apply_patch", "check", "submit"] {
+        assert!(calls.contains(&required), "Missing native call: {required}");
+    }
+}
+
+struct RejectedProvider(ProviderErrorKind, bool);
 impl Provider for RejectedProvider {
     async fn start(&mut self, _: ModelRequest) -> std::result::Result<(), ProviderError> {
-        Err(ProviderError::new(self.0.clone(), false))
+        Err(ProviderError::new(self.0.clone(), self.1))
     }
     async fn next_event(&mut self) -> std::result::Result<Option<ProviderEvent>, ProviderError> {
         panic!("Rejected request cannot have events")
@@ -284,18 +493,26 @@ impl Provider for RejectedProvider {
 }
 
 #[tokio::test]
-async fn permanent_provider_failure_stops_managed_dispatch_without_spending_check_retries() {
+async fn permanent_provider_failure_or_retry_exhaustion_stops_dispatch_without_check_retries() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for (kind, reason, code) in [
+    for (kind, retryable, reason, code) in [
         (
             ProviderErrorKind::Unsupported,
+            false,
             EndReason::ProviderProtocol,
             "nano_provider_protocol",
         ),
         (
             ProviderErrorKind::Authentication,
+            false,
             EndReason::ProviderFailed,
             "nano_provider_failed",
+        ),
+        (
+            ProviderErrorKind::Timeout,
+            true,
+            EndReason::Limit(LimitKind::Retries),
+            "nano_limit_retries",
         ),
     ] {
         let f = Fixture::new().await;
@@ -304,8 +521,11 @@ async fn permanent_provider_failure_stops_managed_dispatch_without_spending_chec
         let end = managed::run(
             session.clone(),
             identity(RUN),
-            Limits::default(),
-            RejectedProvider(kind),
+            Limits {
+                retries: 0,
+                ..Default::default()
+            },
+            RejectedProvider(kind, retryable),
             tools,
             journal,
             &Cancellation::default(),
@@ -341,6 +561,126 @@ async fn permanent_provider_failure_stops_managed_dispatch_without_spending_chec
 }
 
 #[tokio::test]
+async fn exhausted_phase_budgets_stop_dispatch_and_preserve_the_durable_reason() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for (kind, code) in [
+        (LimitKind::Tokens, "nano_limit_tokens"),
+        (LimitKind::ModelTurns, "nano_limit_model_turns"),
+        (LimitKind::ToolCalls, "nano_limit_tool_calls"),
+        (LimitKind::NoProgress, "nano_limit_no_progress"),
+    ] {
+        let f = Fixture::new().await;
+        let session = FerrusSession::bind(f.launch()).await.unwrap();
+        let (tools, journal) = native(&f, session.clone(), RUN);
+        let mut limits = Limits::default();
+        match kind {
+            LimitKind::Tokens => limits.tokens = 1,
+            LimitKind::ModelTurns => limits.model_turns = 1,
+            LimitKind::ToolCalls => limits.tool_calls = 1,
+            LimitKind::NoProgress => limits.no_progress = 1,
+            _ => unreachable!(),
+        }
+        let provider = script(
+            (0..2)
+                .map(|i| ToolCall {
+                    provider_call_id: format!("read-{i}"),
+                    name: "read_file".into(),
+                    arguments: json!({"path":"missing.txt"}).to_string(),
+                })
+                .collect(),
+        );
+        let end = managed::run(
+            session.clone(),
+            identity(RUN),
+            limits,
+            provider,
+            tools,
+            journal,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(end.reason, EndReason::Limit(kind));
+        assert!(end.durable);
+        let state: (String, String, Option<String>, u32) = f
+            .connection()
+            .query_row(
+                "SELECT status,failure_reason,claimed_by,check_retries FROM tasks WHERE id=?1",
+                [TASK],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("failed".into(), code.into(), None, 0));
+        assert!(matches!(
+            session.claim().await.unwrap(),
+            project::ReadyTaskClaim::NoAvailable
+        ));
+        let (_, records) =
+            FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default())
+                .unwrap();
+        assert!(
+            matches!(&records.last().unwrap().event, SessionEvent::Ended { reason } if reason == &end.reason)
+        );
+    }
+}
+
+#[tokio::test]
+async fn truncated_reasoning_response_fails_the_phase_without_executing_partial_calls() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    let (tools, journal) = native(&f, session.clone(), RUN);
+    let provider = Script {
+        responses: VecDeque::from([ProviderEvent::Completed {
+            response: ModelResponse {
+                finish: FinishReason::Length,
+                text: String::new(),
+                calls: Vec::new(),
+                continuation: Some(json!({"reasoning_content":"unfinished reasoning"})),
+            },
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 4096,
+                reported: true,
+            }),
+        }]),
+        starts: Arc::new(AtomicUsize::new(0)),
+        stall: false,
+    };
+    let end = managed::run(
+        session.clone(),
+        identity(RUN),
+        Limits::default(),
+        provider,
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(end.reason, EndReason::ProviderTruncated);
+    assert_eq!(end.budget.reported_output_tokens, 4096);
+    assert_eq!(end.budget.tool_calls, 0);
+    assert!(end.durable);
+    let state: (String, String, Option<String>) = f
+        .connection()
+        .query_row(
+            "SELECT status,failure_reason,claimed_by FROM tasks WHERE id=?1",
+            [TASK],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        ("failed".into(), "nano_provider_truncated".into(), None)
+    );
+    assert!(matches!(
+        session.claim().await.unwrap(),
+        project::ReadyTaskClaim::NoAvailable
+    ));
+}
+
+#[tokio::test]
 async fn terminal_provider_failure_requires_current_executor_ownership() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
@@ -356,7 +696,7 @@ async fn terminal_provider_failure_requires_current_executor_ownership() {
         let events = f.events();
         assert!(
             session
-                .fail_provider(&EndReason::ProviderProtocol)
+                .fail_stopped(&EndReason::ProviderProtocol, false)
                 .await
                 .is_err()
         );
@@ -370,6 +710,8 @@ async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
     for (reason, retryable) in [
         (EndReason::ProviderProtocol, false),
         (EndReason::ProviderFailed, true),
+        (EndReason::Limit(LimitKind::Tokens), true),
+        (EndReason::Limit(LimitKind::Retries), true),
     ] {
         let f = Fixture::new().await;
         let session = FerrusSession::bind(f.launch()).await.unwrap();
@@ -387,7 +729,11 @@ async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
                         task_id: Some(TASK.into()),
                         run_id: Some(previous.into()),
                     },
-                    limits: Limits::default(),
+                    limits: Limits {
+                        tokens: 20,
+                        retries: 0,
+                        ..Default::default()
+                    },
                     input: "task".into(),
                     launch_evidence: None,
                     inherited_budget: None,
@@ -427,6 +773,7 @@ async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
                 &budget,
             )
             .unwrap();
+        let terminal = reason.managed_failure_code(retryable).is_some();
         journal
             .append(SessionEvent::Ended { reason }, &budget)
             .unwrap();
@@ -434,7 +781,7 @@ async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
         let workspace =
             workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
         let recovery = crate::nano::resume::recover_previous(&session, &workspace).await;
-        if retryable {
+        if !terminal {
             assert!(recovery.unwrap().is_some());
             assert_eq!(session.status().await.unwrap().status, "executing");
         } else {

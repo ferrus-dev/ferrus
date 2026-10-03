@@ -227,6 +227,26 @@ pub(crate) enum EndReason {
     EffectUnknown,
 }
 
+impl EndReason {
+    /// These stops cannot make progress by launching another process in the same work phase.
+    pub(crate) fn managed_failure_code(
+        &self,
+        retryable_provider_failure: bool,
+    ) -> Option<&'static str> {
+        match self {
+            Self::ProviderProtocol if !retryable_provider_failure => Some("nano_provider_protocol"),
+            Self::ProviderFailed if !retryable_provider_failure => Some("nano_provider_failed"),
+            Self::ProviderTruncated => Some("nano_provider_truncated"),
+            Self::Limit(LimitKind::Tokens) => Some("nano_limit_tokens"),
+            Self::Limit(LimitKind::ModelTurns) => Some("nano_limit_model_turns"),
+            Self::Limit(LimitKind::ToolCalls) => Some("nano_limit_tool_calls"),
+            Self::Limit(LimitKind::Retries) => Some("nano_limit_retries"),
+            Self::Limit(LimitKind::NoProgress) => Some("nano_limit_no_progress"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum SessionEvent {

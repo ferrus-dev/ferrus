@@ -536,13 +536,14 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     drop(heartbeat);
     if let Ok(end) = &result
         && end.durable
-        && !end.retryable_provider_failure
-        && matches!(
-            end.reason,
-            EndReason::ProviderProtocol | EndReason::ProviderFailed
-        )
+        && end
+            .reason
+            .managed_failure_code(end.retryable_provider_failure)
+            .is_some()
     {
-        session.fail_provider(&end.reason).await?;
+        session
+            .fail_stopped(&end.reason, end.retryable_provider_failure)
+            .await?;
     }
     result
 }

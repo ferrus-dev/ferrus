@@ -213,8 +213,8 @@ async fn launch(
             !matches!(
                 end.reason,
                 EndReason::ProviderProtocol | EndReason::ProviderFailed
-            ),
-            "Nano stopped after a terminal provider failure; inspect provider diagnostics"
+            ) && end.reason.managed_failure_code(end.retryable_provider_failure).is_none(),
+            "Nano stopped after a provider failure or exhausted work-phase budget; inspect diagnostics"
         );
         Ok::<_, anyhow::Error>(())
     }

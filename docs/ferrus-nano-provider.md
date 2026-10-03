@@ -25,6 +25,9 @@ temperature = 0.0
 request_timeout_ms = 120000
 include_usage = true
 
+# Optional; omitted by default. Endpoint/model support determines valid levels.
+# reasoning_effort = "none"
+
 # Independent evaluation ablations; both default to true.
 # native_context_enabled = false
 # working_set_enabled = false
@@ -46,6 +49,13 @@ use `/v1` and cannot contain userinfo, a query, or a fragment. Redirects, automa
 HTTP retries, and environment proxy discovery are disabled. Authentication and
 unsupported endpoint errors do not trigger protocol fallback.
 
+`reasoning_effort` forwards an explicit Chat Completions reasoning level: `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Omit it to use the server's
+default. An endpoint may reject levels it does not support; Nano does not silently
+substitute a different level. The effective value is recorded in the journal and
+included in the settings digest. For a local thinking model, `none` can disable
+reasoning when supported, allowing the output budget to go to tool calls and text.
+
 LM Studio normally allows unauthenticated requests; its authentication option uses
 Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer/core/authentication).
 
@@ -61,10 +71,17 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
 - `reasoning_content` and `reasoning` string deltas are preserved as opaque continuation
   data and projected back unchanged. Other signed/reasoning formats are unsupported;
   the adapter does not silently discard them.
+  Reasoning consumes the same `max_output_tokens` allowance as visible text and tool arguments.
+  A thinking model can exhaust the default 4096 tokens without producing a call. A `length`
+  finish fails the managed work phase as `nano_provider_truncated`; raise the output allowance
+  and configure `context_tokens` to match the server's loaded context, or adjust thinking on
+  the server. Nano never retries a truncated response as though it were a complete tool call.
 - Default limits are 4 MiB wire bytes per attempt, 256 KiB per SSE event, 64 tool calls,
-  and 120 seconds per HTTP request. The request timeout covers headers and body;
+  and 120 seconds of HTTP read inactivity. `request_timeout_ms` bounds waiting for
+  response headers and each subsequent read; receiving bytes resets that timeout.
+  An active stream can exceed it while the model generates a long response or patch;
   connection establishment is capped at the smaller of 10 seconds and that timeout.
-  The engine's independent byte, time, turn, token, and tool budgets still apply.
+  The engine's independent byte, total elapsed time, turn, token, and tool budgets still apply.
 - Context admission conservatively counts serialized request bytes as tokens and
   reserves output space. Configure `context_tokens` to match the loaded model's
   actual context. Known server context-overflow codes end with `Limit(ContextTokens)`;
@@ -93,6 +110,16 @@ Deterministic fixtures and loopback HTTP tests require no model, credentials, or
 inference. They exercise anonymous/Bearer requests, ordered calls and continuation,
 partial streams, usage, retry accounting, context admission, timeout, and cancellation.
 
+To replay a recorded timeout without executing tools, set `FERRUS_NANO_SMOKE_CONFIG` and
+`FERRUS_NANO_SMOKE_JOURNAL`, then run the ignored
+`live_lm_studio_replays_a_timed_out_request_without_executing_tools` test. It uses only a
+loopback endpoint, reconstructs the journal's full context projection, and verifies the current
+native catalog against the recorded request size. `FERRUS_NANO_SMOKE_OUTPUT_TOKENS` optionally
+changes the request's output allowance; the private smoke config may also override reasoning
+effort. `FERRUS_NANO_SMOKE_REQUEST_OUTPUT` exports the reconstructed request to a new private
+file instead of contacting the model. Server debug logs may truncate
+message bodies and cannot substitute for the durable journal when replaying a request.
+
 ```sh
 cargo test --locked --features nano-openai nano::
 cargo clippy --locked --features nano-openai -- -D warnings
@@ -112,3 +139,17 @@ call before final completion, and reports the configured model and reported/esti
 usage. The temporary journal is removed after the test. CI never runs this test.
 Live compatibility is model-specific; run this test against the configured model
 before enabling that endpoint for managed execution.
+
+For a native managed smoke with graph retrieval, a file edit, check, and submission:
+
+```sh
+FERRUS_NANO_SMOKE_CONFIG=/absolute/private/host/path/nano.toml \
+  cargo test --locked --features nano-openai live_lm_studio_managed_graph_edit_check_and_submit -- --ignored --nocapture
+```
+
+This test creates a temporary SQLite project and Git repository, indexes its baseline,
+and runs a small rename task under a three-minute session allowance. It requires native
+`repository_search`, `apply_patch`, `check`, and `submit` calls, the expected source change,
+and a durable `Submitted` outcome with the task in Reviewing. External MCP peers are
+excluded. The configured check runs only inside the temporary workspace. CI ignores
+this test; it does not certify a particular real task or model's general coding quality.

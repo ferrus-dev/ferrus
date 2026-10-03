@@ -33,8 +33,9 @@ impl OpenAi {
             .retry(reqwest::retry::never())
             .no_proxy()
             .connect_timeout(timeout.min(Duration::from_secs(10)))
+            // A local model can stream a patch for longer than the idle allowance.
+            // The engine separately bounds the entire session, including inference.
             .read_timeout(timeout)
-            .timeout(timeout)
             .build()
             .map_err(|_| anyhow::anyhow!("Cannot initialize nano HTTP client"))?;
 
@@ -47,7 +48,7 @@ impl OpenAi {
         })
     }
 
-    pub(super) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
+    pub(crate) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
         let (body, output) = self.body_unbounded(request)?;
         if body.len() as u64 > self.settings.context_tokens.saturating_sub(output) {
             return Err(error(ProviderErrorKind::ContextOverflow));
@@ -94,6 +95,11 @@ impl OpenAi {
 
         let mut body = json!({"model":self.settings.model, "messages":messages, "stream":true,
             "temperature":self.settings.temperature, "max_tokens":output, "n":1});
+
+        if let Some(effort) = self.settings.reasoning_effort {
+            body["reasoning_effort"] =
+                serde_json::to_value(effort).map_err(|_| error(ProviderErrorKind::Protocol))?;
+        }
 
         if self.settings.include_usage {
             body["stream_options"] = json!({"include_usage":true});

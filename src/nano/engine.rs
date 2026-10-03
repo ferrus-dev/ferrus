@@ -510,6 +510,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             }
 
             if response.finish == FinishReason::Length {
+                tracing::warn!(
+                    output_tokens_reserved = output_reservation,
+                    "Nano model response reached its output limit before completing; adjust max_output_tokens or provider reasoning settings"
+                );
                 return EndReason::ProviderTruncated;
             }
             if (response.finish == FinishReason::ToolCalls) == response.calls.is_empty() {

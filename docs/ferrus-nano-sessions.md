@@ -91,6 +91,10 @@ reopening an already ended session preserves its recorded duration and reason.
 The new managed run inherits the prior token, model-turn, tool-call, retry, and no-progress
 counters. Unfinished provider reservations become conservative estimated usage. Elapsed time
 starts a new run allowance after the previous attempt has been sealed.
+If the prior journal ends because its token, model-turn, tool-call, retry, or no-progress
+budget was exhausted, the managed host fails the task with the corresponding `nano_limit_*`
+code instead of requesting a new dispatch with the same exhausted allowance. Owned effects
+are reconciled first; a budget stop never certifies an unknown effect as safe.
 
 ## Storage and recovery
 

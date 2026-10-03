@@ -1130,6 +1130,7 @@ mod tests {
                         context_tokens: 32768,
                         max_output_tokens: 4096,
                         temperature: 0.0,
+                        reasoning_effort: None,
                         request_timeout_ms: 120000,
                         wire_bytes: 4 * 1024 * 1024,
                         event_bytes: 256 * 1024,

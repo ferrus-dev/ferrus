@@ -244,18 +244,20 @@ impl FerrusSession {
         .await
     }
 
-    /// Permanent provider failures must not become fresh HQ dispatch attempts.
+    /// Permanent provider failures and exhausted phase budgets must not become HQ redispatches.
     /// Called only after the engine has stopped owned effects and sealed its journal.
-    pub(crate) async fn fail_provider(&self, reason: &super::session::EndReason) -> Result<()> {
-        let code = match reason {
-            super::session::EndReason::ProviderProtocol => "nano_provider_protocol",
-            super::session::EndReason::ProviderFailed => "nano_provider_failed",
-            _ => anyhow::bail!("Not a terminal provider failure"),
-        };
+    pub(crate) async fn fail_stopped(
+        &self,
+        reason: &super::session::EndReason,
+        retryable_provider_failure: bool,
+    ) -> Result<()> {
+        let code = reason
+            .managed_failure_code(retryable_provider_failure)
+            .ok_or_else(|| anyhow::anyhow!("Not a terminal Nano work-phase stop"))?;
         self.mutate(move |tx, scope, context| {
             ensure!(
                 matches!(context.status.as_str(), "executing" | "addressing"),
-                "Provider failure cannot change a paused or terminal task"
+                "Nano stop cannot change a paused or terminal task"
             );
             let updated = tx.execute(
                 "UPDATE tasks SET status = 'failed', failure_reason = ?2, \

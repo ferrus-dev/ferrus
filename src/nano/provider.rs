@@ -117,6 +117,19 @@ impl ProviderError {
     }
 }
 
+/// Explicit Chat Completions reasoning levels; endpoint support is model-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
 /// Only validated, non-secret effective settings may enter the journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +140,9 @@ pub(crate) struct ProviderSettings {
     pub context_tokens: u64,
     pub max_output_tokens: u64,
     pub temperature: f64,
+    /// Omitted by default; supported levels depend on the endpoint and model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub request_timeout_ms: u64,
     pub wire_bytes: usize,
     pub event_bytes: usize,
