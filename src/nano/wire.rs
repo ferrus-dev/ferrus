@@ -77,6 +77,7 @@ pub(crate) enum Phase {
     Started,
     Model,
     ModelFailed,
+    ModelTruncated,
     Tool,
     ToolFinished,
 }
@@ -107,6 +108,7 @@ impl Event {
                     Phase::Started => "session started",
                     Phase::Model => "generating response",
                     Phase::ModelFailed => "model request failed; see diagnostics",
+                    Phase::ModelTruncated => "response reached output limit; continuing",
                     Phase::Tool => "tool request",
                     Phase::ToolFinished => "tool finished",
                 }
@@ -132,6 +134,10 @@ impl Event {
                 | Self::Error { .. }
                 | Self::Progress {
                     phase: Phase::ModelFailed,
+                    ..
+                }
+                | Self::Progress {
+                    phase: Phase::ModelTruncated,
                     ..
                 }
                 | Self::Progress {
@@ -294,6 +300,11 @@ fn progress(record: &Record) -> Option<Event> {
                 error: error.clone(),
             }),
         ),
+        SessionEvent::ModelCompleted { response, .. }
+            if response.finish == super::provider::FinishReason::Length =>
+        {
+            (Phase::ModelTruncated, None)
+        }
         SessionEvent::ToolIntent { call, .. } => (
             Phase::Tool,
             Some(ProgressDetail::Tool {
@@ -396,6 +407,23 @@ mod tests {
         let event = progress(&record).unwrap();
         assert_eq!(event.summary(), "model request failed: Timeout");
         assert!(event.show_in_hq());
+        record.event = SessionEvent::ModelCompleted {
+            response: crate::nano::provider::ModelResponse {
+                finish: crate::nano::provider::FinishReason::Length,
+                text: "secret partial model response".into(),
+                calls: Vec::new(),
+                continuation: None,
+            },
+            usage: crate::nano::provider::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                reported: true,
+            },
+        };
+        let event = progress(&record).unwrap();
+        assert_eq!(event.summary(), "response reached output limit; continuing");
+        assert!(event.show_in_hq());
+        assert!(!serde_json::to_string(&event).unwrap().contains("secret"));
         let legacy = read_event(&mut Cursor::new(b"{\"version\":1,\"event\":{\"type\":\"progress\",\"sequence\":1,\"phase\":\"model\"}}\n")).unwrap().unwrap();
         assert_eq!(legacy.summary(), "generating response");
         assert!(!legacy.show_in_hq());

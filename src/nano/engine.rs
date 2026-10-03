@@ -224,7 +224,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 .min(
                     self.provider
                         .settings()
-                        .map_or(u64::MAX, |s| s.max_output_tokens),
+                        .and_then(|s| s.max_output_tokens)
+                        .unwrap_or(u64::MAX),
                 )
                 .min(window / 4)
                 .min(remaining / 2);
@@ -499,7 +500,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             self.budget.charge(&usage);
             self.retryable_provider_failure = false;
 
-            if response.calls.is_empty() && response.text.trim().is_empty() {
+            if response.finish == FinishReason::Length
+                || (response.calls.is_empty() && response.text.trim().is_empty())
+            {
                 self.budget.no_progress += 1;
             }
             if !self.commit(SessionEvent::ModelCompleted {
@@ -512,17 +515,19 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if response.finish == FinishReason::Length {
                 tracing::warn!(
                     output_tokens_reserved = output_reservation,
-                    "Nano model response reached its output limit before completing; adjust max_output_tokens or provider reasoning settings"
+                    "Nano model response reached its output limit; continuing without executing truncated tool calls"
                 );
-                return EndReason::ProviderTruncated;
+                self.messages.extend(response.messages());
+                if self.journal.checkpoint().is_err() {
+                    return EndReason::JournalFailed;
+                }
+                continue;
             }
             if (response.finish == FinishReason::ToolCalls) == response.calls.is_empty() {
                 return EndReason::ProviderProtocol;
             }
 
-            self.messages.push(Message::Assistant {
-                response: response.clone(),
-            });
+            self.messages.extend(response.messages());
 
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
@@ -719,11 +724,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         remaining: u64,
         window: u64,
     ) -> Result<Result<(u64, u64), LimitKind>, EndReason> {
+        let automatic = self
+            .provider
+            .settings()
+            .is_some_and(|s| s.max_output_tokens.is_none());
         if encode(&(&messages, &tools), self.limits.context_bytes).is_err() {
             return Ok(Err(LimitKind::ContextBytes));
         }
-        // Reduce output only for the remaining session budget. Context-window
-        // pressure should compact history instead of starving the response.
+        // An explicit ceiling retains the existing compaction policy. Automatic
+        // allocation can also fit the available window without a summary call.
         // The serialized max-output field can change size as the cap shrinks.
         for _ in 0..8 {
             let Some(input) = self.input_estimate(messages, tools, output)? else {
@@ -732,9 +741,16 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if self.fits(messages, tools, output, remaining, window, Some(input)) {
                 return Ok(Ok((input, output)));
             }
-            let reduced = output.min(remaining.saturating_sub(input));
+            let mut reduced = output.min(remaining.saturating_sub(input));
             if reduced == 0 {
                 return Ok(Err(LimitKind::Tokens));
+            }
+            if automatic {
+                let margin = (window / 20).clamp(16, 1024);
+                reduced = reduced.min(window.saturating_sub(input).saturating_sub(margin));
+                if reduced == 0 {
+                    return Ok(Err(LimitKind::ContextTokens));
+                }
             }
             if reduced >= output {
                 return Ok(Err(LimitKind::ContextTokens));

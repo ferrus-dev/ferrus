@@ -20,10 +20,12 @@ owner-only file (0400 or 0600 on Unix; protected owner-only DACL on Windows). Ex
 base_url = "http://127.0.0.1:1234/v1"
 model = "your-loaded-tool-capable-model"
 context_tokens = 32768
-max_output_tokens = 4096
 temperature = 0.0
 request_timeout_ms = 120000
 include_usage = true
+
+# Optional per-response ceiling. Omit to let Nano select a budgeted output cap.
+# max_output_tokens = 8192
 
 # Optional; omitted by default. Endpoint/model support determines valid levels.
 # reasoning_effort = "none"
@@ -72,10 +74,18 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
   data and projected back unchanged. Other signed/reasoning formats are unsupported;
   the adapter does not silently discard them.
   Reasoning consumes the same `max_output_tokens` allowance as visible text and tool arguments.
-  A thinking model can exhaust the default 4096 tokens without producing a call. A `length`
-  finish fails the managed work phase as `nano_provider_truncated`; raise the output allowance
-  and configure `context_tokens` to match the server's loaded context, or adjust thinking on
-  the server. Nano never retries a truncated response as though it were a complete tool call.
+  `max_output_tokens` is an optional ceiling, with no fixed 4096-token default. Without it,
+  the engine derives a cap from the response-byte allowance, one quarter of the configured
+  context window, and the remaining session budget. Existing explicit values remain ceilings;
+  remove the setting to select automatic allocation. Configure `context_tokens` to match the
+  server's loaded context. Nano still sends the effective cap as `max_tokens` so a failed
+  attempt has a bounded output reservation.
+  A `length` finish preserves text/reasoning as history and adds a host continuation cue.
+  Calls from that response are omitted from subsequent requests and never execute, including
+  apparently complete calls; the next response must issue fresh complete calls. The raw
+  response remains in the journal. Continuations consume the same token, turn, time, and
+  no-progress budgets. Repeated truncation without tool progress ends at the no-progress limit,
+  rather than causing unlimited restarts. An EOF without `[DONE]` remains a failed stream.
 - Default limits are 4 MiB wire bytes per attempt, 256 KiB per SSE event, 64 tool calls,
   and 120 seconds of HTTP read inactivity. `request_timeout_ms` bounds waiting for
   response headers and each subsequent read; receiving bytes resets that timeout.
@@ -110,15 +120,19 @@ Deterministic fixtures and loopback HTTP tests require no model, credentials, or
 inference. They exercise anonymous/Bearer requests, ordered calls and continuation,
 partial streams, usage, retry accounting, context admission, timeout, and cancellation.
 
-To replay a recorded timeout without executing tools, set `FERRUS_NANO_SMOKE_CONFIG` and
+To replay a recorded timeout or length-limited response without executing tools, set `FERRUS_NANO_SMOKE_CONFIG` and
 `FERRUS_NANO_SMOKE_JOURNAL`, then run the ignored
-`live_lm_studio_replays_a_timed_out_request_without_executing_tools` test. It uses only a
+`live_lm_studio_replays_a_stopped_request_without_executing_tools` test. It uses only a
 loopback endpoint, reconstructs the journal's full context projection, and verifies the current
 native catalog against the recorded request size. `FERRUS_NANO_SMOKE_OUTPUT_TOKENS` optionally
 changes the request's output allowance; the private smoke config may also override reasoning
 effort. `FERRUS_NANO_SMOKE_REQUEST_OUTPUT` exports the reconstructed request to a new private
 file instead of contacting the model. Server debug logs may truncate
 message bodies and cannot substitute for the durable journal when replaying a request.
+Set `FERRUS_NANO_SMOKE_CONTINUE_TRUNCATED=1` to append the completed length-limited response
+and its continuation cue instead of generating that response again. The original request is
+size-verified first. `FERRUS_NANO_SMOKE_RESPONSE_OUTPUT` optionally saves the generated response
+to a new private file. No generated tools are executed by this diagnostic test.
 
 ```sh
 cargo test --locked --features nano-openai nano::

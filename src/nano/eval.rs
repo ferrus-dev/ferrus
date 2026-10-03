@@ -1128,7 +1128,7 @@ mod tests {
                         base_url: "http://127.0.0.1:1234/v1".into(),
                         model: "mock-model".into(),
                         context_tokens: 32768,
-                        max_output_tokens: 4096,
+                        max_output_tokens: Some(4096),
                         temperature: 0.0,
                         reasoning_effort: None,
                         request_timeout_ms: 120000,

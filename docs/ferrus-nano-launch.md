@@ -98,7 +98,7 @@ start. HQ sends start only after persisting the run and registering the process.
 {"version":1,"event":{"type":"ended","reason":{"reason":"submitted"},"durable":true}}
 ```
 
-Progress phases are `started`, `model`, `model_failed`, `tool`, and `tool_finished`;
+Progress phases are `started`, `model`, `model_failed`, `model_truncated`, `tool`, and `tool_finished`;
 optional typed details identify the model turn, tool name, or provider error kind.
 Older version-1 events without details remain readable. Errors carry a bounded code.
 They contain no task, model response, command output, question, or credential bodies. Progress
@@ -107,7 +107,7 @@ event. A dedicated writer performs stdout I/O without blocking inference, lease 
 commits. Shutdown allows two seconds to drain output after owned effects settle; an unresponsive
 frontend may miss the last event. The journal and SQLite remain authoritative.
 
-HQ shows tool requests, model failures, and terminal outcomes. Internal model-start and
+HQ shows tool requests, model failures, output-limit continuations, and terminal outcomes. Internal model-start and
 tool-finish markers stay in the scoped agent log instead of filling the HQ transcript.
 
 ## HQ ownership
@@ -129,11 +129,13 @@ with a nonzero status while preserving its structured `ended` event. HQ does not
 task until a new work phase is explicitly created. Recovery reconciles a sealed provider stop
 if the process exited before recording task failure. Transient provider errors retain their
 existing retry behavior; cancellation and paused tasks do not become provider failures.
-A response ending with `finish_reason = "length"` also stops the work phase with
-`nano_provider_truncated`: partial tool calls are never executed. Its diagnostic records
-the effective output allowance. Reasoning shares that allowance with the answer and tool
-arguments; adjust `max_output_tokens` or provider `reasoning_effort` if the model spends
-it before producing an action.
+A response ending with `finish_reason = "length"` continues in the same session;
+partial tool calls never execute. Nano retains text/reasoning and asks for the next action
+or a fresh complete call. HQ reports that continuation, and diagnostics record the effective
+output allowance. Reasoning shares that allowance with the answer and tool arguments.
+`max_output_tokens` is an optional ceiling; omit it for automatic allocation from the
+configured context and session budgets. Historical `nano_provider_truncated` terminal stops
+remain readable and do not requeue an already failed task.
 Exhausted token, model-turn, tool-call, retry, and no-progress budgets also fail the working
 task after cleanup and journal sealing, with a matching `nano_limit_*` code and nonzero exit.
 These counters belong to the work phase; HQ cannot replenish them by restarting Nano.

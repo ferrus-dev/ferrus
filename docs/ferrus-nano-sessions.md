@@ -76,11 +76,19 @@ hard real-time guarantees.
 
 Before contacting a provider, `ModelStarted` records input and output reservations. The local
 input estimate uses one token per serialized byte; the request receives an explicit output cap.
+The provider configuration may omit its per-response ceiling; the engine then selects the
+cap from the configured context window, response allowance, and remaining session budget.
 A complete response replaces the reservation with reported usage, or a separately marked local
 estimate when usage is absent. An interrupted/failed request conservatively charges its entire
 reservation as estimated usage, since actual billing is unknown. Counters, reservations,
 no-progress count, and elapsed time are persisted with records and checkpoints. Recovery does not
 reset budgets or treat estimates as provider billing data.
+
+A completed length-limited response is durable history, not a successful finish or an
+executable tool group. Replay and live execution discard its calls from model-request history,
+preserve text/reasoning, and append the same host continuation cue. A new complete response is
+required before effects. Consecutive length finishes consume no-progress allowance as well as
+normal inference budgets; successful tool progress can reset that no-progress counter.
 
 The active attempt uses a process-local monotonic clock. After a crash, time since the last
 committed record is unknown. Recovery conservatively consumes the remaining elapsed allowance

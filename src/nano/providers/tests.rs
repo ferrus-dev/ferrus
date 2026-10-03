@@ -442,7 +442,7 @@ fn configuration_and_transport_bounds_fail_explicitly() {
     }
     let mut cfg = config("http://127.0.0.1:1234/v1");
     cfg.context_tokens = 100;
-    cfg.max_output_tokens = 99;
+    cfg.max_output_tokens = Some(99);
     let provider = OpenAi::new(cfg).unwrap();
     assert_eq!(
         provider.body(request()).unwrap_err().kind,
@@ -467,6 +467,53 @@ fn configuration_and_transport_bounds_fail_explicitly() {
         decoder.push(&vec![b'\n'; 1025]).unwrap_err().kind,
         ProviderErrorKind::ResponseLimit
     );
+}
+
+#[test]
+fn output_ceiling_is_optional_and_old_settings_remain_readable() {
+    let mut cfg = config("http://127.0.0.1:1234/v1");
+    assert!(cfg.max_output_tokens.is_none());
+    let settings = cfg.validate().unwrap().1;
+    let provider = OpenAi::new(cfg).unwrap();
+    let mut req = request();
+    req.max_output_tokens = 16_384;
+    let body: Value = serde_json::from_slice(&provider.body(req.clone()).unwrap()).unwrap();
+    assert_eq!(body["max_tokens"], 16_384);
+    let mut encoded = serde_json::to_value(&settings).unwrap();
+    assert!(encoded.get("max_output_tokens").is_none());
+    encoded["max_output_tokens"] = json!(4096);
+    let legacy: ProviderSettings = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(legacy.max_output_tokens, Some(4096));
+    assert_eq!(serde_json::to_value(legacy).unwrap(), encoded);
+    cfg = config("http://127.0.0.1:1234/v1");
+    cfg.max_output_tokens = Some(4096);
+    let provider = OpenAi::new(cfg).unwrap();
+    let body: Value = serde_json::from_slice(&provider.body(req).unwrap()).unwrap();
+    assert_eq!(body["max_tokens"], 4096);
+    for cap in [0, 32_768] {
+        let mut cfg = config("http://127.0.0.1:1234/v1");
+        cfg.max_output_tokens = Some(cap);
+        assert!(cfg.validate().is_err());
+    }
+}
+
+#[test]
+fn length_finish_preserves_partial_calls_for_audit_but_not_for_continuation() {
+    let wire = TOOLS
+        .replace("\"tool_calls\"}]", "\"length\"}]")
+        .replace("\"id\":\"call-a\"", "\"id\":\"\"")
+        .replace("\"name\":\"look\"", "\"name\":\"\"");
+    let events = decode(&wire, 1).unwrap();
+    let ProviderEvent::Completed { response, .. } = events.last().unwrap() else {
+        panic!("Missing completion");
+    };
+    assert_eq!(response.finish, FinishReason::Length);
+    assert!(!response.calls.is_empty());
+    let messages = response.messages();
+    assert!(
+        matches!(&messages[0], Message::Assistant { response } if response.calls.is_empty() && response.continuation.is_some())
+    );
+    assert!(matches!(&messages[1], Message::User { .. }));
 }
 
 struct Reply {
@@ -704,7 +751,7 @@ async fn authenticated_and_anonymous_sessions_record_settings_and_usage_without_
             );
             assert!(headers.starts_with("POST /v1/chat/completions "));
             assert_eq!(body["stream"], true);
-            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["max_tokens"], 8192);
         }
     }
 }
@@ -748,6 +795,86 @@ async fn retries_and_truncated_streams_share_budget_without_duplicate_effects() 
 }
 
 #[tokio::test]
+async fn length_finish_continues_over_http_without_replaying_partial_calls() {
+    let partial = TOOLS
+        .replace("\"tool_calls\"}]", "\"length\"}]")
+        .replace("\"id\":\"call-a\"", "\"id\":\"\"");
+    let (url, server) = server(vec![
+        Reply::stream(&partial),
+        Reply::stream(TOOLS),
+        Reply::stream(FINAL),
+    ])
+    .await;
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine(OpenAi::new(config(&url)).unwrap(), &directory);
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Use lookup".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(engine.tools.calls, 2);
+    assert_eq!(end.budget.retries, 0);
+    assert_eq!(end.budget.model_turns, 3);
+    assert_eq!(end.budget.reported_input_tokens, 48);
+    assert_eq!(end.budget.reported_output_tokens, 19);
+    let requests = server.await.unwrap();
+    let body = &requests[1].1;
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert!(body["messages"][1].get("tool_calls").is_none());
+    assert_eq!(body["messages"][1]["reasoning_content"], "opaque reasoning");
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert!(
+        body["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("No tools from that response were executed")
+    );
+    let replay = crate::nano::replay::Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.budget, end.budget);
+    assert!(replay.checkpoint_ready());
+}
+
+#[tokio::test]
+async fn automatic_output_fits_remaining_context_without_compacting_active_task() {
+    let (url, server) = server(vec![Reply::stream(FINAL)]).await;
+    let directory = TempDir::new().unwrap();
+    let mut cfg = config(&url);
+    cfg.context_tokens = 10_000;
+    let mut engine = engine(OpenAi::new(cfg).unwrap(), &directory);
+    let text = "x".repeat(8000);
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: text.clone(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 1);
+    assert!(
+        !engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(&record.event, SessionEvent::CompactionStarted { .. }))
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].1;
+    let cap = body["max_tokens"].as_u64().unwrap();
+    assert!((1..2500).contains(&cap));
+    assert!(serde_json::to_vec(body).unwrap().len() as u64 + cap + 500 <= 10_000);
+    assert_eq!(body["messages"][0]["content"], text);
+}
+
+#[tokio::test]
 async fn transient_failures_charge_only_the_effective_output_cap() {
     let partial = &FINAL[..FINAL.find("data: [DONE]").unwrap()];
     let (url, server) = server(vec![
@@ -759,7 +886,9 @@ async fn transient_failures_charge_only_the_effective_output_cap() {
     .await;
     let directory = TempDir::new().unwrap();
     let cfg = config(&url);
-    let output_cap = cfg.max_output_tokens;
+    let output_cap = 4096;
+    let mut cfg = cfg;
+    cfg.max_output_tokens = Some(output_cap);
     let mut engine = engine_with_limits(OpenAi::new(cfg).unwrap(), &directory, Limits::default());
     let end = engine
         .run(

@@ -23,8 +23,8 @@ pub(crate) struct Config {
     pub mcp_config_file: Option<PathBuf>,
     #[serde(default = "default_context")]
     pub context_tokens: u64,
-    #[serde(default = "default_output")]
-    pub max_output_tokens: u64,
+    /// Optional per-response ceiling; otherwise the engine selects a budgeted cap.
+    pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub temperature: f64,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -51,9 +51,6 @@ fn default_enabled() -> bool {
 
 fn default_context() -> u64 {
     32_768
-}
-fn default_output() -> u64 {
-    4096
 }
 fn default_timeout() -> u64 {
     120_000
@@ -112,8 +109,10 @@ impl Config {
         );
 
         ensure!(
-            self.max_output_tokens > 0
-                && self.max_output_tokens < self.context_tokens
+            self.context_tokens > 1
+                && self
+                    .max_output_tokens
+                    .is_none_or(|output| output > 0 && output < self.context_tokens)
                 && self.context_tokens <= 16_777_216,
             "Invalid provider context/output limits"
         );

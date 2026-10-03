@@ -36,6 +36,22 @@ impl ModelResponse {
     pub(crate) fn is_final(&self) -> bool {
         self.finish == FinishReason::Stop && self.calls.is_empty() && !self.text.trim().is_empty()
     }
+
+    /// A length finish never authorizes tools, including syntactically complete calls.
+    /// Keep useful text/reasoning as history, followed by the host's continuation cue.
+    pub(crate) fn messages(&self) -> Vec<Message> {
+        let mut response = self.clone();
+        if self.finish != FinishReason::Length {
+            return vec![Message::Assistant { response }];
+        }
+        response.calls.clear();
+        vec![
+            Message::Assistant { response },
+            Message::User {
+                text: "Your previous response reached its output limit. No tools from that response were executed. Continue the active task from the existing work. Use tools for calculations and verification, and make incremental edits rather than repeating long explanations. Reissue any unfinished tool call with complete arguments.".into(),
+            },
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +154,8 @@ pub(crate) struct ProviderSettings {
     pub base_url: String,
     pub model: String,
     pub context_tokens: u64,
-    pub max_output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     pub temperature: f64,
     /// Omitted by default; supported levels depend on the endpoint and model.
     #[serde(default, skip_serializing_if = "Option::is_none")]

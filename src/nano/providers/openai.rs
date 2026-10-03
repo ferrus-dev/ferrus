@@ -59,7 +59,7 @@ impl OpenAi {
     fn body_unbounded(&self, request: ModelRequest) -> Result<(Vec<u8>, u64), ProviderError> {
         let output = request
             .max_output_tokens
-            .min(self.settings.max_output_tokens);
+            .min(self.settings.max_output_tokens.unwrap_or(u64::MAX));
 
         if output == 0 {
             return Err(error(ProviderErrorKind::ContextOverflow));

@@ -276,7 +276,7 @@ fn script(calls: Vec<ToolCall>) -> Script {
 #[cfg(feature = "nano-openai")]
 #[tokio::test]
 #[ignore = "requires an explicitly selected Nano journal, private config, and local loaded model"]
-async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
+async fn live_lm_studio_replays_a_stopped_request_without_executing_tools() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let config =
         std::env::var_os("FERRUS_NANO_SMOKE_CONFIG").expect("Set FERRUS_NANO_SMOKE_CONFIG");
@@ -304,9 +304,9 @@ async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
                     error: Some(ProviderErrorKind::Timeout),
                     ..
                 }
-            )
+            ) || matches!(&record.event, SessionEvent::ModelCompleted { response, .. } if response.finish == FinishReason::Length)
         })
-        .expect("No timed-out request");
+        .expect("No timed-out or length-limited request");
     let start = records[..failed]
         .iter()
         .rposition(|record| matches!(record.event, SessionEvent::ModelStarted { .. }))
@@ -335,7 +335,7 @@ async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
     let (native, _) = native(&f, session.clone(), RUN);
     let tools = ManagedTools::new(session, native, Cancellation::default());
     let mut provider = crate::nano::providers::openai::OpenAi::new(config).unwrap();
-    let request = ModelRequest {
+    let mut request = ModelRequest {
         messages: replay
             .projection
             .unwrap_or_default()
@@ -365,6 +365,18 @@ async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
         expected_bytes as u64,
         "Recorded request and current catalog/settings differ; do not treat this as an exact replay"
     );
+    if std::env::var_os("FERRUS_NANO_SMOKE_CONTINUE_TRUNCATED").is_some() {
+        let SessionEvent::ModelCompleted { response, .. } = &records[failed].event else {
+            panic!("Continuation requires a completed length-limited response");
+        };
+        assert_eq!(response.finish, FinishReason::Length);
+        request.messages.extend(response.messages());
+        request.max_output_tokens = settings
+            .max_output_tokens
+            .unwrap_or(u64::MAX)
+            .min(settings.context_tokens / 4)
+            .min(Limits::default().response_bytes as u64);
+    }
     if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_REQUEST_OUTPUT") {
         use std::io::Write;
         let mut file = crate::nano::private::file(std::path::Path::new(&path), true).unwrap();
@@ -403,6 +415,13 @@ async fn live_lm_studio_replays_a_timed_out_request_without_executing_tools() {
     );
     assert_eq!(response.0.finish, FinishReason::ToolCalls);
     assert!(!response.0.calls.is_empty());
+    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_RESPONSE_OUTPUT") {
+        use std::io::Write;
+        crate::nano::private::file(std::path::Path::new(&path), true)
+            .unwrap()
+            .write_all(&serde_json::to_vec(&response.0).unwrap())
+            .unwrap();
+    }
     for call in response.0.calls {
         tools
             .validate(&call.name, &serde_json::from_str(&call.arguments).unwrap())
@@ -625,25 +644,44 @@ async fn exhausted_phase_budgets_stop_dispatch_and_preserve_the_durable_reason()
 }
 
 #[tokio::test]
-async fn truncated_reasoning_response_fails_the_phase_without_executing_partial_calls() {
+async fn truncated_reasoning_response_continues_to_submit_with_usage_preserved() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
     let session = FerrusSession::bind(f.launch()).await.unwrap();
     let (tools, journal) = native(&f, session.clone(), RUN);
     let provider = Script {
-        responses: VecDeque::from([ProviderEvent::Completed {
-            response: ModelResponse {
-                finish: FinishReason::Length,
-                text: String::new(),
-                calls: Vec::new(),
-                continuation: Some(json!({"reasoning_content":"unfinished reasoning"})),
+        responses: VecDeque::from([
+            ProviderEvent::Completed {
+                response: ModelResponse {
+                    finish: FinishReason::Length,
+                    text: String::new(),
+                    calls: Vec::new(),
+                    continuation: Some(json!({"reasoning_content":"unfinished reasoning"})),
+                },
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 4096,
+                    reported: true,
+                }),
             },
-            usage: Some(Usage {
-                input_tokens: 10,
-                output_tokens: 4096,
-                reported: true,
-            }),
-        }]),
+            ProviderEvent::Completed {
+                response: ModelResponse {
+                    finish: FinishReason::ToolCalls,
+                    text: String::new(),
+                    calls: vec![ToolCall {
+                        provider_call_id: "submit".into(),
+                        name: "submit".into(),
+                        arguments: json!({"content":"## Summary\nDone"}).to_string(),
+                    }],
+                    continuation: None,
+                },
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    reported: true,
+                }),
+            },
+        ]),
         starts: Arc::new(AtomicUsize::new(0)),
         stall: false,
     };
@@ -658,11 +696,11 @@ async fn truncated_reasoning_response_fails_the_phase_without_executing_partial_
     )
     .await
     .unwrap();
-    assert_eq!(end.reason, EndReason::ProviderTruncated);
-    assert_eq!(end.budget.reported_output_tokens, 4096);
-    assert_eq!(end.budget.tool_calls, 0);
+    assert_eq!(end.reason, EndReason::Submitted);
+    assert_eq!(end.budget.reported_output_tokens, 4116);
+    assert_eq!(end.budget.tool_calls, 1);
     assert!(end.durable);
-    let state: (String, String, Option<String>) = f
+    let state: (String, Option<String>, Option<String>) = f
         .connection()
         .query_row(
             "SELECT status,failure_reason,claimed_by FROM tasks WHERE id=?1",
@@ -670,10 +708,7 @@ async fn truncated_reasoning_response_fails_the_phase_without_executing_partial_
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(
-        state,
-        ("failed".into(), "nano_provider_truncated".into(), None)
-    );
+    assert_eq!(state, ("reviewing".into(), None, None));
     assert!(matches!(
         session.claim().await.unwrap(),
         project::ReadyTaskClaim::NoAvailable

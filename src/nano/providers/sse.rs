@@ -120,10 +120,11 @@ impl Decoder {
             let mut calls = Vec::new();
 
             for (expected, (index, call)) in self.calls.iter().enumerate() {
-                if *index != expected
-                    || call.id.is_empty()
-                    || call.name.is_empty()
-                    || !ids.insert(&call.id)
+                if finish != FinishReason::Length
+                    && (*index != expected
+                        || call.id.is_empty()
+                        || call.name.is_empty()
+                        || !ids.insert(&call.id))
                 {
                     return Err(error(ProviderErrorKind::Protocol));
                 }
