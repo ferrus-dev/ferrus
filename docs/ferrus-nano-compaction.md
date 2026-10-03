@@ -10,6 +10,11 @@ failed or interrupted requests conservatively charge their reservations. The hos
 `context_composed` event with capacity, request size, output reservation, evictions, summary use,
 and the unchanged prefix shared with the previous request.
 
+The private provider setting `session_tokens` controls the cumulative work-phase allowance
+(default 1,000,000), independently of the per-request `context_tokens` window. Admission may
+stop below that total when the remaining allowance cannot pay for another conservative request
+reservation or for both summary inference and its following normal request.
+
 If the request does not fit, Nano first retains the journal and replaces large older read-only
 tool results with bounded handles. Each handle names the original tool and arguments and includes
 an output digest. The model can reissue that read-only tool through normal validation and host

@@ -244,6 +244,38 @@ impl FerrusSession {
         .await
     }
 
+    /// Permanent provider failures and exhausted phase budgets must not become HQ redispatches.
+    /// Called only after the engine has stopped owned effects and sealed its journal.
+    pub(crate) async fn fail_stopped(
+        &self,
+        reason: &super::session::EndReason,
+        retryable_provider_failure: bool,
+    ) -> Result<()> {
+        let code = reason
+            .managed_failure_code(retryable_provider_failure)
+            .ok_or_else(|| anyhow::anyhow!("Not a terminal Nano work-phase stop"))?;
+        self.mutate(move |tx, scope, context| {
+            ensure!(
+                matches!(context.status.as_str(), "executing" | "addressing"),
+                "Nano stop cannot change a paused or terminal task"
+            );
+            let updated = tx.execute(
+                "UPDATE tasks SET status = 'failed', failure_reason = ?2, \
+                 claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL WHERE id = ?1",
+                rusqlite::params![scope.task_id, code],
+            )?;
+            ensure!(updated == 1, "Bound task disappeared");
+            project::executor_event(
+                tx,
+                scope,
+                code,
+                serde_json::json!({"task_id":scope.task_id}),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn previous_submit_committed(&self, run_id: String) -> Result<bool> {
         self.mutate(move |tx, _, _| {
             let committed: bool = tx.query_row(

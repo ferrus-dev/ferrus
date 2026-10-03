@@ -33,8 +33,9 @@ impl OpenAi {
             .retry(reqwest::retry::never())
             .no_proxy()
             .connect_timeout(timeout.min(Duration::from_secs(10)))
+            // A local model can stream a patch for longer than the idle allowance.
+            // The engine separately bounds the entire session, including inference.
             .read_timeout(timeout)
-            .timeout(timeout)
             .build()
             .map_err(|_| anyhow::anyhow!("Cannot initialize nano HTTP client"))?;
 
@@ -47,7 +48,7 @@ impl OpenAi {
         })
     }
 
-    pub(super) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
+    pub(crate) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
         let (body, output) = self.body_unbounded(request)?;
         if body.len() as u64 > self.settings.context_tokens.saturating_sub(output) {
             return Err(error(ProviderErrorKind::ContextOverflow));
@@ -58,7 +59,7 @@ impl OpenAi {
     fn body_unbounded(&self, request: ModelRequest) -> Result<(Vec<u8>, u64), ProviderError> {
         let output = request
             .max_output_tokens
-            .min(self.settings.max_output_tokens);
+            .min(self.settings.max_output_tokens.unwrap_or(u64::MAX));
 
         if output == 0 {
             return Err(error(ProviderErrorKind::ContextOverflow));
@@ -94,6 +95,11 @@ impl OpenAi {
 
         let mut body = json!({"model":self.settings.model, "messages":messages, "stream":true,
             "temperature":self.settings.temperature, "max_tokens":output, "n":1});
+
+        if let Some(effort) = self.settings.reasoning_effort {
+            body["reasoning_effort"] =
+                serde_json::to_value(effort).map_err(|_| error(ProviderErrorKind::Protocol))?;
+        }
 
         if self.settings.include_usage {
             body["stream_options"] = json!({"include_usage":true});
@@ -162,13 +168,14 @@ impl Provider for OpenAi {
 
                 failure.retry_after_ms = retry_after_ms;
 
-                return Err(failure);
+                return Err(failure.with_diagnostic(ProviderDiagnostic::Http { status }));
             }
 
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
                 if chunk.len() > self.settings.event_bytes.saturating_sub(body.len()) {
-                    return Err(error(ProviderErrorKind::ResponseLimit));
+                    return Err(error(ProviderErrorKind::ResponseLimit)
+                        .with_diagnostic(ProviderDiagnostic::Http { status }));
                 }
 
                 body.extend_from_slice(&chunk);
@@ -190,7 +197,7 @@ impl Provider for OpenAi {
             let mut failure = error(kind);
             failure.retry_after_ms = retry_after_ms;
 
-            return Err(failure);
+            return Err(failure.with_diagnostic(ProviderDiagnostic::Http { status }));
         }
         if !response
             .headers()
@@ -202,7 +209,8 @@ impl Provider for OpenAi {
                     .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
             })
         {
-            return Err(error(ProviderErrorKind::Unsupported));
+            return Err(error(ProviderErrorKind::Unsupported)
+                .with_diagnostic(ProviderDiagnostic::UnexpectedContentType));
         }
 
         self.active = Some(Active {
@@ -232,9 +240,15 @@ impl Provider for OpenAi {
                 .chunk()
                 .await
                 .map_err(transport_error)?
-                .ok_or_else(|| error(ProviderErrorKind::TruncatedStream))?;
+                .ok_or_else(|| {
+                    error(ProviderErrorKind::TruncatedStream)
+                        .with_diagnostic(ProviderDiagnostic::EventStream)
+                })?;
 
-            active.decoder.push(&chunk)?;
+            active
+                .decoder
+                .push(&chunk)
+                .map_err(|error| error.with_diagnostic(ProviderDiagnostic::EventStream))?;
         }
     }
 }

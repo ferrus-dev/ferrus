@@ -98,12 +98,19 @@ start. HQ sends start only after persisting the run and registering the process.
 {"version":1,"event":{"type":"ended","reason":{"reason":"submitted"},"durable":true}}
 ```
 
-Progress phases are `started`, `model`, `tool`, and `tool_finished`; errors carry a bounded code.
+Progress phases are `started`, `model`, `model_failed`, `model_truncated`, `tool`, and `tool_finished`;
+optional typed details identify the model turn, tool name, or provider error kind.
+Older version-1 events without details remain readable. Errors carry a bounded code.
 They contain no task, model response, command output, question, or credential bodies. Progress
 sequence numbers refer to durable journal records and may skip: delivery coalesces to one pending
 event. A dedicated writer performs stdout I/O without blocking inference, lease renewal, or journal
 commits. Shutdown allows two seconds to drain output after owned effects settle; an unresponsive
 frontend may miss the last event. The journal and SQLite remain authoritative.
+
+HQ shows the usual process-start announcement. With `--debug`, it also shows tool requests,
+model failures, output-limit continuations, and terminal outcomes. The scoped agent log retains
+all progress and terminal events in both modes, including internal model-start and tool-finish
+markers.
 
 ## HQ ownership
 
@@ -117,6 +124,35 @@ Task status and human questions continue through HQ's SQLite/artifact watcher. A
 sentence never marks a task complete. `/stop` first sends cancel and allows a two-second graceful
 cleanup interval, then uses the existing process-group termination fallback. Review, approval,
 consultation scheduling, and crash recovery remain owned by HQ.
+
+A non-retryable provider failure stops owned effects, seals the session journal, and marks the
+bound working task Failed with `nano_provider_protocol` or `nano_provider_failed`. Nano exits
+with a nonzero status while preserving its structured `ended` event. HQ does not respawn that
+task until a new work phase is explicitly created. Recovery reconciles a sealed provider stop
+if the process exited before recording task failure. Transient provider errors retain their
+existing retry behavior; cancellation and paused tasks do not become provider failures.
+A response ending with `finish_reason = "length"` continues in the same session;
+partial tool calls never execute. Nano retains text/reasoning and asks for the next action
+or a fresh complete call. HQ reports that continuation, and diagnostics record the effective
+output allowance. Reasoning shares that allowance with the answer and tool arguments.
+`max_output_tokens` is an optional ceiling; omit it for automatic allocation from the
+configured context and session budgets. Historical `nano_provider_truncated` terminal stops
+remain readable and do not requeue an already failed task.
+`session_tokens` controls cumulative input and output across the entire work phase, including
+repeated prompts, retries, and summaries. Its default is 1,000,000 tokens. It is independent of
+`context_tokens`, which limits one request, and `max_output_tokens`, which caps one response.
+For example, add `session_tokens = 2000000` to the private provider file for longer tasks.
+This remains a hard budget: admission reserves the conservatively estimated next input and
+output before inference, so Nano can stop before reported usage reaches the configured total.
+The terminal diagnostic reports consumption and the limit. A Failed task requires a new work
+phase; changing settings does not silently restart it or erase recorded usage.
+Exhausted token, model-turn, tool-call, retry, and no-progress budgets also fail the working
+task after cleanup and journal sealing, with a matching `nano_limit_*` code and nonzero exit.
+These counters belong to the work phase; HQ cannot replenish them by restarting Nano.
+Recovery reconciles a sealed budget stop before allowing another inference. Interrupted
+runs continue through ordinary effect reconciliation; elapsed time keeps its per-run allowance.
+Inspect `Nano diagnostic` entries in `.ferrus/logs/executor_<task>_<timestamp>_<run>.log` and
+`nano/sessions/<run>/events.jsonl` under the machine-local project data directory.
 
 When HQ relaunches an answered human or consultation waiter, Nano derives the launch action from
 its bound SQLite task instead of an external-agent prompt. Human waits require the question's

@@ -102,7 +102,7 @@ async fn launch(
         journal::{FileJournal, Quotas},
         native::NativeTools,
         providers::openai::OpenAi,
-        session::{Limits, SessionIdentity},
+        session::{EndReason, Limits, SessionIdentity},
         tools::Cancellation,
         wire::{self, CommandKind, Event, ObservedJournal, Output},
         workspace,
@@ -113,6 +113,11 @@ async fn launch(
         time::Duration,
     };
     let settings = super::agent::load_config(&config, model.as_deref())?;
+    let limits = Limits {
+        tokens: settings.session_tokens,
+        ..Default::default()
+    };
+    let token_limit = limits.tokens;
     let working_set = working_set && settings.working_set_enabled;
     let native_context = native_context && settings.native_context_enabled;
     anyhow::ensure!(
@@ -152,6 +157,7 @@ async fn launch(
     });
     let (output, drained) = Output::spawn(wire::stdout_file()?);
     output.publish(Event::Ready);
+    let mut terminal_published = false;
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), start_rx).await???;
         let session_id = launch.run_id.clone();
@@ -192,7 +198,7 @@ async fn launch(
         let end = super::managed::run(
             session,
             identity,
-            Limits::default(),
+            limits,
             provider,
             native,
             journal,
@@ -200,17 +206,31 @@ async fn launch(
         )
         .await?;
         output.publish(Event::Ended {
-            reason: end.reason,
+            reason: end.reason.clone(),
             durable: end.durable,
         });
+        terminal_published = true;
         anyhow::ensure!(
             end.durable,
             "Nano session could not durably record its outcome"
         );
+        if end.reason == EndReason::Limit(super::session::LimitKind::Tokens) {
+            anyhow::bail!(
+                "Nano cannot reserve another request within the work-phase token budget ({} consumed, {token_limit} limit). Configure session_tokens in nano.toml for a new work phase; context_tokens is the per-request window",
+                end.budget.tokens()
+            );
+        }
+        anyhow::ensure!(
+            !matches!(
+                end.reason,
+                EndReason::ProviderProtocol | EndReason::ProviderFailed
+            ) && end.reason.managed_failure_code(end.retryable_provider_failure).is_none(),
+            "Nano stopped after a provider failure or exhausted work-phase budget; inspect diagnostics"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if result.is_err() {
+    if result.is_err() && !terminal_published {
         output.publish(Event::Error {
             code: "session_failed".into(),
         });

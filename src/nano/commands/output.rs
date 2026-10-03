@@ -44,7 +44,7 @@ pub(super) fn prepare(directory: &Path, state: &Snapshot) -> Result<Prepared> {
 
 pub(super) fn reserve(charged: &AtomicU64, total: u64, bytes: u64) -> bool {
     charged
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|next| *next <= total)
         })
         .is_ok()

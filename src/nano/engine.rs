@@ -4,7 +4,8 @@ use super::{
     compaction::{self, Projection, Summary},
     journal::{Journal, encode, valid_id},
     provider::{
-        FinishReason, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Usage,
+        FinishReason, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind,
+        ProviderEvent, Usage,
     },
     session::{
         Budget, ContextComposition, EndReason, LaunchEvidence, LimitKind, Limits, SessionCommand,
@@ -30,6 +31,7 @@ pub(crate) struct Engine<P, T, H, J> {
     previous_call: Option<(String, serde_json::Value)>,
     started: Option<Instant>,
     launch_evidence: Option<LaunchEvidence>,
+    retryable_provider_failure: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +72,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             previous_call: None,
             started: None,
             launch_evidence: None,
+            retryable_provider_failure: false,
         })
     }
 
@@ -117,6 +120,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 reason: EndReason::Limit(LimitKind::ContextBytes),
                 budget: self.budget.clone(),
                 durable: false,
+                retryable_provider_failure: false,
             });
         }
 
@@ -166,6 +170,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             reason,
             budget: self.budget.clone(),
             durable: true,
+            retryable_provider_failure: self.retryable_provider_failure,
         })
     }
 
@@ -219,7 +224,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 .min(
                     self.provider
                         .settings()
-                        .map_or(u64::MAX, |s| s.max_output_tokens),
+                        .and_then(|s| s.max_output_tokens)
+                        .unwrap_or(u64::MAX),
                 )
                 .min(window / 4)
                 .min(remaining / 2);
@@ -448,7 +454,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if retry {
                         self.budget.retries += 1;
                     }
-                    if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                    if !self.record_failure(error.retryable, Some(error.clone())) {
                         return EndReason::JournalFailed;
                     }
                     if !error.retryable {
@@ -492,8 +498,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             self.budget.reserved_input_tokens = 0;
             self.budget.reserved_output_tokens = 0;
             self.budget.charge(&usage);
+            self.retryable_provider_failure = false;
 
-            if response.calls.is_empty() && response.text.trim().is_empty() {
+            if response.finish == FinishReason::Length
+                || (response.calls.is_empty() && response.text.trim().is_empty())
+            {
                 self.budget.no_progress += 1;
             }
             if !self.commit(SessionEvent::ModelCompleted {
@@ -504,15 +513,21 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             }
 
             if response.finish == FinishReason::Length {
-                return EndReason::ProviderTruncated;
+                tracing::warn!(
+                    output_tokens_reserved = output_reservation,
+                    "Nano model response reached its output limit; continuing without executing truncated tool calls"
+                );
+                self.messages.extend(response.messages());
+                if self.journal.checkpoint().is_err() {
+                    return EndReason::JournalFailed;
+                }
+                continue;
             }
             if (response.finish == FinishReason::ToolCalls) == response.calls.is_empty() {
                 return EndReason::ProviderProtocol;
             }
 
-            self.messages.push(Message::Assistant {
-                response: response.clone(),
-            });
+            self.messages.extend(response.messages());
 
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
@@ -709,11 +724,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         remaining: u64,
         window: u64,
     ) -> Result<Result<(u64, u64), LimitKind>, EndReason> {
+        let automatic = self
+            .provider
+            .settings()
+            .is_some_and(|s| s.max_output_tokens.is_none());
         if encode(&(&messages, &tools), self.limits.context_bytes).is_err() {
             return Ok(Err(LimitKind::ContextBytes));
         }
-        // Reduce output only for the remaining session budget. Context-window
-        // pressure should compact history instead of starving the response.
+        // An explicit ceiling retains the existing compaction policy. Automatic
+        // allocation can also fit the available window without a summary call.
         // The serialized max-output field can change size as the cap shrinks.
         for _ in 0..8 {
             let Some(input) = self.input_estimate(messages, tools, output)? else {
@@ -722,9 +741,16 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if self.fits(messages, tools, output, remaining, window, Some(input)) {
                 return Ok(Ok((input, output)));
             }
-            let reduced = output.min(remaining.saturating_sub(input));
+            let mut reduced = output.min(remaining.saturating_sub(input));
             if reduced == 0 {
                 return Ok(Err(LimitKind::Tokens));
+            }
+            if automatic {
+                let margin = (window / 20).clamp(16, 1024);
+                reduced = reduced.min(window.saturating_sub(input).saturating_sub(margin));
+                if reduced == 0 {
+                    return Ok(Err(LimitKind::ContextTokens));
+                }
             }
             if reduced >= output {
                 return Ok(Err(LimitKind::ContextTokens));
@@ -861,7 +887,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         match interrupt(self.provider.start(request), cancellation, deadline).await {
             Ok(Ok(())) => (),
             Ok(Err(error)) => {
-                if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                if !self.record_failure(error.retryable, Some(error.clone())) {
                     return Err(EndReason::JournalFailed);
                 }
                 return Err(Self::provider_failure(error.kind));
@@ -891,7 +917,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 Ok(Ok(None)) => break Err(EndReason::ProviderProtocol),
                 Ok(Err(error)) => {
                     self.provider.cancel();
-                    if !self.record_failure(error.retryable, Some(error.kind.clone())) {
+                    if !self.record_failure(error.retryable, Some(error.clone())) {
                         return Err(EndReason::JournalFailed);
                     }
                     return Err(Self::provider_failure(error.kind));
@@ -935,6 +961,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.budget.reserved_output_tokens = 0;
         self.budget.charge(&usage);
         summary.text = response.text;
+        self.retryable_provider_failure = false;
         if !self.commit(SessionEvent::CompactionCompleted {
             summary: summary.clone(),
             usage,
@@ -979,7 +1006,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.record_failure(retryable, None)
     }
 
-    fn record_failure(&mut self, retryable: bool, error: Option<ProviderErrorKind>) -> bool {
+    fn record_failure(&mut self, retryable: bool, error: Option<ProviderError>) -> bool {
+        self.retryable_provider_failure = retryable;
         let usage = Usage {
             input_tokens: self.budget.reserved_input_tokens,
             output_tokens: self.budget.reserved_output_tokens,
@@ -990,11 +1018,17 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         self.budget.reserved_output_tokens = 0;
         self.budget.charge(&usage);
 
-        self.commit(SessionEvent::ModelFailed {
+        let committed = self.commit(SessionEvent::ModelFailed {
             retryable,
             usage,
-            error,
-        })
+            error: error.as_ref().map(|error| error.kind.clone()),
+            diagnostic: error.as_ref().and_then(|error| error.diagnostic.clone()),
+        });
+        if committed && let Some(error) = error {
+            tracing::warn!(kind = ?error.kind, retryable, diagnostic = ?error.diagnostic,
+                "Nano provider attempt failed");
+        }
+        committed
     }
 
     fn stop(&self, cancellation: &Cancellation, deadline: Instant) -> Option<EndReason> {
@@ -1036,6 +1070,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             reason: EndReason::JournalFailed,
             budget: self.budget.clone(),
             durable: false,
+            retryable_provider_failure: self.retryable_provider_failure,
         }
     }
 }

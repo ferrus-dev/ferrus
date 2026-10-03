@@ -268,6 +268,11 @@ fn serve(
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(request["model"], "override-model");
+            for tool in request["tools"].as_array().unwrap() {
+                let schema = &tool["function"]["parameters"];
+                assert_eq!(schema["type"], "object", "{tool}");
+                assert!(schema["properties"].is_object(), "{tool}");
+            }
             assert_eq!(
                 request["tools"]
                     .as_array()
@@ -356,6 +361,207 @@ fn serve(
 #[test]
 fn headless_process_edits_checks_and_submits_an_isolated_task() {
     run_headless_task(None, false, false, true, true);
+}
+
+#[test]
+fn headless_http_rejection_fails_the_task_and_preserves_safe_diagnostics() {
+    run_rejected_provider(400, 1, "provider_protocol", "nano_provider_protocol");
+}
+
+#[test]
+fn headless_retry_exhaustion_fails_the_task_instead_of_allowing_hq_redispatch() {
+    run_rejected_provider(503, 4, "limit", "nano_limit_retries");
+}
+
+#[test]
+fn headless_configured_token_budget_is_journaled_and_reported_before_inference() {
+    let fixture = Fixture::new();
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nsession_tokens = 1\n",
+    );
+    let mut child = Process::spawn(&mut fixture.command(&config));
+    let mut stdin = child.0.stdin.take().unwrap();
+    let reader = BufReader::new(child.0.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in reader.lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(ready["event"]["type"], "ready");
+    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    output.join().unwrap();
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| event["event"]["type"] == "ended"
+        && event["event"]["reason"] == json!({"reason":"limit","detail":"tokens"})
+        && event["event"]["durable"] == true));
+    assert!(child.stderr().contains("0 consumed, 1 limit"));
+    let journal =
+        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["event"]["limits"]["tokens"], 1);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"]["event"] == "model_started")
+    );
+    let state: (String, String) = Connection::open(fixture.data.join("ferrus.db"))
+        .unwrap()
+        .query_row(
+            "SELECT status,failure_reason FROM tasks WHERE id='t-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("failed".into(), "nano_limit_tokens".into()));
+}
+
+fn run_rejected_provider(status_code: u16, attempts: usize, reason: &str, failure_code: &str) {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for _ in 0..attempts {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "No provider request");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock API: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!((1..=512 * 1024).contains(&length));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body = r#"{"error":"secret-server-detail: invalid tool schema"}"#;
+            write!(stream, "HTTP/1.1 {status_code} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
+    );
+    let mut child = Process::spawn(&mut fixture.command(&config));
+    let mut stdin = child.0.stdin.take().unwrap();
+    let reader = BufReader::new(child.0.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in reader.lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    let ready = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("No ready event: {error}; {}", child.failure_diagnostics()));
+    assert_eq!(ready["event"]["type"], "ready");
+    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    output.join().unwrap();
+    server.join().unwrap();
+    let events: Vec<_> = rx.try_iter().collect();
+    let ended = events
+        .iter()
+        .find(|event| event["event"]["type"] == "ended")
+        .unwrap();
+    assert_eq!(ended["event"]["reason"]["reason"], reason);
+    if reason == "limit" {
+        assert_eq!(ended["event"]["reason"]["detail"], "retries");
+    }
+    assert_eq!(ended["event"]["durable"], true);
+    assert!(!events.iter().any(|event| event["event"]["type"] == "error"));
+    let stderr = child.stderr();
+    assert!(
+        stderr.contains(if status_code == 400 {
+            "Unsupported"
+        } else {
+            "Transport"
+        }),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&status_code.to_string()), "{stderr}");
+    assert!(!stderr.contains("secret-server-detail"));
+    let journal =
+        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = records
+        .iter()
+        .find(|record| record["event"]["event"] == "model_failed")
+        .unwrap();
+    assert_eq!(
+        failed["event"]["diagnostic"],
+        json!({"source":"http","status":status_code})
+    );
+    assert_eq!(failed["event"]["retryable"], attempts > 1);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"]["event"] == "model_started")
+            .count(),
+        attempts
+    );
+    assert!(!journal.contains("secret-server-detail"));
+    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
+    let state: (String, String, Option<String>, i64) = db
+        .query_row(
+            "SELECT status,failure_reason,claimed_by,check_retries FROM tasks WHERE id='t-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("failed".into(), failure_code.into(), None, 0));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join(".ferrus/tasks/t-001.md")).unwrap(),
+        "Create answer.txt, check and submit."
+    );
 }
 
 #[test]

@@ -25,6 +25,20 @@ fn config(url: &str) -> Config {
     toml::from_str(&format!("base_url = {url:?}\nmodel = 'fixture-model'\n")).unwrap()
 }
 
+#[test]
+fn work_phase_token_budget_is_independent_of_provider_context_and_output() {
+    let original = config("http://127.0.0.1:1234/v1");
+    assert_eq!(original.session_tokens, 1_000_000);
+    let original_provider = original.validate().unwrap().1;
+    let mut changed = config("http://127.0.0.1:1234/v1");
+    changed.session_tokens = 2_000_000;
+    assert_eq!(changed.validate().unwrap().1, original_provider);
+    changed.session_tokens = 0;
+    assert!(changed.validate().is_err());
+    let configured: Config = toml::from_str("base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nsession_tokens = 3000000\n").unwrap();
+    assert_eq!(configured.session_tokens, 3_000_000);
+}
+
 fn request() -> ModelRequest {
     ModelRequest {
         messages: vec![Message::User {
@@ -32,6 +46,62 @@ fn request() -> ModelRequest {
         }],
         tools: Lookup::default().descriptors(),
         max_output_tokens: 4096,
+    }
+}
+
+#[test]
+fn reasoning_effort_is_explicit_and_bound_to_effective_settings() {
+    let cfg = config("http://127.0.0.1:1234/v1");
+    let original = cfg.validate().unwrap().1;
+    let encoded = serde_json::to_value(&original).unwrap();
+    assert!(encoded.get("reasoning_effort").is_none());
+    assert_eq!(
+        serde_json::from_value::<ProviderSettings>(encoded).unwrap(),
+        original
+    );
+    let provider = OpenAi::new(cfg).unwrap();
+    let body: Value = serde_json::from_slice(&provider.body(request()).unwrap()).unwrap();
+    assert!(body.get("reasoning_effort").is_none());
+    let evidence = LaunchEvidence {
+        baseline_tree: "fixture".into(),
+        native_context_enabled: true,
+        working_set_enabled: true,
+        graph_peer_mode: Some(GraphPeerMode::Absent),
+        graph_peer_id: None,
+        mcp_peer_count: Some(0),
+        mcp_tool_count: Some(0),
+        graph_peer_timeout_ms: None,
+        settings_sha256: None,
+    };
+    let digest = effective_settings_sha256(&original, &Limits::default(), &evidence).unwrap();
+    for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let cfg: Config = toml::from_str(&format!(
+            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nreasoning_effort = '{level}'\n"
+        ))
+        .unwrap();
+        let provider = OpenAi::new(cfg).unwrap();
+        let settings = provider.settings().unwrap();
+        let body: Value = serde_json::from_slice(&provider.body(request()).unwrap()).unwrap();
+        assert_eq!(body["reasoning_effort"], level);
+        assert_ne!(
+            effective_settings_sha256(&settings, &Limits::default(), &evidence).unwrap(),
+            digest
+        );
+        let record = serde_json::to_value(&settings).unwrap();
+        assert_eq!(record["reasoning_effort"], level);
+        assert_eq!(
+            serde_json::from_value::<ProviderSettings>(record).unwrap(),
+            settings
+        );
+        assert_eq!(
+            provider.estimate_input_tokens(&request()).unwrap(),
+            serde_json::to_vec(&body).unwrap().len() as u64
+        );
+    }
+    for invalid in ["'automatic'", "true", "1"] {
+        assert!(toml::from_str::<Config>(&format!(
+            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nreasoning_effort = {invalid}\n"
+        )).is_err());
     }
 }
 
@@ -264,6 +334,62 @@ async fn context_overflow_ends_the_session_without_retrying_or_executing_tools()
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn rejected_requests_keep_http_status_without_echoing_server_details() {
+    for (status, kind, reason) in [
+        (
+            400,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            404,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            422,
+            ProviderErrorKind::Unsupported,
+            EndReason::ProviderProtocol,
+        ),
+        (
+            401,
+            ProviderErrorKind::Authentication,
+            EndReason::ProviderFailed,
+        ),
+    ] {
+        let (url, server) = server(vec![Reply::failure(status, "secret-code")]).await;
+        let directory = TempDir::new().unwrap();
+        let mut engine = engine(OpenAi::new(config(&url)).unwrap(), &directory);
+        let end = engine
+            .run(
+                SessionCommand::Start {
+                    input: "Use lookup".into(),
+                },
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.reason, reason);
+        assert_eq!(end.budget.model_turns, 1);
+        assert_eq!(end.budget.retries, 0);
+        assert_eq!(engine.tools.calls, 0);
+        let record = engine
+            .host
+            .records
+            .iter()
+            .find(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+            .unwrap();
+        assert!(
+            matches!(&record.event, SessionEvent::ModelFailed { error: Some(actual), diagnostic: Some(ProviderDiagnostic::Http {status: actual_status}), .. } if actual == &kind && *actual_status == status)
+        );
+        let serialized = serde_json::to_string(record).unwrap();
+        assert!(!serialized.contains("secret-code"));
+        assert!(!serialized.contains("secret-server-detail"));
+        server.await.unwrap();
+    }
+}
+
 #[test]
 fn advertised_tools_are_bounded_by_context_not_generated_call_count() {
     for max_tool_calls in [1, 64] {
@@ -330,7 +456,7 @@ fn configuration_and_transport_bounds_fail_explicitly() {
     }
     let mut cfg = config("http://127.0.0.1:1234/v1");
     cfg.context_tokens = 100;
-    cfg.max_output_tokens = 99;
+    cfg.max_output_tokens = Some(99);
     let provider = OpenAi::new(cfg).unwrap();
     assert_eq!(
         provider.body(request()).unwrap_err().kind,
@@ -357,11 +483,60 @@ fn configuration_and_transport_bounds_fail_explicitly() {
     );
 }
 
+#[test]
+fn output_ceiling_is_optional_and_old_settings_remain_readable() {
+    let mut cfg = config("http://127.0.0.1:1234/v1");
+    assert!(cfg.max_output_tokens.is_none());
+    let settings = cfg.validate().unwrap().1;
+    let provider = OpenAi::new(cfg).unwrap();
+    let mut req = request();
+    req.max_output_tokens = 16_384;
+    let body: Value = serde_json::from_slice(&provider.body(req.clone()).unwrap()).unwrap();
+    assert_eq!(body["max_tokens"], 16_384);
+    let mut encoded = serde_json::to_value(&settings).unwrap();
+    assert!(encoded.get("max_output_tokens").is_none());
+    encoded["max_output_tokens"] = json!(4096);
+    let legacy: ProviderSettings = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(legacy.max_output_tokens, Some(4096));
+    assert_eq!(serde_json::to_value(legacy).unwrap(), encoded);
+    cfg = config("http://127.0.0.1:1234/v1");
+    cfg.max_output_tokens = Some(4096);
+    let provider = OpenAi::new(cfg).unwrap();
+    let body: Value = serde_json::from_slice(&provider.body(req).unwrap()).unwrap();
+    assert_eq!(body["max_tokens"], 4096);
+    for cap in [0, 32_768] {
+        let mut cfg = config("http://127.0.0.1:1234/v1");
+        cfg.max_output_tokens = Some(cap);
+        assert!(cfg.validate().is_err());
+    }
+}
+
+#[test]
+fn length_finish_preserves_partial_calls_for_audit_but_not_for_continuation() {
+    let wire = TOOLS
+        .replace("\"tool_calls\"}]", "\"length\"}]")
+        .replace("\"id\":\"call-a\"", "\"id\":\"\"")
+        .replace("\"name\":\"look\"", "\"name\":\"\"");
+    let events = decode(&wire, 1).unwrap();
+    let ProviderEvent::Completed { response, .. } = events.last().unwrap() else {
+        panic!("Missing completion");
+    };
+    assert_eq!(response.finish, FinishReason::Length);
+    assert!(!response.calls.is_empty());
+    let messages = response.messages();
+    assert!(
+        matches!(&messages[0], Message::Assistant { response } if response.calls.is_empty() && response.continuation.is_some())
+    );
+    assert!(matches!(&messages[1], Message::User { .. }));
+}
+
 struct Reply {
     status: u16,
     body: String,
     headers: &'static str,
     stall: bool,
+    stall_headers: bool,
+    line_delay: Option<Duration>,
 }
 impl Reply {
     fn stream(body: &str) -> Self {
@@ -370,6 +545,8 @@ impl Reply {
             body: body.into(),
             headers: "Content-Type: text/event-stream\r\n",
             stall: false,
+            stall_headers: false,
+            line_delay: None,
         }
     }
     fn failure(status: u16, code: &str) -> Self {
@@ -378,6 +555,8 @@ impl Reply {
             body: json!({"error":{"code":code,"message":"secret-server-detail"}}).to_string(),
             headers: "Retry-After: 1\r\n",
             stall: false,
+            stall_headers: false,
+            line_delay: None,
         }
     }
 }
@@ -420,6 +599,10 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
                 }
             };
             requests.push((headers, body));
+            if reply.stall_headers {
+                assert_closed(&mut socket).await;
+                continue;
+            }
             let head = format!(
                 "HTTP/1.1 {} Fixture\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 reply.status,
@@ -429,14 +612,14 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
             socket.write_all(head.as_bytes()).await.unwrap();
             if reply.stall {
                 socket.write_all(reply.body.as_bytes()).await.unwrap();
-                let mut buf = [0; 1];
-                let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
-                    .await
-                    .unwrap();
-                assert!(
-                    matches!(closed, Ok(0) | Err(_)),
-                    "Cancelled stream remained open"
-                );
+                assert_closed(&mut socket).await;
+            } else if let Some(delay) = reply.line_delay {
+                for line in reply.body.split_inclusive('\n') {
+                    if socket.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                }
             } else {
                 for chunk in reply.body.as_bytes().chunks(7) {
                     if socket.write_all(chunk).await.is_err() {
@@ -448,6 +631,17 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
         requests
     });
     (url, task)
+}
+
+async fn assert_closed(socket: &mut tokio::net::TcpStream) {
+    let mut buf = [0; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "Cancelled stream remained open"
+    );
 }
 
 #[derive(Default)]
@@ -571,7 +765,7 @@ async fn authenticated_and_anonymous_sessions_record_settings_and_usage_without_
             );
             assert!(headers.starts_with("POST /v1/chat/completions "));
             assert_eq!(body["stream"], true);
-            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["max_tokens"], 8192);
         }
     }
 }
@@ -615,6 +809,86 @@ async fn retries_and_truncated_streams_share_budget_without_duplicate_effects() 
 }
 
 #[tokio::test]
+async fn length_finish_continues_over_http_without_replaying_partial_calls() {
+    let partial = TOOLS
+        .replace("\"tool_calls\"}]", "\"length\"}]")
+        .replace("\"id\":\"call-a\"", "\"id\":\"\"");
+    let (url, server) = server(vec![
+        Reply::stream(&partial),
+        Reply::stream(TOOLS),
+        Reply::stream(FINAL),
+    ])
+    .await;
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine(OpenAi::new(config(&url)).unwrap(), &directory);
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Use lookup".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(engine.tools.calls, 2);
+    assert_eq!(end.budget.retries, 0);
+    assert_eq!(end.budget.model_turns, 3);
+    assert_eq!(end.budget.reported_input_tokens, 48);
+    assert_eq!(end.budget.reported_output_tokens, 19);
+    let requests = server.await.unwrap();
+    let body = &requests[1].1;
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert!(body["messages"][1].get("tool_calls").is_none());
+    assert_eq!(body["messages"][1]["reasoning_content"], "opaque reasoning");
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert!(
+        body["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("No tools from that response were executed")
+    );
+    let replay = crate::nano::replay::Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.budget, end.budget);
+    assert!(replay.checkpoint_ready());
+}
+
+#[tokio::test]
+async fn automatic_output_fits_remaining_context_without_compacting_active_task() {
+    let (url, server) = server(vec![Reply::stream(FINAL)]).await;
+    let directory = TempDir::new().unwrap();
+    let mut cfg = config(&url);
+    cfg.context_tokens = 10_000;
+    let mut engine = engine(OpenAi::new(cfg).unwrap(), &directory);
+    let text = "x".repeat(8000);
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: text.clone(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 1);
+    assert!(
+        !engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(&record.event, SessionEvent::CompactionStarted { .. }))
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].1;
+    let cap = body["max_tokens"].as_u64().unwrap();
+    assert!((1..2500).contains(&cap));
+    assert!(serde_json::to_vec(body).unwrap().len() as u64 + cap + 500 <= 10_000);
+    assert_eq!(body["messages"][0]["content"], text);
+}
+
+#[tokio::test]
 async fn transient_failures_charge_only_the_effective_output_cap() {
     let partial = &FINAL[..FINAL.find("data: [DONE]").unwrap()];
     let (url, server) = server(vec![
@@ -626,7 +900,9 @@ async fn transient_failures_charge_only_the_effective_output_cap() {
     .await;
     let directory = TempDir::new().unwrap();
     let cfg = config(&url);
-    let output_cap = cfg.max_output_tokens;
+    let output_cap = 4096;
+    let mut cfg = cfg;
+    cfg.max_output_tokens = Some(output_cap);
     let mut engine = engine_with_limits(OpenAi::new(cfg).unwrap(), &directory, Limits::default());
     let end = engine
         .run(
@@ -710,6 +986,75 @@ async fn cancellation_between_buffered_events_closes_the_stream() {
         Some(ProviderEvent::TextDelta(_))
     ));
     provider.cancel();
+    assert!(provider.next_event().await.unwrap().is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn active_stream_can_outlast_the_provider_idle_timeout() {
+    let body = format!("{}{FINAL}", ": generating\n".repeat(6));
+    let mut reply = Reply::stream(&body);
+    reply.line_delay = Some(Duration::from_millis(250));
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 1000;
+    let mut provider = OpenAi::new(cfg).unwrap();
+    provider.start(request()).await.unwrap();
+    let mut completed = false;
+    while let Some(event) = provider.next_event().await.unwrap() {
+        if let ProviderEvent::Completed { response, .. } = event {
+            assert!(response.is_final());
+            completed = true;
+        }
+    }
+    assert!(completed);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn active_stream_still_consumes_the_engine_elapsed_budget() {
+    let body = format!("{}{FINAL}", ": generating\n".repeat(6));
+    let mut reply = Reply::stream(&body);
+    reply.line_delay = Some(Duration::from_millis(250));
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 10_000;
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine_with_limits(
+        OpenAi::new(cfg).unwrap(),
+        &directory,
+        Limits {
+            elapsed_ms: 1000,
+            ..Default::default()
+        },
+    );
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "lookup".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::Elapsed));
+    assert_eq!(engine.tools.calls, 0);
+    assert!(end.durable);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_headers_remain_bounded_by_the_provider_idle_timeout() {
+    let mut reply = Reply::stream("");
+    reply.stall_headers = true;
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.request_timeout_ms = 1000;
+    let mut provider = OpenAi::new(cfg).unwrap();
+    assert_eq!(
+        provider.start(request()).await.unwrap_err().kind,
+        ProviderErrorKind::Timeout
+    );
     assert!(provider.next_event().await.unwrap().is_none());
     server.await.unwrap();
 }

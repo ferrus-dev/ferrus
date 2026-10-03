@@ -854,7 +854,11 @@ fn spawn_native_log_reader(
                 }
                 Ok(Some(event)) if ready_tx.is_none() && !matches!(event, Event::Ready) => {
                     let _ = logger.lock().unwrap().log_event("Nano", event.summary());
-                    events_tx.send_replace(Some(event));
+                    // Fast tool results and the following model turn must not overwrite
+                    // the useful activity before HQ's slower scheduler tick consumes it.
+                    if event.show_in_hq() {
+                        events_tx.send_replace(Some(event));
+                    }
                 }
                 Ok(None) => break,
                 _ => {

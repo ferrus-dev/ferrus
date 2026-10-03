@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::provider::{ModelResponse, ProviderErrorKind, ProviderSettings, Usage};
+use super::provider::{
+    ModelResponse, ProviderDiagnostic, ProviderErrorKind, ProviderSettings, Usage,
+};
 use super::tools::{EffectPlan, ToolCall, ToolOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +41,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             model_turns: 64,
-            tokens: 200_000,
+            tokens: 1_000_000,
             tool_calls: 256,
             retries: 3,
             no_progress: 3,
@@ -225,6 +227,26 @@ pub(crate) enum EndReason {
     EffectUnknown,
 }
 
+impl EndReason {
+    /// These stops cannot make progress by launching another process in the same work phase.
+    pub(crate) fn managed_failure_code(
+        &self,
+        retryable_provider_failure: bool,
+    ) -> Option<&'static str> {
+        match self {
+            Self::ProviderProtocol if !retryable_provider_failure => Some("nano_provider_protocol"),
+            Self::ProviderFailed if !retryable_provider_failure => Some("nano_provider_failed"),
+            Self::ProviderTruncated => Some("nano_provider_truncated"),
+            Self::Limit(LimitKind::Tokens) => Some("nano_limit_tokens"),
+            Self::Limit(LimitKind::ModelTurns) => Some("nano_limit_model_turns"),
+            Self::Limit(LimitKind::ToolCalls) => Some("nano_limit_tool_calls"),
+            Self::Limit(LimitKind::Retries) => Some("nano_limit_retries"),
+            Self::Limit(LimitKind::NoProgress) => Some("nano_limit_no_progress"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum SessionEvent {
@@ -265,6 +287,8 @@ pub(crate) enum SessionEvent {
         usage: Usage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProviderErrorKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<ProviderDiagnostic>,
     },
     ToolIntent {
         call_id: String,
@@ -322,4 +346,6 @@ pub(crate) struct SessionEnd {
     pub budget: Budget,
     /// False means the final state could not be durably recorded. Never acknowledge it as committed.
     pub durable: bool,
+    /// A compaction attempt can stop its session on a retryable provider error.
+    pub retryable_provider_failure: bool,
 }

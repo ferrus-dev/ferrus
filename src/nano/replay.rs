@@ -239,10 +239,10 @@ impl Replay {
                 );
                 self.model_active = false;
                 self.final_response_ready = response.is_final();
-                self.calls = response.calls.clone().into();
-                self.messages.push(Message::Assistant {
-                    response: response.clone(),
-                });
+                if response.finish != super::provider::FinishReason::Length {
+                    self.calls = response.calls.clone().into();
+                }
+                self.messages.extend(response.messages());
             }
             SessionEvent::CompactionCompleted { summary, .. } => {
                 ensure!(

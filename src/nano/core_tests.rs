@@ -674,6 +674,7 @@ async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
                 next.budget.charge(&usage);
                 next.event = SessionEvent::ModelFailed {
                     error: None,
+                    diagnostic: None,
                     retryable: false,
                     usage,
                 };
@@ -689,6 +690,7 @@ async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
                     "failed" => {
                         record.event = SessionEvent::ModelFailed {
                             error: None,
+                            diagnostic: None,
                             retryable: false,
                             usage: usage.clone(),
                         }
@@ -733,7 +735,78 @@ async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
 }
 
 #[tokio::test]
-async fn truncated_or_duplicate_call_responses_never_execute() {
+async fn truncated_calls_never_execute_and_continuation_can_make_progress() {
+    let mut truncated = response("Partial", vec![call("discarded", 1)]);
+    if let ProviderEvent::Completed { response, .. } = &mut truncated {
+        response.finish = FinishReason::Length;
+        response.calls[0].arguments = "{\"value\":".into();
+    }
+    let (_dir, mut engine) = setup(
+        scripted(vec![
+            truncated,
+            response("", vec![call("complete", 2)]),
+            response("Done", vec![]),
+        ]),
+        limits(),
+    );
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 3);
+    assert_eq!(end.budget.tool_calls, 1);
+    assert_eq!(*engine.tools.effects.lock().unwrap(), ["call-1"]);
+    let messages = &engine.provider.requests[1].messages;
+    assert!(
+        matches!(&messages[1], Message::Assistant { response } if response.finish == FinishReason::Length && response.calls.is_empty() && response.text == "Partial")
+    );
+    assert!(
+        matches!(&messages[2], Message::User { text } if text.contains("No tools from that response were executed"))
+    );
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert!(replay.unknown_effects.is_empty());
+    assert!(replay.checkpoint_ready());
+    assert_eq!(replay.budget, end.budget);
+    let first = engine
+        .host
+        .records
+        .iter()
+        .position(|record| {
+            matches!(&record.event,
+        SessionEvent::ModelCompleted { response, .. } if response.finish == FinishReason::Length)
+        })
+        .unwrap();
+    assert_eq!(
+        Replay::from_records(&engine.host.records[..=first])
+            .unwrap()
+            .messages,
+        engine.provider.requests[1].messages
+    );
+}
+
+#[tokio::test]
+async fn repeated_truncated_responses_stop_at_no_progress_without_executing_calls() {
+    let events = (0..3)
+        .map(|_| {
+            let mut event = response("Partial", vec![call("duplicate", 1), call("duplicate", 2)]);
+            if let ProviderEvent::Completed { response, .. } = &mut event {
+                response.finish = FinishReason::Length;
+            }
+            event
+        })
+        .collect();
+    let (_dir, mut engine) = setup(scripted(events), limits());
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::NoProgress));
+    assert_eq!(end.budget.model_turns, 3);
+    assert_eq!(end.budget.tool_calls, 0);
+    assert_eq!(end.budget.retries, 0);
+    assert!(engine.tools.effects.lock().unwrap().is_empty());
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert!(replay.checkpoint_ready());
+    assert_eq!(replay.budget, end.budget);
+}
+
+#[tokio::test]
+async fn duplicate_call_responses_never_execute() {
     for truncated in [false, true] {
         let mut event = response("Partial", vec![call("duplicate", 1), call("duplicate", 2)]);
         if let ProviderEvent::Completed { response, .. } = &mut event {
@@ -741,12 +814,18 @@ async fn truncated_or_duplicate_call_responses_never_execute() {
                 response.finish = FinishReason::Length;
             }
         }
-        let (_dir, mut engine) = setup(scripted(vec![event]), limits());
+        let (_dir, mut engine) = setup(
+            scripted(vec![event]),
+            Limits {
+                model_turns: 1,
+                ..limits()
+            },
+        );
         let end = run(&mut engine, &Cancellation::default()).await;
         assert_eq!(
             end.reason,
             if truncated {
-                EndReason::ProviderTruncated
+                EndReason::Limit(LimitKind::ModelTurns)
             } else {
                 EndReason::ProviderProtocol
             }
@@ -787,7 +866,9 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
     let journal_root = TempDir::new().unwrap();
     let mut create = call("create", 1);
     create.name = "apply_patch".into();
-    create.arguments = json!({"edits":[{"operation":"create","path":"source.txt","content":"native tool result\n"}]}).to_string();
+    create.arguments =
+        json!({"operation":"create","path":"source.txt","content":"native tool result\n"})
+            .to_string();
     let mut read = call("read", 1);
     read.name = "read_file".into();
     read.arguments = json!({"path":"source.txt"}).to_string();
@@ -832,6 +913,17 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
         results[1]["source"]["digest"]
     );
     assert_eq!(results[1]["text"], "native tool result\n");
+    assert!(
+        engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(&record.event,
+                SessionEvent::ToolIntent {effect_plan:Some(EffectPlan::Patch {files}),..}
+                if files.len()==1 && files[0].path=="source.txt" && files[0].before_digest.is_none()
+                    && files[0].after_digest.as_deref()==results[1]["source"]["digest"].as_str()
+            ))
+    );
     let replay = Replay::from_records(&engine.host.records).unwrap();
     assert_eq!(replay.budget, end.budget);
 }
@@ -1026,6 +1118,7 @@ struct CompactionProvider {
     read_calls: bool,
     normal_text_bytes: usize,
     fail_summary: bool,
+    summary_failure_retryable: bool,
     summary_stream_error: Option<ProviderErrorKind>,
     stall_summary: bool,
     active_summary: bool,
@@ -1041,7 +1134,10 @@ impl Provider for CompactionProvider {
             self.active_summary = true;
             self.summary_started.store(true, Ordering::SeqCst);
             if self.fail_summary {
-                return Err(ProviderError::new(ProviderErrorKind::Transport, false));
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    self.summary_failure_retryable,
+                ));
             }
             ProviderEvent::Completed {
                 response: ModelResponse {
@@ -1380,46 +1476,50 @@ async fn canceled_compaction_is_charged_and_never_replays_tools() {
 
 #[tokio::test]
 async fn failed_compaction_charges_reservation_and_recovers_without_replaying_effects() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let mut engine = Engine::new(
-        identity(),
-        bounds,
-        CompactionProvider {
-            fail_summary: true,
-            ..Default::default()
-        },
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ProviderFailed);
-    assert!(end.durable);
-    assert!(end.budget.estimated_input_tokens > 0);
-    let effects = engine.tools.effects.lock().unwrap().len();
-    let records = engine.host.records.clone();
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-    );
-    drop(engine);
-    let (_journal, recovered) =
-        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
-    let replay = Replay::from_records(&recovered).unwrap();
-    assert_eq!(replay.end, Some(EndReason::ProviderFailed));
-    assert_eq!(replay.budget, end.budget);
-    assert!(effects > 0);
+    for retryable in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut bounds = limits();
+        bounds.context_bytes = 4 * 1024;
+        bounds.response_bytes = 1024;
+        let mut engine = Engine::new(
+            identity(),
+            bounds,
+            CompactionProvider {
+                fail_summary: true,
+                summary_failure_retryable: retryable,
+                ..Default::default()
+            },
+            FakeTools::default(),
+            FakeHost::default(),
+            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
+        )
+        .unwrap();
+        let end = run(&mut engine, &Cancellation::default()).await;
+        assert_eq!(end.reason, EndReason::ProviderFailed);
+        assert_eq!(end.retryable_provider_failure, retryable);
+        assert!(end.durable);
+        assert!(end.budget.estimated_input_tokens > 0);
+        let effects = engine.tools.effects.lock().unwrap().len();
+        let records = engine.host.records.clone();
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+        );
+        drop(engine);
+        let (_journal, recovered) =
+            FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
+        let replay = Replay::from_records(&recovered).unwrap();
+        assert_eq!(replay.end, Some(EndReason::ProviderFailed));
+        assert_eq!(replay.budget, end.budget);
+        assert!(effects > 0);
+    }
 }
 
 #[tokio::test]
