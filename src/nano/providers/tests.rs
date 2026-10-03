@@ -25,6 +25,20 @@ fn config(url: &str) -> Config {
     toml::from_str(&format!("base_url = {url:?}\nmodel = 'fixture-model'\n")).unwrap()
 }
 
+#[test]
+fn work_phase_token_budget_is_independent_of_provider_context_and_output() {
+    let original = config("http://127.0.0.1:1234/v1");
+    assert_eq!(original.session_tokens, 1_000_000);
+    let original_provider = original.validate().unwrap().1;
+    let mut changed = config("http://127.0.0.1:1234/v1");
+    changed.session_tokens = 2_000_000;
+    assert_eq!(changed.validate().unwrap().1, original_provider);
+    changed.session_tokens = 0;
+    assert!(changed.validate().is_err());
+    let configured: Config = toml::from_str("base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nsession_tokens = 3000000\n").unwrap();
+    assert_eq!(configured.session_tokens, 3_000_000);
+}
+
 fn request() -> ModelRequest {
     ModelRequest {
         messages: vec![Message::User {

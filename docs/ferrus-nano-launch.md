@@ -136,6 +136,14 @@ output allowance. Reasoning shares that allowance with the answer and tool argum
 `max_output_tokens` is an optional ceiling; omit it for automatic allocation from the
 configured context and session budgets. Historical `nano_provider_truncated` terminal stops
 remain readable and do not requeue an already failed task.
+`session_tokens` controls cumulative input and output across the entire work phase, including
+repeated prompts, retries, and summaries. Its default is 1,000,000 tokens. It is independent of
+`context_tokens`, which limits one request, and `max_output_tokens`, which caps one response.
+For example, add `session_tokens = 2000000` to the private provider file for longer tasks.
+This remains a hard budget: admission reserves the conservatively estimated next input and
+output before inference, so Nano can stop before reported usage reaches the configured total.
+The terminal diagnostic reports consumption and the limit. A Failed task requires a new work
+phase; changing settings does not silently restart it or erase recorded usage.
 Exhausted token, model-turn, tool-call, retry, and no-progress budgets also fail the working
 task after cleanup and journal sealing, with a matching `nano_limit_*` code and nonzero exit.
 These counters belong to the work phase; HQ cannot replenish them by restarting Nano.

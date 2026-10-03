@@ -403,13 +403,19 @@ pub(super) fn prepare(
                     unknown = Some(index);
                 }
                 if name == "apply_patch" {
-                    if let Ok(args) = serde_json::from_str::<Value>(&args)
-                        && let Some(edits) = args["edits"].as_array()
-                    {
-                        for edit in edits {
-                            if let Some(path) = edit["path"].as_str() {
-                                changed.insert(path.into(), index);
+                    if let Ok(args) = serde_json::from_str::<Value>(&args) {
+                        if let Some(edits) = args["edits"].as_array() {
+                            for edit in edits {
+                                if let Some(path) = edit["path"].as_str() {
+                                    changed.insert(path.into(), index);
+                                }
                             }
+                        } else if args.get("edits").is_none()
+                            && let Some(path) = args["path"].as_str()
+                        {
+                            changed.insert(path.into(), index);
+                        } else {
+                            unknown = Some(index);
                         }
                     } else {
                         unknown = Some(index);

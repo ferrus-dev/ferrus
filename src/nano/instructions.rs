@@ -128,7 +128,9 @@ impl Instructions {
 
         let mut directories = BTreeSet::from([String::new()]);
         for path in paths {
-            let path = super::workspace::instruction_target(path)?;
+            let path = super::workspace::instruction_target(path).context(
+                "paths must select workspace file scopes. Task, review, and root AGENTS.md are loaded automatically; omit .ferrus paths and select skills by name in skills",
+            )?;
             let parts: Vec<_> = path.split('/').collect();
             ensure!(parts.len() <= 16, "Instruction scope is too deep");
             for depth in 1..parts.len() {

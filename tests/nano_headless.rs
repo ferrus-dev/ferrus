@@ -373,6 +373,65 @@ fn headless_retry_exhaustion_fails_the_task_instead_of_allowing_hq_redispatch() 
     run_rejected_provider(503, 4, "limit", "nano_limit_retries");
 }
 
+#[test]
+fn headless_configured_token_budget_is_journaled_and_reported_before_inference() {
+    let fixture = Fixture::new();
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nsession_tokens = 1\n",
+    );
+    let mut child = Process::spawn(&mut fixture.command(&config));
+    let mut stdin = child.0.stdin.take().unwrap();
+    let reader = BufReader::new(child.0.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in reader.lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(ready["event"]["type"], "ready");
+    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    output.join().unwrap();
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| event["event"]["type"] == "ended"
+        && event["event"]["reason"] == json!({"reason":"limit","detail":"tokens"})
+        && event["event"]["durable"] == true));
+    assert!(child.stderr().contains("0 consumed, 1 limit"));
+    let journal =
+        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["event"]["limits"]["tokens"], 1);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"]["event"] == "model_started")
+    );
+    let state: (String, String) = Connection::open(fixture.data.join("ferrus.db"))
+        .unwrap()
+        .query_row(
+            "SELECT status,failure_reason FROM tasks WHERE id='t-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("failed".into(), "nano_limit_tokens".into()));
+}
+
 fn run_rejected_provider(status_code: u16, attempts: usize, reason: &str, failure_code: &str) {
     let fixture = Fixture::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

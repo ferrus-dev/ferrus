@@ -48,6 +48,10 @@ pub(crate) enum EffectPlan {
 pub(crate) enum ToolError {
     UnknownTool,
     InvalidArguments,
+    /// Fixed validation guidance, without quoting model arguments or parser errors.
+    Arguments {
+        message: String,
+    },
     Denied,
     Failed,
     Interrupted,
@@ -60,6 +64,14 @@ pub(crate) enum ToolError {
     Lifecycle(serde_json::Value),
     /// Bounded diagnostic from an explicitly configured external MCP peer.
     Mcp(serde_json::Value),
+}
+
+impl ToolError {
+    pub(crate) fn arguments(message: &'static str) -> Self {
+        Self::Arguments {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

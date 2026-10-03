@@ -17,6 +17,171 @@ fn read(workspace: &Workspace, path: &str) -> ReadResult {
         .unwrap()
 }
 
+#[tokio::test]
+async fn flat_edits_keep_digest_preflight_and_durable_effect_plans() {
+    let (dir, mut workspace) = setup();
+    let call = |arguments| ValidatedCall {
+        call_id: "single".into(),
+        provider_call_id: "single".into(),
+        name: "apply_patch".into(),
+        arguments,
+    };
+    let create = call(json!({"operation":"create","path":"source.txt","content":"old\n"}));
+    workspace.validate(&create.name, &create.arguments).unwrap();
+    assert!(
+        matches!(workspace.effect_plan(&create),Some(EffectPlan::Patch {files}) if files.len()==1 && files[0].before_digest.is_none() && files[0].after_digest == Some(digest(b"old\n")))
+    );
+    assert!(matches!(
+        workspace.execute(&create, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    let update = call(
+        json!({"operation":"update","path":"source.txt","expected_digest":read(&workspace,"source.txt").source.digest,"old_text":"old\n","new_text":"new\n"}),
+    );
+    workspace.validate(&update.name, &update.arguments).unwrap();
+    assert!(
+        matches!(workspace.effect_plan(&update),Some(EffectPlan::Patch {files}) if files.len()==1 && files[0].before_digest == Some(digest(b"old\n")) && files[0].after_digest == Some(digest(b"new\n")))
+    );
+    assert!(matches!(
+        workspace.execute(&update, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(
+        matches!(workspace.execute(&update,&Cancellation::default()).await, ToolOutcome::Failed(ToolError::Workspace(value)) if value["failure"]["code"]=="conflict")
+    );
+    assert_eq!(
+        disk::read_to_string(dir.path().join("source.txt")).unwrap(),
+        "new\n"
+    );
+    let delete = call(
+        json!({"operation":"delete","path":"source.txt","expected_digest":read(&workspace,"source.txt").source.digest}),
+    );
+    assert!(
+        matches!(workspace.effect_plan(&delete),Some(EffectPlan::Patch {files}) if files.len()==1 && files[0].before_digest == Some(digest(b"new\n")) && files[0].after_digest.is_none())
+    );
+    assert!(matches!(
+        workspace.execute(&delete, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(!dir.path().join("source.txt").exists());
+    for invalid in [
+        json!({"operation":"create","path":"x","content":"new\n","edits":[{"operation":"create","path":"y","content":"new\n"}]}),
+        json!({"operation":"update","path":"x","start_line":1,"old_text":"old\n","new_text":"new\n"}),
+        json!({"operation":"update","path":"x","expected_digest":"a".repeat(64),"start_line":0,"old_text":"old\n","new_text":"new\n"}),
+    ] {
+        assert!(workspace.validate("apply_patch", &invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn malformed_patch_feedback_repairs_real_call_shapes_without_effects() {
+    let (dir, mut workspace) = setup();
+    disk::write(dir.path().join("source.txt"), "old\n").unwrap();
+    disk::write(dir.path().join("temporary.txt"), "temporary\n").unwrap();
+    for (arguments, expected) in [
+        (
+            json!({"edits":"[{\"operation\":\"update\",\"secret\":\"do-not-echo\"}]"}),
+            "JSON array",
+        ),
+        (
+            json!({"edits":[{"operation":"delete","path":"temporary.txt"}]}),
+            "source.digest",
+        ),
+        (
+            json!({"edits":[{"operation":"update","path":"source.txt","expected_digest":digest(b"old\n"),"hunks":[{"start_line":1,"old_text":"old\n","new_text":"new\n","secret":"do-not-echo"}]}]}),
+            "No other fields",
+        ),
+    ] {
+        let call = ValidatedCall {
+            call_id: "invalid".into(),
+            provider_call_id: "invalid".into(),
+            name: "apply_patch".into(),
+            arguments,
+        };
+        let error = workspace.validate(&call.name, &call.arguments).unwrap_err();
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(encoded.contains(expected), "{encoded}");
+        assert!(!encoded.contains("do-not-echo"));
+        assert!(encoded.len() < 512);
+        assert_eq!(
+            workspace.execute(&call, &Cancellation::default()).await,
+            ToolOutcome::Failed(error)
+        );
+        assert_eq!(
+            disk::read_to_string(dir.path().join("source.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(dir.path().join("temporary.txt").exists());
+    }
+    let arguments = json!({"edits":[
+        {"operation":"delete","path":"temporary.txt","expected_digest":read(&workspace,"temporary.txt").source.digest},
+        {"operation":"update","path":"source.txt","expected_digest":read(&workspace,"source.txt").source.digest,"hunks":[{"start_line":1,"old_text":"old\n","new_text":"new\n"}]}
+    ]});
+    workspace.validate("apply_patch", &arguments).unwrap();
+    let call = ValidatedCall {
+        call_id: "repaired".into(),
+        provider_call_id: "repaired".into(),
+        name: "apply_patch".into(),
+        arguments,
+    };
+    assert!(matches!(
+        workspace.execute(&call, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert_eq!(
+        disk::read_to_string(dir.path().join("source.txt")).unwrap(),
+        "new\n"
+    );
+    assert!(!dir.path().join("temporary.txt").exists());
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn patch_catalog_exposes_nested_types_without_weakening_operation_validation() {
+    let (_dir, workspace) = setup();
+    let descriptor = workspace
+        .descriptors()
+        .into_iter()
+        .find(|tool| tool.name == "apply_patch")
+        .unwrap();
+    let schema = &descriptor.input_schema;
+    let items = &schema["properties"]["edits"]["items"];
+    assert_eq!(items["type"], "object");
+    assert_eq!(items["properties"]["hunks"]["items"]["type"], "object");
+    let validator = jsonschema::validator_for(schema).unwrap();
+    for edit in [
+        json!({"operation":"create","path":"x","content":"new\n"}),
+        json!({"operation":"delete","path":"x","expected_digest":"a".repeat(64)}),
+        json!({"operation":"update","path":"x","expected_digest":"a".repeat(64),"hunks":[{"start_line":1,"old_text":"old\n","new_text":"new\n"}]}),
+    ] {
+        let value = json!({"edits":[edit]});
+        assert!(validator.is_valid(&value));
+        workspace.validate("apply_patch", &value).unwrap();
+    }
+    for edit in [
+        json!({"operation":"create","path":"x","content":"new\n","expected_digest":"a".repeat(64)}),
+        json!({"operation":"delete","path":"x"}),
+        json!({"operation":"update","path":"x","expected_digest":"a".repeat(64),"hunks":"[]"}),
+    ] {
+        let value = json!({"edits":[edit]});
+        assert!(!validator.is_valid(&value));
+        assert!(workspace.validate("apply_patch", &value).is_err());
+    }
+    assert!(!validator.is_valid(&json!({"edits":"[]"})));
+    for flat in [
+        json!({"operation":"create","path":"x","content":"new\n"}),
+        json!({"operation":"delete","path":"x","expected_digest":"a".repeat(64)}),
+        json!({"operation":"update","path":"x","expected_digest":"a".repeat(64),"old_text":"old\n","new_text":"new\n"}),
+    ] {
+        assert!(validator.is_valid(&flat));
+        workspace.validate("apply_patch", &flat).unwrap();
+    }
+    assert!(!validator.is_valid(&json!({"operation":"delete","path":"x"})));
+    assert!(
+        !validator.is_valid(&json!({"operation":"create","path":"x","content":"new\n","edits":[]}))
+    );
+}
+
 fn update(path: &str, before: &str, start_line: usize, old: &str, new: &str) -> Edit {
     Edit::Update {
         path: path.into(),

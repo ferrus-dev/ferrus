@@ -25,6 +25,9 @@ pub(crate) struct Config {
     pub context_tokens: u64,
     /// Optional per-response ceiling; otherwise the engine selects a budgeted cap.
     pub max_output_tokens: Option<u64>,
+    /// Cumulative input/output allowance for a work phase, not the context window.
+    #[serde(default = "default_session_tokens")]
+    pub session_tokens: u64,
     #[serde(default)]
     pub temperature: f64,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -51,6 +54,9 @@ fn default_enabled() -> bool {
 
 fn default_context() -> u64 {
     32_768
+}
+fn default_session_tokens() -> u64 {
+    super::session::Limits::default().tokens
 }
 fn default_timeout() -> u64 {
     120_000
@@ -121,6 +127,8 @@ impl Config {
             self.temperature.is_finite() && (0.0..=2.0).contains(&self.temperature),
             "Invalid temperature"
         );
+
+        ensure!(self.session_tokens > 0, "Invalid session token budget");
 
         ensure!(
             (1..=3_600_000).contains(&self.request_timeout_ms)

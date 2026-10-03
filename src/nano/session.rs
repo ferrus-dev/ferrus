@@ -41,7 +41,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             model_turns: 64,
-            tokens: 200_000,
+            tokens: 1_000_000,
             tool_calls: 256,
             retries: 3,
             no_progress: 3,

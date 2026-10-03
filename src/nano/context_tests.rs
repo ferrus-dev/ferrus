@@ -88,6 +88,12 @@ async fn instructions_are_scoped_lazy_reloaded_and_bounded() {
     );
     assert!(instructions.load(&[], &["../rust".into()]).await.is_err());
     assert!(instructions.load(&[], &["missing".into()]).await.is_err());
+    let error = instructions
+        .load(&[".ferrus/tasks/t-001.md".into()], &[])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("loaded automatically"));
+    assert!(error.to_string().contains("omit .ferrus paths"));
     let limited = Instructions::new(
         session.clone(),
         Limits {

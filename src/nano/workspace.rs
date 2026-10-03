@@ -647,7 +647,9 @@ impl Tools for Workspace {
         if call.name != "apply_patch" {
             return None;
         }
-        let request: PatchRequest = serde_json::from_value(call.arguments.clone()).ok()?;
+        let Request::Patch(request) = decode(&call.name, &call.arguments).ok()? else {
+            return None;
+        };
         self.patch_effect_plan(request)
     }
 
@@ -668,16 +670,38 @@ impl Tools for Workspace {
             json!({"type":"object","properties":properties,"required":fields,"additionalProperties":false})
         };
 
+        // Expose direct nested property types alongside the exact operation
+        // alternatives so tool catalogs need not resolve oneOf to display them.
+        let edits = json!({"type":"object","properties":{
+            "operation":{"type":"string","enum":["create","update","delete"]},
+            "path":string,"content":string,"expected_digest":string,
+            "hunks":{"type":"array","items":hunk,"minItems":1,"maxItems":128}
+        },"required":["operation","path"],"additionalProperties":false,"oneOf":[
+            edit("create",json!({"content":string}),&["content"]),
+            edit("update",json!({"expected_digest":string,"hunks":{"type":"array","items":hunk,"minItems":1,"maxItems":128}}),&["expected_digest","hunks"]),
+            edit("delete",json!({"expected_digest":string}),&["expected_digest"])
+        ]});
+
+        let batch = json!({"type":"object","properties":{"edits":{"type":"array","minItems":1,"maxItems":16,"items":edits}},"required":["edits"],"additionalProperties":false});
+        let patch_schema = json!({"type":"object","properties":{
+            "operation":{"type":"string","enum":["create","update","delete"]},
+            "path":string,"content":string,"expected_digest":string,
+            "old_text":{"type":"string","minLength":1},"new_text":string,
+            "edits":batch["properties"]["edits"]
+        },"additionalProperties":false,"oneOf":[
+            edit("create",json!({"content":string}),&["content"]),
+            edit("update",json!({"expected_digest":string,"old_text":{"type":"string","minLength":1},"new_text":string}),&["expected_digest","old_text","new_text"]),
+            edit("delete",json!({"expected_digest":string}),&["expected_digest"]),
+            batch
+        ]});
+
         vec![
             ToolDescriptor { name:"read_file".into(), description:"Read whole UTF-8 lines from the current workspace with a full-file SHA-256 digest. Truncation is explicit; oversized lines may return no text.".into(),
                 input_schema:json!({"type":"object","properties":{"path":string,"start_line":positive,"max_lines":positive,"max_bytes":positive},"required":["path"],"additionalProperties":false}) },
             ToolDescriptor { name:"search_text".into(), description:"Literal, case-sensitive search in workspace files or directories. One match per line; paths default to the root. No symlinks or runtime metadata. Inspect truncation and skipped-file issues.".into(),
                 input_schema:json!({"type":"object","properties":{"paths":{"type":"array","items":string,"minItems":1,"maxItems":16},"query":{"type":"string","minLength":1},"max_results":positive},"required":["query"],"additionalProperties":false}) },
-            ToolDescriptor { name:"apply_patch".into(), description:"Apply up to 16 exact file edits. Update/delete require read_file's expected_digest. Hunks replace whole lines at 1-based start_line with exact old_text/new_text (including line endings). Parents must exist. All edits are preflighted; per-file publication is not a multi-file transaction.".into(),
-                input_schema:json!({"type":"object","properties":{"edits":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[
-                    edit("create",json!({"content":string}),&["content"]),
-                    edit("update",json!({"expected_digest":string,"hunks":{"type":"array","items":hunk,"minItems":1,"maxItems":128}}),&["expected_digest","hunks"]),
-                    edit("delete",json!({"expected_digest":string}),&["expected_digest"])]}}},"required":["edits"],"additionalProperties":false}) },
+            ToolDescriptor { name:"apply_patch".into(), description:"Prefer a flat single-file edit: {\"operation\":\"update\",\"path\":\"src/lib.rs\",\"expected_digest\":\"<source.digest>\",\"old_text\":\"old text\",\"new_text\":\"new text\"}. old_text must be a nonempty exact substring occurring once; include enough context and preserve indentation/line endings. No line number is needed. create uses path/content; delete uses path/expected_digest. Update AND delete require expected_digest from read_file's source.digest. For batches, edits is an array of up to 16 objects (update uses exact whole-line hunks with start_line), never a JSON-encoded string; do not combine flat and batch fields. Parents must exist. All edits are preflighted; per-file publication is not a multi-file transaction.".into(),
+                input_schema:patch_schema },
         ]
     }
 
@@ -747,14 +771,34 @@ fn decode(name: &str, value: &Value) -> std::result::Result<Request, ToolError> 
         return Err(ToolError::InvalidArguments);
     }
 
+    if name == "apply_patch" && value.get("edits").is_some() {
+        let Some(edits) = value["edits"].as_array() else {
+            return Err(ToolError::arguments(
+                "edits must be a JSON array, not a string containing JSON. Prefer a flat single-file call with operation, path, expected_digest, old_text, new_text for updates; omit edits. No files were changed",
+            ));
+        };
+        if edits.iter().any(|edit| {
+            matches!(edit["operation"].as_str(), Some("update" | "delete"))
+                && !edit["expected_digest"].is_string()
+        }) {
+            return Err(ToolError::arguments(
+                "Every update and delete requires expected_digest from a current read_file result's source.digest. Read the target if necessary, then reissue the complete batch; no files were changed",
+            ));
+        }
+    }
+
     let parsed = match name {
         "read_file" => serde_json::from_value(value.clone()).map(Request::Read),
         "search_text" => serde_json::from_value(value.clone()).map(Request::Search),
-        "apply_patch" => serde_json::from_value(value.clone()).map(Request::Patch),
+        "apply_patch" => patch::request(value.clone()).map(Request::Patch),
         _ => return Err(ToolError::UnknownTool),
     };
 
-    let request = parsed.map_err(|_| ToolError::InvalidArguments)?;
+    let request = parsed.map_err(|_| ToolError::arguments(match name {
+        "read_file" => "read_file requires path (string); optional start_line, max_lines, max_bytes must be positive integers. No other fields are accepted",
+        "search_text" => "search_text requires query (nonempty string); optional paths is an array of strings and max_results is a positive integer. No other fields are accepted",
+        _ => "A flat call requires operation and path. create requires content; delete requires expected_digest; update requires expected_digest, old_text, new_text (no start_line). Alternatively use edits (an array, update uses hunks). Do not mix flat and batch fields. No other fields are accepted; no files were changed",
+    }))?;
     let valid = match &request {
         Request::Read(r) => r.start_line > 0 && r.max_lines > 0 && r.max_bytes > 0,
         Request::Search(r) => {
@@ -773,6 +817,7 @@ fn decode(name: &str, value: &Value) -> std::result::Result<Request, ToolError> 
                             && hunks.len() <= 128
                             && hunks.iter().all(|h| h.start_line > 0)
                     }
+                    patch::Edit::Replace { old_text, .. } => !old_text.is_empty(),
                     _ => true,
                 })
         }
@@ -781,7 +826,9 @@ fn decode(name: &str, value: &Value) -> std::result::Result<Request, ToolError> 
     if valid {
         Ok(request)
     } else {
-        Err(ToolError::InvalidArguments)
+        Err(ToolError::arguments(
+            "Use positive read/search limits, 1-16 edits, and 1-128 hunks per update with positive 1-based start_line. No files were changed",
+        ))
     }
 }
 

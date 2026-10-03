@@ -20,6 +20,8 @@ owner-only file (0400 or 0600 on Unix; protected owner-only DACL on Windows). Ex
 base_url = "http://127.0.0.1:1234/v1"
 model = "your-loaded-tool-capable-model"
 context_tokens = 32768
+# Total input + output across a work phase, including repeated prompts and retries.
+session_tokens = 1000000
 temperature = 0.0
 request_timeout_ms = 120000
 include_usage = true
@@ -95,7 +97,10 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
 - Context admission conservatively counts serialized request bytes as tokens and
   reserves output space. Configure `context_tokens` to match the loaded model's
   actual context. Known server context-overflow codes end with `Limit(ContextTokens)`;
-  automatic compaction is later work. Set `include_usage = false` explicitly if the
+  [context projection and compaction](ferrus-nano-compaction.md) preserve the active task.
+  `session_tokens` is a separate cumulative work-phase allowance (default 1,000,000).
+  When the remaining allowance cannot reserve the next request, Nano ends with
+  `Limit(Tokens)` even if reported usage is below that total. Set `include_usage = false` explicitly if the
   chosen server does not support streamed usage; absent usage is estimated by the engine.
 - 429, transient 5xx/transport errors, timeout, and incomplete streams use the engine's
   existing retry budget. Backoff starts at 500 ms and is capped at 30 seconds, including
@@ -167,3 +172,13 @@ and runs a small rename task under a three-minute session allowance. It requires
 and a durable `Submitted` outcome with the task in Reviewing. External MCP peers are
 excluded. The configured check runs only inside the temporary workspace. CI ignores
 this test; it does not certify a particular real task or model's general coding quality.
+
+`FERRUS_NANO_SMOKE_CASE_DIR` optionally selects a copied HTML workload instead of the rename.
+The absolute directory must contain `TASK.md` and `static/index.html`; `docs/spec.md` and
+`AGENTS.md` are optional. The test copies only those fixed paths into its temporary project,
+uses the configured `session_tokens`, and permits up to 32 turns and ten minutes. It requires
+an HTML change and native `apply_patch`, `check`, and `submit` calls. The temporary check is
+`git diff --check`; this verifies the managed tool workflow, not the original project's checks
+or the quality of the proposed design. It never copies a source project's runtime database.
+`FERRUS_NANO_SMOKE_JOURNAL_OUTPUT` optionally exports its journal to a new private file for
+inspecting call shapes and failures after the temporary project is removed.

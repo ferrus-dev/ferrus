@@ -448,18 +448,41 @@ async fn live_lm_studio_managed_graph_edit_check_and_submit() {
     );
     let f = Fixture::new().await;
     configure(&f, &["git diff --check"], 3);
+    // Optional copied workload. Fixed paths stay in a disposable project; never
+    // launch the agent in the original project or copy its runtime database.
+    let case = std::env::var_os("FERRUS_NANO_SMOKE_CASE_DIR").map(std::path::PathBuf::from);
+    let original_html = if let Some(case) = &case {
+        assert!(case.is_absolute());
+        for path in ["static/index.html", "docs/spec.md", "AGENTS.md"] {
+            let source = case.join(path);
+            if source.exists() {
+                assert!(std::fs::metadata(&source).unwrap().len() <= 32 * 1024);
+                let target = f.root.join(path);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::copy(source, target).unwrap();
+            }
+        }
+        Some(std::fs::read_to_string(f.root.join("static/index.html")).unwrap())
+    } else {
+        None
+    };
     let session = git_session(&f, true).await;
-    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"),
-        "First locate Baseline using repository_search. In src/lib.rs rename the Baseline struct to Ready, keeping the rest of the file unchanged. Use native apply_patch for the edit. Run the Ferrus check tool and submit the change using the submit tool. Do not commit or ask for consultation.\n"
-    ).unwrap();
+    let task = if let Some(case) = &case {
+        std::fs::read_to_string(case.join("TASK.md")).unwrap()
+    } else {
+        "First locate Baseline using repository_search. In src/lib.rs rename the Baseline struct to Ready, keeping the rest of the file unchanged. Use native apply_patch for the edit. Run the Ferrus check tool and submit the change using the submit tool. Do not commit or ask for consultation.\n".into()
+    };
+    assert!(task.len() <= 32 * 1024);
+    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), task).unwrap();
     let (tools, journal) = native(&f, session.clone(), RUN);
     let start = tokio::time::Instant::now();
     let end = managed::run(
         session.clone(),
         identity(RUN),
         Limits {
-            elapsed_ms: 180_000,
-            model_turns: 12,
+            elapsed_ms: if case.is_some() { 600_000 } else { 180_000 },
+            model_turns: if case.is_some() { 32 } else { 12 },
+            tokens: config.session_tokens,
             ..Limits::default()
         },
         crate::nano::providers::openai::OpenAi::new(config).unwrap(),
@@ -481,6 +504,13 @@ async fn live_lm_studio_managed_graph_edit_check_and_submit() {
     );
     let (_, records) =
         FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
+    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_JOURNAL_OUTPUT") {
+        use std::io::Write;
+        let mut output = crate::nano::private::file(std::path::Path::new(&path), true).unwrap();
+        for record in &records {
+            writeln!(output, "{}", serde_json::to_string(record).unwrap()).unwrap();
+        }
+    }
     let calls: Vec<_> = records
         .iter()
         .filter_map(|record| match &record.event {
@@ -489,14 +519,33 @@ async fn live_lm_studio_managed_graph_edit_check_and_submit() {
         })
         .collect();
     println!("calls={calls:?}");
+    let failures: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            SessionEvent::ToolResult {
+                outcome: ToolOutcome::Failed(error),
+                ..
+            } => Some(error),
+            _ => None,
+        })
+        .collect();
+    println!("tool_failures={failures:?}");
     assert_eq!(end.reason, EndReason::Submitted);
     assert!(end.durable);
     assert_eq!(session.status().await.unwrap().status, "reviewing");
-    assert_eq!(
-        std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
-        "pub struct Ready;\n"
-    );
-    for required in ["repository_search", "apply_patch", "check", "submit"] {
+    if let Some(original) = original_html {
+        assert_ne!(
+            std::fs::read_to_string(f.root.join("static/index.html")).unwrap(),
+            original
+        );
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+            "pub struct Ready;\n"
+        );
+        assert!(calls.contains(&"repository_search"));
+    }
+    for required in ["apply_patch", "check", "submit"] {
         assert!(calls.contains(&required), "Missing native call: {required}");
     }
 }

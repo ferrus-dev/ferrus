@@ -40,8 +40,23 @@ occur between files. No detached filesystem task continues after the engine drop
 
 ## Exact patches
 
-`apply_patch` accepts an `edits` array of at most 16 files, encoded within 256 KiB.
-Parents must already exist. Operations are:
+`apply_patch` prefers a flat single-file call. An update replaces one nonempty exact
+substring that must occur exactly once, including overlapping matches. No line number,
+whitespace normalization, or fuzzy matching is involved. The full-file digest is still
+required; missing or ambiguous text fails without writing:
+
+```json
+{"operation":"update","path":"src/lib.rs","expected_digest":"<SHA-256 from source.digest>","old_text":"old text","new_text":"new text"}
+```
+
+Flat create and delete use `operation`, `path`, and `content` or `expected_digest`.
+This avoids nested argument serialization and manual line counting for ordinary edits.
+All forms use the same confined preflight, durable effect plans, and publication path.
+Invalid inputs return bounded fixed guidance without quoting their values or parser errors.
+
+For multi-file or multi-hunk edits, `apply_patch` also accepts an `edits` array of at most
+16 files, encoded within 256 KiB. It must be an array, not a string containing JSON;
+flat and batch fields cannot be mixed. Parents must already exist. Batch operations are:
 
 ```json
 {"operation":"create","path":"src/new.rs","content":"pub fn new() {}\n"}

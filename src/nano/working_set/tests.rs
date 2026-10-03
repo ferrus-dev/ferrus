@@ -173,7 +173,12 @@ fn external_add_edit_delete_rename_never_uses_generation_as_freshness() {
 #[test]
 fn patches_commands_checks_and_background_writers_invalidate_evidence() {
     let (_dir, workspace) = fixture();
-    for name in ["apply_patch", "exec", "check"] {
+    for (name, arguments) in [
+        ("apply_patch", json!({"edits":[{"path":"a.rs"}]})),
+        ("apply_patch", json!({"operation":"update","path":"a.rs"})),
+        ("exec", json!({})),
+        ("check", json!({})),
+    ] {
         let mut messages = Vec::new();
         append(
             &mut messages,
@@ -181,12 +186,7 @@ fn patches_commands_checks_and_background_writers_invalidate_evidence() {
             json!({}),
             read(&workspace, "a.rs", 1, 4),
         );
-        append(
-            &mut messages,
-            name,
-            json!({"edits":[{"path":"a.rs"}]}),
-            json!({}),
-        );
+        append(&mut messages, name, arguments, json!({}));
         let result = prepare(&messages, &json!({}), &json!({}), &workspace, false).unwrap();
         assert_eq!(result.replacements[0].value["kind"], "evidence_unavailable");
     }

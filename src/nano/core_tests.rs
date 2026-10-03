@@ -866,7 +866,9 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
     let journal_root = TempDir::new().unwrap();
     let mut create = call("create", 1);
     create.name = "apply_patch".into();
-    create.arguments = json!({"edits":[{"operation":"create","path":"source.txt","content":"native tool result\n"}]}).to_string();
+    create.arguments =
+        json!({"operation":"create","path":"source.txt","content":"native tool result\n"})
+            .to_string();
     let mut read = call("read", 1);
     read.name = "read_file".into();
     read.arguments = json!({"path":"source.txt"}).to_string();
@@ -911,6 +913,17 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
         results[1]["source"]["digest"]
     );
     assert_eq!(results[1]["text"], "native tool result\n");
+    assert!(
+        engine
+            .host
+            .records
+            .iter()
+            .any(|record| matches!(&record.event,
+                SessionEvent::ToolIntent {effect_plan:Some(EffectPlan::Patch {files}),..}
+                if files.len()==1 && files[0].path=="source.txt" && files[0].before_digest.is_none()
+                    && files[0].after_digest.as_deref()==results[1]["source"]["digest"].as_str()
+            ))
+    );
     let replay = Replay::from_records(&engine.host.records).unwrap();
     assert_eq!(replay.budget, end.budget);
 }

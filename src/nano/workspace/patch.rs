@@ -26,14 +26,22 @@ pub(crate) enum Edit {
         path: String,
         expected_digest: String,
     },
+    #[serde(skip_deserializing)]
+    Replace {
+        path: String,
+        expected_digest: String,
+        old_text: String,
+        new_text: String,
+    },
 }
 
 impl Edit {
     fn path(&self) -> &str {
         match self {
-            Self::Create { path, .. } | Self::Update { path, .. } | Self::Delete { path, .. } => {
-                path
-            }
+            Self::Create { path, .. }
+            | Self::Update { path, .. }
+            | Self::Delete { path, .. }
+            | Self::Replace { path, .. } => path,
         }
     }
 }
@@ -42,6 +50,62 @@ impl Edit {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PatchRequest {
     pub edits: Vec<Edit>,
+}
+
+/// A flat call avoids nested argument serialization in local tool transports.
+/// Both forms use the same preflight, preconditions, and publication path.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SingleEdit {
+    Create {
+        path: String,
+        content: String,
+    },
+    Update {
+        path: String,
+        expected_digest: String,
+        old_text: String,
+        new_text: String,
+    },
+    Delete {
+        path: String,
+        expected_digest: String,
+    },
+}
+
+impl From<SingleEdit> for PatchRequest {
+    fn from(edit: SingleEdit) -> Self {
+        let edit = match edit {
+            SingleEdit::Create { path, content } => Edit::Create { path, content },
+            SingleEdit::Update {
+                path,
+                expected_digest,
+                old_text,
+                new_text,
+            } => Edit::Replace {
+                path,
+                expected_digest,
+                old_text,
+                new_text,
+            },
+            SingleEdit::Delete {
+                path,
+                expected_digest,
+            } => Edit::Delete {
+                path,
+                expected_digest,
+            },
+        };
+        Self { edits: vec![edit] }
+    }
+}
+
+pub(super) fn request(value: Value) -> std::result::Result<PatchRequest, serde_json::Error> {
+    if value.get("edits").is_some() {
+        serde_json::from_value(value)
+    } else {
+        serde_json::from_value::<SingleEdit>(value).map(Into::into)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -162,6 +226,25 @@ impl Workspace {
                         .check_base(&parent, &path, Some(&expected_digest))?
                         .unwrap();
                     let after = apply_hunks(&path, &current.text, &hunks, self.limits.file_bytes)?;
+                    self.check_text(&path, &after)?;
+                    (Some(current.digest), Some(after))
+                }
+                Edit::Replace {
+                    expected_digest,
+                    old_text,
+                    new_text,
+                    ..
+                } => {
+                    let current = self
+                        .check_base(&parent, &path, Some(&expected_digest))?
+                        .unwrap();
+                    let after = replace_exact(
+                        &path,
+                        &current.text,
+                        &old_text,
+                        &new_text,
+                        self.limits.file_bytes,
+                    )?;
                     self.check_text(&path, &after)?;
                     (Some(current.digest), Some(after))
                 }
@@ -324,6 +407,34 @@ impl Workspace {
     }
 }
 
+fn replace_exact(path: &str, before: &str, old: &str, new: &str, limit: usize) -> Result<String> {
+    let invalid = |message| {
+        let mut failure = Failure::new(Code::InvalidPatch, path);
+        failure.message = message;
+        failure
+    };
+    let advance = old.chars().next().ok_or_else(|| invalid("old_text must be nonempty; use create for a new file or batch hunks for insertion at a line boundary."))?.len_utf8();
+    let start = before.find(old).ok_or_else(|| invalid("old_text was not found verbatim. Read the target again and copy an exact unique substring, including indentation and line endings."))?;
+    // Include overlapping matches and advance on a UTF-8 boundary.
+    if before[start + advance..].contains(old) {
+        return Err(invalid(
+            "old_text occurs more than once. Include more surrounding text to select exactly one occurrence; no files were changed.",
+        ));
+    }
+    let size = before
+        .len()
+        .saturating_sub(old.len())
+        .saturating_add(new.len());
+    if size > limit {
+        return Err(Failure::new(Code::FileTooLarge, path));
+    }
+    let mut after = String::with_capacity(size);
+    after.push_str(&before[..start]);
+    after.push_str(new);
+    after.push_str(&before[start + old.len()..]);
+    Ok(after)
+}
+
 fn apply_hunks(path: &str, before: &str, hunks: &[Hunk], limit: usize) -> Result<String> {
     if hunks.is_empty() || hunks.len() > 128 {
         return Err(Failure::new(Code::InvalidPatch, path));
@@ -384,6 +495,38 @@ fn apply_hunks(path: &str, before: &str, hunks: &[Hunk], limit: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_replacement_rejects_missing_ambiguous_and_overlapping_anchors() {
+        for (before, old) in [
+            ("old old", "old"),
+            ("aaa", "aa"),
+            ("\u{e9}\u{e9}\u{e9}", "\u{e9}\u{e9}"),
+            ("old", "missing"),
+            ("old", ""),
+        ] {
+            assert_eq!(
+                replace_exact("x", before, old, "new", 1024)
+                    .unwrap_err()
+                    .code,
+                Code::InvalidPatch
+            );
+        }
+        assert_eq!(
+            replace_exact("x", "prefix old\r\nsuffix", "old", "new", 1024).unwrap(),
+            "prefix new\r\nsuffix"
+        );
+        assert_eq!(
+            replace_exact("x", "\u{e9} old\n", "old", "", 1024).unwrap(),
+            "\u{e9} \n"
+        );
+        assert_eq!(
+            replace_exact("x", "old", "old", "longer", 3)
+                .unwrap_err()
+                .code,
+            Code::FileTooLarge
+        );
+    }
+
     #[tokio::test]
     async fn late_filesystem_failure_reports_the_applied_prefix() {
         let directory = tempfile::TempDir::new().unwrap();

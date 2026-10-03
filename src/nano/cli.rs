@@ -113,6 +113,11 @@ async fn launch(
         time::Duration,
     };
     let settings = super::agent::load_config(&config, model.as_deref())?;
+    let limits = Limits {
+        tokens: settings.session_tokens,
+        ..Default::default()
+    };
+    let token_limit = limits.tokens;
     let working_set = working_set && settings.working_set_enabled;
     let native_context = native_context && settings.native_context_enabled;
     anyhow::ensure!(
@@ -193,7 +198,7 @@ async fn launch(
         let end = super::managed::run(
             session,
             identity,
-            Limits::default(),
+            limits,
             provider,
             native,
             journal,
@@ -209,6 +214,12 @@ async fn launch(
             end.durable,
             "Nano session could not durably record its outcome"
         );
+        if end.reason == EndReason::Limit(super::session::LimitKind::Tokens) {
+            anyhow::bail!(
+                "Nano cannot reserve another request within the work-phase token budget ({} consumed, {token_limit} limit). Configure session_tokens in nano.toml for a new work phase; context_tokens is the per-request window",
+                end.budget.tokens()
+            );
+        }
         anyhow::ensure!(
             !matches!(
                 end.reason,
