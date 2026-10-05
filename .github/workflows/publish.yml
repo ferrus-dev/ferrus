@@ -72,7 +72,7 @@ jobs:
           #   upload_installer: false
           #   installer_name: install.sh
           - target: aarch64-apple-darwin
-            runs_on: macos-14
+            runs_on: macos-latest
             archive: ferrus-aarch64-apple-darwin.tar.gz
             package_format: tar.gz
             linker: ""
@@ -105,31 +105,25 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
+        if: ${{ matrix.target != 'aarch64-apple-darwin' }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         # Keep Cargo defaults unchanged; release archives include experimental Nano.
         run: cargo build --locked --profile dist --features nano-openai,nano-mcp --target "${{ matrix.target }}"
 
       - name: Package Unix release archive
-        if: ${{ matrix.package_format == 'tar.gz' }}
+        if: ${{ matrix.package_format == 'tar.gz' && matrix.target != 'aarch64-apple-darwin' }}
         env:
           TARGET: ${{ matrix.target }}
           ARCHIVE: ${{ matrix.archive }}
-        run: |
-          mkdir -p dist
-          staging="dist/ferrus-${TARGET}"
-          mkdir -p "${staging}"
-          cp "target/${TARGET}/dist/ferrus" "${staging}/ferrus"
-          cp README.md LICENSE NOTICE "${staging}/"
-          tar -C dist -czf "dist/${ARCHIVE}" "ferrus-${TARGET}"
-          (
-            cd dist
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
-            else
-              shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
-            fi
-          )
+        run: bash .github/scripts/package-unix-release.sh
+
+      - name: Build, package, and verify macOS release archive
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: bash .github/scripts/build-macos-release.sh
 
       - name: Package Windows release archive
         if: ${{ matrix.package_format == 'zip' }}
