@@ -240,6 +240,56 @@ async fn run<P: Provider, T: Tools, H: Host, J: Journal>(
 }
 
 #[tokio::test]
+async fn system_policy_is_durable_and_separate_from_task_and_tool_history() {
+    let (_dir, mut engine) = setup(
+        scripted(vec![
+            response("", vec![call("a", 1)]),
+            response("Done", vec![]),
+        ]),
+        limits(),
+    );
+    assert!(engine.set_system_prompt(" ").is_err());
+    engine.set_system_prompt("Host policy").unwrap();
+    let end = run(&mut engine, &Cancellation::default()).await;
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert!(engine.set_system_prompt("Replacement").is_err());
+    for request in &engine.provider.requests {
+        assert_eq!(
+            request.messages[0],
+            Message::System {
+                text: "Host policy".into()
+            }
+        );
+        assert_eq!(
+            request.messages[1],
+            Message::User {
+                text: "Implement a fixture task".into()
+            }
+        );
+        assert!(super::compaction::boundaries(&request.messages).is_ok());
+    }
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(
+        &replay.messages[..2],
+        &engine.provider.requests[0].messages[..2]
+    );
+    assert!(
+        matches!(&engine.host.records[0].event, SessionEvent::Started { system_prompt: Some(prompt), .. } if prompt == "Host policy")
+    );
+    let mut legacy = serde_json::to_value(&engine.host.records[0]).unwrap();
+    legacy["event"]
+        .as_object_mut()
+        .unwrap()
+        .remove("system_prompt");
+    let record: Record = serde_json::from_value(legacy).unwrap();
+    let legacy_replay = Replay::from_records(&[record]).unwrap();
+    assert!(matches!(
+        &legacy_replay.messages[..],
+        [Message::User { .. }]
+    ));
+}
+
+#[tokio::test]
 async fn text_completion_records_usage_but_does_not_complete_a_ferrus_task() {
     let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), limits());
     let end = run(&mut engine, &Cancellation::default()).await;
@@ -1665,6 +1715,7 @@ async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
         FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
     )
     .unwrap();
+    engine.set_system_prompt("Host policy").unwrap();
     let end = run(&mut engine, &Cancellation::default()).await;
     assert_eq!(end.reason, EndReason::ModelFinished);
     assert!(engine.provider.summaries > 0);
@@ -1682,7 +1733,7 @@ async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
             .any(|record| matches!(record.event, SessionEvent::CompactionCompleted { .. }))
     );
     let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(replay.messages.len(), 22);
+    assert_eq!(replay.messages.len(), 23);
     assert!(replay.summary.is_some());
     let composed: Vec<_> = engine
         .host
@@ -1713,6 +1764,10 @@ async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
             .all(|request| {
                 super::compaction::boundaries(&request.messages).is_ok()
                     && request.messages[0]
+                        == Message::System {
+                            text: "Host policy".into(),
+                        }
+                    && request.messages[1]
                         == Message::User {
                             text: "Implement a fixture task".into(),
                         }

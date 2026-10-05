@@ -154,6 +154,7 @@ impl Replay {
             SessionEvent::Started {
                 limits,
                 input,
+                system_prompt,
                 inherited_budget,
                 ..
             } => {
@@ -165,6 +166,17 @@ impl Replay {
                     "Duplicate or charged session start"
                 );
                 limits.validate()?;
+                ensure!(
+                    input
+                        .len()
+                        .saturating_add(system_prompt.as_ref().map_or(0, String::len))
+                        <= limits.context_bytes,
+                    "Session input exceeds its limit"
+                );
+                if let Some(text) = system_prompt {
+                    ensure!(!text.trim().is_empty(), "Empty system prompt");
+                    self.messages.push(Message::System { text: text.clone() });
+                }
                 self.messages.push(Message::User {
                     text: input.clone(),
                 });
@@ -224,7 +236,7 @@ impl Replay {
                     *turn == before.model_turns + 1
                         && after.model_turns == *turn
                         && super::compaction::boundaries(&self.messages)?.contains(retained_from)
-                        && *retained_from > 1,
+                        && *retained_from > super::compaction::prefix_len(&self.messages)?,
                     "Invalid compaction boundary"
                 );
                 self.model_active = true;

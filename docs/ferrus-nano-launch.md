@@ -35,6 +35,11 @@ provider during registration, and it never replaces an existing file. A model ID
 when creating the file but is not stored as a separate HQ override. On later registrations,
 omit `--executor-model` to clear any Nano override and use the file's model.
 
+The new file contains `base_url`, `model`, and `reasoning_effort = "none"`.
+It omits `temperature` and `context_tokens`, leaving sampling defaults and loaded
+context sizing to the model server. Both remain optional explicit overrides;
+`context_tokens` controls Nano's admission, not the server's model configuration.
+
 For a different endpoint, credentials, or other provider settings, edit the generated file or
 set `FERRUS_NANO_CONFIG` to an absolute owner-only file before registration and HQ launch.
 The [provider contract](ferrus-nano-provider.md) describes the fields:
@@ -42,6 +47,7 @@ The [provider contract](ferrus-nano-provider.md) describes the fields:
 ```toml
 base_url = "http://127.0.0.1:1234/v1"
 model = "your-loaded-model"
+reasoning_effort = "none"
 # Optional; omit for a local server without authentication.
 # api_key_file = "/absolute/private/path/lm-studio-key"
 ```

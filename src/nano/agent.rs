@@ -69,6 +69,7 @@ fn create_default_config(path: &Path, model: Option<&str>) -> Result<()> {
     struct InitialConfig<'a> {
         base_url: &'static str,
         model: &'a str,
+        reasoning_effort: super::provider::ReasoningEffort,
     }
 
     let model = normalized_model(model).context(
@@ -77,6 +78,7 @@ fn create_default_config(path: &Path, model: Option<&str>) -> Result<()> {
     let contents = toml::to_string(&InitialConfig {
         base_url: DEFAULT_BASE_URL,
         model: &model,
+        reasoning_effort: super::provider::ReasoningEffort::None,
     })?;
     let config: super::config::Config = toml::from_str(&contents)?;
     config.validate()?;
@@ -258,6 +260,14 @@ mod tests {
         let config = load_config(&path, None).unwrap();
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.model, "local/model");
+        assert_eq!(
+            config.reasoning_effort,
+            Some(super::super::provider::ReasoningEffort::None)
+        );
+        assert_eq!(config.context_tokens, None);
+        assert_eq!(config.temperature, None);
+        let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(written.len(), 3);
         assert!(crate::nano::private::read_only_file(&path).is_ok());
         assert!(create_default_config(&path, Some("other-model")).is_err());
         assert_eq!(load_config(&path, None).unwrap().model, "local/model");

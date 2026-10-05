@@ -50,7 +50,11 @@ impl OpenAi {
 
     pub(crate) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
         let (body, output) = self.body_unbounded(request)?;
-        if body.len() as u64 > self.settings.context_tokens.saturating_sub(output) {
+        if self
+            .settings
+            .context_tokens
+            .is_some_and(|window| body.len() as u64 > window.saturating_sub(output))
+        {
             return Err(error(ProviderErrorKind::ContextOverflow));
         }
         Ok(body)
@@ -68,6 +72,7 @@ impl OpenAi {
         let mut messages = Vec::new();
         for message in request.messages {
             messages.push(match message {
+                Message::System { text } => json!({"role":"system", "content":text}),
                 Message::User { text } => json!({"role":"user", "content":text}),
                 Message::Tool { provider_call_id, outcome } => json!({
                     "role":"tool", "tool_call_id":provider_call_id,
@@ -94,7 +99,11 @@ impl OpenAi {
         }
 
         let mut body = json!({"model":self.settings.model, "messages":messages, "stream":true,
-            "temperature":self.settings.temperature, "max_tokens":output, "n":1});
+            "max_tokens":output, "n":1});
+
+        if let Some(temperature) = self.settings.temperature {
+            body["temperature"] = json!(temperature);
+        }
 
         if let Some(effort) = self.settings.reasoning_effort {
             body["reasoning_effort"] =

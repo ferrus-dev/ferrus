@@ -19,18 +19,19 @@ owner-only file (0400 or 0600 on Unix; protected owner-only DACL on Windows). Ex
 ```toml
 base_url = "http://127.0.0.1:1234/v1"
 model = "your-loaded-tool-capable-model"
-context_tokens = 32768
+reasoning_effort = "none"
+
+# Optional host admission window; omit to leave model context sizing to the server.
+# context_tokens = 208384
+# Optional sampling override; omit to use the server's defaults.
+# temperature = 1.0
 # Total input + output across a work phase, including repeated prompts and retries.
 session_tokens = 1000000
-temperature = 0.0
 request_timeout_ms = 120000
 include_usage = true
 
 # Optional per-response ceiling. Omit to let Nano select a budgeted output cap.
 # max_output_tokens = 8192
-
-# Optional; omitted by default. Endpoint/model support determines valid levels.
-# reasoning_effort = "none"
 
 # Independent evaluation ablations; both default to true.
 # native_context_enabled = false
@@ -52,6 +53,14 @@ HTTP is permitted only on loopback; other hosts require HTTPS. The base URL must
 use `/v1` and cannot contain userinfo, a query, or a fragment. Redirects, automatic
 HTTP retries, and environment proxy discovery are disabled. Authentication and
 unsupported endpoint errors do not trigger protocol fallback.
+
+Registration creates only `base_url`, `model`, and `reasoning_effort = "none"`.
+Existing settings files are preserved. `temperature` is optional and is absent from
+the HTTP request when omitted. `context_tokens` is also optional: without it Nano
+does not impose a model context window or derive the output allowance from one.
+The server controls its loaded context; Nano does not discover or reconfigure it.
+An explicit `context_tokens` value bounds Nano's local admission and compaction;
+it is never sent as a model-loading parameter. Session and byte limits still apply.
 
 `reasoning_effort` forwards an explicit Chat Completions reasoning level: `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Omit it to use the server's
@@ -78,10 +87,9 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
   Reasoning consumes the same `max_output_tokens` allowance as visible text and tool arguments.
   `max_output_tokens` is an optional ceiling, with no fixed 4096-token default. Without it,
   the engine derives a cap from the response-byte allowance, one quarter of the configured
-  context window, and the remaining session budget. Existing explicit values remain ceilings;
-  remove the setting to select automatic allocation. Configure `context_tokens` to match the
-  server's loaded context. Nano still sends the effective cap as `max_tokens` so a failed
-  attempt has a bounded output reservation.
+  context window when supplied, and the remaining session budget. Existing explicit values
+  remain ceilings; remove the setting to select automatic allocation. Nano still sends the
+  effective cap as `max_tokens` so a failed attempt has a bounded output reservation.
   A `length` finish preserves text/reasoning as history and adds a host continuation cue.
   Calls from that response are omitted from subsequent requests and never execute, including
   apparently complete calls; the next response must issue fresh complete calls. The raw
@@ -95,7 +103,7 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
   connection establishment is capped at the smaller of 10 seconds and that timeout.
   The engine's independent byte, total elapsed time, turn, token, and tool budgets still apply.
 - Context admission conservatively counts serialized request bytes as tokens and
-  reserves output space. Configure `context_tokens` to match the loaded model's
+  reserves output space. Optionally configure `context_tokens` to match the loaded model's
   actual context. Known server context-overflow codes end with `Limit(ContextTokens)`;
   [context projection and compaction](ferrus-nano-compaction.md) preserve the active task.
   `session_tokens` is a separate cumulative work-phase allowance (default 1,000,000).
@@ -114,6 +122,18 @@ Bearer tokens. See [LM Studio authentication](https://lmstudio.ai/docs/developer
   response bodies, headers, or credentials. For HTTP 400/422, check the server's request
   validation diagnostics, including the selected model and tool schemas. Existing
   version-1 journals without these optional fields remain readable.
+
+## System policy and task input
+
+Managed Executor requests begin with a dedicated `system` message containing Nano's
+host-owned runtime policy. Task intent, rejection instructions, and supporting
+`AGENTS.md` guidance remain in the initial `user` message. Tool results and retrieved
+content remain untrusted evidence. The system policy does not replace a model's chat
+template, and Nano does not rely on a server-side preset system prompt.
+
+The exact system policy is persisted in the session's Started record. Replay restores
+it, and context projection preserves both the system message and the active task.
+Older journals without the field retain their original user-only prefix.
 
 Sources: [LM Studio Chat Completions](https://lmstudio.ai/docs/developer/openai-compat/chat-completions),
 [LM Studio tool use](https://lmstudio.ai/docs/developer/openai-compat/tools), and
