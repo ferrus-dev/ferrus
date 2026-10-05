@@ -50,6 +50,66 @@ fn request() -> ModelRequest {
 }
 
 #[test]
+fn omitted_context_and_temperature_delegate_to_the_server() {
+    let cfg = config("http://127.0.0.1:1234/v1");
+    let settings = cfg.validate().unwrap().1;
+    assert_eq!(settings.context_tokens, None);
+    assert_eq!(settings.temperature, None);
+    let encoded = serde_json::to_value(&settings).unwrap();
+    assert!(encoded.get("context_tokens").is_none());
+    assert!(encoded.get("temperature").is_none());
+    let mut req = request();
+    req.messages = vec![
+        Message::System {
+            text: "Host policy".into(),
+        },
+        Message::User {
+            text: "x".repeat(40_000),
+        },
+    ];
+    let provider = OpenAi::new(cfg).unwrap();
+    let body: Value = serde_json::from_slice(&provider.body(req.clone()).unwrap()).unwrap();
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("context_tokens").is_none());
+    assert_eq!(
+        body["messages"][0],
+        json!({"role":"system", "content":"Host policy"})
+    );
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert!(provider.estimate_input_tokens(&req).unwrap() > 32_768);
+
+    let mut cfg = config("http://127.0.0.1:1234/v1");
+    cfg.temperature = Some(1.0);
+    cfg.context_tokens = Some(65_536);
+    let explicit = cfg.validate().unwrap().1;
+    let body: Value =
+        serde_json::from_slice(&OpenAi::new(cfg).unwrap().body(req.clone()).unwrap()).unwrap();
+    assert_eq!(body["temperature"], 1.0);
+    assert_ne!(explicit, settings);
+    assert_eq!(
+        serde_json::from_value::<ProviderSettings>(serde_json::to_value(&explicit).unwrap())
+            .unwrap(),
+        explicit
+    );
+    let mut cfg = config("http://127.0.0.1:1234/v1");
+    cfg.context_tokens = Some(32_768);
+    assert_eq!(
+        OpenAi::new(cfg).unwrap().body(req).unwrap_err().kind,
+        ProviderErrorKind::ContextOverflow
+    );
+    for invalid in [0, 1, 16_777_217] {
+        let mut cfg = config("http://127.0.0.1:1234/v1");
+        cfg.context_tokens = Some(invalid);
+        assert!(cfg.validate().is_err());
+    }
+    for invalid in [-0.1, 2.1, f64::NAN, f64::INFINITY] {
+        let mut cfg = config("http://127.0.0.1:1234/v1");
+        cfg.temperature = Some(invalid);
+        assert!(cfg.validate().is_err());
+    }
+}
+
+#[test]
 fn reasoning_effort_is_explicit_and_bound_to_effective_settings() {
     let cfg = config("http://127.0.0.1:1234/v1");
     let original = cfg.validate().unwrap().1;
@@ -395,7 +455,8 @@ fn advertised_tools_are_bounded_by_context_not_generated_call_count() {
     for max_tool_calls in [1, 64] {
         let mut cfg = config("http://127.0.0.1:1234/v1");
         cfg.max_tool_calls = max_tool_calls;
-        let context_tokens = cfg.context_tokens;
+        cfg.context_tokens = Some(32_768);
+        let context_tokens = cfg.context_tokens.unwrap();
         let provider = OpenAi::new(cfg).unwrap();
         let mut request = request();
         request.tools = (0..=max_tool_calls)
@@ -455,7 +516,7 @@ fn configuration_and_transport_bounds_fail_explicitly() {
         assert!(config(url).validate().is_err());
     }
     let mut cfg = config("http://127.0.0.1:1234/v1");
-    cfg.context_tokens = 100;
+    cfg.context_tokens = Some(100);
     cfg.max_output_tokens = Some(99);
     let provider = OpenAi::new(cfg).unwrap();
     assert_eq!(
@@ -506,6 +567,7 @@ fn output_ceiling_is_optional_and_old_settings_remain_readable() {
     assert_eq!(body["max_tokens"], 4096);
     for cap in [0, 32_768] {
         let mut cfg = config("http://127.0.0.1:1234/v1");
+        cfg.context_tokens = Some(32_768);
         cfg.max_output_tokens = Some(cap);
         assert!(cfg.validate().is_err());
     }
@@ -738,6 +800,7 @@ async fn authenticated_and_anonymous_sessions_record_settings_and_usage_without_
             cfg.api_key_file = Some(path);
         }
         let mut engine = engine(OpenAi::new(cfg).unwrap(), &directory);
+        engine.set_system_prompt("Host policy").unwrap();
         let end = engine
             .run(
                 SessionCommand::Start {
@@ -765,7 +828,9 @@ async fn authenticated_and_anonymous_sessions_record_settings_and_usage_without_
             );
             assert!(headers.starts_with("POST /v1/chat/completions "));
             assert_eq!(body["stream"], true);
-            assert_eq!(body["max_tokens"], 8192);
+            assert_eq!(body["max_tokens"], Limits::default().response_bytes);
+            assert!(body.get("temperature").is_none());
+            assert_eq!(body["messages"][0]["role"], "system");
         }
     }
 }
@@ -854,11 +919,40 @@ async fn length_finish_continues_over_http_without_replaying_partial_calls() {
 }
 
 #[tokio::test]
+async fn unknown_context_does_not_limit_engine_requests_to_the_old_default() {
+    let (url, server) = server(vec![Reply::stream(FINAL)]).await;
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine(OpenAi::new(config(&url)).unwrap(), &directory);
+    engine.set_system_prompt("Host policy").unwrap();
+    let text = "x".repeat(40_000);
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: text.clone(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 1);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1["messages"][1]["content"], text);
+    assert_eq!(
+        requests[0].1["max_tokens"],
+        Limits::default().response_bytes
+    );
+    assert!(requests[0].1.get("temperature").is_none());
+    assert!(crate::nano::replay::Replay::from_records(&engine.host.records).is_ok());
+}
+
+#[tokio::test]
 async fn automatic_output_fits_remaining_context_without_compacting_active_task() {
     let (url, server) = server(vec![Reply::stream(FINAL)]).await;
     let directory = TempDir::new().unwrap();
     let mut cfg = config(&url);
-    cfg.context_tokens = 10_000;
+    cfg.context_tokens = Some(10_000);
     let mut engine = engine(OpenAi::new(cfg).unwrap(), &directory);
     let text = "x".repeat(8000);
     let end = engine

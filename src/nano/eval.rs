@@ -1111,6 +1111,7 @@ mod tests {
                     identity,
                     limits: Limits::default(),
                     input: "task".into(),
+                    system_prompt: None,
                     launch_evidence: Some(Box::new(LaunchEvidence {
                         baseline_tree: start_tree.clone(),
                         native_context_enabled: true,
@@ -1127,9 +1128,9 @@ mod tests {
                         api: "openai_chat_completions_v1".into(),
                         base_url: "http://127.0.0.1:1234/v1".into(),
                         model: "mock-model".into(),
-                        context_tokens: 32768,
+                        context_tokens: Some(32768),
                         max_output_tokens: Some(4096),
-                        temperature: 0.0,
+                        temperature: Some(0.0),
                         reasoning_effort: None,
                         request_timeout_ms: 120000,
                         wire_bytes: 4 * 1024 * 1024,
@@ -1257,7 +1258,7 @@ mod tests {
             ..
         } = &mut records[0].event
         {
-            provider.temperature = 0.5;
+            provider.temperature = Some(0.5);
         }
         write_records(&journal, &records)?;
         assert!(
@@ -1272,7 +1273,7 @@ mod tests {
             ..
         } = &mut records[0].event
         {
-            provider.temperature = 0.0;
+            provider.temperature = Some(0.0);
         }
         write_records(&journal, &records)?;
         let mut wrong_model = baseline_attempt.clone();

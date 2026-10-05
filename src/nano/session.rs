@@ -255,6 +255,8 @@ pub(crate) enum SessionEvent {
         limits: Limits,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_evidence: Option<Box<LaunchEvidence>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inherited_budget: Option<Budget>,

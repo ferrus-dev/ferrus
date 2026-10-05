@@ -57,6 +57,9 @@ impl ModelResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub(crate) enum Message {
+    System {
+        text: String,
+    },
     User {
         text: String,
     },
@@ -153,10 +156,12 @@ pub(crate) struct ProviderSettings {
     pub api: String,
     pub base_url: String,
     pub model: String,
-    pub context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
-    pub temperature: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// Omitted by default; supported levels depend on the endpoint and model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,

@@ -21,15 +21,13 @@ pub(crate) struct Config {
     /// Explicit owner-only stdio MCP configuration. Never sent to the provider.
     #[cfg(feature = "nano-mcp")]
     pub mcp_config_file: Option<PathBuf>,
-    #[serde(default = "default_context")]
-    pub context_tokens: u64,
+    pub context_tokens: Option<u64>,
     /// Optional per-response ceiling; otherwise the engine selects a budgeted cap.
     pub max_output_tokens: Option<u64>,
     /// Cumulative input/output allowance for a work phase, not the context window.
     #[serde(default = "default_session_tokens")]
     pub session_tokens: u64,
-    #[serde(default)]
-    pub temperature: f64,
+    pub temperature: Option<f64>,
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_timeout")]
     pub request_timeout_ms: u64,
@@ -52,9 +50,6 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_context() -> u64 {
-    32_768
-}
 fn default_session_tokens() -> u64 {
     super::session::Limits::default().tokens
 }
@@ -115,16 +110,17 @@ impl Config {
         );
 
         ensure!(
-            self.context_tokens > 1
-                && self
-                    .max_output_tokens
-                    .is_none_or(|output| output > 0 && output < self.context_tokens)
-                && self.context_tokens <= 16_777_216,
+            self.context_tokens
+                .is_none_or(|window| (2..=16_777_216).contains(&window))
+                && self.max_output_tokens.is_none_or(|output| {
+                    output > 0 && self.context_tokens.is_none_or(|window| output < window)
+                }),
             "Invalid provider context/output limits"
         );
 
         ensure!(
-            self.temperature.is_finite() && (0.0..=2.0).contains(&self.temperature),
+            self.temperature
+                .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value)),
             "Invalid temperature"
         );
 

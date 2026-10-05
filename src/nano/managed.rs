@@ -418,11 +418,16 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     let mut native = native;
     let recovery = super::resume::recover_previous(&session, &native.coding.workspace).await?;
     let recovery_note = recovery.as_ref().map_or("", |value| value.note.as_str());
-    let mut input = native
-        .instructions
-        .load(&[], &[])
-        .await?
-        .constraint_text(limits.context_bytes.saturating_sub(recovery_note.len()))?;
+    let mut instructions = native.instructions.load(&[], &[]).await?;
+    instructions
+        .documents
+        .retain(|document| !matches!(document.kind, super::instructions::Kind::RuntimePolicy));
+    let mut input = instructions.constraint_text(
+        limits
+            .context_bytes
+            .saturating_sub(recovery_note.len())
+            .saturating_sub(super::instructions::ROLE_POLICY.len()),
+    )?;
     input.push_str(recovery_note);
     #[cfg(feature = "nano-mcp")]
     if let Some(path) = native.mcp_config.take()
@@ -496,9 +501,14 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
                 !cancelled.is_cancelled(),
                 "Native answer delivery interrupted"
             );
-            let messages = [Message::User {
-                text: answered_input(&prefix, answer, human),
-            }];
+            let messages = [
+                Message::System {
+                    text: super::instructions::ROLE_POLICY.into(),
+                },
+                Message::User {
+                    text: answered_input(&prefix, answer, human),
+                },
+            ];
             super::journal::encode(&(&messages, &descriptors), max_bytes)?;
             Ok(())
         })
@@ -516,6 +526,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         stop: stop.clone(),
     };
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
+    engine.set_system_prompt(super::instructions::ROLE_POLICY)?;
     if let Some(evidence) = launch_evidence {
         engine.set_launch_evidence(evidence);
     }

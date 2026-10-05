@@ -26,6 +26,7 @@ pub(crate) struct Engine<P, T, H, J> {
     pub journal: J,
     budget: Budget,
     messages: Vec<Message>,
+    system_prompt: Option<String>,
     summary: Option<Summary>,
     last_request: Vec<Message>,
     previous_call: Option<(String, serde_json::Value)>,
@@ -67,6 +68,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             journal,
             budget: Budget::default(),
             messages: Vec::new(),
+            system_prompt: None,
             summary: None,
             last_request: Vec::new(),
             previous_call: None,
@@ -78,6 +80,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
 
     pub(crate) fn set_launch_evidence(&mut self, evidence: LaunchEvidence) {
         self.launch_evidence = Some(evidence);
+    }
+
+    pub(crate) fn set_system_prompt(&mut self, prompt: &str) -> Result<()> {
+        ensure!(
+            self.started.is_none() && !prompt.trim().is_empty(),
+            "Invalid system prompt"
+        );
+        self.system_prompt = Some(prompt.into());
+        Ok(())
     }
 
     pub(crate) fn inherit_budget(&mut self, budget: Budget) -> Result<()> {
@@ -114,7 +125,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             }
         };
 
-        if input.len() > self.limits.context_bytes {
+        if input
+            .len()
+            .saturating_add(self.system_prompt.as_ref().map_or(0, String::len))
+            > self.limits.context_bytes
+        {
             // An oversized input is never copied into the journal.
             return Ok(SessionEnd {
                 reason: EndReason::Limit(LimitKind::ContextBytes),
@@ -134,6 +149,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
             input: input.clone(),
+            system_prompt: self.system_prompt.clone(),
             launch_evidence: launch_evidence.map(Box::new),
             inherited_budget: (self.budget != Budget::default()).then(|| self.budget.clone()),
             provider: provider_settings.map(Box::new),
@@ -141,6 +157,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             return Ok(self.journal_failure());
         }
 
+        if let Some(text) = &self.system_prompt {
+            self.messages.push(Message::System { text: text.clone() });
+        }
         self.messages.push(Message::User { text: input });
 
         let mut reason = self.drive(cancellation, deadline).await;
@@ -219,7 +238,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             let window = self
                 .provider
                 .settings()
-                .map_or(self.limits.context_bytes as u64, |s| s.context_tokens);
+                .map_or(self.limits.context_bytes as u64, |settings| {
+                    settings.context_tokens.unwrap_or(u64::MAX)
+                });
             let mut output_reservation = (self.limits.response_bytes as u64)
                 .min(
                     self.provider
@@ -265,11 +286,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 Err(reason) => return reason,
             };
             if admitted.is_err() {
+                let prefix = match compaction::prefix_len(&base) {
+                    Ok(prefix) => prefix,
+                    Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
+                };
                 let mut projection = Projection::deterministic(
                     &base,
                     self.summary
                         .as_ref()
-                        .map_or(1, |summary| summary.retained_from),
+                        .map_or(prefix, |summary| summary.retained_from),
                 );
                 projection.summary = self.summary.clone();
                 preparation.projection = Some(projection);
@@ -771,10 +796,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
     ) -> Result<Summary, EndReason> {
         let boundaries = compaction::boundaries(&self.messages)
             .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let existing = self
-            .summary
-            .as_ref()
-            .map_or(1, |summary| summary.retained_from);
+        let existing = self.summary.as_ref().map_or(
+            compaction::prefix_len(&self.messages)
+                .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?,
+            |summary| summary.retained_from,
+        );
         let summary_cap = (capacity.window / 8).clamp(1, 4096) as usize;
         let summary_cap = summary_cap.min(self.limits.response_bytes);
         let mut selected = None;

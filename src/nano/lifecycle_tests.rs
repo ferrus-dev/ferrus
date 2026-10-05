@@ -128,6 +128,7 @@ fn previous_intent(f: &Fixture, id: &str, name: &str, plan: Option<EffectPlan>, 
                 },
                 limits: Limits::default(),
                 input: "task".into(),
+                system_prompt: None,
                 launch_evidence: None,
                 inherited_budget: None,
                 provider: None,
@@ -374,7 +375,7 @@ async fn live_lm_studio_replays_a_stopped_request_without_executing_tools() {
         request.max_output_tokens = settings
             .max_output_tokens
             .unwrap_or(u64::MAX)
-            .min(settings.context_tokens / 4)
+            .min(settings.context_tokens.unwrap_or(u64::MAX) / 4)
             .min(Limits::default().response_bytes as u64);
     }
     if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_REQUEST_OUTPUT") {
@@ -819,6 +820,7 @@ async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
                         ..Default::default()
                     },
                     input: "task".into(),
+                    system_prompt: None,
                     launch_evidence: None,
                     inherited_budget: None,
                     provider: None,
@@ -2112,6 +2114,22 @@ async fn managed_journal_records_effective_launch_flags_and_baseline() {
                 && !evidence.native_context_enabled
                 && !evidence.working_set_enabled
     ));
+    let SessionEvent::Started {
+        system_prompt,
+        input,
+        ..
+    } = &records[0].event
+    else {
+        panic!("Missing session start");
+    };
+    assert_eq!(
+        system_prompt.as_deref(),
+        Some(crate::nano::instructions::ROLE_POLICY)
+    );
+    let task: Value = serde_json::from_str(input).unwrap();
+    let documents = task["documents"].as_array().unwrap();
+    assert!(documents.iter().any(|doc| doc["kind"] == "task"));
+    assert!(documents.iter().all(|doc| doc["kind"] != "runtime_policy"));
 }
 
 #[tokio::test]

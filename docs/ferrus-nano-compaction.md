@@ -1,7 +1,7 @@
 # Nano context budget and compaction
 
 Status: implemented for #82. This is a model-request projection, not a rewrite of the session
-journal or Ferrus task state. The first task/constraint message remains intact.
+journal or Ferrus task state. The system policy and first task/constraint message remain intact.
 
 Before each inference, Nano measures the provider's serialized request, including tool schemas
 and wire framing, then reserves output tokens and a context safety margin. The OpenAI-compatible
@@ -14,6 +14,11 @@ The private provider setting `session_tokens` controls the cumulative work-phase
 (default 1,000,000), independently of the per-request `context_tokens` window. Admission may
 stop below that total when the remaining allowance cannot pay for another conservative request
 reservation or for both summary inference and its following normal request.
+
+`context_tokens` is optional. When omitted, Nano does not assume a model window;
+session-token and context-byte admission remain bounded. The server owns its loaded
+context size and can still reject a request that exceeds it. Set an explicit window
+to enable local admission and compaction against that model capacity.
 
 If the request does not fit, Nano first retains the journal and replaces large older read-only
 tool results with bounded handles. Each handle names the original tool and arguments and includes
