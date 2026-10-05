@@ -87,6 +87,10 @@ impl ExecutorAgent for FakeNative {
         anyhow::ensure!(!self.reject, "invalid native config");
         Ok(())
     }
+    fn validate_interactive_launch(&self, _: &str, _: u32) -> Result<()> {
+        anyhow::ensure!(!self.reject, "invalid native config");
+        Ok(())
+    }
     fn spawn_with_index(&self, _: AgentRunMode<'_>, _: u32) -> Result<StdCommand> {
         #[cfg(unix)]
         {
@@ -259,6 +263,7 @@ if (Test-Path 'second_attach.marker') {
     if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
     exit 0
 }
+
 if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 11 }
 if ([Console]::In.ReadLine() -cne '{"version":1,"command":{"steer":{"text":"Keep the API stable"}}}') { exit 12 }
 if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 13 }
@@ -360,4 +365,88 @@ exit 0
     assert!(ctx.nano_paused_tasks.is_empty());
     assert_eq!(f.dispatches(), 2);
     ctx.shutdown_all_headless().await;
+}
+
+#[tokio::test]
+async fn native_executor_opens_directly_without_consuming_ready_tasks() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("taskless fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"[ -z "$FERRUS_TASK_ID" ] && [ -z "$FERRUS_BASELINE_TREE" ] || exit 20
+echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+[ "$start" = '{"version":1,"command":"start"}' ] || exit 10
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 11
+IFS= read -r steer
+[ "$steer" = '{"version":1,"command":{"steer":{"text":"Inspect this workspace"}}}' ] || exit 12
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 13
+echo attached > direct_attach.marker
+IFS= read -r cancel
+[ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+exit 0
+"#;
+    #[cfg(windows)]
+    let source = r#"$ErrorActionPreference = 'Stop'
+if ($env:FERRUS_TASK_ID -or $env:FERRUS_BASELINE_TREE) { exit 20 }
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"start"}') { exit 10 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 11 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":{"steer":{"text":"Inspect this workspace"}}}') { exit 12 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 13 }
+Set-Content -Path 'direct_attach.marker' -Value 'attached'
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+exit 0
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    dispatch("/executor", &mut ctx).await.unwrap();
+    let name = "executor:nano:1";
+    let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
+    assert!(ctx.headless[name].task_id.is_none());
+    assert_eq!(fixture.dispatches(), 0);
+    dispatch_with_human_question_target(
+        "Inspect this workspace",
+        None,
+        Some(&run),
+        false,
+        &mut ctx,
+    )
+    .await
+    .unwrap();
+    dispatch("/detach", &mut ctx).await.unwrap();
+    dispatch("/executor", &mut ctx).await.unwrap();
+    assert_eq!(ctx.nano_view.as_ref().unwrap().run_id, run);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !fixture.root.join("direct_attach.marker").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatch("/cancel", &mut ctx).await.unwrap();
+    assert!(ctx.nano_paused_tasks.is_empty());
+    ctx.shutdown_all_headless().await;
+    assert_eq!(fixture.dispatches(), 0);
+    assert_eq!(
+        crate::project::list_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .find(|task| task.id == "t-001")
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert!(!fixture.data.join("worktrees").exists());
 }

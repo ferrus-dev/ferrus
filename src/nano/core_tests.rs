@@ -1811,6 +1811,79 @@ struct InteractiveJournal {
     fail_input: bool,
     inject_steering: bool,
 }
+
+#[tokio::test]
+async fn taskless_interactive_waits_before_inference_and_reconstructs_from_journal() {
+    let (dir, base) = setup(scripted(vec![response("Checks passed.", vec![])]), limits());
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: true,
+        waits: 0,
+        fail_input: false,
+        inject_steering: false,
+    };
+    let mut identity = identity();
+    identity.task_id = None;
+    let mut engine = Engine::new(
+        identity,
+        limits(),
+        base.provider,
+        base.tools,
+        base.host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Workspace constraints".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Cancelled);
+    assert!(end.durable);
+    assert_eq!(engine.provider.requests.len(), 1);
+    assert!(
+        matches!(engine.provider.requests[0].messages.last(), Some(Message::User { text }) if text == "Explain the completed checks.")
+    );
+    let records = &engine.host.records;
+    let wait = records
+        .iter()
+        .position(|r| matches!(r.event, SessionEvent::InputRequested))
+        .unwrap();
+    let input = records
+        .iter()
+        .position(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+        .unwrap();
+    let model = records
+        .iter()
+        .position(|r| matches!(r.event, SessionEvent::ModelStarted { .. }))
+        .unwrap();
+    assert!(wait < input && input < model);
+    assert_eq!(records[wait].budget.model_turns, 0);
+    Replay::from_records(records).unwrap();
+    let snapshot = super::conversation::Reader::new(
+        dir.path().join("nano/sessions/session-1/events.jsonl"),
+        "session-1".into(),
+    )
+    .poll()
+    .unwrap()
+    .unwrap();
+    assert!(snapshot.ended);
+    assert!(snapshot.task_id.is_empty());
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.contains("Checks passed."))
+    );
+}
+
 impl Journal for InteractiveJournal {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
         anyhow::ensure!(

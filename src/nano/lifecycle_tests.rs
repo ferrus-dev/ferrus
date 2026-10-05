@@ -2779,7 +2779,7 @@ async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
     let mut refresh = Refresh::default();
     refresh.invalidate();
     assert_eq!(
-        refresh.prepare(&session, false).await[0]["status"],
+        refresh.prepare(&session.clone().into(), false).await[0]["status"],
         "scheduled"
     );
     assert_eq!(refresh.settle().await.unwrap()["status"], "published");

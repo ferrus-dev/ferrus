@@ -36,6 +36,7 @@ pub(crate) struct Replay {
     final_response_ready: bool,
     latest_steering: Option<usize>,
     interactive: bool,
+    taskless: bool,
     submitted: bool,
     calls: VecDeque<ToolCall>,
 }
@@ -76,6 +77,9 @@ impl Replay {
                 "Journal must start with its session identity"
             );
             self.session_id = record.session_id.clone();
+            if let SessionEvent::Started { identity, .. } = &record.event {
+                self.taskless = identity.task_id.is_none();
+            }
         }
 
         ensure!(
@@ -246,8 +250,11 @@ impl Replay {
                 self.interactive = true;
             }
             SessionEvent::InputRequested => {
+                let initial = self.taskless && self.budget.model_turns == 0;
                 ensure!(
-                    self.checkpoint_ready() && self.final_response_ready && self.interactive,
+                    self.checkpoint_ready()
+                        && (self.final_response_ready || initial)
+                        && self.interactive,
                     "Input requested before an interactive final response"
                 );
             }

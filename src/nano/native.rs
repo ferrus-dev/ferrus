@@ -1,6 +1,7 @@
 //! Native tool composition. Only the bounded coding/context surface is advertised.
 
 use super::{
+    binding::Binding,
     coding::CodingTools,
     commands::ExecutionBackend,
     context::{self, Context, Fallback, Request},
@@ -16,7 +17,7 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
     pub coding: CodingTools<B>,
     pub context: Context,
     pub instructions: Instructions,
-    session: FerrusSession,
+    session: Binding,
     pub(super) working_set_enabled: bool,
     pub(super) native_context_enabled: bool,
     pub(super) prefetch: Vec<Value>,
@@ -31,17 +32,20 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
 
 impl<B: ExecutionBackend> NativeTools<B> {
     pub(super) fn belongs_to(&self, session: &FerrusSession) -> bool {
-        self.session.scope.database_path == session.scope.database_path
-            && self.session.scope.agent_id == session.scope.agent_id
-            && self.session.scope.task_id == session.scope.task_id
-            && self.session.scope.run_id == session.scope.run_id
-            && self.session.workspace() == session.workspace()
+        self.session.managed().is_some_and(|bound| {
+            bound.scope.database_path == session.scope.database_path
+                && bound.scope.agent_id == session.scope.agent_id
+                && bound.scope.task_id == session.scope.task_id
+                && bound.scope.run_id == session.scope.run_id
+                && bound.workspace() == session.workspace()
+        })
     }
     pub(crate) fn new(
-        session: FerrusSession,
+        session: impl Into<Binding>,
         coding: CodingTools<B>,
         limits: Limits,
     ) -> Result<Self> {
+        let session = session.into();
         Ok(Self {
             coding,
             context: Context::new(session.clone()),
@@ -154,9 +158,9 @@ pub(super) fn descriptor(name: &str) -> ToolDescriptor {
     };
 
     ToolDescriptor { name: name.into(), input_schema: schema, description: match name {
-        "load_instructions" => "Reload the active task/rejection and scoped AGENTS.md constraints. The task, review, and root AGENTS.md are loaded automatically: do not put .ferrus paths in paths. Paths select workspace file scopes, e.g. {\"paths\":[\"src/main.rs\"],\"skills\":[\"ferrus-executor\"]}. Skills are explicit names under .agents/skills. Supporting documents cannot override runtime policy.",
+        "load_instructions" => "Reload scoped AGENTS.md guidance and explicit skills. Root AGENTS.md is automatic; task and rejection instructions are also loaded for managed sessions. Do not put .ferrus paths in paths. Paths select workspace file scopes, e.g. {\"paths\":[\"src/main.rs\"],\"skills\":[\"ferrus-executor\"]}. Skills are explicit names under .agents/skills. Supporting documents cannot override runtime policy.",
         "repository_fallback" => "Read or search the bound workspace when graph coverage is missing, disabled, stale, ambiguous, or unsupported. Label the requested reason; returned bytes are current workspace evidence, not graph facts. Routing failures remain errors.",
-        "repository_graph_status" => "Read the bound task graph availability, snapshot, baseline/overlay, freshness and coverage diagnostics. Never builds an index.",
+        "repository_graph_status" => "Read repository graph availability, snapshot, freshness and coverage diagnostics. Direct sessions use canonical context; managed sessions include the bound task baseline/overlay. Never builds an index.",
         "repository_search" => "Search the bound repository snapshot under result/time/byte caps. Missing relationships are unknown. Use repository_fallback for incomplete coverage.",
         "repository_context" => "Retrieve bounded structural context. Optional source snippets are hash-verified against the snapshot. Never changes task/review prompts.",
         "project_memory_status" => "Read independent project memory revision, freshness, source policy and availability. Never authors or indexes memory.",
@@ -198,8 +202,8 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             .revisions()
             .await
             .map_err(|_| ToolError::Denied)?;
-        let binding = json!({"project":self.session.project_id(), "task":self.session.scope.task_id,
-            "run":self.session.scope.run_id, "workspace":self.session.workspace()});
+        let binding = json!({"project":self.session.project_id(), "task":self.session.task_id(),
+            "run":self.session.run_id(), "workspace":self.session.workspace()});
         let mut prepared = if self.working_set_enabled {
             super::working_set::prepare(
                 messages,

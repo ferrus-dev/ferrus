@@ -58,7 +58,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         ensure!(
             valid_id(&identity.session_id)
                 && !identity.project_id.is_empty()
-                && identity.task_id.is_some() == identity.run_id.is_some(),
+                && (identity.task_id.is_none() || identity.run_id.is_some()),
             "Invalid session identity"
         );
 
@@ -176,7 +176,18 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         if self.interactive && !self.commit(SessionEvent::InteractionOpened) {
             return Ok(self.journal_failure());
         }
-        let mut reason = self.drive(cancellation, deadline).await;
+        let mut reason = if self.interactive && self.identity.task_id.is_none() {
+            if !self.commit(SessionEvent::InputRequested) {
+                EndReason::JournalFailed
+            } else {
+                match self.wait_for_input(cancellation, deadline).await {
+                    Ok(()) => self.drive(cancellation, deadline).await,
+                    Err(reason) => reason,
+                }
+            }
+        } else {
+            self.drive(cancellation, deadline).await
+        };
 
         self.provider.cancel();
 
@@ -250,8 +261,29 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         Ok(accepted)
     }
 
+    async fn wait_for_input(
+        &mut self,
+        cancellation: &Cancellation,
+        deadline: Instant,
+    ) -> Result<(), EndReason> {
+        loop {
+            let Some(commands) = self.commands.as_mut() else {
+                return Err(EndReason::Cancelled);
+            };
+            match interrupt(commands.recv(), cancellation, deadline).await {
+                Ok(Some(command)) => {
+                    if self.accept_input(command)? {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => return Err(EndReason::Cancelled),
+                Err(reason) => return Err(reason),
+            }
+        }
+    }
+
     async fn drive(&mut self, cancellation: &Cancellation, deadline: Instant) -> EndReason {
-        'drive: loop {
+        loop {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
@@ -648,20 +680,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if !self.commit(SessionEvent::InputRequested) {
                         return EndReason::JournalFailed;
                     }
-                    loop {
-                        let Some(commands) = self.commands.as_mut() else {
-                            return EndReason::Cancelled;
-                        };
-                        match interrupt(commands.recv(), cancellation, deadline).await {
-                            Ok(Some(command)) => match self.accept_input(command) {
-                                Ok(true) => continue 'drive,
-                                Ok(false) => (),
-                                Err(reason) => return reason,
-                            },
-                            Ok(None) => return EndReason::Cancelled,
-                            Err(reason) => return reason,
-                        }
+                    if let Err(reason) = self.wait_for_input(cancellation, deadline).await {
+                        return reason;
                     }
+                    continue;
                 }
                 return EndReason::ModelFinished;
             }

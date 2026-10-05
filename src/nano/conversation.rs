@@ -86,6 +86,13 @@ impl Snapshot {
                 self.run_id = identity.session_id.clone();
                 self.task_id = identity.task_id.clone().unwrap_or_default();
                 self.status = "Starting".into();
+                if identity.task_id.is_none() {
+                    self.push(
+                        "Session",
+                        "Direct workspace conversation. Type a request to begin.",
+                    );
+                    return;
+                }
                 let initial = serde_json::Deserializer::from_str(input)
                     .into_iter::<serde_json::Value>()
                     .next()

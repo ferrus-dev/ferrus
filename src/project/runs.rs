@@ -2,6 +2,50 @@
 
 use super::*;
 
+/// Taskless Executor runs use the same legacy bookkeeping row as external interactive
+/// agents. That row grants no task lease, task intent, or lifecycle authority.
+pub(crate) async fn authorize_taskless_executor_run_at(
+    database: &Path,
+    run_id: &str,
+    agent_id: &str,
+    workspace: &Path,
+) -> Result<()> {
+    let (database, run_id, agent_id, workspace) = (
+        database.to_path_buf(),
+        run_id.to_owned(),
+        agent_id.to_owned(),
+        workspace.to_path_buf(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let run: (String, String, String, String, String) = connection.query_row(
+            "SELECT task_id, role, agent, status, workspace_path FROM runs WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        anyhow::ensure!(
+            run.0 == CURRENT_TASK_ID
+                && run.1 == "executor"
+                && run.2 == agent_id
+                && run.3 == "running"
+                && Path::new(&run.4).is_absolute()
+                && std::fs::canonicalize(&run.4)? == workspace,
+            "Interactive run binding mismatch or run is no longer active"
+        );
+        Ok(())
+    })
+    .await?
+}
+
 pub async fn record_runtime_event(
     run_id: Option<String>,
     event_type: &str,

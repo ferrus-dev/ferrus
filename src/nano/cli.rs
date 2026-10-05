@@ -11,11 +11,14 @@ pub(crate) enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Run a managed Executor; HQ sends versioned commands over open stdin
+    /// Run a native Executor; HQ sends versioned commands over open stdin
     Run {
-        /// Keep the managed conversation open for queued user steering
+        /// Keep the conversation open for queued user steering
         #[arg(long)]
         interactive: bool,
+        /// Open a direct workspace conversation without claiming a managed task
+        #[arg(long, requires = "interactive")]
+        taskless: bool,
         /// Absolute owner-only provider settings file (or FERRUS_NANO_CONFIG)
         #[arg(long)]
         config: Option<PathBuf>,
@@ -28,7 +31,7 @@ pub(crate) enum Command {
         /// Disable native graph and memory tools; external MCP tools remain available
         #[arg(long)]
         no_native_context: bool,
-        /// Prefetch this explicit task path (repeatable; at most eight seeds total)
+        /// Prefetch this explicit workspace path (repeatable; at most eight seeds total)
         #[arg(long)]
         prefetch_path: Vec<String>,
         /// Prefetch this exact graph symbol key (repeatable; opt-in)
@@ -54,10 +57,12 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         prefetch_path,
         prefetch_symbol,
         interactive,
+        taskless,
     ) = match command {
         Command::Eval { manifest } => return super::eval::report(&manifest),
         Command::Run {
             interactive,
+            taskless,
             config,
             model,
             no_working_set,
@@ -72,6 +77,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
             prefetch_path,
             prefetch_symbol,
             interactive,
+            taskless,
         ),
         #[cfg(feature = "nano-mcp")]
         Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
@@ -90,11 +96,18 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         !no_native_context,
         seeds,
         interactive,
+        taskless,
     )
     .await;
     #[cfg(not(feature = "nano-openai"))]
     {
-        let _ = (no_working_set, no_native_context, seeds, interactive);
+        let _ = (
+            no_working_set,
+            no_native_context,
+            seeds,
+            interactive,
+            taskless,
+        );
         unreachable!("feature validated above");
     }
 }
@@ -107,6 +120,7 @@ async fn launch(
     native_context: bool,
     seeds: Vec<serde_json::Value>,
     interactive: bool,
+    taskless: bool,
 ) -> Result<()> {
     use super::{
         coding::CodingTools,
@@ -141,7 +155,11 @@ async fn launch(
     #[cfg(feature = "nano-mcp")]
     let mcp_config = settings.mcp_config_file.clone();
     let provider = OpenAi::new(settings)?;
-    let launch = LaunchContext::from_env()?;
+    let launch = if taskless {
+        None
+    } else {
+        Some(LaunchContext::from_env()?)
+    };
     let stop = Cancellation::default();
     let error = Arc::new(Mutex::new(None::<String>));
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
@@ -203,29 +221,26 @@ async fn launch(
     let mut terminal_published = false;
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), start_rx).await???;
-        let session_id = launch.run_id.clone();
-        let session = FerrusSession::bind(launch).await?;
-        let identity = SessionIdentity {
-            session_id: session_id.clone(),
-            project_id: session.project_id().into(),
-            task_id: Some(session.scope.task_id.clone()),
-            run_id: Some(session.scope.run_id.clone()),
+        let binding = match launch {
+            Some(launch) => super::binding::Binding::from(FerrusSession::bind(launch).await?),
+            None => super::binding::Binding::interactive_from_env().await?,
         };
-        let journal = FileJournal::create(session.data_dir(), &session_id, Quotas::default())?;
+        let session_id = binding.run_id().to_owned();
+        let journal = FileJournal::create(binding.data_dir(), &session_id, Quotas::default())?;
         let coding = CodingTools {
             workspace: workspace::Workspace::new(
-                session.workspace(),
+                binding.workspace(),
                 workspace::Limits::default(),
             )?,
             commands: commands::Commands::trusted_local(
-                session.workspace(),
+                binding.workspace(),
                 &session_id,
                 journal.directory(),
                 commands::Limits::default(),
             )?,
         };
         let mut native =
-            NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
+            NativeTools::new(binding.clone(), coding, instructions::Limits::default())?;
         #[cfg(feature = "nano-mcp")]
         {
             native.mcp_config = mcp_config;
@@ -242,16 +257,17 @@ async fn launch(
             interactive,
             preview_enabled,
         };
-        let end = super::managed::run(
-            session,
-            identity,
-            limits,
-            provider,
-            native,
-            journal,
-            &stop,
-        )
-        .await?;
+        let end = if let Some(session) = binding.managed() {
+            let identity = SessionIdentity {
+                session_id,
+                project_id: binding.project_id().into(),
+                task_id: Some(session.scope.task_id.clone()),
+                run_id: Some(session.scope.run_id.clone()),
+            };
+            super::managed::run(session.clone(), identity, limits, provider, native, journal, &stop).await?
+        } else {
+            super::interactive::run(binding, limits, provider, native, journal, &stop).await?
+        };
         output.publish(Event::Ended {
             reason: end.reason.clone(),
             durable: end.durable,

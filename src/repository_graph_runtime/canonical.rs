@@ -306,6 +306,14 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
     }
 }
 
+/// Interactive workspace edits use canonical maintenance without a task transition.
+pub(crate) async fn refresh_canonical_graph_after_workspace_change(
+    project_root: std::path::PathBuf,
+    run_id: String,
+) {
+    refresh_canonical_graph_after_approval(project_root, "current".into(), Some(run_id)).await;
+}
+
 async fn refresh_canonical_graph_at(
     project_root: &Path,
 ) -> Result<

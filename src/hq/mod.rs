@@ -312,17 +312,18 @@ async fn dispatch_with_human_question_target(
             nano_run_id.is_none_or(|run| run == view.run_id),
             "Conversation changed; cancel was not sent"
         );
-        let task = view
-            .name
-            .strip_prefix("executor:nano:")
-            .context("Invalid Nano task identity")?;
         handle
             .native_control
             .as_ref()
             .context("This conversation is read-only")?
             .cancel();
-        ctx.nano_paused_tasks.insert(task.to_string());
-        ctx.display.info("Nano cancelled; automatic dispatch for this task is paused in this HQ. Use /executor for ready work or /resume for paused work.");
+        if let Some(task) = &handle.task_id {
+            ctx.nano_paused_tasks.insert(task.clone());
+            ctx.display.info("Nano cancelled; automatic dispatch for this task is paused in this HQ. Use /resume for paused work.");
+        } else {
+            ctx.display
+                .info("Nano conversation cancelled. Use /executor to open a new session.");
+        }
         return Ok(());
     }
     if !line.starts_with('/') {

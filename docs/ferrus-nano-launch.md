@@ -1,7 +1,7 @@
 # Nano headless launch and HQ events
 
-Status: Nano supports headless and [interactive HQ](ferrus-nano-interactive.md) managed
-Executor sessions. Supervisor support and standalone packaging are deferred. Live crash
+Status: Nano supports headless managed Executors and [interactive HQ](ferrus-nano-interactive.md)
+workspace conversations. Supervisor support and standalone packaging are deferred. Live crash
 recovery and reconciliation are implemented for #84.
 The process lifecycle is tested with a local mock API; live LM Studio validation remains opt-in.
 
@@ -82,6 +82,10 @@ HQ invokes `ferrus nano run --config <absolute-path> [--model <model>]` in its p
 This is a managed entry point: it requires the existing `FERRUS_PROJECT_ROOT`, `FERRUS_AGENT_ID`,
 `FERRUS_TASK_ID`, `FERRUS_RUN_ID`, and, for Git workspaces, `FERRUS_BASELINE_TREE` binding.
 It does not allocate tasks, worktrees, or runs itself.
+
+HQ `/executor` uses `--interactive --taskless` for direct canonical-workspace sessions. These
+require project, agent, and persisted run identity, with no task or baseline environment binding.
+They wait for the user's first message and never claim a managed task.
 
 Stdin stays open for UTF-8 JSONL commands. Each newline-terminated frame, including its newline,
 is at most 4,096 bytes. Unknown versions, fields, commands, malformed JSON, oversized frames,

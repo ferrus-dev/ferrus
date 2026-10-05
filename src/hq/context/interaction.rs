@@ -29,51 +29,27 @@ impl HqContext {
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
         if agent.capabilities().native {
-            let mut names: Vec<_> = self
-                .headless
-                .iter()
-                .filter(|(name, handle)| name.starts_with("executor:nano:") && handle.is_alive())
-                .map(|(name, _)| name.clone())
-                .collect();
-            names.sort();
-            let name = match names.len() {
-                0 => None,
-                1 => names.pop(),
-                _ => self
-                    .display
-                    .select("Select Nano conversation", names.clone())
-                    .await?
-                    .and_then(|index| names.get(index).cloned()),
-            };
-            if let Some(name) = name {
-                return self.attach_nano_conversation(&name).await;
-            }
-            if !names.is_empty() {
-                return Ok(());
-            }
-            let tasks = crate::project::list_tasks().await?;
-            let live = crate::project::live_active_run_task_ids().await?;
-            let task = tasks
-                .iter()
-                .find(|task| {
-                    is_executor_ready_task_status(&task.status)
-                        && !task_claim_blocks_spawn(task, "", chrono::Utc::now(), &live)
-                })
-                .context("Nano needs a ready managed task. Queue a task first.")?;
-            let name = self.executor_agent_id_for_task(&task.id)?;
-            let limit = Config::load().await?.limits.max_parallel_tasks;
-            anyhow::ensure!(
-                self.occupied_executor_slots().await? < executor_parallel_limit(limit).await?,
-                "Executor parallelism limit reached"
-            );
-            self.spawn_executor_for_task_mode(&name, "", DEFAULT_AGENT_INDEX, &task.id, true)
-                .await?;
-            if self
+            let name = self.executor_agent_id()?;
+            if !self
                 .headless
                 .get(&name)
                 .is_some_and(agent_manager::HeadlessHandle::is_alive)
             {
-                self.nano_paused_tasks.remove(&task.id);
+                self.prepare_headless_slot(&name).await;
+                let root = crate::project::canonical_project_root().await?;
+                let handle = agent_manager::spawn_native_interactive_executor_with_env(
+                    agent.as_ref(),
+                    &name,
+                    DEFAULT_AGENT_INDEX,
+                    self.debug,
+                    vec![(ENV_AGENT_ID, name.clone())],
+                    Some(agent_manager::HeadlessWorkspace {
+                        workspace_dir: root.clone(),
+                        project_root: root,
+                    }),
+                )
+                .await?;
+                self.store_headless_handle(&name, handle);
             }
             return self.attach_nano_conversation(&name).await;
         }
@@ -90,7 +66,7 @@ impl HqContext {
     pub(in crate::hq) async fn attach_nano_conversation(&mut self, name: &str) -> Result<()> {
         anyhow::ensure!(
             name.starts_with("executor:nano:"),
-            "Expected a managed Nano Executor identity"
+            "Expected a Nano Executor identity"
         );
         let (run, events) = if let Some(handle) = self.headless.get(name) {
             (

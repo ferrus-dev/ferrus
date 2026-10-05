@@ -1,32 +1,40 @@
 # Nano conversation in Ferrus HQ
 
-Status: #86 adds a native interactive frontend for the managed Executor. It uses the same
-provider, engine, journal, workspace, tools, and lifecycle as headless Nano. Standalone delivery
+Status: #86 adds native HQ conversations for direct workspace sessions and managed Executors.
+Both use the same provider, engine, journal, workspace, and native tools. Standalone delivery
 and Supervisor, Reviewer, and Consultant profiles remain separate work.
 
 ## Open a conversation
 
 Configure Nano as the Executor as described in [Nano launch](ferrus-nano-launch.md), then open HQ.
 
-- `/executor` connects to the running Nano Executor. With multiple running Executors, HQ asks
-  which conversation to open. With no running Executor, it starts a ready managed task within
-  the normal parallelism and dispatch limits.
+- `/executor` opens a direct conversation in the canonical project workspace, without requiring
+  or claiming a queued task. It waits for your first message before calling the model. Repeating
+  the command reconnects to the same live direct session; managed Executors continue headlessly.
+- `/attach executor:nano:1` reconnects to the direct session, including its persisted history.
 - `/attach executor:nano:<task-id>` selects that task's active run, or displays its latest
   persisted Executor run when no process remains.
 - Type plain text to queue steering for the next model turn. Nano commits the input after the
   current inference and its complete tool-call/result group, before another inference starts.
   It never interrupts a patch or inserts an orphan tool result into provider history.
-- A final textual response waits for input in interactive mode. `submit`, failure, cancellation,
-  and configured session limits still end the managed attempt normally.
+- A final textual response waits for input. Failure, cancellation, and configured session limits
+  end the attempt; managed `submit` ends a task-bound attempt normally.
 - PageUp/PageDown scroll the bounded conversation history. Input editing, multiline paste,
   terminal resize, completion, and other HQ commands use the existing HQ implementation.
 - `/detach` returns to the dashboard without stopping the Executor or changing task state.
 - `/cancel` cancels the selected attempt, stops owned writers, and journals its terminal outcome.
-  HQ pauses automatic Executor dispatch for that task, including answered consultations and
-  human questions. Use `/executor` to resume ready work or `/resume` to resume all paused work.
+  For a managed conversation, HQ pauses automatic dispatch for that task, including answered
+  consultations and human questions. Use `/resume` to resume paused managed work.
   Answering the task's human question also permits its Executor to resume.
   Starting another HQ does not retain this frontend pause; task status, leases, dispatch counts,
   and recovery remain authoritative.
+
+Direct sessions expose native file, patch, command, instruction, repository graph, project memory,
+and configured external MCP tools. Their `check` runs configured workspace checks without changing
+task retry counters. They read canonical graph context and refresh it best-effort after mutations;
+they do not use a task overlay. They ask questions in ordinary responses and do not expose managed
+`submit`, `consult`, or `ask_human`. `/cancel` stops the direct session; the next `/executor` opens
+a fresh one. No task dispatch budget or lease is consumed.
 
 Attaching a live headless Nano enables interaction through its existing command pipe, at a safe
 engine boundary. The process is not replaced and no effects are replayed. Its final textual
@@ -66,14 +74,16 @@ Frames remain limited to 4096 bytes, including JSON encoding and the terminating
 Both the pipe writer and the engine input queue hold at most eight commands. Full or disconnected
 queues report an error; queued input is authoritative only once `UserInput` has been committed.
 Cancellation bypasses queued steering. Stdout remains structured protocol; stderr remains diagnostics.
-`ferrus nano run --interactive` is the managed launch mode used by HQ, not a standalone terminal UI.
+HQ uses `ferrus nano run --interactive --taskless` for direct conversations. Task-bound launches
+use `--interactive` alone. Both use the private HQ protocol, not a standalone terminal UI.
 
 ## Validation
 
 Offline tests cover inference-time steering, intact tool groups, input commit failure, journal
 reconnect and incomplete tails, bounded long output, blocked input pipes, stream coalescing,
 resize/scroll/prompt geometry, scoped question input, detach, cancellation/dispatch suppression,
-and a real managed process submitting through a mock OpenAI-compatible HTTP provider.
+and real processes submitting managed work or editing/checking a direct workspace through a mock
+OpenAI-compatible HTTP provider. Direct-session tests verify that pending tasks remain unclaimed.
 Interactive attempts are excluded from the headless comparative evaluation reporter, including
 runs activated by attaching HQ. Live LM Studio checks remain opt-in. Local validation does not
 replace Windows runtime CI.

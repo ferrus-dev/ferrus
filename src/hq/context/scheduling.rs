@@ -356,12 +356,17 @@ impl HqContext {
     }
 
     pub(super) async fn occupied_executor_slots(&self) -> Result<usize> {
-        let live_db_task_ids =
+        let mut live_db_task_ids =
             crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+        // Taskless interactive sessions use the legacy bookkeeping row, not a task slot.
+        live_db_task_ids.remove("current");
         Ok(occupied_executor_slots_from_handles(
             live_db_task_ids,
             self.headless.iter().filter_map(|(name, handle)| {
-                (name.starts_with(ROLE_EXECUTOR) && handle.is_alive()).then_some(name.as_str())
+                (name.starts_with(ROLE_EXECUTOR)
+                    && handle.is_alive()
+                    && !(handle.native_control.is_some() && handle.task_id.is_none()))
+                .then_some(name.as_str())
             }),
         ))
     }

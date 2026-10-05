@@ -349,6 +349,7 @@ pub struct HeadlessHandle {
         Option<tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>>,
     pub(super) native_control: Option<crate::nano::conversation::InputWriter>,
     pub(super) run_id: Option<String>,
+    pub(super) task_id: Option<String>,
 }
 
 impl HeadlessHandle {
@@ -453,7 +454,16 @@ pub(super) async fn spawn_native_interactive_executor_with_env(
         "Native interactive Executor is unavailable"
     );
     agent.validate_interactive_launch(ROLE_EXECUTOR, index)?;
-    let command = agent.spawn_with_index(AgentRunMode::Interactive { prompt: None }, index)?;
+    let mut command = agent.spawn_with_index(AgentRunMode::Interactive { prompt: None }, index)?;
+    if !env
+        .iter()
+        .any(|(key, value)| *key == ENV_TASK_ID && !value.is_empty())
+    {
+        command.arg("--taskless");
+        command
+            .env_remove(ENV_TASK_ID)
+            .env_remove(ENV_BASELINE_TREE);
+    }
     spawn_headless(HeadlessSpawn {
         agent_type: agent.name(),
         command,
@@ -832,6 +842,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         native_events,
         native_control,
         run_id: db_run_id,
+        task_id,
     })
 }
 

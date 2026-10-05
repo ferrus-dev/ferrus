@@ -1470,3 +1470,243 @@ fn run_interactive_task(interactive: bool) {
         .unwrap();
     assert_eq!(status, "reviewing");
 }
+
+#[test]
+fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks() {
+    let fixture = Fixture::new();
+    let mut config_text = fs::read_to_string(fixture.root.join("ferrus.toml")).unwrap();
+    config_text.push_str("\n[repository_graph]\nenabled = true\n");
+    fs::write(fixture.root.join("ferrus.toml"), config_text).unwrap();
+    success(ferrus(&fixture.root).args(["graph", "index"]));
+    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
+    db.execute("INSERT OR IGNORE INTO tasks(id,path,status) VALUES ('current','.ferrus/TASK.md','unknown')", []).unwrap();
+    db.execute("INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path) VALUES ('nano-direct-run','current','executor','executor:nano:1','running','2026-10-05T00:00:00Z','2026-10-05T00:00:00Z',?1)", [fixture.root.to_str().unwrap()]).unwrap();
+    drop(db);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (requests_tx, requests_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for turn in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "Missing taskless request");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!((1..=512 * 1024).contains(&length));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let names: Vec<_> = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            for forbidden in [
+                "submit",
+                "consult",
+                "ask_human",
+                "wait_for_task",
+                "approve",
+                "reject",
+                "enqueue_task",
+            ] {
+                assert!(!names.contains(&forbidden));
+            }
+            assert!(
+                request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("There is no managed task")
+            );
+            let data = if turn == 0 {
+                assert_eq!(
+                    request["messages"].as_array().unwrap().last().unwrap(),
+                    &json!({"role":"user", "content":"Create answer.txt with 42 and check it."})
+                );
+                let calls: Vec<_> = [
+                    ("repository_graph_status", json!({})),
+                    ("apply_patch", json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]})),
+                    ("check", json!({})),
+                ].into_iter().enumerate().map(|(index, (name,args))|
+                    json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect();
+                json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
+            } else {
+                let messages = request["messages"].as_array().unwrap();
+                let result = |id| {
+                    let message = messages
+                        .iter()
+                        .find(|message| message["tool_call_id"] == id)
+                        .unwrap();
+                    serde_json::from_str::<Value>(message["content"].as_str().unwrap()).unwrap()
+                };
+                let graph = result("call-0");
+                assert_eq!(graph["status"], "success", "{graph}");
+                assert!(
+                    graph["content"]["result"]["snapshot_id"].is_string(),
+                    "{graph}"
+                );
+                assert!(graph["content"]["result"]["task_view"].is_null(), "{graph}");
+                assert_eq!(result("call-1")["status"], "success");
+                assert_eq!(result("call-2")["content"]["passed"], true);
+                json!({"choices":[{"index":0,"delta":{"content":"Created and checked answer.txt."},"finish_reason":"stop"}]})
+            };
+            requests_tx.send(turn).unwrap();
+            let sse = format!("data: {data}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
+        }
+    });
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
+    );
+    let mut command = fixture.command(&config);
+    command
+        .current_dir(&fixture.root)
+        .args(["--interactive", "--taskless"])
+        .env_remove("FERRUS_TASK_ID")
+        .env_remove("FERRUS_BASELINE_TREE")
+        .env("FERRUS_RUN_ID", "nano-direct-run");
+    let mut child = Process::spawn(&mut command);
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            sender
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(30)).unwrap()["event"]["type"],
+        "ready"
+    );
+    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
+    let wait_for_input = |child: &mut Process| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|error| panic!("{error}; {}", child.failure_diagnostics()));
+            assert_ne!(event["event"]["type"], "ended", "{event}");
+            if event["event"]["phase"] == "input_requested" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        }
+    };
+    wait_for_input(&mut child);
+    assert!(
+        requests_rx.try_recv().is_err(),
+        "Opening /executor must not call the provider"
+    );
+    writeln!(
+        stdin,
+        "{}",
+        json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42 and check it."}}})
+    )
+    .unwrap();
+    wait_for_input(&mut child);
+    assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("answer.txt")).unwrap(),
+        "42\n"
+    );
+    assert!(!fixture.workspace.join("answer.txt").exists());
+    writeln!(stdin, "{}", json!({"version":1,"command":"cancel"})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{}", child.stderr());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    output.join().unwrap();
+    server.join().unwrap();
+    let journal = fs::read_to_string(
+        fixture
+            .data
+            .join("nano/sessions/nano-direct-run/events.jsonl"),
+    )
+    .unwrap();
+    let records: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(records[0]["event"]["identity"]["task_id"].is_null());
+    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
+    let task: (String, Option<String>, u32, u32) = db.query_row(
+        "SELECT status, claimed_by, check_retries, executor_dispatches FROM tasks WHERE id = 't-001'", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(task, ("pending".into(), None, 0, 0));
+}
+
+#[test]
+fn taskless_interactive_rejects_a_managed_run_binding_before_inference() {
+    let fixture = Fixture::new();
+    let config = fixture.root.join("nano.toml");
+    private_config(
+        &config,
+        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\n",
+    );
+    let mut command = fixture.command(&config);
+    command
+        .current_dir(&fixture.root)
+        .args(["--interactive", "--taskless"])
+        .env_remove("FERRUS_TASK_ID")
+        .env_remove("FERRUS_BASELINE_TREE");
+    let mut child = Process::spawn(&mut command);
+    let mut stdin = child.0.stdin.take().unwrap();
+    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(!status.success());
+            assert!(
+                child.stderr().contains("Interactive run binding mismatch"),
+                "{}",
+                child.stderr()
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!fixture.data.join("nano/sessions").exists());
+    let state: String = Connection::open(fixture.data.join("ferrus.db"))
+        .unwrap()
+        .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "pending");
+}
