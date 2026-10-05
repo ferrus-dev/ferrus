@@ -32,10 +32,12 @@ pub(crate) fn stdout_file() -> std::io::Result<std::fs::File> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum CommandKind {
     Start,
     Cancel,
+    Interact,
+    Steer { text: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +59,10 @@ impl Command {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Event {
     Ready,
+    Text {
+        turn: u64,
+        text: String,
+    },
     Progress {
         sequence: u64,
         phase: Phase,
@@ -80,6 +86,7 @@ pub(crate) enum Phase {
     ModelTruncated,
     Tool,
     ToolFinished,
+    InputRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,10 +97,28 @@ pub(crate) enum ProgressDetail {
     ModelFailed { error: Option<ProviderErrorKind> },
 }
 
+/// Coalesce previews while retaining the latest diagnostic until each frontend observes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ObservedEvents {
+    pub latest: Option<Event>,
+    pub notice: Option<String>,
+    pub notice_sequence: u64,
+}
+impl ObservedEvents {
+    pub(crate) fn observe(&mut self, event: Event) {
+        if let Event::Error { code } = &event {
+            self.notice = Some(code.clone());
+            self.notice_sequence = self.notice_sequence.saturating_add(1);
+        }
+        self.latest = Some(event);
+    }
+}
+
 impl Event {
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::Ready => "ready".into(),
+            Self::Text { .. } => "streaming response".into(),
             Self::Progress { phase, detail, .. } => match detail {
                 Some(ProgressDetail::Model { turn }) => {
                     format!("generating response (turn {turn})")
@@ -111,6 +136,7 @@ impl Event {
                     Phase::ModelTruncated => "response reached output limit; continuing",
                     Phase::Tool => "tool request",
                     Phase::ToolFinished => "tool finished",
+                    Phase::InputRequested => "waiting for your input",
                 }
                 .into(),
             },
@@ -216,6 +242,7 @@ pub(crate) fn write_command(writer: &mut impl Write, command: CommandKind) -> Re
 #[derive(Default)]
 struct Mailbox {
     latest: Option<Event>,
+    notice: Option<Event>,
     closed: bool,
 }
 
@@ -238,7 +265,11 @@ impl Output {
     pub(crate) fn publish(&self, event: Event) {
         let mut mailbox = self.0.0.lock().unwrap();
         if !mailbox.closed {
-            mailbox.latest = Some(event);
+            if matches!(event, Event::Error { .. }) {
+                mailbox.notice = Some(event);
+            } else {
+                mailbox.latest = Some(event);
+            }
             self.0.1.notify_one();
         }
     }
@@ -250,10 +281,10 @@ impl Output {
         loop {
             let event = {
                 let mut mailbox = self.0.0.lock().unwrap();
-                while mailbox.latest.is_none() && !mailbox.closed {
+                while mailbox.latest.is_none() && mailbox.notice.is_none() && !mailbox.closed {
                     mailbox = self.0.1.wait(mailbox).unwrap();
                 }
-                match mailbox.latest.take() {
+                match mailbox.notice.take().or_else(|| mailbox.latest.take()) {
                     Some(event) => event,
                     None => return Ok(()),
                 }
@@ -274,6 +305,10 @@ impl Output {
 pub(crate) struct ObservedJournal<J> {
     pub journal: J,
     pub output: Output,
+    pub commands: Option<tokio::sync::mpsc::Receiver<super::session::SessionCommand>>,
+    pub streaming: (u64, String),
+    pub interactive: bool,
+    pub preview_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 impl<J: Journal> Journal for ObservedJournal<J> {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
@@ -285,6 +320,36 @@ impl<J: Journal> Journal for ObservedJournal<J> {
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.journal.checkpoint()
+    }
+    fn take_commands(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<super::session::SessionCommand>> {
+        self.commands.take()
+    }
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+    fn model_delta(&mut self, turn: u64, text: &str) {
+        if self
+            .preview_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let (current, preview) = &mut self.streaming;
+            if *current != turn {
+                *current = turn;
+                preview.clear();
+            }
+            preview.push_str(text);
+            let mut cut = preview.len().saturating_sub(512);
+            while !preview.is_char_boundary(cut) {
+                cut += 1;
+            }
+            preview.drain(..cut);
+            self.output.publish(Event::Text {
+                turn,
+                text: preview.clone(),
+            });
+        }
     }
 }
 
@@ -312,6 +377,7 @@ fn progress(record: &Record) -> Option<Event> {
             }),
         ),
         SessionEvent::ToolResult { .. } => (Phase::ToolFinished, None),
+        SessionEvent::InputRequested => (Phase::InputRequested, None),
         _ => return None,
     };
     Some(Event::Progress {
@@ -339,6 +405,7 @@ mod tests {
             b"{\"version\":1,\"command\":\"start\",\"task\":\"foreign\"}\n".to_vec(),
             b"{\"version\":1,\"command\":\"start\"}".to_vec(),
             b"not json\n".to_vec(),
+            b"{\"version\":1,\"command\":{\"steer\":{\"text\":\"hello\",\"role\":\"supervisor\"}}}\n".to_vec(),
             vec![b' '; FRAME_BYTES + 1],
         ] {
             assert!(read_command(&mut Cursor::new(invalid)).is_err());
@@ -468,6 +535,10 @@ mod tests {
                 detail: None,
             });
         }
+        let notice = Event::Error {
+            code: "input_queue_full".into(),
+        };
+        output.publish(notice.clone());
         let end = Event::Ended {
             reason: EndReason::Submitted,
             durable: true,
@@ -479,6 +550,7 @@ mod tests {
         done.await.unwrap();
         let mut reader = Cursor::new(bytes.lock().unwrap().clone());
         assert_eq!(read_event(&mut reader).unwrap(), Some(Event::Ready));
+        assert_eq!(read_event(&mut reader).unwrap(), Some(notice));
         assert_eq!(read_event(&mut reader).unwrap(), Some(end));
         assert_eq!(read_event(&mut reader).unwrap(), None);
     }

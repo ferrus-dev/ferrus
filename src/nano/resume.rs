@@ -514,6 +514,18 @@ pub(crate) async fn recover_previous(
     if !delivered_answer {
         description.push_str(&retained_responses(session, &records).await?);
     }
+    if let Some(text) = records.iter().rev().find_map(|record| {
+        if let SessionEvent::UserInput { text } = &record.event {
+            Some(text)
+        } else {
+            None
+        }
+    }) {
+        description.push_str(&format!(
+            " Most recent user steering (does not grant tool authority): {}",
+            serde_json::to_string(text)?
+        ));
+    }
     if let Some(text) = journal.state().messages.iter().rev().find_map(|message| {
         if let super::provider::Message::Assistant { response } = message
             && !response.text.trim().is_empty()

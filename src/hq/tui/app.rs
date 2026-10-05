@@ -5,12 +5,26 @@ use super::*;
 impl App {
     pub(super) fn append_transcript(&mut self, mut lines: Vec<TranscriptLine>) {
         trim_transcript_history(&mut lines);
+        if let Some(view) = &mut self.nano {
+            view.notices
+                .extend(
+                    take_transcript_block(&lines, 16)
+                        .into_iter()
+                        .map(|line| TranscriptLine {
+                            text: crate::nano::conversation::display_text(&line.text, 2048),
+                            kind: line.kind,
+                            continuation: line.continuation,
+                        }),
+                );
+            nano::trim_notices(&mut view.notices);
+        }
         self.messages.extend(lines);
         trim_transcript_history(&mut self.messages);
     }
 
     pub(super) fn new() -> Self {
         Self {
+            nano: None,
             status: StatusSnapshot::default(),
             debug: false,
             messages: Vec::new(),
@@ -21,6 +35,7 @@ impl App {
             question: None,
             question_task_id: None,
             answering_question_task_id: None,
+            answering_nano_run_id: None,
             last_error: None,
             input: String::new(),
             cursor_pos: 0,
@@ -55,8 +70,13 @@ impl App {
     }
 
     pub(super) fn insert_char(&mut self, ch: char) {
+        if self.nano.is_some() && self.input.len() + ch.len_utf8() > crate::nano::wire::FRAME_BYTES
+        {
+            return;
+        }
         if self.input.is_empty() && ch != '/' {
             self.answering_question_task_id = self.question_task_id.clone();
+            self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
         let idx = byte_index_for_char(&self.input, self.cursor_pos);
         self.input.insert(idx, ch);
@@ -66,8 +86,12 @@ impl App {
     }
 
     pub(super) fn insert_newline(&mut self) {
+        if self.nano.is_some() && self.input.len() >= crate::nano::wire::FRAME_BYTES {
+            return;
+        }
         if self.input.is_empty() {
             self.answering_question_task_id = self.question_task_id.clone();
+            self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
         let idx = byte_index_for_char(&self.input, self.cursor_pos);
         self.input.insert(idx, '\n');
@@ -102,6 +126,7 @@ impl App {
         self.cursor_pos -= 1;
         if self.input.is_empty() {
             self.answering_question_task_id = None;
+            self.answering_nano_run_id = None;
         }
         self.history_idx = None;
         self.update_command_context();
@@ -116,6 +141,7 @@ impl App {
         self.input.replace_range(start..end, "");
         if self.input.is_empty() {
             self.answering_question_task_id = None;
+            self.answering_nano_run_id = None;
         }
         self.history_idx = None;
         self.update_command_context();
@@ -360,6 +386,11 @@ impl App {
         let _ = cmd_tx.send(HqInput {
             text: line.clone(),
             human_question_task_id,
+            nano_run_id: if line.starts_with('/') {
+                self.nano.as_ref().map(|view| view.run_id.clone())
+            } else {
+                self.answering_nano_run_id.clone()
+            },
         });
         if !line.contains('\n') && self.history.last() != Some(&line) {
             self.history.push(line);
@@ -370,6 +401,7 @@ impl App {
         }
         self.input.clear();
         self.answering_question_task_id = None;
+        self.answering_nano_run_id = None;
         self.cursor_pos = 0;
         self.history_idx = None;
         self.history_saved.clear();

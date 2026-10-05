@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport};
-use std::{path::PathBuf, process::Command as StdCommand, sync::Arc};
+use std::{path::PathBuf, process::Command as StdCommand, sync::Arc, time::Duration};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -66,6 +66,14 @@ struct FakeNative {
     reject: bool,
 }
 impl ExecutorAgent for FakeNative {
+    fn capabilities(&self) -> crate::agents::ExecutorCapabilities {
+        crate::agents::ExecutorCapabilities {
+            interactive: true,
+            headless: true,
+            native: true,
+            event_output: true,
+        }
+    }
     fn name(&self) -> &'static str {
         "nano"
     }
@@ -215,4 +223,141 @@ exit 0
         crate::project::list_tasks().await.unwrap()[0].status,
         "pending"
     );
+}
+
+#[tokio::test]
+async fn native_conversation_attach_steer_detach_and_cancel_preserve_run_ownership() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let script = f.root.join("interactive fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+[ "$start" = '{"version":1,"command":"start"}' ] || exit 10
+if [ -f second_attach.marker ]; then
+    IFS= read -r cancel
+    [ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+    exit 0
+fi
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 11
+IFS= read -r steer
+[ "$steer" = '{"version":1,"command":{"steer":{"text":"Keep the API stable"}}}' ] || exit 12
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 13
+echo attached > second_attach.marker
+IFS= read -r cancel
+[ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+exit 0
+"#;
+    #[cfg(windows)]
+    let source = r#"$ErrorActionPreference = 'Stop'
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"start"}') { exit 10 }
+if (Test-Path 'second_attach.marker') {
+    if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+    exit 0
+}
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 11 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":{"steer":{"text":"Keep the API stable"}}}') { exit 12 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 13 }
+Set-Content -Path 'second_attach.marker' -Value 'attached'
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+exit 0
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    let name = "executor:nano:t-001";
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.nano_paused_tasks.insert("t-001".into());
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Consultation,
+    )
+    .await
+    .unwrap();
+    store::write_consult_response_for_run_dir(".ferrus/runs/t-001", "Keep the API stable")
+        .await
+        .unwrap();
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert!(ctx.headless.is_empty());
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Executing,
+    )
+    .await
+    .unwrap();
+    crate::project::record_task_human_question_requested(
+        "t-001",
+        crate::project::TaskStatus::Executing,
+        name,
+    )
+    .await
+    .unwrap();
+    crate::project::record_task_human_answer("t-001")
+        .await
+        .unwrap();
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert!(ctx.headless.is_empty());
+    assert_eq!(f.dispatches(), 0);
+    ctx.nano_paused_tasks.clear();
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Pending,
+    )
+    .await
+    .unwrap();
+    ctx.spawn_headless_executor_for_task(name, "", 1, "t-001")
+        .await
+        .unwrap();
+    ctx.attach_nano_conversation(name).await.unwrap();
+    let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
+    assert!(
+        dispatch_with_human_question_target("Wrong run", None, Some("foreign"), false, &mut ctx)
+            .await
+            .is_err()
+    );
+    dispatch_with_human_question_target("Keep the API stable", None, Some(&run), false, &mut ctx)
+        .await
+        .unwrap();
+    dispatch("/detach", &mut ctx).await.unwrap();
+    assert!(ctx.nano_view.is_none());
+    assert!(ctx.headless[name].is_alive());
+    ctx.attach_nano_conversation(name).await.unwrap();
+    assert_eq!(ctx.nano_view.as_ref().unwrap().run_id, run);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !f.root.join("second_attach.marker").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatch("/cancel", &mut ctx).await.unwrap();
+    let mut exit = ctx.headless[name].exit_rx.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exit.borrow().is_none() {
+            exit.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*exit.borrow(), Some(0));
+    assert_eq!(f.dispatches(), 1);
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(f.dispatches(), 1);
+    ctx.resume().await.unwrap();
+    assert!(ctx.nano_paused_tasks.is_empty());
+    assert_eq!(f.dispatches(), 2);
+    ctx.shutdown_all_headless().await;
 }

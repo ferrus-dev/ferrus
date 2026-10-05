@@ -46,6 +46,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/check", "run the Ferrus check gate from HQ"),
     ("/supervisor", "open an interactive supervisor session"),
     ("/executor", "open an interactive executor session"),
+    ("/detach", "return from the Nano conversation to HQ"),
+    ("/cancel", "cancel the attached interactive Nano session"),
     (
         "/resume",
         "resume the executor headlessly or recover consultation",
@@ -56,7 +58,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/run", "plan a batch run from ready milestones"),
     ("/runs", "list SQLite run attempts"),
     ("/events", "list SQLite runtime events"),
-    ("/attach", "show log path for a running headless session"),
+    (
+        "/attach",
+        "open a Nano conversation or show an external session log path",
+    ),
     ("/stop", "stop all running sessions"),
     ("/reset", "reset state to Idle"),
     ("/init", "initialize ferrus in current directory"),
@@ -67,6 +72,13 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 pub enum UiMessage {
+    NanoOpen {
+        name: String,
+        run_id: String,
+        snapshots: watch::Receiver<Option<crate::nano::conversation::Snapshot>>,
+        events: Option<watch::Receiver<crate::nano::wire::ObservedEvents>>,
+    },
+    NanoClose,
     Info(String),
     Table(Vec<String>),
     Success(String),
@@ -97,6 +109,7 @@ pub enum UiMessage {
 pub(super) struct HqInput {
     pub text: String,
     pub human_question_task_id: Option<String>,
+    pub nano_run_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -194,6 +207,7 @@ enum TranscriptKind {
 }
 
 pub struct App {
+    nano: Option<NanoConversation>,
     status: StatusSnapshot,
     debug: bool,
     messages: Vec<TranscriptLine>,
@@ -204,6 +218,7 @@ pub struct App {
     question: Option<String>,
     question_task_id: Option<String>,
     answering_question_task_id: Option<String>,
+    answering_nano_run_id: Option<String>,
     last_error: Option<String>,
     input: String,
     cursor_pos: usize,
@@ -225,6 +240,8 @@ pub struct App {
 }
 
 mod app;
+mod nano;
+use nano::NanoConversation;
 
 struct StartupHeader {
     version: String,
@@ -317,6 +334,7 @@ pub async fn run_tui(
             }
             _ = tick.tick() => {
                 let refreshed_dashboard = refresh_dashboard_snapshot(&mut app, false).await;
+                let refreshed_conversation = app.nano.as_mut().is_some_and(NanoConversation::poll);
                 if app.ctrl_c_pending
                     && app
                         .ctrl_c_at
@@ -327,7 +345,7 @@ pub async fn run_tui(
                     if !app.suspended {
                         redraw_dashboard(&mut stdout, &app, &mut ui)?;
                     }
-                } else if refreshed_dashboard && !app.suspended {
+                } else if (refreshed_dashboard || refreshed_conversation) && !app.suspended {
                     redraw_dashboard(&mut stdout, &app, &mut ui)?;
                 }
             }
@@ -405,8 +423,11 @@ async fn refresh_dashboard_snapshot(app: &mut App, force: bool) -> bool {
     }
 
     let next_question = if let Ok(questions) = crate::project::list_human_questions().await
-        && let Some(question) = questions.first()
-    {
+        && let Some(question) = questions.iter().find(|question| {
+            app.nano
+                .as_ref()
+                .is_none_or(|view| view.snapshot.task_id == question.task_id)
+        }) {
         let prefix = if questions.len() > 1 {
             format!("[{} queued] {}: ", questions.len(), question.task_id)
         } else {
@@ -482,6 +503,18 @@ fn handle_event(
                         }
                     }
                     (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                        full_redraw = true;
+                    }
+                    (KeyCode::PageUp, _) if app.nano.is_some() => {
+                        app.nano
+                            .as_mut()
+                            .unwrap()
+                            .scroll_up(terminal_width() as usize);
+                        full_redraw = true;
+                    }
+                    (KeyCode::PageDown, _) if app.nano.is_some() => {
+                        app.nano.as_mut().unwrap().scroll =
+                            app.nano.as_ref().unwrap().scroll.saturating_sub(10);
                         full_redraw = true;
                     }
                     (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => {
@@ -606,6 +639,21 @@ fn handle_message(
     ui: &mut TerminalUi,
 ) -> Result<bool> {
     match msg {
+        UiMessage::NanoOpen {
+            name,
+            run_id,
+            snapshots,
+            events,
+        } => {
+            app.nano = Some(NanoConversation::new(name, run_id, snapshots, events));
+            app.runtime_snapshot_at = None;
+            redraw_dashboard(stdout, app, ui)?;
+        }
+        UiMessage::NanoClose => {
+            app.nano = None;
+            app.runtime_snapshot_at = None;
+            redraw_dashboard(stdout, app, ui)?;
+        }
         UiMessage::Info(text) => {
             let lines = split_transcript(&text, TranscriptKind::Info);
             app.append_transcript(lines);

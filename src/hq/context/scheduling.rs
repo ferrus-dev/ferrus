@@ -157,6 +157,9 @@ impl HqContext {
         let answered_tasks = answered_consultation_tasks(tasks).await?;
         let mut spawn_tasks = Vec::new();
         for task in answered_tasks {
+            if self.nano_paused_tasks.contains(&task.id) {
+                continue;
+            }
             let name = self.executor_agent_id_for_task(&task.id)?;
             if task_claim_blocks_spawn(&task, &name, now, &live_run_task_ids)
                 || self
@@ -218,6 +221,11 @@ impl HqContext {
         let mut spawned = 0usize;
 
         for waiter in waiters {
+            if waiter.awaiting_human_by.starts_with(ROLE_EXECUTOR)
+                && self.nano_paused_tasks.contains(&waiter.task_id)
+            {
+                continue;
+            }
             if answered_human_owner_is_live(
                 &waiter.awaiting_human_by,
                 &live_run_agents,
@@ -274,10 +282,10 @@ impl HqContext {
         let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
         let max_parallel = executor_parallel_limit(max_parallel).await?;
         let mut ready_tasks = Vec::new();
-        for task in tasks
-            .into_iter()
-            .filter(|task| is_executor_ready_task_status(&task.status))
-        {
+        for task in tasks.into_iter().filter(|task| {
+            is_executor_ready_task_status(&task.status)
+                && !self.nano_paused_tasks.contains(&task.id)
+        }) {
             let expected_agent_id = self.executor_agent_id_for_task(&task.id)?;
             if !task_claim_blocks_spawn(&task, &expected_agent_id, now, &live_run_task_ids) {
                 ready_tasks.push(task);

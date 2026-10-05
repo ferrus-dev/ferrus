@@ -345,9 +345,10 @@ pub struct HeadlessHandle {
     platform_guard: Option<platform::HeadlessProcessGuard>,
     wait_thread: Option<std::thread::JoinHandle<()>>,
     output_threads: Vec<std::thread::JoinHandle<()>>,
-    native_stdin: Option<std::process::ChildStdin>,
     pub(super) native_events:
-        Option<tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>>,
+        Option<tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>>,
+    pub(super) native_control: Option<crate::nano::conversation::InputWriter>,
+    pub(super) run_id: Option<String>,
 }
 
 impl HeadlessHandle {
@@ -368,15 +369,10 @@ impl HeadlessHandle {
     }
 
     fn blocking_shutdown(&mut self, terminate: bool) {
-        if terminate
-            && self.is_alive()
-            && let Some(mut stdin) = self.native_stdin.take()
-        {
-            let _ = crate::nano::wire::write_command(
-                &mut stdin,
-                crate::nano::wire::CommandKind::Cancel,
-            );
-            // Give Nano time to stop owned effects and journal the outcome.
+        if terminate && let Some(control) = &self.native_control {
+            control.cancel();
+        }
+        if terminate && self.native_control.is_some() && self.is_alive() {
             for _ in 0..20 {
                 if !self.is_alive() {
                     break;
@@ -437,6 +433,34 @@ pub async fn spawn_headless_executor_with_env(
         role: ROLE_EXECUTOR,
         name,
         prompt,
+        debug,
+        env,
+        workspace,
+    })
+    .await
+}
+
+pub(super) async fn spawn_native_interactive_executor_with_env(
+    agent: &dyn ExecutorAgent,
+    name: &str,
+    index: u32,
+    debug: bool,
+    env: Vec<(&'static str, String)>,
+    workspace: Option<HeadlessWorkspace>,
+) -> Result<HeadlessHandle> {
+    anyhow::ensure!(
+        agent.capabilities().native && agent.capabilities().interactive,
+        "Native interactive Executor is unavailable"
+    );
+    agent.validate_interactive_launch(ROLE_EXECUTOR, index)?;
+    let command = agent.spawn_with_index(AgentRunMode::Interactive { prompt: None }, index)?;
+    spawn_headless(HeadlessSpawn {
+        agent_type: agent.name(),
+        command,
+        prompt_transport: HeadlessPromptTransport::Jsonl,
+        role: ROLE_EXECUTOR,
+        name,
+        prompt: "",
         debug,
         env,
         workspace,
@@ -796,6 +820,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         }
     });
 
+    let native_control = native_stdin.map(crate::nano::conversation::InputWriter::new);
     Ok(HeadlessHandle {
         name: request.name.to_string(),
         log_path,
@@ -804,8 +829,9 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         platform_guard,
         wait_thread: Some(wait_thread),
         output_threads,
-        native_stdin,
         native_events,
+        native_control,
+        run_id: db_run_id,
     })
 }
 
@@ -839,11 +865,11 @@ fn spawn_native_log_reader(
 ) -> (
     std::thread::JoinHandle<()>,
     tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>,
+    tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>,
 ) {
     use crate::nano::wire::{self, Event};
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    let (events_tx, events) = tokio::sync::watch::channel(None);
+    let (events_tx, events) = tokio::sync::watch::channel(wire::ObservedEvents::default());
     let thread = std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut ready_tx = Some(ready_tx);
@@ -853,11 +879,13 @@ fn spawn_native_log_reader(
                     let _ = ready_tx.take().unwrap().send(());
                 }
                 Ok(Some(event)) if ready_tx.is_none() && !matches!(event, Event::Ready) => {
-                    let _ = logger.lock().unwrap().log_event("Nano", event.summary());
+                    if !matches!(event, Event::Text { .. }) {
+                        let _ = logger.lock().unwrap().log_event("Nano", event.summary());
+                    }
                     // Fast tool results and the following model turn must not overwrite
                     // the useful activity before HQ's slower scheduler tick consumes it.
-                    if event.show_in_hq() {
-                        events_tx.send_replace(Some(event));
+                    if event.show_in_hq() || matches!(event, Event::Text { .. }) {
+                        events_tx.send_modify(|state| state.observe(event));
                     }
                 }
                 Ok(None) => break,

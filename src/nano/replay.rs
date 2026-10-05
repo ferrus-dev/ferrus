@@ -34,6 +34,8 @@ pub(crate) struct Replay {
     compaction_active: bool,
     compaction_cut: Option<usize>,
     final_response_ready: bool,
+    latest_steering: Option<usize>,
+    interactive: bool,
     submitted: bool,
     calls: VecDeque<ToolCall>,
 }
@@ -224,6 +226,31 @@ impl Replay {
                 self.model_active = true;
                 self.final_response_ready = false;
             }
+            SessionEvent::UserInput { text } => {
+                ensure!(
+                    self.checkpoint_ready()
+                        && self.interactive
+                        && !text.trim().is_empty()
+                        && text.len() <= super::wire::FRAME_BYTES,
+                    "Invalid steering boundary"
+                );
+                self.latest_steering = Some(self.messages.len());
+                self.messages.push(Message::User { text: text.clone() });
+                self.final_response_ready = false;
+            }
+            SessionEvent::InteractionOpened => {
+                ensure!(
+                    self.checkpoint_ready() && !self.interactive,
+                    "Invalid interaction activation"
+                );
+                self.interactive = true;
+            }
+            SessionEvent::InputRequested => {
+                ensure!(
+                    self.checkpoint_ready() && self.final_response_ready && self.interactive,
+                    "Input requested before an interactive final response"
+                );
+            }
             SessionEvent::CompactionStarted {
                 turn,
                 retained_from,
@@ -236,7 +263,10 @@ impl Replay {
                     *turn == before.model_turns + 1
                         && after.model_turns == *turn
                         && super::compaction::boundaries(&self.messages)?.contains(retained_from)
-                        && *retained_from > super::compaction::prefix_len(&self.messages)?,
+                        && *retained_from > super::compaction::prefix_len(&self.messages)?
+                        && self
+                            .latest_steering
+                            .is_none_or(|index| *retained_from <= index),
                     "Invalid compaction boundary"
                 );
                 self.model_active = true;
@@ -372,8 +402,8 @@ impl Replay {
                         "Model finish inside an unfinished group"
                     );
                     ensure!(
-                        self.final_response_ready,
-                        "Model finish requires a completed final response"
+                        self.final_response_ready && !self.interactive,
+                        "Model finish requires a completed headless final response"
                     );
                 }
                 self.end = Some(reason.clone());

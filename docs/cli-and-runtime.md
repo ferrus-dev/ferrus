@@ -97,7 +97,7 @@ Agent support is normalized through `src/agents/`: shared Supervisor and Executo
 the concrete CLI, while the Claude Code, Codex, Qwen Code, opencode, and goose adapters own launch flags, model
 overrides, headless prompt transport, and local permission or configuration conventions.
 
-The native Nano adapter stays under `src/nano/` and supports headless Executors only.
+The native Nano adapter stays under `src/nano/` and supports headless and native interactive HQ Executors.
 Build with `nano-openai` and select it with
 `ferrus register --executor nano --executor-model YOUR_LOADED_MODEL_ID`. Registration creates
 private local LM Studio settings if none exist; set an absolute private `FERRUS_NANO_CONFIG`

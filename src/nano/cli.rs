@@ -11,8 +11,11 @@ pub(crate) enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Run a managed Executor; HQ sends start/cancel commands over open stdin
+    /// Run a managed Executor; HQ sends versioned commands over open stdin
     Run {
+        /// Keep the managed conversation open for queued user steering
+        #[arg(long)]
+        interactive: bool,
         /// Absolute owner-only provider settings file (or FERRUS_NANO_CONFIG)
         #[arg(long)]
         config: Option<PathBuf>,
@@ -43,27 +46,36 @@ pub(crate) enum Command {
 }
 
 pub(crate) async fn run(command: Command) -> Result<()> {
-    let (config, model, no_working_set, no_native_context, prefetch_path, prefetch_symbol) =
-        match command {
-            Command::Eval { manifest } => return super::eval::report(&manifest),
-            Command::Run {
-                config,
-                model,
-                no_working_set,
-                no_native_context,
-                prefetch_path,
-                prefetch_symbol,
-            } => (
-                config,
-                model,
-                no_working_set,
-                no_native_context,
-                prefetch_path,
-                prefetch_symbol,
-            ),
-            #[cfg(feature = "nano-mcp")]
-            Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
-        };
+    let (
+        config,
+        model,
+        no_working_set,
+        no_native_context,
+        prefetch_path,
+        prefetch_symbol,
+        interactive,
+    ) = match command {
+        Command::Eval { manifest } => return super::eval::report(&manifest),
+        Command::Run {
+            interactive,
+            config,
+            model,
+            no_working_set,
+            no_native_context,
+            prefetch_path,
+            prefetch_symbol,
+        } => (
+            config,
+            model,
+            no_working_set,
+            no_native_context,
+            prefetch_path,
+            prefetch_symbol,
+            interactive,
+        ),
+        #[cfg(feature = "nano-mcp")]
+        Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
+    };
     let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
     anyhow::ensure!(
         !no_native_context || seeds.is_empty(),
@@ -77,11 +89,12 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         !no_working_set,
         !no_native_context,
         seeds,
+        interactive,
     )
     .await;
     #[cfg(not(feature = "nano-openai"))]
     {
-        let _ = (no_working_set, no_native_context, seeds);
+        let _ = (no_working_set, no_native_context, seeds, interactive);
         unreachable!("feature validated above");
     }
 }
@@ -93,6 +106,7 @@ async fn launch(
     working_set: bool,
     native_context: bool,
     seeds: Vec<serde_json::Value>,
+    interactive: bool,
 ) -> Result<()> {
     use super::{
         coding::CodingTools,
@@ -131,6 +145,11 @@ async fn launch(
     let stop = Cancellation::default();
     let error = Arc::new(Mutex::new(None::<String>));
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let preview_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(interactive));
+    let input_preview = preview_enabled.clone();
+    let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(8);
+    let (output, drained) = Output::spawn(wire::stdout_file()?);
+    let input_output = output.clone();
     let input_stop = stop.clone();
     let input_error = error.clone();
     std::thread::spawn(move || {
@@ -147,15 +166,39 @@ async fn launch(
             }
         }
         let _ = start_tx.send(Ok(()));
-        if !matches!(
-            wire::read_command(&mut input),
-            Ok(Some(CommandKind::Cancel)) | Ok(None)
-        ) {
-            *input_error.lock().unwrap() = Some("invalid_command".into());
+        loop {
+            match wire::read_command(&mut input) {
+                Ok(Some(CommandKind::Cancel)) | Ok(None) => break,
+                Ok(Some(CommandKind::Interact)) => {
+                    input_preview.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if commands_tx
+                        .try_send(super::session::SessionCommand::Interact)
+                        .is_err()
+                    {
+                        input_output.publish(Event::Error {
+                            code: "input_queue_full".into(),
+                        });
+                    }
+                }
+                Ok(Some(CommandKind::Steer { text })) if !text.trim().is_empty() => {
+                    input_preview.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if commands_tx
+                        .try_send(super::session::SessionCommand::Steer { text })
+                        .is_err()
+                    {
+                        input_output.publish(Event::Error {
+                            code: "input_queue_full".into(),
+                        });
+                    }
+                }
+                _ => {
+                    *input_error.lock().unwrap() = Some("invalid_command".into());
+                    break;
+                }
+            }
         }
         input_stop.cancel();
     });
-    let (output, drained) = Output::spawn(wire::stdout_file()?);
     output.publish(Event::Ready);
     let mut terminal_published = false;
     let result = async {
@@ -194,6 +237,10 @@ async fn launch(
         let journal = ObservedJournal {
             journal,
             output: output.clone(),
+            commands: Some(commands_rx),
+            streaming: (0, String::new()),
+            interactive,
+            preview_enabled,
         };
         let end = super::managed::run(
             session,

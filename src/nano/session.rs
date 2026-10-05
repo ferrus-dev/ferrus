@@ -21,6 +21,8 @@ pub(crate) struct SessionIdentity {
 pub(crate) enum SessionCommand {
     Start { input: String },
     Cancel,
+    Interact,
+    Steer { text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +268,11 @@ pub(crate) enum SessionEvent {
     ModelStarted {
         turn: u64,
     },
+    UserInput {
+        text: String,
+    },
+    InputRequested,
+    InteractionOpened,
     CompactionStarted {
         turn: u64,
         retained_from: usize,

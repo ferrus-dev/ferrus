@@ -177,17 +177,13 @@ impl ExecutorAgent for Executor {
     }
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
-            interactive: false,
+            interactive: cfg!(feature = "nano-openai"),
             headless: true,
             native: true,
             event_output: true,
         }
     }
     fn spawn_with_index(&self, mode: AgentRunMode<'_>, _: u32) -> Result<Command> {
-        ensure!(
-            matches!(mode, AgentRunMode::Headless { .. }),
-            "Nano supports headless Executor sessions only"
-        );
         // The native host selects work or stored-response delivery from the bound
         // SQLite task; external-agent relaunch prompts are not model input here.
         validate_config(None, self.model())?;
@@ -195,6 +191,9 @@ impl ExecutorAgent for Executor {
         command
             .args(["nano", "run", "--config"])
             .arg(config_path(None)?);
+        if matches!(mode, AgentRunMode::Interactive { .. }) {
+            command.arg("--interactive");
+        }
         if let Some(model) = self.model() {
             command.arg("--model").arg(model);
         }
@@ -208,8 +207,9 @@ impl ExecutorAgent for Executor {
     fn mcp_config_entry(&self, _: &str, _: u32) -> Result<McpConfigEntry> {
         bail!("Nano uses native Ferrus operations and has no loopback MCP entry")
     }
-    fn validate_interactive_launch(&self, _: &str, _: u32) -> Result<()> {
-        bail!("Nano supports headless Executor sessions only")
+    fn validate_interactive_launch(&self, role: &str, _: u32) -> Result<()> {
+        ensure!(role == "executor", "Nano supports the Executor role only");
+        validate_config(None, self.model())
     }
     fn validate_headless_launch(&self, role: &str, _: u32) -> Result<()> {
         ensure!(role == "executor", "Nano supports the Executor role only");
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(
             agent.capabilities(),
             ExecutorCapabilities {
-                interactive: false,
+                interactive: cfg!(feature = "nano-openai"),
                 headless: true,
                 native: true,
                 event_output: true
@@ -308,11 +308,8 @@ mod tests {
             agent.headless_prompt_transport(),
             HeadlessPromptTransport::Jsonl
         );
-        assert!(
-            agent
-                .spawn(AgentRunMode::Interactive { prompt: None })
-                .is_err()
-        );
+        assert!(agent.validate_interactive_launch("supervisor", 1).is_err());
+        assert!(agent.validate_interactive_launch("reviewer", 1).is_err());
         assert!(crate::agents::parse_supervisor_agent("nano", None).is_err());
         assert!(agent.mcp_config_entry("executor", 1).is_err());
         let version = agent.version_command().unwrap();

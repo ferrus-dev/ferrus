@@ -27,6 +27,9 @@ pub(crate) struct Engine<P, T, H, J> {
     budget: Budget,
     messages: Vec<Message>,
     system_prompt: Option<String>,
+    interactive: bool,
+    latest_steering: Option<usize>,
+    commands: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
     summary: Option<Summary>,
     last_request: Vec<Message>,
     previous_call: Option<(String, serde_json::Value)>,
@@ -49,7 +52,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         provider: P,
         tools: T,
         host: H,
-        journal: J,
+        mut journal: J,
     ) -> Result<Self> {
         limits.validate()?;
         ensure!(
@@ -59,6 +62,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             "Invalid session identity"
         );
 
+        let interactive = journal.interactive();
+        let commands = journal.take_commands();
         Ok(Self {
             identity,
             limits,
@@ -69,6 +74,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             budget: Budget::default(),
             messages: Vec::new(),
             system_prompt: None,
+            commands,
+            interactive,
+            latest_steering: None,
             summary: None,
             last_request: Vec::new(),
             previous_call: None,
@@ -103,7 +111,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         Ok(())
     }
 
-    /// One attempt per engine. Live resume and interactive steering are separate adapters.
+    /// One managed attempt per engine; frontends submit steering at safe turn boundaries.
     pub(crate) async fn run(
         &mut self,
         command: SessionCommand,
@@ -122,6 +130,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             SessionCommand::Cancel => {
                 cancellation.cancel();
                 String::new()
+            }
+            SessionCommand::Steer { .. } | SessionCommand::Interact => {
+                anyhow::bail!("Expected session start")
             }
         };
 
@@ -162,6 +173,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         }
         self.messages.push(Message::User { text: input });
 
+        if self.interactive && !self.commit(SessionEvent::InteractionOpened) {
+            return Ok(self.journal_failure());
+        }
         let mut reason = self.drive(cancellation, deadline).await;
 
         self.provider.cancel();
@@ -193,9 +207,55 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         })
     }
 
+    fn accept_input(&mut self, command: SessionCommand) -> Result<bool, EndReason> {
+        if matches!(
+            command,
+            SessionCommand::Cancel | SessionCommand::Start { .. }
+        ) {
+            return Err(EndReason::Cancelled);
+        }
+        if !self.interactive {
+            if !self.commit(SessionEvent::InteractionOpened) {
+                return Err(EndReason::JournalFailed);
+            }
+            self.interactive = true;
+        }
+        let SessionCommand::Steer { text } = command else {
+            return Ok(false);
+        };
+        if text.trim().is_empty() || text.len() > super::wire::FRAME_BYTES {
+            return Err(EndReason::ProviderProtocol);
+        }
+        if !self.commit(SessionEvent::UserInput { text: text.clone() }) {
+            return Err(EndReason::JournalFailed);
+        }
+        self.latest_steering = Some(self.messages.len());
+        self.messages.push(Message::User { text });
+        self.journal
+            .checkpoint()
+            .map_err(|_| EndReason::JournalFailed)?;
+        Ok(true)
+    }
+
+    fn drain_input(&mut self) -> Result<bool, EndReason> {
+        let mut accepted = false;
+        for _ in 0..8 {
+            let command = self
+                .commands
+                .as_mut()
+                .and_then(|commands| commands.try_recv().ok());
+            let Some(command) = command else { break };
+            accepted |= self.accept_input(command)?;
+        }
+        Ok(accepted)
+    }
+
     async fn drive(&mut self, cancellation: &Cancellation, deadline: Instant) -> EndReason {
-        loop {
+        'drive: loop {
             if let Some(reason) = self.stop(cancellation, deadline) {
+                return reason;
+            }
+            if let Err(reason) = self.drain_input() {
                 return reason;
             }
             if self.budget.model_turns >= self.limits.model_turns {
@@ -453,8 +513,17 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                             return EndReason::ProviderProtocol;
                         }
                         Ok(Ok(Some(
-                            ProviderEvent::TextDelta(delta) | ProviderEvent::ArgumentsDelta(delta),
+                            event
+                            @ (ProviderEvent::TextDelta(_) | ProviderEvent::ArgumentsDelta(_)),
                         ))) => {
+                            let delta = match &event {
+                                ProviderEvent::TextDelta(text) => {
+                                    self.journal.model_delta(self.budget.model_turns, text);
+                                    text
+                                }
+                                ProviderEvent::ArgumentsDelta(text) => text,
+                                _ => unreachable!(),
+                            };
                             stream_bytes = stream_bytes.saturating_add(delta.len().max(1));
                             if stream_bytes > self.limits.response_bytes {
                                 if !self.record_model_failure(false) {
@@ -569,6 +638,30 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if response.is_final() {
                 if self.journal.checkpoint().is_err() {
                     return EndReason::JournalFailed;
+                }
+                match self.drain_input() {
+                    Ok(true) => continue,
+                    Ok(false) => (),
+                    Err(reason) => return reason,
+                }
+                if self.interactive {
+                    if !self.commit(SessionEvent::InputRequested) {
+                        return EndReason::JournalFailed;
+                    }
+                    loop {
+                        let Some(commands) = self.commands.as_mut() else {
+                            return EndReason::Cancelled;
+                        };
+                        match interrupt(commands.recv(), cancellation, deadline).await {
+                            Ok(Some(command)) => match self.accept_input(command) {
+                                Ok(true) => continue 'drive,
+                                Ok(false) => (),
+                                Err(reason) => return reason,
+                            },
+                            Ok(None) => return EndReason::Cancelled,
+                            Err(reason) => return reason,
+                        }
+                    }
                 }
                 return EndReason::ModelFinished;
             }
@@ -805,10 +898,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         let summary_cap = summary_cap.min(self.limits.response_bytes);
         let mut selected = None;
         // Keep the latest completed group as direct context, even at the limit.
-        for &cut in boundaries
-            .iter()
-            .filter(|&&cut| cut > existing && cut < self.messages.len())
-        {
+        for &cut in boundaries.iter().filter(|&&cut| {
+            cut > existing
+                && cut < self.messages.len()
+                && self.latest_steering.is_none_or(|index| cut <= index)
+        }) {
             let mut handles: Vec<_> = compaction::handles(&self.messages)
                 .into_iter()
                 .filter(|handle| handle.message < cut)

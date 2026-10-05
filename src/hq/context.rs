@@ -20,6 +20,8 @@ impl HqContext {
             state_rx,
             display,
             announced_completed_tasks: HashSet::new(),
+            nano_view: None,
+            nano_paused_tasks: HashSet::new(),
         }
     }
 
@@ -333,6 +335,18 @@ impl HqContext {
         index: u32,
         task_id: &str,
     ) -> Result<()> {
+        self.spawn_executor_for_task_mode(name, prompt, index, task_id, false)
+            .await
+    }
+
+    pub(super) async fn spawn_executor_for_task_mode(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        index: u32,
+        task_id: &str,
+        interactive: bool,
+    ) -> Result<()> {
         if !self.prepare_headless_slot(name).await {
             return Ok(());
         }
@@ -375,19 +389,32 @@ impl HqContext {
         if let Some(baseline_tree) = workspace.baseline_tree.as_deref() {
             env.push((ENV_BASELINE_TREE, baseline_tree.to_string()));
         }
-        let handle = agent_manager::spawn_headless_executor_with_env(
-            agent.as_ref(),
-            name,
-            prompt,
-            index,
-            self.debug,
-            env,
-            Some(agent_manager::HeadlessWorkspace {
-                workspace_dir: workspace.workspace_dir.clone(),
-                project_root: workspace.project_root.clone(),
-            }),
-        )
-        .await?;
+        let workspace = Some(agent_manager::HeadlessWorkspace {
+            workspace_dir: workspace.workspace_dir.clone(),
+            project_root: workspace.project_root.clone(),
+        });
+        let handle = if interactive {
+            agent_manager::spawn_native_interactive_executor_with_env(
+                agent.as_ref(),
+                name,
+                index,
+                self.debug,
+                env,
+                workspace,
+            )
+            .await?
+        } else {
+            agent_manager::spawn_headless_executor_with_env(
+                agent.as_ref(),
+                name,
+                prompt,
+                index,
+                self.debug,
+                env,
+                workspace,
+            )
+            .await?
+        };
         self.store_headless_handle(name, handle);
 
         // The session is now running: account for this dispatch against the
@@ -410,6 +437,7 @@ impl HqContext {
             self.ensure_hq_config().await?;
             let config = Config::load().await?;
             let max_parallel = config.limits.max_parallel_tasks.max(1);
+            self.nano_paused_tasks.clear();
             let human_answer = self
                 .schedule_answered_human_tasks(&answered_human_waiters, max_parallel)
                 .await?;

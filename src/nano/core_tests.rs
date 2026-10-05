@@ -101,6 +101,7 @@ struct FakeHost {
     records: Vec<Record>,
     deny: bool,
     cancel_on_intent: Option<Cancellation>,
+    cancel_on_input: Option<Cancellation>,
 }
 
 impl Host for FakeHost {
@@ -117,6 +118,11 @@ impl Host for FakeHost {
             if let Some(cancel) = &self.cancel_on_intent {
                 cancel.cancel();
             }
+        }
+        if matches!(record.event, SessionEvent::InputRequested)
+            && let Some(cancel) = &self.cancel_on_input
+        {
+            cancel.cancel();
         }
         self.records.push(record.clone());
     }
@@ -1794,4 +1800,262 @@ async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
             .messages
             .iter()
             .any(|message| matches!(message, Message::Assistant { .. }))));
+}
+
+struct InteractiveJournal {
+    inner: FileJournal,
+    commands: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
+    sender: tokio::sync::mpsc::Sender<SessionCommand>,
+    interactive: bool,
+    waits: usize,
+    fail_input: bool,
+    inject_steering: bool,
+}
+impl Journal for InteractiveJournal {
+    fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
+        anyhow::ensure!(
+            !(self.fail_input && matches!(event, SessionEvent::UserInput { .. })),
+            "Injected input failure"
+        );
+        let record = self.inner.append(event, budget)?;
+        match &record.event {
+            // Simulate typing while inference is active, before its two tool effects.
+            SessionEvent::ModelStarted { turn: 1 } if self.inject_steering => {
+                self.sender.try_send(SessionCommand::Interact).unwrap();
+                self.sender
+                    .try_send(SessionCommand::Steer {
+                        text: "Keep the public API stable.".into(),
+                    })
+                    .unwrap();
+            }
+            SessionEvent::InputRequested => {
+                self.waits += 1;
+                let command = if self.waits == 1 {
+                    SessionCommand::Steer {
+                        text: "Explain the completed checks.".into(),
+                    }
+                } else {
+                    SessionCommand::Cancel
+                };
+                self.sender.try_send(command).unwrap();
+            }
+            _ => (),
+        }
+        Ok(record)
+    }
+    fn checkpoint(&mut self) -> Result<()> {
+        self.inner.checkpoint()
+    }
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+    fn take_commands(&mut self) -> Option<tokio::sync::mpsc::Receiver<SessionCommand>> {
+        self.commands.take()
+    }
+}
+
+#[tokio::test]
+async fn interactive_steering_waits_for_complete_tool_groups_and_replays() {
+    let (dir, base) = setup(
+        scripted(vec![
+            response("Editing", vec![call("a", 1), call("b", 2)]),
+            response("Checks completed.", vec![]),
+            response("Both checks passed.", vec![]),
+        ]),
+        limits(),
+    );
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: false,
+        waits: 0,
+        fail_input: false,
+        inject_steering: true,
+    };
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        base.provider,
+        base.tools,
+        base.host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Implement the task".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Cancelled);
+    assert!(end.durable);
+    assert_eq!(engine.provider.requests.len(), 3);
+    let messages = &engine.provider.requests[1].messages;
+    assert!(
+        matches!(messages.last(), Some(Message::User { text }) if text == "Keep the public API stable.")
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        matches!(engine.provider.requests[2].messages.last(), Some(Message::User { text }) if text == "Explain the completed checks.")
+    );
+    let records = &engine.host.records;
+    let first_input = records
+        .iter()
+        .position(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+        .unwrap();
+    assert_eq!(
+        records[..first_input]
+            .iter()
+            .filter(|r| matches!(r.event, SessionEvent::ToolResult { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(r.event, SessionEvent::InteractionOpened))
+            .count(),
+        1
+    );
+    let replay = Replay::from_records(records).unwrap();
+    assert_eq!(
+        replay.messages.len(),
+        engine.provider.requests[2].messages.len() + 1
+    );
+    assert!(
+        matches!(replay.messages.last(), Some(Message::Assistant { response }) if response.text == "Both checks passed.")
+    );
+    // A fresh frontend can read the same durable conversation without touching its writer.
+    let path = dir.path().join("nano/sessions/session-1/events.jsonl");
+    let snapshot = super::conversation::Reader::new(path, "session-1".into())
+        .poll()
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.ended);
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|text| text.contains("Explain the completed checks."))
+    );
+    let second_turn = records
+        .iter()
+        .position(|record| matches!(record.event, SessionEvent::ModelStarted { turn: 2 }))
+        .unwrap();
+    let cut = Replay::from_records(&records[..second_turn])
+        .unwrap()
+        .messages
+        .len();
+    let mut summarized_steering = records.clone();
+    summarized_steering[second_turn].event = SessionEvent::CompactionStarted {
+        turn: 2,
+        retained_from: cut,
+    };
+    assert!(Replay::from_records(&summarized_steering).is_err());
+    // Owner-written input inside a pending tool group fails closed.
+    let mut malformed = records.clone();
+    let at = malformed
+        .iter()
+        .position(|r| matches!(r.event, SessionEvent::ToolStarted { .. }))
+        .unwrap();
+    malformed[at].event = SessionEvent::UserInput {
+        text: "interrupt this tool".into(),
+    };
+    assert!(Replay::from_records(&malformed).is_err());
+}
+
+#[tokio::test]
+async fn interactive_input_is_not_used_if_its_journal_commit_fails() {
+    let (_dir, base) = setup(
+        scripted(vec![response("Editing", vec![call("a", 1)])]),
+        limits(),
+    );
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: true,
+        waits: 0,
+        fail_input: true,
+        inject_steering: true,
+    };
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        base.provider,
+        base.tools,
+        base.host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Implement".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::JournalFailed);
+    assert_eq!(engine.provider.requests.len(), 1);
+    assert_eq!(engine.tools.effects.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn interactive_input_wait_is_cancellable_without_an_extra_inference() {
+    let (_dir, base) = setup(
+        scripted(vec![response("Ready for direction.", vec![])]),
+        limits(),
+    );
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: true,
+        waits: 0,
+        fail_input: false,
+        inject_steering: false,
+    };
+    let cancel = Cancellation::default();
+    let host = FakeHost {
+        cancel_on_input: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let mut engine = Engine::new(
+        identity(),
+        limits(),
+        base.provider,
+        base.tools,
+        host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Implement".into(),
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Cancelled);
+    assert!(end.durable);
+    assert_eq!(engine.provider.requests.len(), 1);
+    let replay = Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.end, Some(EndReason::Cancelled));
 }

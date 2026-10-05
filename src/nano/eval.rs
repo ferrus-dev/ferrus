@@ -519,6 +519,15 @@ fn nano_metrics(attempt: &Attempt) -> Result<(Metrics, Option<EndReason>)> {
         .map(serde_json::from_slice)
         .collect::<serde_json::Result<_>>()?;
     let replay = Replay::from_records(&records)?;
+    ensure!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            SessionEvent::InteractionOpened
+                | SessionEvent::UserInput { .. }
+                | SessionEvent::InputRequested
+        )),
+        "Headless evaluation cannot include an interactive Nano attempt"
+    );
     ensure!(replay.session_id == attempt.run_id, "Journal/run mismatch");
     ensure!(
         matches!(records.first().map(|record| &record.event),
@@ -1680,13 +1689,31 @@ mod tests {
         drop(file);
         let report = build(Manifest {
             version: 1,
-            attempts: vec![baseline_attempt],
+            attempts: vec![baseline_attempt.clone()],
         })?;
         let metrics = &report.attempts[0].metrics;
         assert_eq!(metrics.model_turns, Some(0));
         assert_eq!(metrics.tool_calls, Some(0));
         assert_eq!(metrics.input_tokens_reported, Some(0));
         assert_eq!(metrics.output_tokens_estimated, Some(0));
+        let activation = Record {
+            event: SessionEvent::InteractionOpened,
+            sequence: 2,
+            ..records[0].clone()
+        };
+        records[1].sequence = 3;
+        write_records(
+            baseline_attempt.journal.as_ref().unwrap(),
+            &[records[0].clone(), activation, records[1].clone()],
+        )?;
+        let error = nano_metrics(&baseline_attempt)
+            .err()
+            .expect("interactive attempt must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("Headless evaluation cannot include an interactive")
+        );
         Ok(())
     }
 }
