@@ -110,6 +110,29 @@ jobs:
       - name: Test Nano headless integration
         run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless
 
+  macos-release:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build, package, and verify macOS release archive
+        env:
+          TARGET: aarch64-apple-darwin
+          ARCHIVE: ferrus-aarch64-apple-darwin.tar.gz
+        run: bash .github/scripts/build-macos-release.sh
+
   smoke:
     strategy:
       fail-fast: false

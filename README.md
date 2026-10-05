@@ -85,6 +85,10 @@ cargo install ferrus --locked --profile dist
 ```
 
 Prebuilt release archives include experimental Nano with native context and external MCP tools.
+The Apple Silicon archive targets macOS 11.0 or newer (`MACOSX_DEPLOYMENT_TARGET=11.0`).
+CI builds it on `macos-latest`, checks the packaged arm64 executable's deployment target and
+SHA-256 checksum, and runs `--version`, `init`, and `doctor` with an isolated home and project.
+Runtime smoke coverage uses the runner's macOS version; older macOS versions are not exercised.
 Cargo installations use the smaller default feature set; to install Nano from crates.io, enable
 both features explicitly:
 
