@@ -279,6 +279,10 @@ impl App {
         }
         match self.history_idx {
             None => {
+                if self.input.is_empty() {
+                    self.answering_question_task_id = self.question_task_id.clone();
+                    self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
+                }
                 self.history_saved = self.input.clone();
                 self.history_idx = Some(self.history.len() - 1);
             }
@@ -304,6 +308,10 @@ impl App {
                 self.history_idx = None;
                 self.input = self.history_saved.clone();
                 self.cursor_pos = self.input.chars().count();
+                if self.input.is_empty() {
+                    self.answering_question_task_id = None;
+                    self.answering_nano_run_id = None;
+                }
             }
         }
         self.update_command_context();

@@ -251,6 +251,63 @@ mod tests {
     }
 
     #[test]
+    fn recalled_answers_keep_the_question_target_from_drafting_start() {
+        for (draft, initial_question, expected_question) in [
+            ("", Some("t-001"), Some("t-001")),
+            ("", None, None),
+            ("Existing draft", Some("t-001"), Some("t-001")),
+            ("Existing draft", None, None),
+        ] {
+            let mut app = App::new();
+            app.nano = Some(view("run-1"));
+            app.question_task_id = initial_question.map(str::to_string);
+            app.history = vec!["Older answer".into(), "Recalled answer".into()];
+            app.insert_text(draft);
+            if !draft.is_empty() {
+                app.question_task_id = Some("t-002".into());
+                app.nano = Some(view("run-2"));
+            }
+            app.history_up();
+            app.question_task_id = Some("t-003".into());
+            app.nano = Some(view("run-3"));
+            app.history_up();
+            app.history_down();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            app.submit_input(&sender);
+            let input = receiver.try_recv().unwrap();
+            assert_eq!(input.text, "Recalled answer");
+            assert_eq!(input.human_question_task_id.as_deref(), expected_question);
+            assert_eq!(input.nano_run_id.as_deref(), Some("run-1"));
+            assert_eq!(input.nano_input_id.is_some(), expected_question.is_none());
+            assert_eq!(app.nano_pending.is_some(), expected_question.is_none());
+            assert_eq!(app.input.is_empty(), expected_question.is_some());
+        }
+    }
+
+    #[test]
+    fn returning_from_history_to_an_empty_editor_releases_answer_targets() {
+        let mut app = App::new();
+        app.nano = Some(view("run-1"));
+        app.question_task_id = Some("t-001".into());
+        app.history = vec!["Recalled answer".into()];
+        app.history_up();
+        assert_eq!(app.answering_question_task_id.as_deref(), Some("t-001"));
+        app.history_down();
+        assert!(app.input.is_empty());
+        assert!(app.answering_question_task_id.is_none());
+        assert!(app.answering_nano_run_id.is_none());
+        app.question_task_id = Some("t-002".into());
+        app.nano = Some(view("run-2"));
+        app.insert_text("New answer");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.submit_input(&sender);
+        let input = receiver.try_recv().unwrap();
+        assert_eq!(input.human_question_task_id.as_deref(), Some("t-002"));
+        assert_eq!(input.nano_run_id.as_deref(), Some("run-2"));
+        assert!(input.nano_input_id.is_none());
+    }
+
+    #[test]
     fn oversized_steering_frames_preserve_the_editor_and_targets() {
         use crate::nano::wire::{self, CommandKind};
 
