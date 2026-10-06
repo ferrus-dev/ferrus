@@ -168,7 +168,6 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     };
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
     engine.set_system_prompt(super::instructions::INTERACTIVE_POLICY)?;
-    engine
-        .run(SessionCommand::Start { input }, cancellation)
-        .await
+    // Do not embed the inference/tool future in the host's launch state.
+    Box::pin(engine.run(SessionCommand::Start { input }, cancellation)).await
 }

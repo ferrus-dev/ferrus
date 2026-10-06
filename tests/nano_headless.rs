@@ -1591,6 +1591,30 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         .env_remove("FERRUS_TASK_ID")
         .env_remove("FERRUS_BASELINE_TREE")
         .env("FERRUS_RUN_ID", "nano-direct-run");
+    // Linux also exercises the direct launch with a Windows-sized main-thread
+    // stack instead of relying on the host's larger default stack.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure only calls OS resource-limit functions and
+        // constructs an error from errno; it does not allocate or acquire locks.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = 1024 * 1024;
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = Process::spawn(&mut command);
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();

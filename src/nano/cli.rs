@@ -89,7 +89,8 @@ pub(crate) async fn run(command: Command) -> Result<()> {
     );
     super::agent::validate_config(config.as_deref(), model.as_deref())?;
     #[cfg(feature = "nano-openai")]
-    return launch(
+    // Keep the session state off the CLI/main-thread stack, especially on Windows.
+    return Box::pin(launch(
         super::agent::config_path(config.as_deref())?,
         model,
         !no_working_set,
@@ -97,7 +98,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         seeds,
         interactive,
         taskless,
-    )
+    ))
     .await;
     #[cfg(not(feature = "nano-openai"))]
     {
@@ -264,9 +265,9 @@ async fn launch(
                 task_id: Some(session.scope.task_id.clone()),
                 run_id: Some(session.scope.run_id.clone()),
             };
-            super::managed::run(session.clone(), identity, limits, provider, native, journal, &stop).await?
+            Box::pin(super::managed::run(session.clone(), identity, limits, provider, native, journal, &stop)).await?
         } else {
-            super::interactive::run(binding, limits, provider, native, journal, &stop).await?
+            Box::pin(super::interactive::run(binding, limits, provider, native, journal, &stop)).await?
         };
         output.publish(Event::Ended {
             reason: end.reason.clone(),
@@ -334,6 +335,30 @@ fn prefetch_seeds(paths: Vec<String>, symbols: Vec<String>) -> Result<Vec<serde_
 #[cfg(test)]
 mod working_set_tests {
     use super::*;
+    #[cfg(feature = "nano-openai")]
+    #[test]
+    fn launch_future_does_not_embed_the_session_engine() {
+        // Windows processes have a small main-thread stack. Keep the public
+        // launch state bounded so nested polling and moves leave room for tools.
+        for taskless in [false, true] {
+            let future = run(Command::Run {
+                config: None,
+                model: None,
+                no_working_set: false,
+                no_native_context: false,
+                prefetch_path: Vec::new(),
+                prefetch_symbol: Vec::new(),
+                interactive: true,
+                taskless,
+            });
+            let bytes = std::mem::size_of_val(&future);
+            assert!(bytes <= 8 * 1024, "Nano launch future uses {bytes} bytes");
+            let host = launch(PathBuf::new(), None, true, true, Vec::new(), true, taskless);
+            let bytes = std::mem::size_of_val(&host);
+            assert!(bytes <= 8 * 1024, "Nano host future uses {bytes} bytes");
+        }
+    }
+
     #[test]
     fn explicit_prefetch_is_opt_in_validated_bounded_and_sorted() {
         assert!(prefetch_seeds(vec![], vec![]).unwrap().is_empty());
