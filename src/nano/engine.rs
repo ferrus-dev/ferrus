@@ -242,12 +242,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         {
             return Err(EndReason::ProviderProtocol);
         }
+        let previous_no_progress = std::mem::replace(&mut self.budget.no_progress, 0);
         if !self.commit(SessionEvent::UserInput {
             text: text.clone(),
             input_id,
         }) {
+            self.budget.no_progress = previous_no_progress;
             return Err(EndReason::JournalFailed);
         }
+        self.previous_call = None;
         self.latest_steering = Some(self.messages.len());
         self.messages.push(Message::User { text });
         self.journal

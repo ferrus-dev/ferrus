@@ -1808,6 +1808,7 @@ struct InteractiveJournal {
     sender: tokio::sync::mpsc::Sender<SessionCommand>,
     interactive: bool,
     waits: usize,
+    user_requests: usize,
     fail_input: bool,
     inject_steering: bool,
 }
@@ -1822,6 +1823,7 @@ async fn taskless_interactive_waits_before_inference_and_reconstructs_from_journ
         sender,
         interactive: true,
         waits: 0,
+        user_requests: 1,
         fail_input: false,
         inject_steering: false,
     };
@@ -1904,7 +1906,7 @@ impl Journal for InteractiveJournal {
             }
             SessionEvent::InputRequested => {
                 self.waits += 1;
-                let command = if self.waits == 1 {
+                let command = if self.waits <= self.user_requests {
                     SessionCommand::Steer {
                         input_id: None,
                         text: "Explain the completed checks.".into(),
@@ -1946,6 +1948,7 @@ async fn interactive_steering_waits_for_complete_tool_groups_and_replays() {
         sender,
         interactive: false,
         waits: 0,
+        user_requests: 1,
         fail_input: false,
         inject_steering: true,
     };
@@ -2052,6 +2055,100 @@ async fn interactive_steering_waits_for_complete_tool_groups_and_replays() {
 }
 
 #[tokio::test]
+async fn interactive_user_turns_reset_loop_tracking_and_preserve_session_budgets() {
+    for fail in [false, true] {
+        let provider = scripted(
+            (0..5)
+                .flat_map(|turn| {
+                    [
+                        response(
+                            "",
+                            vec![call(&format!("{turn}-a"), 1), call(&format!("{turn}-b"), 1)],
+                        ),
+                        response("Request completed.", vec![]),
+                    ]
+                })
+                .collect(),
+        );
+        let (_dir, base) = setup(provider, limits());
+        let (sender, commands) = tokio::sync::mpsc::channel(8);
+        let journal = InteractiveJournal {
+            inner: base.journal,
+            commands: Some(commands),
+            sender,
+            interactive: true,
+            waits: 0,
+            user_requests: 5,
+            fail_input: false,
+            inject_steering: false,
+        };
+        let mut identity = identity();
+        identity.task_id = None;
+        let mut engine = Engine::new(
+            identity,
+            limits(),
+            base.provider,
+            base.tools,
+            base.host,
+            journal,
+        )
+        .unwrap();
+        engine.tools.fail = fail;
+        let end = engine
+            .run(
+                SessionCommand::Start {
+                    input: "Workspace constraints".into(),
+                },
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.reason, EndReason::Cancelled, "failed tools: {fail}");
+        assert!(end.durable);
+        assert_eq!(end.budget.model_turns, 10);
+        assert_eq!(end.budget.tool_calls, 10);
+        assert_eq!(end.budget.reported_input_tokens, 100);
+        assert_eq!(end.budget.reported_output_tokens, 50);
+        let records = &engine.host.records;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+                .count(),
+            5
+        );
+        for (index, record) in records.iter().enumerate() {
+            if matches!(record.event, SessionEvent::UserInput { .. }) {
+                assert_eq!(record.budget.no_progress, 0);
+                if index > 0 {
+                    let before = &records[index - 1].budget;
+                    assert_eq!(record.budget.model_turns, before.model_turns);
+                    assert_eq!(record.budget.tool_calls, before.tool_calls);
+                    assert_eq!(record.budget.tokens(), before.tokens());
+                    assert_eq!(record.budget.retries, before.retries);
+                }
+            }
+        }
+        // Repetition and failures still accumulate within each individual request.
+        let progress: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, SessionEvent::ToolResult { .. }))
+            .map(|r| r.budget.no_progress)
+            .collect();
+        assert_eq!(
+            progress,
+            if fail {
+                vec![1, 2].repeat(5)
+            } else {
+                vec![0, 1].repeat(5)
+            }
+        );
+        let replay = Replay::from_records(records).unwrap();
+        assert_eq!(replay.budget, end.budget);
+    }
+}
+
+#[tokio::test]
 async fn interactive_input_is_not_used_if_its_journal_commit_fails() {
     let (_dir, base) = setup(
         scripted(vec![response("Editing", vec![call("a", 1)])]),
@@ -2064,6 +2161,7 @@ async fn interactive_input_is_not_used_if_its_journal_commit_fails() {
         sender,
         interactive: true,
         waits: 0,
+        user_requests: 1,
         fail_input: true,
         inject_steering: true,
     };
@@ -2103,6 +2201,7 @@ async fn interactive_input_wait_is_cancellable_without_an_extra_inference() {
         sender,
         interactive: true,
         waits: 0,
+        user_requests: 1,
         fail_input: false,
         inject_steering: false,
     };
