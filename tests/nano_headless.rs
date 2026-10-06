@@ -72,9 +72,13 @@ impl Process {
     }
 
     fn failure_diagnostics(&mut self) -> String {
+        let before_stop = self.0.try_wait();
         let _ = self.0.kill();
         let status = self.0.wait();
-        format!("status={status:?}\nstderr tail:\n{}", self.stderr())
+        format!(
+            "status_before_test_cleanup={before_stop:?}; status_after_test_cleanup={status:?}\nstderr tail:\n{}",
+            self.stderr()
+        )
     }
 }
 impl Drop for Process {
@@ -1413,7 +1417,7 @@ fn run_interactive_task(interactive: bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let event = receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap_or_else(|error| panic!("{error}; {}", child.failure_diagnostics()));
         assert_ne!(
             event["event"]["type"], "ended",
@@ -1575,6 +1579,11 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
                 json!({"choices":[{"index":0,"delta":{"content":"Created and checked answer.txt."},"finish_reason":"stop"}]})
             };
             requests_tx.send(turn).unwrap();
+            if turn == 1 {
+                // A provider can produce no streaming events while thinking.
+                // Keep this gap above the old five-second per-event timeout.
+                std::thread::sleep(Duration::from_secs(6));
+            }
             let sse = format!("data: {data}\n\ndata: [DONE]\n\n");
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
         }
@@ -1631,12 +1640,24 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         "ready"
     );
     writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
-    let wait_for_input = |child: &mut Process| {
+    let journal_path = fixture
+        .data
+        .join("nano/sessions/nano-direct-run/events.jsonl");
+    let wait_for_input = |child: &mut Process, stage: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let event = receiver
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or_else(|error| panic!("{error}; {}", child.failure_diagnostics()));
+                // Graph refresh, checks, or a non-streaming model response may
+                // legitimately be silent for more than five seconds. Apply the
+                // overall deadline instead of an accidental per-event deadline.
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{stage}: {error}; {}\njournal tail:\n{}",
+                        child.failure_diagnostics(),
+                        log_tail(&journal_path).unwrap_or_else(|error| error.to_string())
+                    )
+                });
             assert_ne!(event["event"]["type"], "ended", "{event}");
             if event["event"]["phase"] == "input_requested" {
                 break;
@@ -1644,7 +1665,7 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
             assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
         }
     };
-    wait_for_input(&mut child);
+    wait_for_input(&mut child, "initial input request");
     assert!(
         requests_rx.try_recv().is_err(),
         "Opening /executor must not call the provider"
@@ -1655,7 +1676,7 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42 and check it."}}})
     )
     .unwrap();
-    wait_for_input(&mut child);
+    wait_for_input(&mut child, "response after editing and checks");
     assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
     assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
     assert_eq!(
