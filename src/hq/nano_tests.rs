@@ -429,6 +429,9 @@ exit 0
     let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
     assert!(ctx.headless[name].task_id.is_none());
     assert_eq!(fixture.dispatches(), 0);
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(fixture.dispatches(), 0);
     dispatch_with_human_question_target(
         "Inspect this workspace",
         None,
@@ -449,6 +452,15 @@ exit 0
     })
     .await
     .unwrap();
+    assert!(
+        StdCommand::new("git")
+            .args(["init", "-q", "--object-format=sha1"])
+            .current_dir(&fixture.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
     dispatch("/cancel", &mut ctx).await.unwrap();
     assert!(ctx.nano_paused_tasks.is_empty());
     ctx.shutdown_all_headless().await;
@@ -464,4 +476,47 @@ exit 0
         "pending"
     );
     assert!(!fixture.data.join("worktrees").exists());
+}
+
+#[tokio::test]
+async fn taskless_native_executor_waits_for_the_non_git_managed_executor() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("shared workspace fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+while IFS= read -r command; do
+    [ "$command" = '{"version":1,"command":"cancel"}' ] && exit 0
+done
+"#;
+    #[cfg(windows)]
+    let source = r#"[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+while ($null -ne ($command = [Console]::In.ReadLine())) {
+    if ($command -ceq '{"version":1,"command":"cancel"}') { exit 0 }
+}
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001")
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    let result = dispatch("/executor", &mut ctx).await;
+    ctx.shutdown_all_headless().await;
+    assert!(result.unwrap_err().to_string().contains("non-Git"));
+    assert!(ctx.nano_view.is_none());
+    assert_eq!(fixture.dispatches(), 1);
+    // Once the shared workspace is released, a direct session can start.
+    dispatch("/executor", &mut ctx).await.unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.shutdown_all_headless().await;
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
 }

@@ -35,8 +35,12 @@ impl HqContext {
                 .get(&name)
                 .is_some_and(agent_manager::HeadlessHandle::is_alive)
             {
-                self.prepare_headless_slot(&name).await;
                 let root = crate::project::canonical_project_root().await?;
+                anyhow::ensure!(
+                    git_is_work_tree(&root).await || self.occupied_executor_slots().await? == 0,
+                    "Cannot start a direct Nano session while an Executor uses the shared non-Git workspace. Stop the Executor first."
+                );
+                self.prepare_headless_slot(&name).await;
                 let handle = agent_manager::spawn_native_interactive_executor_with_env(
                     agent.as_ref(),
                     &name,
