@@ -3,6 +3,58 @@
 use super::*;
 
 #[tokio::test]
+async fn latest_run_filters_agent_and_role_before_limiting_history() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (_dir, previous) = setup_project().await;
+    let connection = open_runtime_database(&current_database_path().await.unwrap()).unwrap();
+    // Cover both taskless and managed conversation identities, and deterministic ties.
+    for agent in ["executor:nano:1", "executor:nano:t-001"] {
+        for suffix in ["a", "b"] {
+            connection.execute(
+                "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, workspace_path)
+                 VALUES (?1, 't-001', 'executor', ?2, 'finished', '2020', '2020', '/workspace')",
+                params![format!("{agent}-{suffix}"), agent],
+            ).unwrap();
+        }
+        connection.execute(
+            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, workspace_path)
+             VALUES (?1, 't-001', 'reviewer', ?2, 'finished', '2030', '2030', '/workspace')",
+            params![format!("{agent}-reviewer"), agent],
+        ).unwrap();
+    }
+    for index in 0..101 {
+        connection.execute(
+            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, workspace_path)
+             VALUES (?1, 't-001', 'executor', 'executor:codex:1', 'finished', '2030', '2030', '/workspace')",
+            [format!("other-{index}")],
+        ).unwrap();
+    }
+    assert!(
+        list_runs(100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.agent == "executor:codex:1")
+    );
+    for agent in ["executor:nano:1", "executor:nano:t-001"] {
+        let run = latest_run_for_agent_role(agent, "executor")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.id, format!("{agent}-b"));
+        assert_eq!(run.agent, agent);
+        assert_eq!(run.role, "executor");
+    }
+    assert!(
+        latest_run_for_agent_role("executor:nano:missing", "executor")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    teardown(previous);
+}
+
+#[tokio::test]
 async fn runtime_doctor_checks_detect_missing_active_artifacts() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let (_dir, previous) = setup_project().await;

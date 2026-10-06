@@ -77,10 +77,8 @@ impl HqContext {
                 handle.native_events.clone(),
             )
         } else {
-            let run = crate::project::list_runs(100)
+            let run = crate::project::latest_run_for_agent_role(name, ROLE_EXECUTOR)
                 .await?
-                .into_iter()
-                .find(|run| run.agent == name && run.role == ROLE_EXECUTOR)
                 .context("No persisted Nano run found")?;
             (run.id, None)
         };

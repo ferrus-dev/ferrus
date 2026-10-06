@@ -237,8 +237,8 @@ impl InputWriter {
     }
     pub(crate) fn steer(&self, text: String) -> Result<()> {
         ensure!(!text.trim().is_empty(), "Input cannot be empty");
+        wire::validate_steer(&text)?;
         let command = CommandKind::Steer { text };
-        wire::write_command(&mut Vec::new(), command.clone())?;
         self.sender
             .try_send(command)
             .map_err(|_| anyhow::anyhow!("Nano input queue is full or disconnected"))

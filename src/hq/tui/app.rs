@@ -374,6 +374,16 @@ impl App {
         if line.is_empty() {
             return;
         }
+        if !line.starts_with('/')
+            && self.answering_question_task_id.is_none()
+            && (self.nano.is_some() || self.answering_nano_run_id.is_some())
+            && crate::nano::wire::validate_steer(&line).is_err()
+        {
+            self.last_error = Some(
+                "Nano input exceeds the serialized frame limit; shorten it before sending.".into(),
+            );
+            return;
+        }
         self.last_error = None;
         if line == "/quit" {
             self.should_quit = true;

@@ -239,6 +239,14 @@ pub(crate) fn write_command(writer: &mut impl Write, command: CommandKind) -> Re
     Ok(())
 }
 
+/// Apply the exact wire limit, including JSON escaping and the terminating newline.
+pub(crate) fn validate_steer(text: &str) -> Result<()> {
+    write_command(
+        &mut std::io::sink(),
+        CommandKind::Steer { text: text.into() },
+    )
+}
+
 #[derive(Default)]
 struct Mailbox {
     latest: Option<Event>,

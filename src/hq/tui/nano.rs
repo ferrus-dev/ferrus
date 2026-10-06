@@ -248,6 +248,55 @@ mod tests {
     }
 
     #[test]
+    fn oversized_steering_frames_preserve_the_editor_and_targets() {
+        use crate::nano::wire::{self, CommandKind};
+
+        // Include the envelope and newline when finding the exact text allowance.
+        let mut empty = Vec::new();
+        wire::write_command(
+            &mut empty,
+            CommandKind::Steer {
+                text: String::new(),
+            },
+        )
+        .unwrap();
+        let allowance = wire::FRAME_BYTES - empty.len();
+        for text in [
+            "x".repeat(allowance + 1),
+            "\"".repeat(allowance / 2 + 1),
+            "\\".repeat(allowance / 2 + 1),
+            format!("x{}x", "\n".repeat(allowance / 2)),
+        ] {
+            let mut app = App::new();
+            app.nano = Some(view("run-1"));
+            app.insert_text(&text);
+            assert_eq!(app.input, text);
+            let cursor = app.cursor_pos;
+            let history = app.history.clone();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            app.submit_input(&sender);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(app.input, text);
+            assert_eq!(app.cursor_pos, cursor);
+            assert_eq!(app.answering_nano_run_id.as_deref(), Some("run-1"));
+            assert_eq!(app.history, history);
+            assert!(app.last_error.as_deref().unwrap().contains("frame limit"));
+        }
+
+        let mut app = App::new();
+        app.nano = Some(view("run-1"));
+        app.insert_text(&"x".repeat(allowance));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.submit_input(&sender);
+        let input = receiver.try_recv().unwrap();
+        let mut frame = Vec::new();
+        wire::write_command(&mut frame, CommandKind::Steer { text: input.text }).unwrap();
+        assert_eq!(frame.len(), wire::FRAME_BYTES);
+        assert!(app.input.is_empty());
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
     fn human_question_and_errors_remain_visible_over_a_full_conversation() {
         let mut app = App::new();
         app.nano = Some(view("run-1"));
