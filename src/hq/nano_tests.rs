@@ -328,13 +328,27 @@ exit 0
     ctx.attach_nano_conversation(name).await.unwrap();
     let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
     assert!(
-        dispatch_with_human_question_target("Wrong run", None, Some("foreign"), false, &mut ctx)
-            .await
-            .is_err()
-    );
-    dispatch_with_human_question_target("Keep the API stable", None, Some(&run), false, &mut ctx)
+        dispatch_with_human_question_target(
+            "Wrong run",
+            None,
+            Some("foreign"),
+            None,
+            false,
+            &mut ctx
+        )
         .await
-        .unwrap();
+        .is_err()
+    );
+    dispatch_with_human_question_target(
+        "Keep the API stable",
+        None,
+        Some(&run),
+        None,
+        false,
+        &mut ctx,
+    )
+    .await
+    .unwrap();
     dispatch("/detach", &mut ctx).await.unwrap();
     assert!(ctx.nano_view.is_none());
     assert!(ctx.headless[name].is_alive());
@@ -419,6 +433,7 @@ exit 0
         "Inspect this workspace",
         None,
         Some(&run),
+        None,
         false,
         &mut ctx,
     )

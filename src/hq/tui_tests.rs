@@ -778,6 +778,7 @@ fn multiline_submission_does_not_enter_history() {
             text: "first\nsecond".to_string(),
             human_question_task_id: Some("t-002".to_string()),
             nano_run_id: None,
+            nano_input_id: None,
         }
     );
     assert_eq!(app.history.len(), original_history_len);
@@ -799,6 +800,7 @@ fn human_answer_keeps_the_question_target_from_typing_start() {
             text: "first line\nsecond line".to_string(),
             human_question_task_id: Some("t-001".to_string()),
             nano_run_id: None,
+            nano_input_id: None,
         }
     );
 }

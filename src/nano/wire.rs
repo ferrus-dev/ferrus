@@ -37,7 +37,11 @@ pub(crate) enum CommandKind {
     Start,
     Cancel,
     Interact,
-    Steer { text: String },
+    Steer {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,10 +107,14 @@ pub(crate) struct ObservedEvents {
     pub latest: Option<Event>,
     pub notice: Option<String>,
     pub notice_sequence: u64,
+    pub rejected_input: Option<String>,
 }
 impl ObservedEvents {
     pub(crate) fn observe(&mut self, event: Event) {
         if let Event::Error { code } = &event {
+            if let Some(id) = code.strip_prefix("input_queue_full:") {
+                self.rejected_input = Some(id.into());
+            }
             self.notice = Some(code.clone());
             self.notice_sequence = self.notice_sequence.saturating_add(1);
         }
@@ -240,10 +248,17 @@ pub(crate) fn write_command(writer: &mut impl Write, command: CommandKind) -> Re
 }
 
 /// Apply the exact wire limit, including JSON escaping and the terminating newline.
-pub(crate) fn validate_steer(text: &str) -> Result<()> {
+pub(crate) fn validate_identified_steer(text: &str, input_id: Option<&str>) -> Result<()> {
+    ensure!(
+        input_id.is_none_or(super::journal::valid_id),
+        "Invalid input identity"
+    );
     write_command(
         &mut std::io::sink(),
-        CommandKind::Steer { text: text.into() },
+        CommandKind::Steer {
+            text: text.into(),
+            input_id: input_id.map(str::to_owned),
+        },
     )
 }
 
@@ -251,6 +266,7 @@ pub(crate) fn validate_steer(text: &str) -> Result<()> {
 struct Mailbox {
     latest: Option<Event>,
     notice: Option<Event>,
+    rejection: Option<Event>,
     closed: bool,
 }
 
@@ -273,7 +289,9 @@ impl Output {
     pub(crate) fn publish(&self, event: Event) {
         let mut mailbox = self.0.0.lock().unwrap();
         if !mailbox.closed {
-            if matches!(event, Event::Error { .. }) {
+            if matches!(&event, Event::Error { code } if code.starts_with("input_queue_full:")) {
+                mailbox.rejection = Some(event);
+            } else if matches!(event, Event::Error { .. }) {
                 mailbox.notice = Some(event);
             } else {
                 mailbox.latest = Some(event);
@@ -289,10 +307,19 @@ impl Output {
         loop {
             let event = {
                 let mut mailbox = self.0.0.lock().unwrap();
-                while mailbox.latest.is_none() && mailbox.notice.is_none() && !mailbox.closed {
+                while mailbox.latest.is_none()
+                    && mailbox.notice.is_none()
+                    && mailbox.rejection.is_none()
+                    && !mailbox.closed
+                {
                     mailbox = self.0.1.wait(mailbox).unwrap();
                 }
-                match mailbox.notice.take().or_else(|| mailbox.latest.take()) {
+                match mailbox
+                    .rejection
+                    .take()
+                    .or_else(|| mailbox.notice.take())
+                    .or_else(|| mailbox.latest.take())
+                {
                     Some(event) => event,
                     None => return Ok(()),
                 }
@@ -546,6 +573,10 @@ mod tests {
         let notice = Event::Error {
             code: "input_queue_full".into(),
         };
+        let rejection = Event::Error {
+            code: "input_queue_full:input-1".into(),
+        };
+        output.publish(rejection.clone());
         output.publish(notice.clone());
         let end = Event::Ended {
             reason: EndReason::Submitted,
@@ -558,6 +589,7 @@ mod tests {
         done.await.unwrap();
         let mut reader = Cursor::new(bytes.lock().unwrap().clone());
         assert_eq!(read_event(&mut reader).unwrap(), Some(Event::Ready));
+        assert_eq!(read_event(&mut reader).unwrap(), Some(rejection));
         assert_eq!(read_event(&mut reader).unwrap(), Some(notice));
         assert_eq!(read_event(&mut reader).unwrap(), Some(end));
         assert_eq!(read_event(&mut reader).unwrap(), None);

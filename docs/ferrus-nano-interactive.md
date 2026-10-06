@@ -17,6 +17,8 @@ Configure Nano as the Executor as described in [Nano launch](ferrus-nano-launch.
 - Type plain text to queue steering for the next model turn. Nano commits the input after the
   current inference and its complete tool-call/result group, before another inference starts.
   It never interrupts a patch or inserts an orphan tool result into provider history.
+  HQ keeps the submitted text until its input ID appears in the durable journal, and allows
+  one unconfirmed steering request at a time. Queue failures preserve the request for retry.
 - A final textual response waits for input. Failure, cancellation, and configured session limits
   end the attempt; managed `submit` ends a task-bound attempt normally.
 - PageUp/PageDown scroll the bounded conversation history. Input editing, multiline paste,
@@ -35,6 +37,8 @@ task retry counters. They read canonical graph context and refresh it best-effor
 they do not use a task overlay. They ask questions in ordinary responses and do not expose managed
 `submit`, `consult`, or `ask_human`. `/cancel` stops the direct session; the next `/executor` opens
 a fresh one. No task dispatch budget or lease is consumed.
+MCP peers with `inherit_managed_binding = true` are omitted in direct sessions; native repository
+tools continue to use canonical context. Other configured MCP peers remain available.
 
 Attaching a live headless Nano enables interaction through its existing command pipe, at a safe
 engine boundary. The process is not replaced and no effects are replayed. Its final textual
@@ -73,6 +77,9 @@ The existing v1 JSONL protocol adds `interact` and `steer` commands and text-pre
 Frames remain limited to 4096 bytes, including JSON encoding and the terminating newline.
 Both the pipe writer and the engine input queue hold at most eight commands. Full or disconnected
 queues report an error; queued input is authoritative only once `UserInput` has been committed.
+HQ supplies an optional `input_id` in steering frames and the journal records that ID on acceptance.
+Identified queue rejections survive progress/preview coalescing. Frames and old journals without
+input IDs remain readable.
 Cancellation bypasses queued steering. Stdout remains structured protocol; stderr remains diagnostics.
 HQ uses `ferrus nano run --interactive --taskless` for direct conversations. Task-bound launches
 use `--interactive` alone. Both use the private HQ protocol, not a standalone terminal UI.

@@ -19,10 +19,15 @@ pub(crate) struct SessionIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionCommand {
-    Start { input: String },
+    Start {
+        input: String,
+    },
     Cancel,
     Interact,
-    Steer { text: String },
+    Steer {
+        text: String,
+        input_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +275,8 @@ pub(crate) enum SessionEvent {
     },
     UserInput {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<String>,
     },
     InputRequested,
     InteractionOpened,

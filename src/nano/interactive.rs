@@ -141,8 +141,10 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     let mut native = native;
     #[cfg(feature = "nano-mcp")]
     if let Some(path) = native.mcp_config.take() {
-        native.mcp =
-            Some(super::mcp::McpTools::connect(&path, &native.descriptors(), cancellation).await?);
+        native.mcp = Some(
+            super::mcp::McpTools::connect_taskless(&path, &native.descriptors(), cancellation)
+                .await?,
+        );
     }
     let mut instructions = native.instructions.load(&[], &[]).await?;
     instructions

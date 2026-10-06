@@ -16,6 +16,7 @@ pub(super) struct NanoConversation {
     pub(super) scroll: usize,
     pub(super) notices: Vec<TranscriptLine>,
     seen_notice: u64,
+    pub(super) rejected_input: Option<String>,
 }
 impl NanoConversation {
     pub(super) fn new(
@@ -38,6 +39,7 @@ impl NanoConversation {
             scroll: 0,
             notices: Vec::new(),
             seen_notice: 0,
+            rejected_input: None,
         }
     }
     pub(super) fn scroll_up(&mut self, width: usize) {
@@ -72,6 +74,7 @@ impl NanoConversation {
             && !matches!(events.has_changed(), Ok(false))
         {
             let state = events.borrow_and_update().clone();
+            self.rejected_input = state.rejected_input.clone();
             let event = state.latest;
             if let Some(NativeEvent::Text { turn, text }) = &event
                 && *turn == self.snapshot.turn
@@ -82,7 +85,7 @@ impl NanoConversation {
                 self.preview = preview;
             }
             if let Some(NativeEvent::Ended { reason, durable }) = &event
-                && self.snapshot.sequence == 0
+                && !self.snapshot.ended
             {
                 self.snapshot.status = format!("Process ended: {reason:?}, durable={durable}");
                 self.snapshot.ended = true;
@@ -257,6 +260,7 @@ mod tests {
             &mut empty,
             CommandKind::Steer {
                 text: String::new(),
+                input_id: Some(crate::project::allocate_run_id("input", "nano")),
             },
         )
         .unwrap();
@@ -290,10 +294,114 @@ mod tests {
         app.submit_input(&sender);
         let input = receiver.try_recv().unwrap();
         let mut frame = Vec::new();
-        wire::write_command(&mut frame, CommandKind::Steer { text: input.text }).unwrap();
+        wire::write_command(
+            &mut frame,
+            CommandKind::Steer {
+                text: input.text,
+                input_id: input.nano_input_id,
+            },
+        )
+        .unwrap();
         assert_eq!(frame.len(), wire::FRAME_BYTES);
+        assert!(!app.input.is_empty());
+        assert!(app.nano_pending.is_some());
+    }
+
+    #[test]
+    fn steering_retains_multiline_drafts_until_durable_acceptance_or_queue_rejection() {
+        let (snapshots_tx, snapshots) = watch::channel(Some(Snapshot::default()));
+        let (events_tx, events) = watch::channel(ObservedEvents::default());
+        let mut app = App::new();
+        app.nano = Some(NanoConversation::new(
+            "nano".into(),
+            "run-1".into(),
+            snapshots,
+            Some(events),
+        ));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let text = "Implement the fix\nand run the checks";
+        app.insert_text(text);
+        app.submit_input(&sender);
+        let first = receiver.try_recv().unwrap();
+        let first_id = first.nano_input_id.unwrap();
+        assert_eq!(app.input, text);
+        // Rapid Enter cannot enqueue the same request twice.
+        app.submit_input(&sender);
+        assert!(receiver.try_recv().is_err());
+        assert!(app.nano_pending.is_some());
+        // The host's queue failure is tied to the original run and input.
+        assert!(!app.reject_nano_input("other-run", &first_id));
+        assert!(app.reject_nano_input("run-1", &first_id));
+        assert_eq!(app.input, text);
+        assert!(app.nano_pending.is_none());
+
+        app.submit_input(&sender);
+        let second_id = receiver.try_recv().unwrap().nano_input_id.unwrap();
+        assert_ne!(first_id, second_id);
+        events_tx.send_modify(|state| {
+            state.observe(NativeEvent::Error {
+                code: format!("input_queue_full:{second_id}"),
+            });
+            // An unrelated diagnostic must not hide the child's rejection.
+            state.observe(NativeEvent::Error {
+                code: "another_notice".into(),
+            });
+            state.observe(NativeEvent::Text {
+                turn: 1,
+                text: "preview".into(),
+            });
+        });
+        assert!(app.poll_nano_input());
+        assert_eq!(app.input, text);
+        assert!(app.nano_pending.is_none());
+
+        app.submit_input(&sender);
+        let third_id = receiver.try_recv().unwrap().nano_input_id.unwrap();
+        snapshots_tx.send_replace(Some(Snapshot {
+            accepted_inputs: [first_id, second_id].into(),
+            ..Default::default()
+        }));
+        app.poll_nano_input();
+        assert_eq!(app.input, text);
+        assert!(app.nano_pending.is_some());
+        snapshots_tx.send_replace(Some(Snapshot {
+            accepted_inputs: [third_id].into(),
+            ..Default::default()
+        }));
+        assert!(app.poll_nano_input());
         assert!(app.input.is_empty());
+        assert!(app.nano_pending.is_none());
         assert!(app.last_error.is_none());
+        // History recall does not go through insert_char, but still needs a receipt.
+        app.history.push("A recalled request".into());
+        app.history_up();
+        app.submit_input(&sender);
+        assert_eq!(app.input, "A recalled request");
+        assert_eq!(
+            receiver.try_recv().unwrap().nano_run_id.as_deref(),
+            Some("run-1")
+        );
+        assert!(app.nano_pending.is_some());
+    }
+
+    #[test]
+    fn steering_failure_preserves_newer_edits_and_closed_hq_channel_input() {
+        let mut app = App::new();
+        app.nano = Some(view("run-1"));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.insert_text("Original\nrequest");
+        app.submit_input(&sender);
+        let id = receiver.try_recv().unwrap().nano_input_id.unwrap();
+        app.insert_text("\nnew draft detail");
+        let newer = app.input.clone();
+        assert!(app.reject_nano_input("run-1", &id));
+        assert_eq!(app.input, "Original\nrequest");
+        assert_eq!(app.history.last(), Some(&newer));
+        drop(receiver);
+        app.submit_input(&sender);
+        assert_eq!(app.input, "Original\nrequest");
+        assert!(app.nano_pending.is_none());
+        assert!(app.last_error.as_deref().unwrap().contains("closed"));
     }
 
     #[test]

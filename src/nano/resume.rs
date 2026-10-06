@@ -515,7 +515,7 @@ pub(crate) async fn recover_previous(
         description.push_str(&retained_responses(session, &records).await?);
     }
     if let Some(text) = records.iter().rev().find_map(|record| {
-        if let SessionEvent::UserInput { text } = &record.event {
+        if let SessionEvent::UserInput { text, .. } = &record.event {
             Some(text)
         } else {
             None

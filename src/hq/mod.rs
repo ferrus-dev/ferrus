@@ -137,11 +137,20 @@ pub async fn run(debug: bool) -> Result<()> {
                             line,
                             input.human_question_task_id.as_deref(),
                             input.nano_run_id.as_deref(),
+                            input.nano_input_id.as_deref(),
                             false,
                             &mut ctx,
                         )
                         .await
                         {
+                            if !line.starts_with('/') && input.human_question_task_id.is_none()
+                                && let (Some(run_id), Some(input_id)) = (input.nano_run_id, input.nano_input_id)
+                            {
+                                let _ = ctx.display.0.send(tui::UiMessage::NanoInputRejected {
+                                    run_id,
+                                    input_id,
+                                });
+                            }
                             ctx.display.error(err.to_string());
                         }
                     }
@@ -281,13 +290,14 @@ fn normalize_agent_version(agent_name: &str, version: &str) -> Option<String> {
 
 #[cfg(test)]
 async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
-    dispatch_with_human_question_target(line, None, None, true, ctx).await
+    dispatch_with_human_question_target(line, None, None, None, true, ctx).await
 }
 
 async fn dispatch_with_human_question_target(
     line: &str,
     human_question_task_id: Option<&str>,
     nano_run_id: Option<&str>,
+    nano_input_id: Option<&str>,
     allow_fifo_fallback: bool,
     ctx: &mut HqContext,
 ) -> Result<()> {
@@ -353,7 +363,7 @@ async fn dispatch_with_human_question_target(
                 .native_control
                 .as_ref()
                 .context("Headless conversation is read-only")?
-                .steer(line.to_string())?;
+                .steer(line.to_string(), nano_input_id.map(str::to_owned))?;
             ctx.display.muted("Input queued for the next model turn.");
             return Ok(());
         }

@@ -230,12 +230,15 @@ impl Replay {
                 self.model_active = true;
                 self.final_response_ready = false;
             }
-            SessionEvent::UserInput { text } => {
+            SessionEvent::UserInput { text, input_id } => {
                 ensure!(
                     self.checkpoint_ready()
                         && self.interactive
                         && !text.trim().is_empty()
-                        && text.len() <= super::wire::FRAME_BYTES,
+                        && text.len() <= super::wire::FRAME_BYTES
+                        && input_id
+                            .as_ref()
+                            .is_none_or(|id| super::journal::valid_id(id)),
                     "Invalid steering boundary"
                 );
                 self.latest_steering = Some(self.messages.len());

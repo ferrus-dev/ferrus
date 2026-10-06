@@ -199,15 +199,20 @@ async fn launch(
                         });
                     }
                 }
-                Ok(Some(CommandKind::Steer { text })) if !text.trim().is_empty() => {
+                Ok(Some(CommandKind::Steer { text, input_id }))
+                    if !text.trim().is_empty()
+                        && input_id.as_deref().is_none_or(super::journal::valid_id) =>
+                {
                     input_preview.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let rejection = input_id.as_ref().map_or_else(
+                        || "input_queue_full".into(),
+                        |id| format!("input_queue_full:{id}"),
+                    );
                     if commands_tx
-                        .try_send(super::session::SessionCommand::Steer { text })
+                        .try_send(super::session::SessionCommand::Steer { text, input_id })
                         .is_err()
                     {
-                        input_output.publish(Event::Error {
-                            code: "input_queue_full".into(),
-                        });
+                        input_output.publish(Event::Error { code: rejection });
                     }
                 }
                 _ => {

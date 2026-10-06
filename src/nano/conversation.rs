@@ -34,6 +34,7 @@ pub(crate) struct Snapshot {
     pub budget: Budget,
     pub ended: bool,
     pub turn: u64,
+    pub accepted_inputs: VecDeque<String>,
 }
 
 /// Strip terminal control sequences as text, and bound bytes without splitting UTF-8.
@@ -109,7 +110,15 @@ impl Snapshot {
                     .unwrap_or(input);
                 self.push("Task", task);
             }
-            SessionEvent::UserInput { text } => self.push("You", text),
+            SessionEvent::UserInput { text, input_id } => {
+                if let Some(id) = input_id {
+                    self.accepted_inputs.push_back(id.clone());
+                }
+                while self.accepted_inputs.len() > 32 {
+                    self.accepted_inputs.pop_front();
+                }
+                self.push("You", text);
+            }
             SessionEvent::InputRequested => self.status = "Waiting for your input".into(),
             SessionEvent::ModelStarted { turn } => {
                 self.turn = *turn;
@@ -235,10 +244,10 @@ impl InputWriter {
             .try_send(CommandKind::Interact)
             .map_err(|_| anyhow::anyhow!("Nano input queue is full or disconnected"))
     }
-    pub(crate) fn steer(&self, text: String) -> Result<()> {
+    pub(crate) fn steer(&self, text: String, input_id: Option<String>) -> Result<()> {
         ensure!(!text.trim().is_empty(), "Input cannot be empty");
-        wire::validate_steer(&text)?;
-        let command = CommandKind::Steer { text };
+        wire::validate_identified_steer(&text, input_id.as_deref())?;
+        let command = CommandKind::Steer { text, input_id };
         self.sender
             .try_send(command)
             .map_err(|_| anyhow::anyhow!("Nano input queue is full or disconnected"))
@@ -347,6 +356,7 @@ mod tests {
             journal
                 .append(
                     SessionEvent::UserInput {
+                        input_id: None,
                         text: format!("\x1b[2J{}", "x".repeat(3500)),
                     },
                     &Budget::default(),
@@ -442,10 +452,10 @@ mod tests {
         writer.open().unwrap();
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
         for _ in 0..8 {
-            writer.steer("queued".into()).unwrap();
+            writer.steer("queued".into(), None).unwrap();
         }
-        assert!(writer.steer("overflow".into()).is_err());
-        assert!(writer.steer("x".repeat(wire::FRAME_BYTES)).is_err());
+        assert!(writer.steer("overflow".into(), None).is_err());
+        assert!(writer.steer("x".repeat(wire::FRAME_BYTES), None).is_err());
         writer.cancel();
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

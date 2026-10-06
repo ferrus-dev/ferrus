@@ -1897,6 +1897,7 @@ impl Journal for InteractiveJournal {
                 self.sender.try_send(SessionCommand::Interact).unwrap();
                 self.sender
                     .try_send(SessionCommand::Steer {
+                        input_id: None,
                         text: "Keep the public API stable.".into(),
                     })
                     .unwrap();
@@ -1905,6 +1906,7 @@ impl Journal for InteractiveJournal {
                 self.waits += 1;
                 let command = if self.waits == 1 {
                     SessionCommand::Steer {
+                        input_id: None,
                         text: "Explain the completed checks.".into(),
                     }
                 } else {
@@ -2043,6 +2045,7 @@ async fn interactive_steering_waits_for_complete_tool_groups_and_replays() {
         .position(|r| matches!(r.event, SessionEvent::ToolStarted { .. }))
         .unwrap();
     malformed[at].event = SessionEvent::UserInput {
+        input_id: None,
         text: "interrupt this tool".into(),
     };
     assert!(Replay::from_records(&malformed).is_err());

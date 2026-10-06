@@ -2987,6 +2987,99 @@ async fn disabled_working_set_keeps_workspace_tools_but_never_schedules_refresh(
 }
 
 #[tokio::test]
+async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_failure() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, true).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-prefetch",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-prefetch".into(),
+    };
+    let journal = FileJournal::create(&f.data, "direct-prefetch", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-prefetch",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut tools = NativeTools::new(binding, coding, instructions::Limits::default()).unwrap();
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let patch = baseline_patch(&tools, "CanonicalPrefetchedEdit");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let messages = [Message::User {
+        text: "Inspect the changed symbol".into(),
+    }];
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "published"),
+        "{:?}",
+        prepared.observations
+    );
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "prefetch"),
+        "{:?}",
+        prepared.observations
+    );
+
+    std::fs::write(
+        f.root.join("ferrus.toml"),
+        "[repository_graph]\nenabled = 'invalid'\n",
+    )
+    .unwrap();
+    tools.invalidate_unknown().await;
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "failed")
+    );
+    assert!(
+        !prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "prefetch")
+    );
+    assert!(tools.shutdown().await);
+}
+
+#[tokio::test]
 async fn prefetch_waits_for_the_new_overlay_after_a_quick_patch() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;

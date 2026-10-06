@@ -1589,10 +1589,22 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         }
     });
     let config = fixture.root.join("nano.toml");
-    private_config(
-        &config,
-        &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
-    );
+    let mut provider_config = format!("base_url = {url:?}\nmodel = 'fixture-model'\n");
+    if cfg!(feature = "nano-mcp") {
+        let peers = fixture.root.join("mcp.toml");
+        let executable = toml::Value::String(env!("CARGO_BIN_EXE_ferrus").into());
+        private_config(
+            &peers,
+            &format!(
+                "[[servers]]\nid = 'graph'\ncommand = {executable}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_search']\ninherit_managed_binding = true\n"
+            ),
+        );
+        provider_config.push_str(&format!(
+            "mcp_config_file = {}\n",
+            toml::Value::String(peers.to_string_lossy().into_owned())
+        ));
+    }
+    private_config(&config, &provider_config);
     let mut command = fixture.command(&config);
     command
         .current_dir(&fixture.root)
@@ -1674,7 +1686,7 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
     writeln!(
         stdin,
         "{}",
-        json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42 and check it."}}})
+        json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42 and check it.","input_id":"direct-input-1"}}})
     )
     .unwrap();
     wait_for_input(&mut child, "response after editing and checks");
@@ -1708,6 +1720,12 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(records[0]["event"]["identity"]["task_id"].is_null());
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"]["event"] == "user_input"
+                && record["event"]["input_id"] == "direct-input-1")
+    );
     let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
     let task: (String, Option<String>, u32, u32) = db.query_row(
         "SELECT status, claimed_by, check_retries, executor_dispatches FROM tasks WHERE id = 't-001'", [],

@@ -231,13 +231,21 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             }
             self.interactive = true;
         }
-        let SessionCommand::Steer { text } = command else {
+        let SessionCommand::Steer { text, input_id } = command else {
             return Ok(false);
         };
-        if text.trim().is_empty() || text.len() > super::wire::FRAME_BYTES {
+        if text.trim().is_empty()
+            || text.len() > super::wire::FRAME_BYTES
+            || input_id
+                .as_ref()
+                .is_some_and(|id| !super::journal::valid_id(id))
+        {
             return Err(EndReason::ProviderProtocol);
         }
-        if !self.commit(SessionEvent::UserInput { text: text.clone() }) {
+        if !self.commit(SessionEvent::UserInput {
+            text: text.clone(),
+            input_id,
+        }) {
             return Err(EndReason::JournalFailed);
         }
         self.latest_steering = Some(self.messages.len());

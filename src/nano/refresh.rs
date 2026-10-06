@@ -60,12 +60,12 @@ impl Refresh {
                 if session.status().await.is_err() {
                     return json!({"kind":"canonical_refresh", "status":"failed"});
                 }
-                crate::repository_graph_runtime::refresh_canonical_graph_after_workspace_change(
+                let status = crate::repository_graph_runtime::refresh_canonical_graph_after_workspace_change(
                     session.project_root().to_path_buf(),
                     session.run_id().into(),
                 )
                 .await;
-                return json!({"kind":"canonical_refresh", "status":"settled"});
+                return json!({"kind":"canonical_refresh", "status":status});
             }
             let session = session.managed().unwrap();
             let result = async {

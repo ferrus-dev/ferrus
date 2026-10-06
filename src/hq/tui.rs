@@ -79,6 +79,10 @@ pub enum UiMessage {
         events: Option<watch::Receiver<crate::nano::wire::ObservedEvents>>,
     },
     NanoClose,
+    NanoInputRejected {
+        run_id: String,
+        input_id: String,
+    },
     Info(String),
     Table(Vec<String>),
     Success(String),
@@ -110,6 +114,7 @@ pub(super) struct HqInput {
     pub text: String,
     pub human_question_task_id: Option<String>,
     pub nano_run_id: Option<String>,
+    pub nano_input_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -208,6 +213,7 @@ enum TranscriptKind {
 
 pub struct App {
     nano: Option<NanoConversation>,
+    nano_pending: Option<app::PendingNanoInput>,
     status: StatusSnapshot,
     debug: bool,
     messages: Vec<TranscriptLine>,
@@ -334,7 +340,7 @@ pub async fn run_tui(
             }
             _ = tick.tick() => {
                 let refreshed_dashboard = refresh_dashboard_snapshot(&mut app, false).await;
-                let refreshed_conversation = app.nano.as_mut().is_some_and(NanoConversation::poll);
+                let refreshed_conversation = app.poll_nano_input();
                 if app.ctrl_c_pending
                     && app
                         .ctrl_c_at
@@ -645,14 +651,37 @@ fn handle_message(
             snapshots,
             events,
         } => {
+            if app
+                .nano_pending
+                .as_ref()
+                .is_some_and(|pending| pending.run_id != run_id)
+            {
+                app.release_nano_input(false);
+                app.last_error = Some(
+                    "Previous input delivery is unconfirmed; inspect its journal before retrying."
+                        .into(),
+                );
+            }
             app.nano = Some(NanoConversation::new(name, run_id, snapshots, events));
+            app.poll_nano_input();
             app.runtime_snapshot_at = None;
             redraw_dashboard(stdout, app, ui)?;
         }
         UiMessage::NanoClose => {
+            if app.nano_pending.is_some() {
+                app.release_nano_input(false);
+                app.last_error = Some(
+                    "Input delivery is unconfirmed; inspect the journal before retrying.".into(),
+                );
+            }
             app.nano = None;
             app.runtime_snapshot_at = None;
             redraw_dashboard(stdout, app, ui)?;
+        }
+        UiMessage::NanoInputRejected { run_id, input_id } => {
+            if app.reject_nano_input(&run_id, &input_id) {
+                redraw_dashboard(stdout, app, ui)?;
+            }
         }
         UiMessage::Info(text) => {
             let lines = split_transcript(&text, TranscriptKind::Info);

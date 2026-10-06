@@ -2,7 +2,93 @@
 
 use super::*;
 
+pub(super) struct PendingNanoInput {
+    pub(super) run_id: String,
+    pub(super) text: String,
+    pub(super) input_id: String,
+}
+
 impl App {
+    pub(super) fn reject_nano_input(&mut self, run_id: &str, input_id: &str) -> bool {
+        if !self
+            .nano_pending
+            .as_ref()
+            .is_some_and(|pending| pending.run_id == run_id && pending.input_id == input_id)
+        {
+            return false;
+        }
+        self.release_nano_input(false);
+        self.last_error =
+            Some("Nano input was rejected; the request is still in the editor.".into());
+        true
+    }
+
+    pub(super) fn poll_nano_input(&mut self) -> bool {
+        let changed = self.nano.as_mut().is_some_and(NanoConversation::poll);
+        let (Some(view), Some(pending)) = (&self.nano, &self.nano_pending) else {
+            return changed;
+        };
+        if view.run_id != pending.run_id {
+            return changed;
+        }
+        let accepted = view
+            .snapshot
+            .accepted_inputs
+            .iter()
+            .any(|id| *id == pending.input_id);
+        let rejected = view.rejected_input.as_deref() == Some(pending.input_id.as_str());
+        if accepted || rejected || view.snapshot.ended {
+            self.release_nano_input(accepted);
+            if !accepted {
+                self.last_error = Some(if rejected {
+                    "Nano rejected the input; the request is still in the editor."
+                } else {
+                    "Nano ended before input confirmation; the request is kept. Inspect the journal before retrying."
+                }.into());
+            }
+            return true;
+        }
+        changed
+    }
+
+    pub(super) fn release_nano_input(&mut self, accepted: bool) {
+        let Some(pending) = self.nano_pending.take() else {
+            return;
+        };
+        if accepted {
+            self.last_error = None;
+            let line = pending.text.trim();
+            if !line.contains('\n') && self.history.last().map(String::as_str) != Some(line) {
+                self.history.push(line.into());
+                if self.history.len() > MAX_HISTORY {
+                    self.history.remove(0);
+                }
+            }
+            if self.input == pending.text {
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.answering_nano_run_id = None;
+                self.history_idx = None;
+                self.history_saved.clear();
+                self.clear_completion();
+            }
+        } else {
+            // Preserve a newer draft too, including multiline edits made while waiting.
+            if !self.input.is_empty() && self.input != pending.text {
+                self.history.push(self.input.clone());
+                if self.history.len() > MAX_HISTORY {
+                    self.history.remove(0);
+                }
+            }
+            self.input = pending.text;
+            self.cursor_pos = self.input.chars().count();
+            self.answering_nano_run_id = Some(pending.run_id);
+            self.answering_question_task_id = None;
+            self.history_idx = None;
+            self.update_command_context();
+        }
+    }
+
     pub(super) fn append_transcript(&mut self, mut lines: Vec<TranscriptLine>) {
         trim_transcript_history(&mut lines);
         if let Some(view) = &mut self.nano {
@@ -25,6 +111,7 @@ impl App {
     pub(super) fn new() -> Self {
         Self {
             nano: None,
+            nano_pending: None,
             status: StatusSnapshot::default(),
             debug: false,
             messages: Vec::new(),
@@ -374,10 +461,19 @@ impl App {
         if line.is_empty() {
             return;
         }
-        if !line.starts_with('/')
+        let steering = !line.starts_with('/')
             && self.answering_question_task_id.is_none()
-            && (self.nano.is_some() || self.answering_nano_run_id.is_some())
-            && crate::nano::wire::validate_steer(&line).is_err()
+            && (self.nano.is_some() || self.answering_nano_run_id.is_some());
+        if steering && self.nano_pending.is_some() {
+            self.last_error = Some(
+                "Nano input is awaiting acceptance; keep the next draft until it is confirmed."
+                    .into(),
+            );
+            return;
+        }
+        let input_id = steering.then(|| crate::project::allocate_run_id("input", "nano"));
+        if steering
+            && crate::nano::wire::validate_identified_steer(&line, input_id.as_deref()).is_err()
         {
             self.last_error = Some(
                 "Nano input exceeds the serialized frame limit; shorten it before sending.".into(),
@@ -393,15 +489,35 @@ impl App {
         } else {
             self.answering_question_task_id.clone()
         };
-        let _ = cmd_tx.send(HqInput {
-            text: line.clone(),
-            human_question_task_id,
-            nano_run_id: if line.starts_with('/') {
-                self.nano.as_ref().map(|view| view.run_id.clone())
-            } else {
-                self.answering_nano_run_id.clone()
-            },
-        });
+        let nano_run_id = if line.starts_with('/') {
+            self.nano.as_ref().map(|view| view.run_id.clone())
+        } else {
+            self.answering_nano_run_id
+                .clone()
+                .or_else(|| self.nano.as_ref().map(|view| view.run_id.clone()))
+        };
+        if cmd_tx
+            .send(HqInput {
+                text: line.clone(),
+                human_question_task_id,
+                nano_run_id: nano_run_id.clone(),
+                nano_input_id: input_id.clone(),
+            })
+            .is_err()
+        {
+            self.last_error =
+                Some("HQ input channel is closed; the request is still in the editor.".into());
+            return;
+        }
+        if steering && let Some(run_id) = nano_run_id {
+            self.nano_pending = Some(PendingNanoInput {
+                run_id,
+                text: self.input.clone(),
+                input_id: input_id.unwrap(),
+            });
+            self.last_error = Some("Waiting for Nano to accept the input.".into());
+            return;
+        }
         if !line.contains('\n') && self.history.last() != Some(&line) {
             self.history.push(line);
             if self.history.len() > MAX_HISTORY {
