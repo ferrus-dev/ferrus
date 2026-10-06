@@ -1599,6 +1599,7 @@ fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks()
         .args(["--interactive", "--taskless"])
         .env_remove("FERRUS_TASK_ID")
         .env_remove("FERRUS_BASELINE_TREE")
+        .env("RUST_LOG", "ferrus=debug")
         .env("FERRUS_RUN_ID", "nano-direct-run");
     // Linux also exercises the direct launch with a Windows-sized main-thread
     // stack instead of relying on the host's larger default stack.

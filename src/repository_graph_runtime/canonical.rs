@@ -372,11 +372,14 @@ async fn refresh_canonical_graph_at(
                 &config,
                 &identities,
             )?;
+            tracing::debug!("canonical graph source discovery started");
             let source = LocalRepositorySource::discover(project_root, context)?;
+            tracing::debug!("canonical graph source discovery finished");
             let source_identity = project::CanonicalSourceIdentity {
                 source_revision_id: source.manifest().revision.id.clone(),
                 manifest_digest: source.manifest().revision.manifest_digest.clone(),
             };
+            tracing::debug!("canonical graph indexing started");
             let outcome = IndexCoordinator::new(&mut sidecar).index(
                 &source,
                 &config,
@@ -386,9 +389,12 @@ async fn refresh_canonical_graph_at(
                     force_full: false,
                 },
             )?;
+            tracing::debug!("canonical graph indexing finished");
             Ok((source_identity, outcome))
         })();
+        tracing::debug!("stopping canonical graph lease heartbeat");
         let lease_healthy = heartbeat.finish();
+        tracing::debug!("canonical graph lease heartbeat stopped");
         let released =
             sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
         let indexed = indexed?;

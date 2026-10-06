@@ -32,7 +32,10 @@ impl Refresh {
 
     pub async fn settle(&mut self) -> Option<Value> {
         // Retain ownership if the caller is cancelled while awaiting maintenance.
-        let result = self.task.as_mut()?.await;
+        let task = self.task.as_mut()?;
+        tracing::debug!("Nano is waiting for repository graph refresh");
+        let result = task.await;
+        tracing::debug!("Nano repository graph refresh finished");
         self.task.take();
         Some(match result {
             Ok(value) => value,
