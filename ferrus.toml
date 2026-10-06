@@ -32,5 +32,4 @@ agent = "claude-code"
 model = ""
 
 [hq.executor]
-agent = "nano"
-model = "qwen/qwen3.8-27b"
+agent = "codex"
