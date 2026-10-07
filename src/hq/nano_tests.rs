@@ -479,6 +479,45 @@ exit 0
 }
 
 #[tokio::test]
+async fn foreign_taskless_executor_occupies_the_non_git_workspace() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let mut ctx = context(
+        FakeNative {
+            script: fixture.root.join("unused-script"),
+            reject: true,
+        },
+        false,
+    );
+    crate::project::record_run_started_for_task_with_workspace(
+        "foreign-taskless-run",
+        ROLE_EXECUTOR,
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        fixture.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert!(ctx.headless.is_empty());
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(fixture.dispatches(), 0);
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("non-Git")
+    );
+    crate::project::record_run_finished("foreign-taskless-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn taskless_native_executor_waits_for_the_non_git_managed_executor() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let fixture = Fixture::new().await;

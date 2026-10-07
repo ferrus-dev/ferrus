@@ -358,11 +358,17 @@ impl HqContext {
     pub(in crate::hq) async fn occupied_executor_slots(&self) -> Result<usize> {
         let mut live_db_task_ids =
             crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
-        // Count taskless sessions through their handles, not the shared bookkeeping row.
-        live_db_task_ids.remove("current");
-        let managed_workspaces_isolated = if self.headless.values().any(|handle| {
-            handle.is_alive() && handle.native_control.is_some() && handle.task_id.is_none()
-        }) {
+        let local_taskless_executor = self.headless.iter().any(|(name, handle)| {
+            name.starts_with(ROLE_EXECUTOR)
+                && handle.is_alive()
+                && handle.native_control.is_some()
+                && handle.task_id.is_none()
+        });
+        // Replace the shared bookkeeping row only when a live local handle accounts for it.
+        if local_taskless_executor {
+            live_db_task_ids.remove("current");
+        }
+        let managed_workspaces_isolated = if local_taskless_executor {
             git_is_work_tree(&crate::project::canonical_project_root().await?).await
         } else {
             false
