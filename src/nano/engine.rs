@@ -177,7 +177,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             return Ok(self.journal_failure());
         }
         let mut reason = if self.interactive && self.identity.task_id.is_none() {
-            if !self.commit(SessionEvent::InputRequested) {
+            if let Some(reason) = self.next_turn_limit() {
+                reason
+            } else if !self.commit(SessionEvent::InputRequested) {
                 EndReason::JournalFailed
             } else {
                 match self.wait_for_input(cancellation, deadline).await {
@@ -234,6 +236,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         let SessionCommand::Steer { text, input_id } = command else {
             return Ok(false);
         };
+        if let Some(reason) = self.next_turn_limit() {
+            return Err(reason);
+        }
         if text.trim().is_empty()
             || text.len() > super::wire::FRAME_BYTES
             || input_id
@@ -298,11 +303,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
-            if let Err(reason) = self.drain_input() {
+            if let Some(reason) = self.next_turn_limit() {
                 return reason;
             }
-            if self.budget.model_turns >= self.limits.model_turns {
-                return EndReason::Limit(LimitKind::ModelTurns);
+            if let Err(reason) = self.drain_input() {
+                return reason;
             }
 
             let assembly_start = Instant::now();
@@ -688,6 +693,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     Err(reason) => return reason,
                 }
                 if self.interactive {
+                    if let Some(reason) = self.next_turn_limit() {
+                        return reason;
+                    }
                     if !self.commit(SessionEvent::InputRequested) {
                         return EndReason::JournalFailed;
                     }
@@ -1182,6 +1190,17 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 "Nano provider attempt failed");
         }
         committed
+    }
+
+    fn next_turn_limit(&self) -> Option<EndReason> {
+        if self.budget.model_turns >= self.limits.model_turns {
+            Some(EndReason::Limit(LimitKind::ModelTurns))
+        } else if self.limits.tokens.saturating_sub(self.budget.tokens()) < 2 {
+            // Admission reserves at least one token each for input and output.
+            Some(EndReason::Limit(LimitKind::Tokens))
+        } else {
+            None
+        }
     }
 
     fn stop(&self, cancellation: &Cancellation, deadline: Instant) -> Option<EndReason> {

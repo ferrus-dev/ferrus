@@ -211,14 +211,14 @@ impl Reader {
 
     fn poll_persisted(&mut self, database: &std::path::Path) -> Result<Option<Snapshot>> {
         let snapshot = self.poll()?;
-        if snapshot.is_none() && !self.path.try_exists()? {
+        if snapshot.is_none() && !self.snapshot.ended {
             let status = crate::project::run_status_at(database, &self.expected_run)?;
             ensure!(
                 matches!(
                     status.as_deref(),
                     Some("running" | "checking" | "reviewing")
                 ),
-                "Run {} has no durable session journal (status: {})",
+                "Run {} has no complete terminal session record (status: {})",
                 self.expected_run,
                 status.as_deref().unwrap_or("missing")
             );
@@ -457,7 +457,7 @@ mod tests {
                     .poll_persisted(&database)
                     .unwrap_err()
                     .to_string()
-                    .contains("no durable session journal")
+                    .contains("no complete terminal session record")
             );
         }
         assert!(!path.exists());
@@ -486,6 +486,73 @@ mod tests {
         assert_eq!(snapshot.run_id, "view-test");
         assert!(snapshot.status.contains("Conversation unavailable"));
         assert!(snapshot.status.contains("failed"));
+    }
+
+    #[test]
+    fn nonprogressing_journals_wait_only_for_active_runs() {
+        for with_history in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let database = root.join("ferrus.db");
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT); INSERT INTO runs VALUES ('view-test', 'running');").unwrap();
+            let mut journal = if with_history {
+                journal(&root)
+            } else {
+                FileJournal::create(&root, "view-test", Quotas::default()).unwrap()
+            };
+            let path = root.join("nano/sessions/view-test/events.jsonl");
+            let mut reader = Reader::new(path.clone(), "view-test".into());
+            assert_eq!(
+                reader.poll_persisted(&database).unwrap().is_some(),
+                with_history
+            );
+            for tail in [b"".as_slice(), b"{\"interrupted\":"] {
+                let mut file = private::file(&path, false).unwrap();
+                file.seek(SeekFrom::End(0)).unwrap();
+                file.write_all(tail).unwrap();
+                drop(file);
+                let bytes = std::fs::read(&path).unwrap();
+                for status in ["running", "checking", "reviewing"] {
+                    connection
+                        .execute("UPDATE runs SET status = ?1", [status])
+                        .unwrap();
+                    assert!(reader.poll_persisted(&database).unwrap().is_none());
+                }
+                for status in ["failed", "completed", "interrupted"] {
+                    connection
+                        .execute("UPDATE runs SET status = ?1", [status])
+                        .unwrap();
+                    assert!(reader.poll_persisted(&database).is_err());
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                connection
+                    .execute("UPDATE runs SET status = 'running'", [])
+                    .unwrap();
+            }
+            if with_history {
+                // A complete Ended record remains authoritative, even with a partial tail.
+                let file = private::file(&path, false).unwrap();
+                file.set_len(reader.offset).unwrap();
+                drop(file);
+                journal
+                    .append(
+                        SessionEvent::Ended {
+                            reason: super::super::session::EndReason::Cancelled,
+                        },
+                        &Budget::default(),
+                    )
+                    .unwrap();
+                let mut file = private::file(&path, false).unwrap();
+                file.seek(SeekFrom::End(0)).unwrap();
+                file.write_all(b"{\"interrupted\":").unwrap();
+                connection
+                    .execute("UPDATE runs SET status = 'completed'", [])
+                    .unwrap();
+                assert!(reader.poll_persisted(&database).unwrap().unwrap().ended);
+                assert!(reader.poll_persisted(&database).unwrap().is_none());
+            }
+        }
     }
 
     #[test]

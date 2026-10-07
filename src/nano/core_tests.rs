@@ -1814,6 +1814,86 @@ struct InteractiveJournal {
 }
 
 #[tokio::test]
+async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
+    for queued in [false, true] {
+        for limit in [LimitKind::ModelTurns, LimitKind::Tokens] {
+            for remaining in [0, 1] {
+                let mut limits = limits();
+                let mut event = response("Request completed.", vec![]);
+                match limit {
+                    LimitKind::ModelTurns => limits.model_turns = 1,
+                    LimitKind::Tokens => {
+                        let ProviderEvent::Completed { usage, .. } = &mut event else {
+                            unreachable!()
+                        };
+                        *usage = Some(Usage {
+                            input_tokens: limits.tokens - remaining,
+                            output_tokens: 0,
+                            reported: true,
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                let (_dir, base) = setup(scripted(vec![event]), limits.clone());
+                let (sender, commands) = tokio::sync::mpsc::channel(8);
+                let journal = InteractiveJournal {
+                    inner: base.journal,
+                    commands: Some(commands),
+                    sender,
+                    interactive: !queued,
+                    waits: 0,
+                    user_requests: 2,
+                    fail_input: false,
+                    inject_steering: queued,
+                };
+                let mut identity = identity();
+                if !queued {
+                    identity.task_id = None;
+                }
+                let mut engine = Engine::new(
+                    identity,
+                    limits,
+                    base.provider,
+                    base.tools,
+                    base.host,
+                    journal,
+                )
+                .unwrap();
+                let end = engine
+                    .run(
+                        SessionCommand::Start {
+                            input: "Workspace constraints".into(),
+                        },
+                        &Cancellation::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(end.reason, EndReason::Limit(limit.clone()));
+                assert!(end.durable);
+                assert_eq!(engine.provider.requests.len(), 1);
+                let records = &engine.host.records;
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|r| matches!(r.event, SessionEvent::InputRequested))
+                        .count(),
+                    usize::from(!queued)
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+                        .count(),
+                    usize::from(!queued)
+                );
+                assert!(records.iter().any(|r| matches!(&r.event, SessionEvent::ModelCompleted { response, .. } if response.text == "Request completed.")));
+                Replay::from_records(records).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn taskless_interactive_waits_before_inference_and_reconstructs_from_journal() {
     let (dir, base) = setup(scripted(vec![response("Checks passed.", vec![])]), limits());
     let (sender, commands) = tokio::sync::mpsc::channel(8);
