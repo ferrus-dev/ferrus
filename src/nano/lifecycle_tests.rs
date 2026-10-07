@@ -3107,6 +3107,70 @@ async fn direct_mutations_and_running_commands_share_the_canonical_approval_lock
 }
 
 #[tokio::test]
+async fn taskless_mutation_persists_invalidation_without_scheduled_maintenance() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, true).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-invalidation",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-invalidation".into(),
+    };
+    let prior = binding.graph().await.unwrap().status().await.unwrap();
+    let journal = FileJournal::create(&f.data, "direct-invalidation", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-invalidation",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut tools =
+        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
+    tools.working_set_enabled = false;
+    let patch = baseline_patch(&tools, "CanonicalUnrefreshedEdit");
+    // Invalidation must use the bound database rather than the process working directory.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(elsewhere.path()).unwrap();
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    drop(tools);
+    std::env::set_current_dir(&f.root).unwrap();
+    let state = project::canonical_graph_reference().await.unwrap();
+    assert_eq!(state.status, project::CanonicalGraphStatus::Stale);
+    let invalidations: i64 = f.connection().query_row(
+        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-invalidation'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(invalidations, 1);
+    let after = binding.graph().await.unwrap().status().await.unwrap();
+    assert_eq!(after.snapshot_id, prior.snapshot_id);
+    assert_eq!(
+        after.freshness.freshness,
+        crate::repository_graph::domain::Freshness::Stale
+    );
+}
+
+#[tokio::test]
 async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_failure() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
@@ -3172,6 +3236,10 @@ async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_
         "{:?}",
         prepared.observations
     );
+    assert_eq!(
+        project::canonical_graph_reference().await.unwrap().status,
+        project::CanonicalGraphStatus::Fresh
+    );
 
     std::fs::write(
         f.root.join("ferrus.toml"),
@@ -3196,6 +3264,15 @@ async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_
             .iter()
             .any(|item| item["kind"] == "prefetch")
     );
+    assert_eq!(
+        project::canonical_graph_reference().await.unwrap().status,
+        project::CanonicalGraphStatus::Stale
+    );
+    let invalidations: i64 = f.connection().query_row(
+        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-prefetch'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(invalidations, 2);
     assert!(tools.shutdown().await);
 }
 

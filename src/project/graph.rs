@@ -131,6 +131,17 @@ pub async fn record_canonical_graph_invalidation(
     reason: CanonicalInvalidationReason,
 ) -> Result<()> {
     let database_path = current_database_path().await?;
+    record_canonical_graph_invalidation_at(&database_path, task_id, run_id, source, reason).await
+}
+
+pub(crate) async fn record_canonical_graph_invalidation_at(
+    database_path: &Path,
+    task_id: &str,
+    run_id: Option<&str>,
+    source: Option<&CanonicalSourceIdentity>,
+    reason: CanonicalInvalidationReason,
+) -> Result<()> {
+    let database_path = database_path.to_path_buf();
     let task_id = task_id.to_string();
     let run_id = run_id.map(str::to_string);
     let source = source.cloned();

@@ -65,11 +65,23 @@ impl<B: ExecutionBackend> NativeTools<B> {
     }
 
     pub(super) async fn invalidate_unknown(&mut self) {
+        self.before_mutation().await;
+        if self.session.managed().is_none()
+            && let Err(error) = crate::project::record_canonical_graph_invalidation_at(
+                &self.session.data_dir().join("ferrus.db"),
+                "current",
+                Some(self.session.run_id()),
+                None,
+                crate::project::CanonicalInvalidationReason::SourceComparisonUnavailable,
+            )
+            .await
+        {
+            tracing::warn!(error = ?error, "failed to invalidate the canonical graph before a Nano mutation");
+        }
         if !self.working_set_enabled {
             self.prefetch_invalidated = true;
             return;
         }
-        self.before_mutation().await;
         self.context.invalidate();
         self.refresh.invalidate();
         self.prefetch_invalidated = true;

@@ -479,7 +479,7 @@ exit 0
 }
 
 #[tokio::test]
-async fn foreign_taskless_executor_occupies_the_non_git_workspace() {
+async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let fixture = Fixture::new().await;
     let mut ctx = context(
@@ -511,6 +511,31 @@ async fn foreign_taskless_executor_occupies_the_non_git_workspace() {
             .to_string()
             .contains("non-Git")
     );
+    assert!(
+        StdCommand::new("git")
+            .args(["init", "-q", "--object-format=sha1"])
+            .current_dir(&fixture.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    // Only taskless runs are excluded; a foreign managed Executor still occupies a slot.
+    crate::project::record_run_started_for_task_with_workspace(
+        "foreign-managed-run",
+        ROLE_EXECUTOR,
+        "executor:nano:t-001",
+        std::process::id(),
+        Some("t-001"),
+        fixture.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    crate::project::record_run_finished("foreign-managed-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
     crate::project::record_run_finished("foreign-taskless-run", 0)
         .await
         .unwrap();

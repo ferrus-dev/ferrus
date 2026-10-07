@@ -364,15 +364,16 @@ impl HqContext {
                 && handle.native_control.is_some()
                 && handle.task_id.is_none()
         });
-        // Replace the shared bookkeeping row only when a live local handle accounts for it.
-        if local_taskless_executor {
+        let managed_workspaces_isolated =
+            if local_taskless_executor || live_db_task_ids.contains("current") {
+                git_is_work_tree(&crate::project::canonical_project_root().await?).await
+            } else {
+                false
+            };
+        // Git tasks use isolated worktrees. Otherwise only replace a row counted locally.
+        if managed_workspaces_isolated || local_taskless_executor {
             live_db_task_ids.remove("current");
         }
-        let managed_workspaces_isolated = if local_taskless_executor {
-            git_is_work_tree(&crate::project::canonical_project_root().await?).await
-        } else {
-            false
-        };
         Ok(occupied_executor_slots_from_handles(
             live_db_task_ids,
             self.headless.iter().filter_map(|(name, handle)| {
