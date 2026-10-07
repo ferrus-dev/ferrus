@@ -1104,7 +1104,8 @@ async fn acquire_canonical_approval_lock_guard(
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => break,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            // Windows reports ERROR_LOCK_VIOLATION rather than WouldBlock.
+            Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(err) => return Err(err).context("Failed to acquire canonical approval lock guard"),
@@ -1241,7 +1242,9 @@ async fn remove_stale_canonical_approval_lock(lock_path: &Path) -> Result<bool> 
     };
     match file.try_lock_exclusive() {
         Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            return Ok(false);
+        }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
