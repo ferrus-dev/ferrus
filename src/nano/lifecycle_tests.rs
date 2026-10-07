@@ -2987,6 +2987,126 @@ async fn disabled_working_set_keeps_workspace_tools_but_never_schedules_refresh(
 }
 
 #[tokio::test]
+#[cfg(feature = "nano-openai")]
+async fn direct_mutations_and_running_commands_share_the_canonical_approval_lock() {
+    use crate::server::tools::approve::acquire_canonical_approval_lock_at;
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, false).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-lock",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-lock".into(),
+    };
+    let journal = FileJournal::create(&f.data, "direct-lock", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-lock",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut native =
+        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
+    native.working_set_enabled = false;
+    let patch = baseline_patch(&native, "DirectLockedEdit");
+    let mut tools =
+        crate::nano::interactive::InteractiveTools::new(native, binding, Cancellation::default());
+    let lock_path = f.data.join("canonical-approval.lock");
+    let approval = acquire_canonical_approval_lock_at(&lock_path, "t-review")
+        .await
+        .unwrap();
+    let before = std::fs::read(f.root.join("src/lib.rs")).unwrap();
+    let cancelled = Cancellation::default();
+    let signal = cancelled.clone();
+    let cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.cancel();
+    });
+    assert_eq!(
+        tools.execute(&patch, &cancelled).await,
+        ToolOutcome::Failed(ToolError::Interrupted)
+    );
+    cancel.await.unwrap();
+    assert_eq!(std::fs::read(f.root.join("src/lib.rs")).unwrap(), before);
+    drop(approval);
+    assert!(matches!(
+        tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(!lock_path.exists());
+    let short = ValidatedCall {
+        call_id: "short".into(),
+        provider_call_id: "short".into(),
+        name: "exec".into(),
+        arguments: json!({"command":"echo done", "cwd":".", "timeout_ms":60000}),
+    };
+    assert!(matches!(
+        tools.execute(&short, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    // The process guard must release without another model turn or tool call.
+    let approval = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(approval);
+    #[cfg(unix)]
+    let command = "sleep 30";
+    #[cfg(windows)]
+    let command = "ping -n 30 127.0.0.1 >nul";
+    let exec = ValidatedCall {
+        call_id: "exec".into(),
+        provider_call_id: "exec".into(),
+        name: "exec".into(),
+        arguments: json!({"command":command, "cwd":".", "timeout_ms":60000}),
+    };
+    assert!(matches!(
+        tools.execute(&exec, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_canonical_approval_lock_at(&lock_path, "t-review")
+        )
+        .await
+        .is_err()
+    );
+    assert!(tools.shutdown().await);
+    let approval = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(approval);
+    assert!(!lock_path.exists());
+}
+
+#[tokio::test]
 async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_failure() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;

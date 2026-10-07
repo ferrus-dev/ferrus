@@ -206,6 +206,33 @@ async fn canonical_approval_lock_contention_preserves_existing_lock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_approval_guard_contention_is_cancellable() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    let guard = acquire_canonical_approval_lock_guard(&lock_path)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_canonical_approval_lock_at(&lock_path, "direct-run"),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!lock_path.exists());
+    drop(guard);
+    let lock = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(lock);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_approval_lock_stale_recovery_admits_one_owner_at_a_time() {
     let dir = TempDir::new().unwrap();
     let lock_path = dir.path().join("canonical-approval.lock");

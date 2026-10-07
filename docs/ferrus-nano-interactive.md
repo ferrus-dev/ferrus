@@ -39,6 +39,9 @@ they do not use a task overlay. They ask questions in ordinary responses and do 
 a fresh one. No task dispatch budget or lease is consumed.
 MCP peers with `inherit_managed_binding = true` are omitted in direct sessions; native repository
 tools continue to use canonical context. Other configured MCP peers remain available.
+Without Git, direct and managed Executors share one workspace slot. In Git projects, direct
+mutations and checks share the canonical approval lock with integration. A running command keeps
+that lock until its writer stops; an idle direct conversation does not block approval.
 
 Attaching a live headless Nano enables interaction through its existing command pipe, at a safe
 engine boundary. The process is not replaced and no effects are replayed. Its final textual
@@ -62,6 +65,8 @@ an assistant message. Only the normal checked submission path produces a Reviewi
 The private append-only journal is the durable conversation. HQ reads only complete validated
 records, incrementally, without acquiring its writer lock or repairing partial tails. Reconnecting
 reconstructs display state from those records. Dropping the view stops its reader, not persistence.
+A missing journal is shown as unavailable once the persisted run is terminal, rather than
+waiting indefinitely for records that will not arrive.
 
 The display retains at most 128 entries and 32 KiB of text, with 2 KiB per entry. Tool arguments,
 results, status, token usage, and completed assistant responses come from typed journal events.

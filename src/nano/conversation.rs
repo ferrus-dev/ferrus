@@ -208,6 +208,23 @@ impl Reader {
         }
         Ok((self.offset != before).then(|| self.snapshot.clone()))
     }
+
+    fn poll_persisted(&mut self, database: &std::path::Path) -> Result<Option<Snapshot>> {
+        let snapshot = self.poll()?;
+        if snapshot.is_none() && !self.path.try_exists()? {
+            let status = crate::project::run_status_at(database, &self.expected_run)?;
+            ensure!(
+                matches!(
+                    status.as_deref(),
+                    Some("running" | "checking" | "reviewing")
+                ),
+                "Run {} has no durable session journal (status: {})",
+                self.expected_run,
+                status.as_deref().unwrap_or("missing")
+            );
+        }
+        Ok(snapshot)
+    }
 }
 
 /// A single blocking pipe writer with bounded queued input. Rendering never owns pipe I/O.
@@ -270,7 +287,7 @@ pub(crate) struct View {
     stop: Arc<AtomicBool>,
 }
 impl View {
-    pub(crate) fn spawn(name: String, path: PathBuf, run: String) -> Self {
+    pub(crate) fn spawn(name: String, path: PathBuf, run: String, database: PathBuf) -> Self {
         let (sender, snapshots) = tokio::sync::watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
         let cancelled = stop.clone();
@@ -278,7 +295,7 @@ impl View {
         std::thread::spawn(move || {
             let mut reader = Reader::new(path, run);
             while !cancelled.load(Ordering::SeqCst) {
-                match reader.poll() {
+                match reader.poll_persisted(&database) {
                     Ok(Some(snapshot)) => {
                         let ended = snapshot.ended;
                         sender.send_replace(Some(snapshot));
@@ -289,6 +306,7 @@ impl View {
                     Ok(None) => (),
                     Err(error) => {
                         let mut snapshot = reader.snapshot.clone();
+                        snapshot.run_id = reader.expected_run.clone();
                         snapshot.ended = true;
                         snapshot.status = format!("Conversation unavailable: {error}");
                         sender.send_replace(Some(snapshot));
@@ -419,6 +437,55 @@ mod tests {
         file.seek(SeekFrom::End(0)).unwrap();
         file.write_all(b"invalid\n").unwrap();
         assert!(Reader::new(path, "view-test".into()).poll().is_err());
+    }
+
+    #[test]
+    fn missing_journals_wait_only_for_active_persisted_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("ferrus.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT); INSERT INTO runs VALUES ('view-test', 'running');").unwrap();
+        let path = dir.path().join("missing/events.jsonl");
+        let mut reader = Reader::new(path.clone(), "view-test".into());
+        assert!(reader.poll_persisted(&database).unwrap().is_none());
+        for status in ["completed", "failed", "interrupted"] {
+            connection
+                .execute("UPDATE runs SET status = ?1", [status])
+                .unwrap();
+            assert!(
+                reader
+                    .poll_persisted(&database)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no durable session journal")
+            );
+        }
+        assert!(!path.exists());
+        let mut missing = Reader::new(path, "unknown-run".into());
+        assert!(missing.poll_persisted(&database).is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_view_ends_as_unavailable_when_the_journal_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("ferrus.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT); INSERT INTO runs VALUES ('view-test', 'failed');").unwrap();
+        let mut view = View::spawn(
+            "nano".into(),
+            dir.path().join("events.jsonl"),
+            "view-test".into(),
+            database,
+        );
+        tokio::time::timeout(Duration::from_secs(5), view.snapshots.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = view.snapshots.borrow().clone().unwrap();
+        assert!(snapshot.ended);
+        assert_eq!(snapshot.run_id, "view-test");
+        assert!(snapshot.status.contains("Conversation unavailable"));
+        assert!(snapshot.status.contains("failed"));
     }
 
     #[test]

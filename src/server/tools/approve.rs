@@ -996,10 +996,12 @@ async fn write_integration_error(context: &RuntimeTaskContext, reason: &str) -> 
     store::write_integration_error_for_run_dir(&context.run_dir, &content).await
 }
 
-struct CanonicalApprovalLock {
+pub(crate) struct CanonicalApprovalLock {
     path: PathBuf,
     owner_path: PathBuf,
     owner_file: Option<std::fs::File>,
+    // Keep creation, stale recovery, and owner cleanup serialized for the full operation.
+    _guard: Option<CanonicalApprovalLockGuard>,
 }
 
 struct CanonicalApprovalLockGuard {
@@ -1052,7 +1054,7 @@ async fn acquire_canonical_approval_lock(
     acquire_canonical_approval_lock_at(&lock_path, &context.task_id).await
 }
 
-async fn acquire_canonical_approval_lock_at(
+pub(crate) async fn acquire_canonical_approval_lock_at(
     lock_path: &Path,
     task_id: &str,
 ) -> Result<CanonicalApprovalLock> {
@@ -1064,22 +1066,28 @@ async fn acquire_canonical_approval_lock_at(
 
     // Serialize creation and stale-lock removal on a stable guard file so
     // competing recoveries cannot unlink a newly acquired approval lock.
-    let _guard = acquire_canonical_approval_lock_guard(lock_path)?;
     loop {
+        let guard = acquire_canonical_approval_lock_guard(lock_path).await?;
         match try_create_canonical_approval_lock(lock_path, task_id).await {
-            Ok(Some(lock)) => return Ok(lock),
+            Ok(Some(mut lock)) => {
+                lock._guard = Some(guard);
+                return Ok(lock);
+            }
             Ok(None) => {
                 if remove_stale_canonical_approval_lock(lock_path).await? {
                     continue;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(err) => return Err(err),
         }
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn acquire_canonical_approval_lock_guard(lock_path: &Path) -> Result<CanonicalApprovalLockGuard> {
+async fn acquire_canonical_approval_lock_guard(
+    lock_path: &Path,
+) -> Result<CanonicalApprovalLockGuard> {
     let guard_path = canonical_approval_lock_guard_path(lock_path);
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -1093,12 +1101,15 @@ fn acquire_canonical_approval_lock_guard(lock_path: &Path) -> Result<CanonicalAp
                 guard_path.display()
             )
         })?;
-    file.lock_exclusive().with_context(|| {
-        format!(
-            "Failed to acquire canonical approval lock guard {}",
-            guard_path.display()
-        )
-    })?;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err).context("Failed to acquire canonical approval lock guard"),
+        }
+    }
     Ok(CanonicalApprovalLockGuard { _file: file })
 }
 
@@ -1165,11 +1176,13 @@ async fn try_create_canonical_approval_lock(
                 }
             };
             register_canonical_approval_owner(&owner_path);
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            // No cancellation point between publishing ownership and its RAII guard.
+            let _ = std::fs::remove_file(&temp_path);
             Ok(Some(CanonicalApprovalLock {
                 path: lock_path.to_path_buf(),
                 owner_path,
                 owner_file: Some(owner_file),
+                _guard: None,
             }))
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {

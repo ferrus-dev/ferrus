@@ -95,12 +95,17 @@ impl HqContext {
                 .context("Native input pipe is unavailable")?
                 .open()?;
         }
-        let path = crate::project::current_project_data_dir()
-            .await?
+        let data_dir = crate::project::current_project_data_dir().await?;
+        let path = data_dir
             .join("nano/sessions")
             .join(&run)
             .join("events.jsonl");
-        let view = crate::nano::conversation::View::spawn(name.into(), path, run);
+        let view = crate::nano::conversation::View::spawn(
+            name.into(),
+            path,
+            run,
+            data_dir.join("ferrus.db"),
+        );
         let _ = self.display.0.send(tui::UiMessage::NanoOpen {
             name: name.into(),
             run_id: view.run_id.clone(),

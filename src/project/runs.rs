@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Read one persisted run without relying on the caller's working directory or mutating schema.
+pub(crate) fn run_status_at(database: &Path, run_id: &str) -> Result<Option<String>> {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    Ok(connection
+        .query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
 /// Taskless Executor runs use the same legacy bookkeeping row as external interactive
 /// agents. That row grants no task lease, task intent, or lifecycle authority.
 pub(crate) async fn authorize_taskless_executor_run_at(

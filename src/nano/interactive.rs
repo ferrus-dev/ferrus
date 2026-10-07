@@ -10,51 +10,41 @@ use super::{
     session::{Limits, Record, SessionCommand, SessionEnd, SessionIdentity},
     tools::*,
 };
+use crate::server::tools::approve::{CanonicalApprovalLock, acquire_canonical_approval_lock_at};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
+use std::sync::{Arc, Weak};
 use tokio::task::JoinHandle;
 
-struct InteractiveTools<B: ExecutionBackend> {
+pub(super) struct InteractiveTools<B: ExecutionBackend> {
     native: NativeTools<B>,
     binding: Binding,
     stop: Cancellation,
     pending: Option<JoinHandle<Result<Value>>>,
+    workspace_lock: Option<Arc<CanonicalApprovalLock>>,
+    workspace_owner: Weak<CanonicalApprovalLock>,
 }
 
-impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
-    async fn prepare_context(
-        &mut self,
-        messages: &[Message],
-        stop: &Cancellation,
-    ) -> Result<Option<super::working_set::Preparation>, ToolError> {
-        self.native.prepare_context(messages, stop).await
-    }
-    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
-        self.native.effect_plan(call)
-    }
-    fn descriptors(&self) -> Vec<ToolDescriptor> {
-        let mut tools = self.native.descriptors();
-        tools.push(ToolDescriptor {
-            name: "check".into(),
-            description: "Run configured workspace checks after stopping owned writers. Does not claim or change any Ferrus task.".into(),
-            input_schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
-        });
-        tools
-    }
-    fn validate(&self, name: &str, args: &Value) -> Result<(), ToolError> {
-        if name == "check" {
-            return if args.as_object().is_some_and(|args| args.is_empty()) {
-                Ok(())
-            } else {
-                Err(ToolError::InvalidArguments)
-            };
+impl<B: ExecutionBackend> InteractiveTools<B> {
+    pub(super) fn new(native: NativeTools<B>, binding: Binding, stop: Cancellation) -> Self {
+        Self {
+            native,
+            binding,
+            stop,
+            pending: None,
+            workspace_lock: None,
+            workspace_owner: Weak::new(),
         }
-        self.native.validate(name, args)
     }
-    async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome {
-        if call.name != "check" {
-            return self.native.execute(call, cancellation).await;
+
+    fn release_workspace_if_quiet(&mut self) {
+        if self.pending.is_none() {
+            self.native.coding.commands.set_execution_guard(None);
+            self.workspace_lock = None;
         }
+    }
+
+    async fn check(&mut self, call: &ValidatedCall) -> ToolOutcome {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::InvalidArguments);
         }
@@ -81,6 +71,76 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
         self.pending = None;
         check_outcome(result)
     }
+}
+
+impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
+    async fn prepare_context(
+        &mut self,
+        messages: &[Message],
+        stop: &Cancellation,
+    ) -> Result<Option<super::working_set::Preparation>, ToolError> {
+        self.release_workspace_if_quiet();
+        self.native.prepare_context(messages, stop).await
+    }
+    fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
+        self.native.effect_plan(call)
+    }
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
+        let mut tools = self.native.descriptors();
+        tools.push(ToolDescriptor {
+            name: "check".into(),
+            description: "Run configured workspace checks after stopping owned writers. Does not claim or change any Ferrus task.".into(),
+            input_schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+        });
+        tools
+    }
+    fn validate(&self, name: &str, args: &Value) -> Result<(), ToolError> {
+        if name == "check" {
+            return if args.as_object().is_some_and(|args| args.is_empty()) {
+                Ok(())
+            } else {
+                Err(ToolError::InvalidArguments)
+            };
+        }
+        self.native.validate(name, args)
+    }
+    async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome {
+        let may_write = matches!(call.name.as_str(), "exec" | "apply_patch" | "check")
+            || call.name.starts_with("mcp_");
+        if may_write && self.workspace_lock.is_none() {
+            if let Some(lock) = self.workspace_owner.upgrade() {
+                self.workspace_lock = Some(lock);
+            } else {
+                let path = self.binding.data_dir().join("canonical-approval.lock");
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return ToolOutcome::Failed(ToolError::Interrupted),
+                    lock = acquire_canonical_approval_lock_at(&path, self.binding.run_id()) => lock,
+                };
+                match result {
+                    Ok(lock) => self.workspace_lock = Some(Arc::new(lock)),
+                    Err(_) => return ToolOutcome::Failed(ToolError::Failed),
+                }
+            }
+            self.workspace_owner = Arc::downgrade(self.workspace_lock.as_ref().unwrap());
+        }
+        if may_write {
+            self.native.coding.commands.set_execution_guard(
+                self.workspace_lock
+                    .clone()
+                    .map(|lock| lock as Arc<dyn Send + Sync>),
+            );
+        }
+        let outcome = if call.name == "check" {
+            self.check(call).await
+        } else {
+            self.native.execute(call, cancellation).await
+        };
+        // An exec reply can precede process completion. Keep the lock until
+        // every owned writer is joined or has a definitive terminal state.
+        self.release_workspace_if_quiet();
+        outcome
+    }
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         if let Some(task) = self.pending.take() {
             self.stop.cancel();
@@ -94,7 +154,12 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
             Some(task) => task.await.is_ok(),
             None => true,
         };
-        self.native.shutdown().await && joined
+        let stopped = self.native.shutdown().await && joined;
+        if stopped {
+            self.native.coding.commands.set_execution_guard(None);
+            self.workspace_lock = None;
+        }
+        stopped
     }
 }
 
@@ -162,12 +227,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         run_id: Some(binding.run_id().into()),
     };
     let host = InteractiveHost(binding.clone());
-    let tools = InteractiveTools {
-        native,
-        binding,
-        stop: cancellation.clone(),
-        pending: None,
-    };
+    let tools = InteractiveTools::new(native, binding, cancellation.clone());
     let mut engine = Engine::new(identity, limits, provider, tools, host, journal)?;
     engine.set_system_prompt(super::instructions::INTERACTIVE_POLICY)?;
     // Do not embed the inference/tool future in the host's launch state.
