@@ -509,7 +509,7 @@ async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("non-Git")
+            .contains("taskless Executor")
     );
     assert!(
         StdCommand::new("git")
@@ -520,6 +520,13 @@ async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
             .success()
     );
     assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("taskless Executor")
+    );
     // Only taskless runs are excluded; a foreign managed Executor still occupies a slot.
     crate::project::record_run_started_for_task_with_workspace(
         "foreign-managed-run",
@@ -540,6 +547,14 @@ async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
         .await
         .unwrap();
     assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    // A terminal taskless run no longer blocks launch preflight.
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid native config")
+    );
 }
 
 #[tokio::test]

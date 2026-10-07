@@ -36,6 +36,12 @@ impl HqContext {
                 .is_some_and(agent_manager::HeadlessHandle::is_alive)
             {
                 let root = crate::project::canonical_project_root().await?;
+                let live_executor_tasks =
+                    crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+                anyhow::ensure!(
+                    !live_executor_tasks.contains("current"),
+                    "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first."
+                );
                 anyhow::ensure!(
                     git_is_work_tree(&root).await || self.occupied_executor_slots().await? == 0,
                     "Cannot start a direct Nano session while an Executor uses the shared non-Git workspace. Stop the Executor first."
