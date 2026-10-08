@@ -580,25 +580,33 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .to_string(),
     };
 
-    let mut direct_reservation = if native && request.role == ROLE_EXECUTOR && task_id.is_none() {
-        let registration = crate::project::read_project_registration_at(
-            request
-                .workspace
-                .as_ref()
-                .context("Direct Nano has no workspace")?
-                .project_root
-                .as_path(),
-        )
-        .await?;
-        Some(
-            crate::project::reserve_direct_session_at(
-                &registration.data_dir.join("ferrus.db"),
-                &run_id,
-                request.name,
-                Path::new(&workspace_path),
+    let mut executor_reservation = if request.role == ROLE_EXECUTOR && (native || task_id.is_some())
+    {
+        let root = match request.workspace.as_ref() {
+            Some(workspace) => workspace.project_root.clone(),
+            None => std::env::current_dir()?,
+        };
+        let root = std::fs::canonicalize(root)?;
+        if Path::new(&workspace_path) == root || (native && task_id.is_none()) {
+            // Managed runs in the canonical directory share its single writer slot.
+            // Git task worktrees do not compete with direct canonical sessions.
+            let shared_workspace =
+                task_id.is_some() || !super::workspace::git_is_work_tree(&root).await;
+            let registration = crate::project::read_project_registration_at(&root).await?;
+            Some(
+                crate::project::reserve_executor_session_at(
+                    &registration.data_dir.join("ferrus.db"),
+                    &run_id,
+                    request.name,
+                    Path::new(&workspace_path),
+                    task_id.as_deref().unwrap_or("current"),
+                    shared_workspace,
+                )
+                .await?,
             )
-            .await?,
-        )
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -687,7 +695,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         request.role,
         request.name,
         pid,
-        if direct_reservation.is_some() {
+        if executor_reservation.is_some() && task_id.is_none() {
             Some("current")
         } else {
             task_id.as_deref()
@@ -699,8 +707,8 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         },
     )
     .await;
-    if native && db_run_id.is_none() {
-        anyhow::bail!("Nano requires a persisted run before start");
+    if (native || executor_reservation.is_some()) && db_run_id.is_none() {
+        anyhow::bail!("Executor requires a persisted run before start");
     }
     let mut output_threads = Vec::new();
     let setup = async {
@@ -823,7 +831,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     };
 
     let (exit_tx, exit_rx) = tokio::sync::watch::channel::<Option<i32>>(None);
-    if let Some(reservation) = &mut direct_reservation {
+    if let Some(reservation) = &mut executor_reservation {
         reservation.started();
     }
     let mut child = child.0.take().expect("owned child");

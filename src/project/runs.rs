@@ -14,19 +14,19 @@ pub(crate) fn run_status_at(database: &Path, run_id: &str) -> Result<Option<Stri
 }
 
 /// A reserved run counts as live under the HQ PID until startup transfers it to the child.
-pub(crate) struct DirectSessionReservation {
+pub(crate) struct ExecutorSessionReservation {
     database: PathBuf,
     run_id: String,
     reserved: bool,
 }
 
-impl DirectSessionReservation {
+impl ExecutorSessionReservation {
     pub(crate) fn started(&mut self) {
         self.reserved = false;
     }
 }
 
-impl Drop for DirectSessionReservation {
+impl Drop for ExecutorSessionReservation {
     fn drop(&mut self) {
         if !self.reserved {
             return;
@@ -42,46 +42,53 @@ impl Drop for DirectSessionReservation {
             Ok(())
         })();
         if let Err(error) = result {
-            warn!(run_id = self.run_id, error = ?error, "failed to release a direct session reservation");
+            warn!(run_id = self.run_id, error = ?error, "failed to release an Executor session reservation");
         }
     }
 }
 
-pub(crate) async fn reserve_direct_session_at(
+pub(crate) async fn reserve_executor_session_at(
     database: &Path,
     run_id: &str,
     agent: &str,
     workspace: &Path,
-) -> Result<DirectSessionReservation> {
-    let (database, run_id, agent, workspace) = (
+    task_id: &str,
+    shared_workspace: bool,
+) -> Result<ExecutorSessionReservation> {
+    let (database, run_id, agent, workspace, task_id) = (
         database.to_path_buf(),
         run_id.to_owned(),
         agent.to_owned(),
         path_string(workspace),
+        task_id.to_owned(),
     );
     tokio::task::spawn_blocking(move || {
         let mut connection = open_runtime_database(&database)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let occupied = {
             let mut statement = transaction.prepare(
-                "SELECT pid FROM runs WHERE task_id = 'current' AND role = 'executor' AND status IN ('running', 'checking', 'reviewing')",
+                "SELECT pid FROM runs WHERE (?1 OR task_id = 'current') AND role = 'executor' AND status IN ('running', 'checking', 'reviewing')",
             )?;
-            let pids = statement.query_map([], |row| row.get::<_, Option<u32>>(0))?;
+            let pids = statement.query_map([shared_workspace], |row| row.get::<_, Option<u32>>(0))?;
             let mut live = false;
             for pid in pids {
                 live |= pid?.is_some_and(process_is_alive);
             }
             live
         };
-        anyhow::ensure!(!occupied, "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first.");
-        ensure_task_exists(&transaction, CURRENT_TASK_ID, CURRENT_TASK_PATH)?;
+        anyhow::ensure!(!occupied, if shared_workspace {
+            "Cannot start an Executor while another Executor uses the shared workspace. Stop that session first."
+        } else {
+            "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first."
+        });
+        ensure_task_exists(&transaction, &task_id, &default_task_path_for_id(&task_id))?;
         transaction.execute(
-            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path) VALUES (?1, 'current', 'executor', ?2, 'running', ?3, ?3, ?4, ?5)",
-            params![run_id, agent, timestamp(), std::process::id(), workspace],
+            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path) VALUES (?1, ?2, 'executor', ?3, 'running', ?4, ?4, ?5, ?6)",
+            params![run_id, task_id, agent, timestamp(), std::process::id(), workspace],
         )?;
         transaction.commit()?;
         // Build the guard inside the worker so cancellation also drops a committed reservation.
-        Ok(DirectSessionReservation { database, run_id, reserved: true })
+        Ok(ExecutorSessionReservation { database, run_id, reserved: true })
     })
     .await?
 }

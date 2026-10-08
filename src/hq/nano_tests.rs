@@ -484,17 +484,21 @@ async fn direct_session_reservation_is_atomic_and_released_on_setup_failure() {
     let fixture = Fixture::new().await;
     let database = fixture.data.join("ferrus.db");
     let (first, second) = tokio::join!(
-        crate::project::reserve_direct_session_at(
+        crate::project::reserve_executor_session_at(
             &database,
             "direct-a",
             "executor:nano:1",
-            &fixture.root
+            &fixture.root,
+            "current",
+            true
         ),
-        crate::project::reserve_direct_session_at(
+        crate::project::reserve_executor_session_at(
             &database,
             "direct-b",
             "executor:nano:1",
-            &fixture.root
+            &fixture.root,
+            "current",
+            true
         ),
     );
     assert_ne!(first.is_ok(), second.is_ok());
@@ -533,11 +537,141 @@ async fn direct_session_reservation_is_atomic_and_released_on_setup_failure() {
             .all(|run| run.status == "failed")
     );
     // A fresh claim can immediately replace the failed setup.
-    let _next = crate::project::reserve_direct_session_at(
+    let _next = crate::project::reserve_executor_session_at(
         &database,
         "direct-next",
         "executor:nano:1",
         &fixture.root,
+        "current",
+        true,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shared_executor_reservations_exclude_managed_and_direct_runs() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let database = fixture.data.join("ferrus.db");
+    for (index, (first_task, second_task)) in [
+        ("current", "t-001"),
+        ("t-001", "current"),
+        ("t-001", "t-002"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let first = crate::project::reserve_executor_session_at(
+            &database,
+            &format!("first-{index}"),
+            "executor:nano:1",
+            &fixture.root,
+            first_task,
+            true,
+        )
+        .await
+        .unwrap();
+        let second = crate::project::reserve_executor_session_at(
+            &database,
+            &format!("second-{index}"),
+            "executor:codex:2",
+            &fixture.root,
+            second_task,
+            true,
+        )
+        .await;
+        assert!(second.is_err());
+        // Git direct sessions exclude only other taskless runs, not isolated managed runs.
+        if first_task != "current" {
+            let direct = crate::project::reserve_executor_session_at(
+                &database,
+                &format!("git-direct-{index}"),
+                "executor:nano:1",
+                &fixture.root,
+                "current",
+                false,
+            )
+            .await
+            .unwrap();
+            drop(direct);
+        }
+        drop(first);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_direct_and_managed_launches_share_one_non_git_slot() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("shared-slot.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+IFS= read -r cancel
+"#;
+    #[cfg(windows)]
+    let source = r#"[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+$null = [Console]::In.ReadLine()
+$null = [Console]::In.ReadLine()
+"#;
+    std::fs::write(&script, source).unwrap();
+    let direct_agent = FakeNative {
+        script: script.clone(),
+        reject: false,
+    };
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    // Both callers have already passed their independent HQ occupancy preflights.
+    let (managed, direct) = tokio::join!(
+        ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001"),
+        agent_manager::spawn_native_interactive_executor_with_env(
+            &direct_agent,
+            "executor:nano:1",
+            1,
+            false,
+            vec![(ENV_AGENT_ID, "executor:nano:1".into())],
+            Some(agent_manager::HeadlessWorkspace {
+                project_root: fixture.root.clone(),
+                workspace_dir: fixture.root.clone(),
+            }),
+        ),
+    );
+    assert_ne!(managed.is_ok(), direct.is_ok());
+    assert_eq!(fixture.dispatches(), i64::from(managed.is_ok()));
+    assert_eq!(
+        crate::project::list_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|run| run.status == "running")
+            .count(),
+        1
+    );
+    if let Ok(handle) = direct {
+        handle.terminate().await;
+    }
+    ctx.shutdown_all_headless().await;
+    // A failed managed setup also releases the same shared slot.
+    std::fs::write(&direct_agent.script, "echo malformed-event\n").unwrap();
+    assert!(
+        ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001")
+            .await
+            .is_err()
+    );
+    let _next = crate::project::reserve_executor_session_at(
+        &fixture.data.join("ferrus.db"),
+        "after-failed-managed",
+        "executor:nano:1",
+        &fixture.root,
+        "current",
+        true,
     )
     .await
     .unwrap();
