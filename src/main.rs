@@ -22,6 +22,7 @@ mod state;
 mod templates;
 #[cfg(feature = "update-check")]
 mod update_check;
+mod user_paths;
 
 use clap::Parser;
 use ferrus::{project_memory, repository_graph};

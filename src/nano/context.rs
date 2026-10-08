@@ -5,6 +5,8 @@ use super::{
     tools::*,
     workspace::{self, Workspace},
 };
+#[cfg(all(test, feature = "nano-mcp"))]
+use crate::repository_graph::config::QueryLimitsConfig;
 use crate::{
     project_memory::{
         domain::{FederationPageCursor, MemoryQueryText},
@@ -12,340 +14,17 @@ use crate::{
         query::MemoryContextPolicy,
     },
     repository_graph::{
-        config::QueryLimitsConfig,
-        domain::{PageCursor, QueryBudget, RepoPath},
-        query::{self, ContextPolicy, ContextSeed, PageRequest},
+        domain::{PageCursor, RepoPath},
+        query::{self, ContextPolicy, PageRequest},
     },
     repository_graph_runtime::LocalGraphContext,
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 
-pub(crate) const NAMES: &[&str] = &[
-    "repository_graph_status",
-    "repository_search",
-    "repository_context",
-    "project_memory_status",
-    "project_context_search",
-    "project_context",
-    "repository_fallback",
-];
-
-pub(super) fn fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "repository_graph_status" => &[],
-        "project_memory_status" => &[
-            "max_results",
-            "max_bytes",
-            "max_duration_ms",
-            "max_diagnostics",
-        ],
-        "repository_search" => &[
-            "query",
-            "paths",
-            "kinds",
-            "cursor",
-            "max_results",
-            "max_bytes",
-            "max_duration_ms",
-            "max_diagnostics",
-        ],
-        "project_context_search" => &[
-            "domain",
-            "query",
-            "paths",
-            "kinds",
-            "cursor",
-            "max_results",
-            "max_bytes",
-            "max_duration_ms",
-            "max_diagnostics",
-        ],
-        "repository_context" => &[
-            "seeds",
-            "cursor",
-            "max_results",
-            "max_bytes",
-            "max_depth",
-            "max_duration_ms",
-            "max_diagnostics",
-            "max_snippet_bytes",
-            "include_snippets",
-            "include_unresolved",
-            "direction",
-        ],
-        "project_context" => &[
-            "domain",
-            "seeds",
-            "cursor",
-            "max_results",
-            "max_bytes",
-            "max_depth",
-            "max_duration_ms",
-            "max_diagnostics",
-            "max_snippet_bytes",
-            "include_snippets",
-            "include_unresolved",
-            "include_stale",
-            "direction",
-        ],
-        _ => &[],
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Request {
-    domain: Option<ContextDomain>,
-    query: Option<String>,
-    #[serde(default)]
-    paths: Vec<String>,
-    #[serde(default)]
-    kinds: Vec<String>,
-    #[serde(default)]
-    seeds: Vec<Seed>,
-    cursor: Option<String>,
-    max_results: Option<u32>,
-    max_bytes: Option<u64>,
-    max_depth: Option<u32>,
-    max_duration_ms: Option<u64>,
-    max_diagnostics: Option<u32>,
-    max_snippet_bytes: Option<u64>,
-    #[serde(default)]
-    include_snippets: bool,
-    #[serde(default)]
-    include_unresolved: bool,
-    #[serde(default)]
-    include_stale: bool,
-    #[serde(default)]
-    direction: query::EdgeDirection,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub(crate) enum Seed {
-    Node(String),
-    Symbol(String),
-    Path(String),
-    MemoryEntity(String),
-    Milestone(String),
-    Task(String),
-    Run(String),
-}
-
-impl Seed {
-    fn value(&self) -> &str {
-        match self {
-            Self::Node(s)
-            | Self::Symbol(s)
-            | Self::Path(s)
-            | Self::MemoryEntity(s)
-            | Self::Milestone(s)
-            | Self::Task(s)
-            | Self::Run(s) => s,
-        }
-    }
-
-    fn native(&self) -> Result<FederatedContextSeed> {
-        use crate::{
-            project_memory::domain::{MemoryEntityId, MemoryRecordId},
-            repository_graph::domain::{NodeId, SemanticKey},
-        };
-
-        Ok(match self {
-            Self::Node(v) => FederatedContextSeed::Repository(ContextSeed::Node(NodeId::new(v)?)),
-            Self::Symbol(v) => {
-                FederatedContextSeed::Repository(ContextSeed::Symbol(SemanticKey::new(v)?))
-            }
-            Self::Path(v) => FederatedContextSeed::Repository(ContextSeed::Path(RepoPath::new(v)?)),
-            Self::MemoryEntity(v) => FederatedContextSeed::MemoryEntity(MemoryEntityId::new(v)?),
-            Self::Milestone(v) => FederatedContextSeed::Milestone(MemoryRecordId::new(v)?),
-            Self::Task(v) => FederatedContextSeed::Task(MemoryRecordId::new(v)?),
-            Self::Run(v) => FederatedContextSeed::Run(MemoryRecordId::new(v)?),
-        })
-    }
-}
-
-impl Request {
-    pub(crate) fn parse(name: &str, value: Value) -> Result<Self> {
-        let object = value
-            .as_object()
-            .context("Expected context request object")?;
-
-        ensure!(
-            object
-                .keys()
-                .all(|key| fields(name).contains(&key.as_str())),
-            "Unsupported context field"
-        );
-
-        let r: Self = serde_json::from_value(value)?;
-        ensure!(NAMES.contains(&name), "Unknown context tool");
-
-        if name.starts_with("project_context") {
-            r.domain.context("Explicit domain is required")?;
-        } else {
-            ensure!(r.domain.is_none(), "This tool has a fixed domain");
-        }
-
-        if name.ends_with("search") {
-            let query = r.query.as_deref().context("Query is required")?;
-            ensure!(
-                !query.trim().is_empty() && query.len() <= 512,
-                "Invalid query"
-            );
-        }
-
-        if name == "repository_context" || name == "project_context" {
-            ensure!(
-                !r.seeds.is_empty() && r.seeds.len() <= 32,
-                "Expected 1..=32 seeds"
-            );
-        }
-
-        ensure!(
-            r.paths.len() <= 32 && r.kinds.len() <= 32 && r.seeds.len() <= 32,
-            "Too many filters"
-        );
-
-        for value in r
-            .paths
-            .iter()
-            .chain(&r.kinds)
-            .map(String::as_str)
-            .chain(r.seeds.iter().map(Seed::value))
-        {
-            ensure!(
-                !value.trim().is_empty() && value.len() <= 512,
-                "Invalid filter or seed"
-            );
-        }
-
-        for path in &r.paths {
-            RepoPath::new(path)?;
-        }
-
-        for seed in &r.seeds {
-            let native = seed.native()?;
-            match r.domain.unwrap_or(ContextDomain::Repository) {
-                ContextDomain::Repository => ensure!(
-                    matches!(native, FederatedContextSeed::Repository(_)),
-                    "Repository seeds required"
-                ),
-                ContextDomain::Memory => ensure!(
-                    !matches!(
-                        native,
-                        FederatedContextSeed::Repository(ContextSeed::Node(_))
-                    ),
-                    "Memory cannot resolve node IDs"
-                ),
-                ContextDomain::All => (),
-            }
-        }
-
-        ensure!(
-            r.cursor
-                .as_ref()
-                .is_none_or(|s| !s.is_empty() && s.len() <= 16384),
-            "Invalid cursor"
-        );
-
-        for n in [
-            r.max_results.map(u64::from),
-            r.max_bytes,
-            r.max_depth.map(u64::from),
-            r.max_duration_ms,
-            r.max_diagnostics.map(u64::from),
-            r.max_snippet_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ensure!(n > 0, "Query limits must be positive");
-        }
-
-        Ok(r)
-    }
-
-    fn graph_budget(&self, limits: &QueryLimitsConfig) -> Result<QueryBudget> {
-        let default = crate::repository_graph::query_sqlite::default_budget(limits)?;
-
-        Ok(QueryBudget::new(
-            NonZeroU32::new(
-                self.max_results
-                    .unwrap_or(default.max_results.get())
-                    .min(64),
-            )
-            .unwrap(),
-            NonZeroU64::new(
-                self.max_bytes
-                    .unwrap_or(default.max_bytes.get())
-                    .min(24 * 1024),
-            )
-            .unwrap(),
-            NonZeroU32::new(self.max_depth.unwrap_or(default.max_depth.get()).min(8)).unwrap(),
-            NonZeroU64::new(
-                self.max_duration_ms
-                    .unwrap_or(default.max_duration_ms.get())
-                    .min(1000),
-            )
-            .unwrap(),
-            NonZeroU32::new(
-                self.max_diagnostics
-                    .unwrap_or(default.max_diagnostics.get())
-                    .min(16),
-            )
-            .unwrap(),
-        ))
-    }
-
-    #[cfg(feature = "nano-mcp")]
-    fn with_graph_budget(&self, mut value: Value, limits: &QueryLimitsConfig) -> Result<Value> {
-        let budget = self.graph_budget(limits)?;
-        let fields = value
-            .as_object_mut()
-            .context("Expected graph request object")?;
-        fields.insert("max_results".into(), json!(budget.max_results.get()));
-        fields.insert("max_bytes".into(), json!(budget.max_bytes.get()));
-        fields.insert(
-            "max_duration_ms".into(),
-            json!(budget.max_duration_ms.get()),
-        );
-        fields.insert(
-            "max_diagnostics".into(),
-            json!(budget.max_diagnostics.get()),
-        );
-        if !self.seeds.is_empty() {
-            fields.insert("max_depth".into(), json!(budget.max_depth.get()));
-            if self.include_snippets {
-                fields.insert(
-                    "max_snippet_bytes".into(),
-                    json!(self.max_snippet_bytes.unwrap_or(4096).min(8192)),
-                );
-            }
-        }
-        Ok(value)
-    }
-}
-
-/// Keep typed domain responses up to the final model-tool encoding boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
-pub(crate) enum Response {
-    RepositoryStatus(query::StatusResponse),
-    RepositorySearch(std::result::Result<query::SearchResponse, query::QueryError>),
-    RepositoryContext(std::result::Result<query::ContextResponse, query::QueryError>),
-    MemoryStatus(crate::project_memory::query::MemoryStatusResponse),
-    ProjectSearch(std::result::Result<federation::FederatedSearchResponse, String>),
-    ProjectContext(std::result::Result<federation::FederatedContextResponse, String>),
-}
+pub(crate) use super::context_request::*;
 
 pub(crate) struct Context {
     session: Binding,
@@ -400,7 +79,7 @@ impl Context {
         .await
         .unwrap_or(None);
         Ok(
-            json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":runtime.as_ref().map(|runtime| super::working_set::view_identity(&runtime.repository_view))}),
+            json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":runtime.as_ref().map(|runtime| super::binding::view_identity(&runtime.repository_view))}),
         )
     }
 
@@ -449,7 +128,7 @@ impl Context {
                 graph
                     .repository_view
                     .as_ref()
-                    .map(super::working_set::view_identity),
+                    .map(super::binding::view_identity),
                 &graph.run_id,
                 format!("{:?}", graph.config),
                 self.session.project_id(),

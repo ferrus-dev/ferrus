@@ -13,6 +13,9 @@ pub mod federation;
 pub mod federation_service;
 pub mod index;
 pub mod links;
+// Shared by local binary adapters and the optional standalone host.
+#[doc(hidden)]
+pub mod local_query;
 pub mod policy;
 pub mod ports;
 pub mod query;

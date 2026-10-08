@@ -95,7 +95,7 @@ impl Refresh {
             .await;
             match result {
                 Ok(Some(view)) => {
-                    json!({"kind":"overlay_refresh", "status":"published", "view":super::working_set::view_identity(&view)})
+                    json!({"kind":"overlay_refresh", "status":"published", "view":super::binding::view_identity(&view)})
                 }
                 Ok(None) => json!({"kind":"overlay_refresh", "status":"disabled"}),
                 Err(error) => {

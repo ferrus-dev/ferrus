@@ -122,6 +122,11 @@ pub(crate) struct Workspace {
     limits: Limits,
 }
 
+/// Host identity for a held workspace directory, including case/normalization aliases.
+pub(crate) fn directory_identity(path: &Path) -> std::io::Result<(u64, u128)> {
+    fs::identity(&fs::Root::new(path)?.directory()?)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Source {
     pub kind: &'static str,

@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-pub(super) const NAMES: &[&str] = &["check", "submit", "consult", "ask_human"];
+pub(super) use super::descriptors::MANAGED_NAMES as NAMES;
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn working(context: &RuntimeTaskContext) -> Result<()> {

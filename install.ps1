@@ -167,6 +167,11 @@ function Install-Binary {
     }
 
     Copy-Item $binPath $destination -Force
+    # Older releases contain only ferrus; install the companion when present.
+    $nanoPath = Join-Path $TempDir "ferrus-$Target\ferrus-nano.exe"
+    if (Test-Path $nanoPath) {
+        Copy-Item $nanoPath (Join-Path $InstallDir "ferrus-nano.exe") -Force
+    }
 }
 
 function Print-Success {

@@ -97,7 +97,7 @@ src/
   agent_id.rs                 # stable agent IDs and MCP server names
   legacy_state.rs             # legacy STATE.json import shape
   agents/                     # agent launcher and config adapters
-  nano/                       # native Executor runtime, headless protocol, and HQ conversations
+  nano/                       # shared native runtime, managed/HQ adapters, standalone host and binary
   platform/                   # OS-specific process and lifecycle helpers
   state/                      # scoped human-readable artifact helpers
   checks/                     # configured check runner
@@ -294,7 +294,9 @@ implement both role adapters, model normalization, headless prompt transport whe
 version and config behavior, registration wiring, and focused tests. `opencode` is
 experimental: it binds a project to one working directory by Git root commit, so it is
 currently reliable only for the Supervisor and Reviewer roles.
-Nano is Executor-only; keep its native runtime and adapter under `src/nano/`.
+Nano managed roles are Executor-only; keep its runtime and adapters under `src/nano/`.
+`ferrus-nano` is a separate trusted-local headless host: no registration, task lease, or
+`ferrus.db`. Share core tools/contracts while keeping standalone completion separate from submit.
 
 Claude Code role-scoped MCP configuration is stored in `.claude/mcp-supervisor.json` and
 `.claude/mcp-executor.json`; permissions are stored in `.claude/settings.local.json`.
