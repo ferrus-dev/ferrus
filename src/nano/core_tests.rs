@@ -1817,7 +1817,7 @@ struct InteractiveJournal {
 async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
     for queued in [false, true] {
         for limit in [LimitKind::ModelTurns, LimitKind::Tokens] {
-            for remaining in [0, 1] {
+            for remaining in [0, 1, 2, 32] {
                 let mut limits = limits();
                 let mut event = response("Request completed.", vec![]);
                 match limit {
@@ -1891,6 +1891,128 @@ async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn interactive_rejects_unserviceable_text_before_durable_acceptance() {
+    let mut limits = limits();
+    limits.tokens = 2_000;
+    let (_dir, base) = setup(scripted(vec![]), limits.clone());
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    sender
+        .try_send(SessionCommand::Steer {
+            input_id: Some("draft-1".into()),
+            text: "x".repeat(4_000),
+        })
+        .unwrap();
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: true,
+        waits: 0,
+        user_requests: 0,
+        fail_input: false,
+        inject_steering: false,
+    };
+    let mut identity = identity();
+    identity.task_id = None;
+    let mut engine = Engine::new(
+        identity,
+        limits,
+        base.provider,
+        base.tools,
+        base.host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Workspace constraints".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
+    assert!(end.durable);
+    assert!(engine.provider.requests.is_empty());
+    let records = &engine.host.records;
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.event, SessionEvent::InputRequested))
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+    );
+    Replay::from_records(records).unwrap();
+}
+
+#[tokio::test]
+async fn interactive_capacity_keeps_compaction_available_for_later_user_turns() {
+    let mut limits = limits();
+    limits.context_bytes = 4 * 1024;
+    limits.response_bytes = 1024;
+    let (_dir, base) = setup(scripted(vec![]), limits.clone());
+    let (sender, commands) = tokio::sync::mpsc::channel(8);
+    let journal = InteractiveJournal {
+        inner: base.journal,
+        commands: Some(commands),
+        sender,
+        interactive: true,
+        waits: 0,
+        user_requests: 40,
+        fail_input: false,
+        inject_steering: false,
+    };
+    let mut identity = identity();
+    identity.task_id = None;
+    let mut engine = Engine::new(
+        identity,
+        limits,
+        CompactionProvider {
+            normal_turns: 10,
+            ..Default::default()
+        },
+        base.tools,
+        base.host,
+        journal,
+    )
+    .unwrap();
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Workspace constraints".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::Cancelled);
+    assert!(end.durable);
+    assert!(engine.provider.summaries > 0);
+    let records = &engine.host.records;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(r.event, SessionEvent::UserInput { .. }))
+            .count(),
+        40
+    );
+    assert_eq!(
+        engine
+            .provider
+            .requests
+            .iter()
+            .filter(|r| !r.tools.is_empty())
+            .count(),
+        40
+    );
+    Replay::from_records(records).unwrap();
 }
 
 #[tokio::test]

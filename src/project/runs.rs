@@ -13,6 +13,79 @@ pub(crate) fn run_status_at(database: &Path, run_id: &str) -> Result<Option<Stri
         .optional()?)
 }
 
+/// A reserved run counts as live under the HQ PID until startup transfers it to the child.
+pub(crate) struct DirectSessionReservation {
+    database: PathBuf,
+    run_id: String,
+    reserved: bool,
+}
+
+impl DirectSessionReservation {
+    pub(crate) fn started(&mut self) {
+        self.reserved = false;
+    }
+}
+
+impl Drop for DirectSessionReservation {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            let connection =
+                Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection.execute(
+                "UPDATE runs SET status = 'failed', pid = NULL, updated_at = ?2 WHERE id = ?1",
+                params![self.run_id, timestamp()],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            warn!(run_id = self.run_id, error = ?error, "failed to release a direct session reservation");
+        }
+    }
+}
+
+pub(crate) async fn reserve_direct_session_at(
+    database: &Path,
+    run_id: &str,
+    agent: &str,
+    workspace: &Path,
+) -> Result<DirectSessionReservation> {
+    let (database, run_id, agent, workspace) = (
+        database.to_path_buf(),
+        run_id.to_owned(),
+        agent.to_owned(),
+        path_string(workspace),
+    );
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_runtime_database(&database)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let occupied = {
+            let mut statement = transaction.prepare(
+                "SELECT pid FROM runs WHERE task_id = 'current' AND role = 'executor' AND status IN ('running', 'checking', 'reviewing')",
+            )?;
+            let pids = statement.query_map([], |row| row.get::<_, Option<u32>>(0))?;
+            let mut live = false;
+            for pid in pids {
+                live |= pid?.is_some_and(process_is_alive);
+            }
+            live
+        };
+        anyhow::ensure!(!occupied, "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first.");
+        ensure_task_exists(&transaction, CURRENT_TASK_ID, CURRENT_TASK_PATH)?;
+        transaction.execute(
+            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path) VALUES (?1, 'current', 'executor', ?2, 'running', ?3, ?3, ?4, ?5)",
+            params![run_id, agent, timestamp(), std::process::id(), workspace],
+        )?;
+        transaction.commit()?;
+        // Build the guard inside the worker so cancellation also drops a committed reservation.
+        Ok(DirectSessionReservation { database, run_id, reserved: true })
+    })
+    .await?
+}
+
 /// Taskless Executor runs use the same legacy bookkeeping row as external interactive
 /// agents. That row grants no task lease, task intent, or lifecycle authority.
 pub(crate) async fn authorize_taskless_executor_run_at(

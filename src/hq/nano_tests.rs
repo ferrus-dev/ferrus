@@ -479,6 +479,71 @@ exit 0
 }
 
 #[tokio::test]
+async fn direct_session_reservation_is_atomic_and_released_on_setup_failure() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let database = fixture.data.join("ferrus.db");
+    let (first, second) = tokio::join!(
+        crate::project::reserve_direct_session_at(
+            &database,
+            "direct-a",
+            "executor:nano:1",
+            &fixture.root
+        ),
+        crate::project::reserve_direct_session_at(
+            &database,
+            "direct-b",
+            "executor:nano:1",
+            &fixture.root
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let reservations: Vec<_> = [first, second].into_iter().filter_map(Result::ok).collect();
+    assert!(
+        crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR)
+            .await
+            .unwrap()
+            .contains("current")
+    );
+    drop(reservations);
+    assert!(
+        !crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR)
+            .await
+            .unwrap()
+            .contains("current")
+    );
+
+    let script = fixture.root.join("malformed-direct.ps1");
+    std::fs::write(&script, "echo malformed-event\n").unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    assert!(dispatch("/executor", &mut ctx).await.is_err());
+    assert!(ctx.headless.is_empty());
+    assert_eq!(fixture.dispatches(), 0);
+    assert!(
+        crate::project::list_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.status == "failed")
+    );
+    // A fresh claim can immediately replace the failed setup.
+    let _next = crate::project::reserve_direct_session_at(
+        &database,
+        "direct-next",
+        "executor:nano:1",
+        &fixture.root,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let fixture = Fixture::new().await;

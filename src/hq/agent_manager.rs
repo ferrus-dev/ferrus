@@ -9,7 +9,7 @@ use crate::state::agents::{AgentEntry, AgentStatus, read_agents, write_agents};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -580,6 +580,29 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .to_string(),
     };
 
+    let mut direct_reservation = if native && request.role == ROLE_EXECUTOR && task_id.is_none() {
+        let registration = crate::project::read_project_registration_at(
+            request
+                .workspace
+                .as_ref()
+                .context("Direct Nano has no workspace")?
+                .project_root
+                .as_path(),
+        )
+        .await?;
+        Some(
+            crate::project::reserve_direct_session_at(
+                &registration.data_dir.join("ferrus.db"),
+                &run_id,
+                request.name,
+                Path::new(&workspace_path),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Capture workload and index state before the child can change either one.
     let evaluation = if request.role.eq_ignore_ascii_case("executor") {
         match std::env::var("FERRUS_NANO_EVAL_CASE") {
@@ -664,7 +687,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         request.role,
         request.name,
         pid,
-        task_id.as_deref(),
+        if direct_reservation.is_some() {
+            Some("current")
+        } else {
+            task_id.as_deref()
+        },
         workspace_path,
         crate::project::RunStartEvidence {
             baseline_tree: baseline_tree.as_deref(),
@@ -796,6 +823,9 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     };
 
     let (exit_tx, exit_rx) = tokio::sync::watch::channel::<Option<i32>>(None);
+    if let Some(reservation) = &mut direct_reservation {
+        reservation.started();
+    }
     let mut child = child.0.take().expect("owned child");
     let wait_logger = logger.clone();
     let wait_thread = std::thread::spawn(move || {
