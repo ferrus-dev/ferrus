@@ -175,6 +175,36 @@ async fn canonical_approval_lock_replaces_malformed_owner() {
 }
 
 #[tokio::test]
+async fn canonical_approval_lock_preserves_a_live_external_owner() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    let owner_path = canonical_approval_lock_owner_path(&lock_path);
+    let contents = "pid=2147483647\ntask_id=t-external\n";
+    std::fs::write(&lock_path, contents).unwrap();
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&owner_path)
+        .unwrap();
+    owner.lock_exclusive().unwrap();
+    // Bypass the in-process owner registry, as another Ferrus process would.
+    assert!(
+        !remove_stale_canonical_approval_lock(&lock_path)
+            .await
+            .unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), contents);
+    assert!(owner_path.exists());
+    drop(owner);
+    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-next")
+        .await
+        .unwrap();
+    drop(lock);
+    assert!(!lock_path.exists());
+}
+
+#[tokio::test]
 async fn canonical_approval_lock_contention_preserves_existing_lock() {
     let dir = TempDir::new().unwrap();
     let lock_path = dir.path().join("canonical-approval.lock");
@@ -202,6 +232,33 @@ async fn canonical_approval_lock_contention_preserves_existing_lock() {
         })
         .count();
     assert_eq!(temp_files, 0);
+    drop(lock);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_approval_guard_contention_is_cancellable() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    let guard = acquire_canonical_approval_lock_guard(&lock_path)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_canonical_approval_lock_at(&lock_path, "direct-run"),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!lock_path.exists());
+    drop(guard);
+    let lock = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     drop(lock);
 }
 

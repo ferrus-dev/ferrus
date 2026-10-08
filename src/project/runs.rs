@@ -2,6 +2,141 @@
 
 use super::*;
 
+/// Read one persisted run without relying on the caller's working directory or mutating schema.
+pub(crate) fn run_status_at(database: &Path, run_id: &str) -> Result<Option<String>> {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    Ok(connection
+        .query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+/// A reserved run counts as live under the HQ PID until startup transfers it to the child.
+pub(crate) struct ExecutorSessionReservation {
+    database: PathBuf,
+    run_id: String,
+    reserved: bool,
+}
+
+impl ExecutorSessionReservation {
+    pub(crate) fn started(&mut self) {
+        self.reserved = false;
+    }
+}
+
+impl Drop for ExecutorSessionReservation {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            let connection =
+                Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection.execute(
+                "UPDATE runs SET status = 'failed', pid = NULL, updated_at = ?2 WHERE id = ?1",
+                params![self.run_id, timestamp()],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            warn!(run_id = self.run_id, error = ?error, "failed to release an Executor session reservation");
+        }
+    }
+}
+
+pub(crate) async fn reserve_executor_session_at(
+    database: &Path,
+    run_id: &str,
+    agent: &str,
+    workspace: &Path,
+    task_id: &str,
+    shared_workspace: bool,
+) -> Result<ExecutorSessionReservation> {
+    let (database, run_id, agent, workspace, task_id) = (
+        database.to_path_buf(),
+        run_id.to_owned(),
+        agent.to_owned(),
+        path_string(workspace),
+        task_id.to_owned(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_runtime_database(&database)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let occupied = {
+            let mut statement = transaction.prepare(
+                "SELECT pid FROM runs WHERE (?1 OR task_id = 'current') AND role = 'executor' AND status IN ('running', 'checking', 'reviewing')",
+            )?;
+            let pids = statement.query_map([shared_workspace], |row| row.get::<_, Option<u32>>(0))?;
+            let mut live = false;
+            for pid in pids {
+                live |= pid?.is_some_and(process_is_alive);
+            }
+            live
+        };
+        anyhow::ensure!(!occupied, if shared_workspace {
+            "Cannot start an Executor while another Executor uses the shared workspace. Stop that session first."
+        } else {
+            "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first."
+        });
+        ensure_task_exists(&transaction, &task_id, &default_task_path_for_id(&task_id))?;
+        transaction.execute(
+            "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path) VALUES (?1, ?2, 'executor', ?3, 'running', ?4, ?4, ?5, ?6)",
+            params![run_id, task_id, agent, timestamp(), std::process::id(), workspace],
+        )?;
+        transaction.commit()?;
+        // Build the guard inside the worker so cancellation also drops a committed reservation.
+        Ok(ExecutorSessionReservation { database, run_id, reserved: true })
+    })
+    .await?
+}
+
+/// Taskless Executor runs use the same legacy bookkeeping row as external interactive
+/// agents. That row grants no task lease, task intent, or lifecycle authority.
+pub(crate) async fn authorize_taskless_executor_run_at(
+    database: &Path,
+    run_id: &str,
+    agent_id: &str,
+    workspace: &Path,
+) -> Result<()> {
+    let (database, run_id, agent_id, workspace) = (
+        database.to_path_buf(),
+        run_id.to_owned(),
+        agent_id.to_owned(),
+        workspace.to_path_buf(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let run: (String, String, String, String, String) = connection.query_row(
+            "SELECT task_id, role, agent, status, workspace_path FROM runs WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        anyhow::ensure!(
+            run.0 == CURRENT_TASK_ID
+                && run.1 == "executor"
+                && run.2 == agent_id
+                && run.3 == "running"
+                && Path::new(&run.4).is_absolute()
+                && std::fs::canonicalize(&run.4)? == workspace,
+            "Interactive run binding mismatch or run is no longer active"
+        );
+        Ok(())
+    })
+    .await?
+}
+
 pub async fn record_runtime_event(
     run_id: Option<String>,
     event_type: &str,

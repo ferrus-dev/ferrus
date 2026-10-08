@@ -456,7 +456,27 @@ impl McpTools {
         native: &[ToolDescriptor],
         cancellation: &Cancellation,
     ) -> Result<Self> {
-        let config = Config::load(config_path)?;
+        Self::connect_scoped(config_path, native, cancellation, false).await
+    }
+
+    pub(crate) async fn connect_taskless(
+        config_path: &Path,
+        native: &[ToolDescriptor],
+        cancellation: &Cancellation,
+    ) -> Result<Self> {
+        Self::connect_scoped(config_path, native, cancellation, true).await
+    }
+
+    async fn connect_scoped(
+        config_path: &Path,
+        native: &[ToolDescriptor],
+        cancellation: &Cancellation,
+        taskless: bool,
+    ) -> Result<Self> {
+        let mut config = Config::load(config_path)?;
+        if taskless {
+            config.servers.retain(|peer| !peer.inherit_managed_binding);
+        }
         let mut this = Self {
             servers: Vec::new(),
             entries: BTreeMap::new(),
@@ -1003,6 +1023,24 @@ mod tests {
             drop(file);
             assert_eq!(Config::load(&path).is_ok(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn taskless_discovery_omits_peers_requiring_a_managed_binding() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        private::directory(&directory, true).unwrap();
+        let path = directory.join("peers.toml");
+        let command = toml::Value::String(std::env::current_exe().unwrap().display().to_string());
+        let mut file = private::file(&path, true).unwrap();
+        write!(file, "[[servers]]\nid = 'graph'\ncommand = {command}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_search']\ninherit_managed_binding = true\n").unwrap();
+        drop(file);
+        let mut tools = McpTools::connect_taskless(&path, &[], &Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.catalog_counts(), (0, 0));
+        assert_eq!(tools.graph_peer_mode(), GraphPeerMode::Absent);
+        assert!(tools.shutdown().await);
     }
 
     #[test]

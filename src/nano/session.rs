@@ -19,8 +19,15 @@ pub(crate) struct SessionIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionCommand {
-    Start { input: String },
+    Start {
+        input: String,
+    },
     Cancel,
+    Interact,
+    Steer {
+        text: String,
+        input_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +273,13 @@ pub(crate) enum SessionEvent {
     ModelStarted {
         turn: u64,
     },
+    UserInput {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<String>,
+    },
+    InputRequested,
+    InteractionOpened,
     CompactionStarted {
         turn: u64,
         retained_from: usize,

@@ -162,9 +162,25 @@ impl LocalProjectContext {
         domain: ContextDomain,
         snippets: bool,
     ) -> AnyResult<Self> {
+        Self::load_for_binding(root, project_id, data_dir, Some(runtime), domain, snippets).await
+    }
+
+    pub(crate) async fn load_for_binding(
+        root: &std::path::Path,
+        project_id: &str,
+        data_dir: &std::path::Path,
+        runtime: Option<&project::RuntimeTaskContext>,
+        domain: ContextDomain,
+        snippets: bool,
+    ) -> AnyResult<Self> {
         let contents = tokio::fs::read_to_string(root.join("ferrus.toml")).await?;
         let graph = if domain != ContextDomain::Memory {
-            Some(LocalGraphContext::load_for_runtime(root, project_id, data_dir, runtime).await?)
+            Some(match runtime {
+                Some(runtime) => {
+                    LocalGraphContext::load_for_runtime(root, project_id, data_dir, runtime).await?
+                }
+                None => LocalGraphContext::load_canonical(root, project_id, data_dir).await?,
+            })
         } else {
             None
         };

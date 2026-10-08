@@ -708,9 +708,14 @@ async fn working_set_refresh_is_best_effort_and_preserves_failed_publications() 
     session.claim().await.unwrap();
     let mut refresh = Refresh::default();
     refresh.elapse_debounce();
-    assert!(refresh.prepare(&session, true).await.is_empty());
+    assert!(
+        refresh
+            .prepare(&session.clone().into(), true)
+            .await
+            .is_empty()
+    );
     assert_eq!(
-        refresh.prepare(&session, false).await[0]["status"],
+        refresh.prepare(&session.clone().into(), false).await[0]["status"],
         "scheduled"
     );
     assert_eq!(refresh.settle().await.unwrap()["status"], "disabled");
@@ -745,7 +750,7 @@ async fn working_set_refresh_is_best_effort_and_preserves_failed_publications() 
     let session = FerrusSession::bind(launch).await.unwrap();
     let before = session.status().await.unwrap();
     refresh.elapse_debounce();
-    refresh.prepare(&session, false).await;
+    refresh.prepare(&session.clone().into(), false).await;
     assert_eq!(refresh.settle().await.unwrap()["status"], "failed");
     let after = session.status().await.unwrap();
     let mut expected = view;

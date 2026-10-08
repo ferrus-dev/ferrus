@@ -152,6 +152,28 @@ impl LocalGraphContext {
         })
     }
 
+    /// Taskless native sessions use canonical context with explicit project identity.
+    pub(crate) async fn load_canonical(
+        root: &Path,
+        project_id: &str,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        let contents = tokio::fs::read_to_string(root.join("ferrus.toml")).await?;
+        Ok(Self {
+            project_root: root.to_path_buf(),
+            root: root.to_path_buf(),
+            query_path: Some(data_dir.join(SIDECAR_FILE_NAME)),
+            repository: RepositoryRef {
+                namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
+                repository_id: RepositoryId::new("root")?,
+            },
+            config: RepositoryGraphConfig::from_ferrus_toml(&contents)?,
+            repository_view: None,
+            task_view_id: None,
+            run_id: None,
+        })
+    }
+
     /// The caller validated the exact managed run; never consult ambient identity.
     pub(crate) async fn load_for_runtime(
         root: &Path,

@@ -27,6 +27,9 @@ pub(crate) struct Engine<P, T, H, J> {
     budget: Budget,
     messages: Vec<Message>,
     system_prompt: Option<String>,
+    interactive: bool,
+    latest_steering: Option<usize>,
+    commands: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
     summary: Option<Summary>,
     last_request: Vec<Message>,
     previous_call: Option<(String, serde_json::Value)>,
@@ -42,6 +45,13 @@ struct Capacity {
     window: u64,
 }
 
+struct CompactionPlan {
+    summary: Summary,
+    request: ModelRequest,
+    input: u64,
+    summary_cap: usize,
+}
+
 impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
     pub(crate) fn new(
         identity: SessionIdentity,
@@ -49,16 +59,18 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         provider: P,
         tools: T,
         host: H,
-        journal: J,
+        mut journal: J,
     ) -> Result<Self> {
         limits.validate()?;
         ensure!(
             valid_id(&identity.session_id)
                 && !identity.project_id.is_empty()
-                && identity.task_id.is_some() == identity.run_id.is_some(),
+                && (identity.task_id.is_none() || identity.run_id.is_some()),
             "Invalid session identity"
         );
 
+        let interactive = journal.interactive();
+        let commands = journal.take_commands();
         Ok(Self {
             identity,
             limits,
@@ -69,6 +81,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             budget: Budget::default(),
             messages: Vec::new(),
             system_prompt: None,
+            commands,
+            interactive,
+            latest_steering: None,
             summary: None,
             last_request: Vec::new(),
             previous_call: None,
@@ -103,7 +118,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         Ok(())
     }
 
-    /// One attempt per engine. Live resume and interactive steering are separate adapters.
+    /// One managed attempt per engine; frontends submit steering at safe turn boundaries.
     pub(crate) async fn run(
         &mut self,
         command: SessionCommand,
@@ -122,6 +137,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             SessionCommand::Cancel => {
                 cancellation.cancel();
                 String::new()
+            }
+            SessionCommand::Steer { .. } | SessionCommand::Interact => {
+                anyhow::bail!("Expected session start")
             }
         };
 
@@ -162,7 +180,23 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         }
         self.messages.push(Message::User { text: input });
 
-        let mut reason = self.drive(cancellation, deadline).await;
+        if self.interactive && !self.commit(SessionEvent::InteractionOpened) {
+            return Ok(self.journal_failure());
+        }
+        let mut reason = if self.interactive && self.identity.task_id.is_none() {
+            if let Err(reason) = self.input_capacity("") {
+                reason
+            } else if !self.commit(SessionEvent::InputRequested) {
+                EndReason::JournalFailed
+            } else {
+                match self.wait_for_input(cancellation, deadline).await {
+                    Ok(()) => self.drive(cancellation, deadline).await,
+                    Err(reason) => reason,
+                }
+            }
+        } else {
+            self.drive(cancellation, deadline).await
+        };
 
         self.provider.cancel();
 
@@ -193,13 +227,92 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         })
     }
 
+    fn accept_input(&mut self, command: SessionCommand) -> Result<bool, EndReason> {
+        if matches!(
+            command,
+            SessionCommand::Cancel | SessionCommand::Start { .. }
+        ) {
+            return Err(EndReason::Cancelled);
+        }
+        if !self.interactive {
+            if !self.commit(SessionEvent::InteractionOpened) {
+                return Err(EndReason::JournalFailed);
+            }
+            self.interactive = true;
+        }
+        let SessionCommand::Steer { text, input_id } = command else {
+            return Ok(false);
+        };
+        if text.trim().is_empty()
+            || text.len() > super::wire::FRAME_BYTES
+            || input_id
+                .as_ref()
+                .is_some_and(|id| !super::journal::valid_id(id))
+        {
+            return Err(EndReason::ProviderProtocol);
+        }
+        self.input_capacity(&text)?;
+        let previous_no_progress = std::mem::replace(&mut self.budget.no_progress, 0);
+        if !self.commit(SessionEvent::UserInput {
+            text: text.clone(),
+            input_id,
+        }) {
+            self.budget.no_progress = previous_no_progress;
+            return Err(EndReason::JournalFailed);
+        }
+        self.previous_call = None;
+        self.latest_steering = Some(self.messages.len());
+        self.messages.push(Message::User { text });
+        self.journal
+            .checkpoint()
+            .map_err(|_| EndReason::JournalFailed)?;
+        Ok(true)
+    }
+
+    fn drain_input(&mut self) -> Result<bool, EndReason> {
+        let mut accepted = false;
+        for _ in 0..8 {
+            let command = self
+                .commands
+                .as_mut()
+                .and_then(|commands| commands.try_recv().ok());
+            let Some(command) = command else { break };
+            accepted |= self.accept_input(command)?;
+        }
+        Ok(accepted)
+    }
+
+    async fn wait_for_input(
+        &mut self,
+        cancellation: &Cancellation,
+        deadline: Instant,
+    ) -> Result<(), EndReason> {
+        loop {
+            let Some(commands) = self.commands.as_mut() else {
+                return Err(EndReason::Cancelled);
+            };
+            match interrupt(commands.recv(), cancellation, deadline).await {
+                Ok(Some(command)) => {
+                    if self.accept_input(command)? {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => return Err(EndReason::Cancelled),
+                Err(reason) => return Err(reason),
+            }
+        }
+    }
+
     async fn drive(&mut self, cancellation: &Cancellation, deadline: Instant) -> EndReason {
         loop {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
-            if self.budget.model_turns >= self.limits.model_turns {
-                return EndReason::Limit(LimitKind::ModelTurns);
+            if let Some(reason) = self.next_turn_limit() {
+                return reason;
+            }
+            if let Err(reason) = self.drain_input() {
+                return reason;
             }
 
             let assembly_start = Instant::now();
@@ -241,15 +354,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 .map_or(self.limits.context_bytes as u64, |settings| {
                     settings.context_tokens.unwrap_or(u64::MAX)
                 });
-            let mut output_reservation = (self.limits.response_bytes as u64)
-                .min(
-                    self.provider
-                        .settings()
-                        .and_then(|s| s.max_output_tokens)
-                        .unwrap_or(u64::MAX),
-                )
-                .min(window / 4)
-                .min(remaining / 2);
+            let mut output_reservation = self.output_reservation(remaining, window);
             if output_reservation == 0 {
                 return EndReason::Limit(LimitKind::Tokens);
             }
@@ -453,8 +558,17 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                             return EndReason::ProviderProtocol;
                         }
                         Ok(Ok(Some(
-                            ProviderEvent::TextDelta(delta) | ProviderEvent::ArgumentsDelta(delta),
+                            event
+                            @ (ProviderEvent::TextDelta(_) | ProviderEvent::ArgumentsDelta(_)),
                         ))) => {
+                            let delta = match &event {
+                                ProviderEvent::TextDelta(text) => {
+                                    self.journal.model_delta(self.budget.model_turns, text);
+                                    text
+                                }
+                                ProviderEvent::ArgumentsDelta(text) => text,
+                                _ => unreachable!(),
+                            };
                             stream_bytes = stream_bytes.saturating_add(delta.len().max(1));
                             if stream_bytes > self.limits.response_bytes {
                                 if !self.record_model_failure(false) {
@@ -569,6 +683,23 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if response.is_final() {
                 if self.journal.checkpoint().is_err() {
                     return EndReason::JournalFailed;
+                }
+                match self.drain_input() {
+                    Ok(true) => continue,
+                    Ok(false) => (),
+                    Err(reason) => return reason,
+                }
+                if self.interactive {
+                    if let Err(reason) = self.input_capacity("") {
+                        return reason;
+                    }
+                    if !self.commit(SessionEvent::InputRequested) {
+                        return EndReason::JournalFailed;
+                    }
+                    if let Err(reason) = self.wait_for_input(cancellation, deadline).await {
+                        return reason;
+                    }
+                    continue;
                 }
                 return EndReason::ModelFinished;
             }
@@ -785,19 +916,19 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         Ok(Err(LimitKind::ContextTokens))
     }
 
-    async fn compact(
-        &mut self,
+    fn plan_compaction(
+        &self,
         base: &[Message],
+        history: &[Message],
+        latest_steering: Option<usize>,
         descriptors: &[super::tools::ToolDescriptor],
         capacity: Capacity,
         mut limit: LimitKind,
-        cancellation: &Cancellation,
-        deadline: Instant,
-    ) -> Result<Summary, EndReason> {
-        let boundaries = compaction::boundaries(&self.messages)
+    ) -> Result<CompactionPlan, EndReason> {
+        let boundaries = compaction::boundaries(history)
             .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
         let existing = self.summary.as_ref().map_or(
-            compaction::prefix_len(&self.messages)
+            compaction::prefix_len(history)
                 .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?,
             |summary| summary.retained_from,
         );
@@ -805,11 +936,12 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         let summary_cap = summary_cap.min(self.limits.response_bytes);
         let mut selected = None;
         // Keep the latest completed group as direct context, even at the limit.
-        for &cut in boundaries
-            .iter()
-            .filter(|&&cut| cut > existing && cut < self.messages.len())
-        {
-            let mut handles: Vec<_> = compaction::handles(&self.messages)
+        for &cut in boundaries.iter().filter(|&&cut| {
+            cut > existing
+                && cut < history.len()
+                && latest_steering.is_none_or(|index| cut <= index)
+        }) {
+            let mut handles: Vec<_> = compaction::handles(history)
                 .into_iter()
                 .filter(|handle| handle.message < cut)
                 .rev()
@@ -845,7 +977,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 }
             }
         }
-        let (mut summary, normal_cost) = selected.ok_or(EndReason::Limit(limit))?;
+        let (summary, normal_cost) = selected.ok_or(EndReason::Limit(limit))?;
         let first = existing;
         let compacted = Projection::deterministic(base, first)
             .apply(base)
@@ -881,6 +1013,37 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         if self.budget.model_turns.saturating_add(1) >= self.limits.model_turns {
             return Err(EndReason::Limit(LimitKind::ModelTurns));
         }
+        Ok(CompactionPlan {
+            summary,
+            request,
+            input,
+            summary_cap,
+        })
+    }
+
+    async fn compact(
+        &mut self,
+        base: &[Message],
+        descriptors: &[super::tools::ToolDescriptor],
+        capacity: Capacity,
+        limit: LimitKind,
+        cancellation: &Cancellation,
+        deadline: Instant,
+    ) -> Result<Summary, EndReason> {
+        let CompactionPlan {
+            mut summary,
+            request,
+            input,
+            summary_cap,
+        } = self.plan_compaction(
+            base,
+            &self.messages,
+            self.latest_steering,
+            descriptors,
+            capacity,
+            limit,
+        )?;
+        let summary_output = request.max_output_tokens;
         let composition = ContextComposition {
             history_messages: self.messages.len(),
             request_messages: request.messages.len(),
@@ -1055,6 +1218,79 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 "Nano provider attempt failed");
         }
         committed
+    }
+
+    fn input_capacity(&self, text: &str) -> Result<(), EndReason> {
+        if let Some(reason) = self.next_turn_limit() {
+            return Err(reason);
+        }
+        let mut messages = self.messages.clone();
+        messages.push(Message::User { text: text.into() });
+        let prefix = compaction::prefix_len(&messages)
+            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
+        let mut projection = Projection::deterministic(
+            &messages,
+            self.summary
+                .as_ref()
+                .map_or(prefix, |summary| summary.retained_from),
+        );
+        projection.summary = self.summary.clone();
+        let projected = projection
+            .apply(&messages)
+            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
+        let remaining = self.limits.tokens.saturating_sub(self.budget.tokens());
+        let window = self
+            .provider
+            .settings()
+            .map_or(self.limits.context_bytes as u64, |s| {
+                s.context_tokens.unwrap_or(u64::MAX)
+            });
+        let output = self.output_reservation(remaining, window);
+        if output == 0 {
+            return Err(EndReason::Limit(LimitKind::Tokens));
+        }
+        // Use the same reservation and serialized-request estimator as inference admission.
+        let descriptors = self.tools.descriptors();
+        match self.admit(&projected, &descriptors, output, remaining, window)? {
+            Ok(_) => Ok(()),
+            Err(limit) => self
+                .plan_compaction(
+                    &messages,
+                    &messages,
+                    Some(messages.len() - 1),
+                    &descriptors,
+                    Capacity {
+                        output,
+                        remaining,
+                        window,
+                    },
+                    limit,
+                )
+                .map(|_| ()),
+        }
+    }
+
+    fn output_reservation(&self, remaining: u64, window: u64) -> u64 {
+        (self.limits.response_bytes as u64)
+            .min(
+                self.provider
+                    .settings()
+                    .and_then(|s| s.max_output_tokens)
+                    .unwrap_or(u64::MAX),
+            )
+            .min(window / 4)
+            .min(remaining / 2)
+    }
+
+    fn next_turn_limit(&self) -> Option<EndReason> {
+        if self.budget.model_turns >= self.limits.model_turns {
+            Some(EndReason::Limit(LimitKind::ModelTurns))
+        } else if self.limits.tokens.saturating_sub(self.budget.tokens()) < 2 {
+            // Admission reserves at least one token each for input and output.
+            Some(EndReason::Limit(LimitKind::Tokens))
+        } else {
+            None
+        }
     }
 
     fn stop(&self, cancellation: &Cancellation, deadline: Instant) -> Option<EndReason> {

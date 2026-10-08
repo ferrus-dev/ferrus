@@ -1,8 +1,8 @@
 # Nano headless launch and HQ events
 
-Status: Nano is an opt-in headless Executor backend. Interactive sessions,
-Supervisor support, and standalone packaging are deferred. Live crash recovery
-and reconciliation are implemented for #84.
+Status: Nano supports headless managed Executors and [interactive HQ](ferrus-nano-interactive.md)
+workspace conversations. Supervisor support and standalone packaging are deferred. Live crash
+recovery and reconciliation are implemented for #84.
 The process lifecycle is tested with a local mock API; live LM Studio validation remains opt-in.
 
 ## Configure and select
@@ -72,8 +72,8 @@ Existing external adapter registration is unchanged. Model overrides are trimmed
 an override, Nano uses the model in its provider file. HQ displays the same selection.
 `ferrus nano --version` reports the bundled Ferrus version without loading provider settings.
 
-Use the ordinary HQ task/run workflow. `/executor` interactive launch and Supervisor selection
-are rejected. A build without `nano-openai` reports the missing feature before task setup.
+Use the ordinary HQ task/run workflow. `/executor` opens the native
+[conversation](ferrus-nano-interactive.md); Supervisor selection remains unsupported. A build without `nano-openai` reports the missing feature before task setup.
 HQ checks launch configuration before preparing a worktree or consuming a dispatch attempt.
 
 ## Process protocol
@@ -83,13 +83,20 @@ This is a managed entry point: it requires the existing `FERRUS_PROJECT_ROOT`, `
 `FERRUS_TASK_ID`, `FERRUS_RUN_ID`, and, for Git workspaces, `FERRUS_BASELINE_TREE` binding.
 It does not allocate tasks, worktrees, or runs itself.
 
+HQ `/executor` uses `--interactive --taskless` for direct canonical-workspace sessions. These
+require project, agent, and persisted run identity, with no task or baseline environment binding.
+They wait for the user's first message and never claim a managed task.
+
 Stdin stays open for UTF-8 JSONL commands. Each newline-terminated frame, including its newline,
 is at most 4,096 bytes. Unknown versions, fields, commands, malformed JSON, oversized frames,
-and incomplete final frames fail explicitly. One start is accepted; subsequent input may cancel.
+and incomplete final frames fail explicitly. One start is accepted; subsequent input can activate
+interaction, queue steering, or cancel.
 EOF after start also cancels. Closing stdin immediately after start is not a batch-run interface.
 
 ```json
 {"version":1,"command":"start"}
+{"version":1,"command":"interact"}
+{"version":1,"command":{"steer":{"text":"Keep the public API stable."}}}
 {"version":1,"command":"cancel"}
 ```
 

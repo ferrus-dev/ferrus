@@ -11,8 +11,14 @@ pub(crate) enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Run a managed Executor; HQ sends start/cancel commands over open stdin
+    /// Run a native Executor; HQ sends versioned commands over open stdin
     Run {
+        /// Keep the conversation open for queued user steering
+        #[arg(long)]
+        interactive: bool,
+        /// Open a direct workspace conversation without claiming a managed task
+        #[arg(long, requires = "interactive")]
+        taskless: bool,
         /// Absolute owner-only provider settings file (or FERRUS_NANO_CONFIG)
         #[arg(long)]
         config: Option<PathBuf>,
@@ -25,7 +31,7 @@ pub(crate) enum Command {
         /// Disable native graph and memory tools; external MCP tools remain available
         #[arg(long)]
         no_native_context: bool,
-        /// Prefetch this explicit task path (repeatable; at most eight seeds total)
+        /// Prefetch this explicit workspace path (repeatable; at most eight seeds total)
         #[arg(long)]
         prefetch_path: Vec<String>,
         /// Prefetch this exact graph symbol key (repeatable; opt-in)
@@ -43,27 +49,39 @@ pub(crate) enum Command {
 }
 
 pub(crate) async fn run(command: Command) -> Result<()> {
-    let (config, model, no_working_set, no_native_context, prefetch_path, prefetch_symbol) =
-        match command {
-            Command::Eval { manifest } => return super::eval::report(&manifest),
-            Command::Run {
-                config,
-                model,
-                no_working_set,
-                no_native_context,
-                prefetch_path,
-                prefetch_symbol,
-            } => (
-                config,
-                model,
-                no_working_set,
-                no_native_context,
-                prefetch_path,
-                prefetch_symbol,
-            ),
-            #[cfg(feature = "nano-mcp")]
-            Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
-        };
+    let (
+        config,
+        model,
+        no_working_set,
+        no_native_context,
+        prefetch_path,
+        prefetch_symbol,
+        interactive,
+        taskless,
+    ) = match command {
+        Command::Eval { manifest } => return super::eval::report(&manifest),
+        Command::Run {
+            interactive,
+            taskless,
+            config,
+            model,
+            no_working_set,
+            no_native_context,
+            prefetch_path,
+            prefetch_symbol,
+        } => (
+            config,
+            model,
+            no_working_set,
+            no_native_context,
+            prefetch_path,
+            prefetch_symbol,
+            interactive,
+            taskless,
+        ),
+        #[cfg(feature = "nano-mcp")]
+        Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
+    };
     let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
     anyhow::ensure!(
         !no_native_context || seeds.is_empty(),
@@ -71,17 +89,26 @@ pub(crate) async fn run(command: Command) -> Result<()> {
     );
     super::agent::validate_config(config.as_deref(), model.as_deref())?;
     #[cfg(feature = "nano-openai")]
-    return launch(
+    // Keep the session state off the CLI/main-thread stack, especially on Windows.
+    return Box::pin(launch(
         super::agent::config_path(config.as_deref())?,
         model,
         !no_working_set,
         !no_native_context,
         seeds,
-    )
+        interactive,
+        taskless,
+    ))
     .await;
     #[cfg(not(feature = "nano-openai"))]
     {
-        let _ = (no_working_set, no_native_context, seeds);
+        let _ = (
+            no_working_set,
+            no_native_context,
+            seeds,
+            interactive,
+            taskless,
+        );
         unreachable!("feature validated above");
     }
 }
@@ -93,6 +120,8 @@ async fn launch(
     working_set: bool,
     native_context: bool,
     seeds: Vec<serde_json::Value>,
+    interactive: bool,
+    taskless: bool,
 ) -> Result<()> {
     use super::{
         coding::CodingTools,
@@ -127,10 +156,19 @@ async fn launch(
     #[cfg(feature = "nano-mcp")]
     let mcp_config = settings.mcp_config_file.clone();
     let provider = OpenAi::new(settings)?;
-    let launch = LaunchContext::from_env()?;
+    let launch = if taskless {
+        None
+    } else {
+        Some(LaunchContext::from_env()?)
+    };
     let stop = Cancellation::default();
     let error = Arc::new(Mutex::new(None::<String>));
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let preview_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(interactive));
+    let input_preview = preview_enabled.clone();
+    let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(8);
+    let (output, drained) = Output::spawn(wire::stdout_file()?);
+    let input_output = output.clone();
     let input_stop = stop.clone();
     let input_error = error.clone();
     std::thread::spawn(move || {
@@ -147,42 +185,68 @@ async fn launch(
             }
         }
         let _ = start_tx.send(Ok(()));
-        if !matches!(
-            wire::read_command(&mut input),
-            Ok(Some(CommandKind::Cancel)) | Ok(None)
-        ) {
-            *input_error.lock().unwrap() = Some("invalid_command".into());
+        loop {
+            match wire::read_command(&mut input) {
+                Ok(Some(CommandKind::Cancel)) | Ok(None) => break,
+                Ok(Some(CommandKind::Interact)) => {
+                    input_preview.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if commands_tx
+                        .try_send(super::session::SessionCommand::Interact)
+                        .is_err()
+                    {
+                        input_output.publish(Event::Error {
+                            code: "input_queue_full".into(),
+                        });
+                    }
+                }
+                Ok(Some(CommandKind::Steer { text, input_id }))
+                    if !text.trim().is_empty()
+                        && input_id.as_deref().is_none_or(super::journal::valid_id) =>
+                {
+                    input_preview.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let rejection = input_id.as_ref().map_or_else(
+                        || "input_queue_full".into(),
+                        |id| format!("input_queue_full:{id}"),
+                    );
+                    if commands_tx
+                        .try_send(super::session::SessionCommand::Steer { text, input_id })
+                        .is_err()
+                    {
+                        input_output.publish(Event::Error { code: rejection });
+                    }
+                }
+                _ => {
+                    *input_error.lock().unwrap() = Some("invalid_command".into());
+                    break;
+                }
+            }
         }
         input_stop.cancel();
     });
-    let (output, drained) = Output::spawn(wire::stdout_file()?);
     output.publish(Event::Ready);
     let mut terminal_published = false;
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), start_rx).await???;
-        let session_id = launch.run_id.clone();
-        let session = FerrusSession::bind(launch).await?;
-        let identity = SessionIdentity {
-            session_id: session_id.clone(),
-            project_id: session.project_id().into(),
-            task_id: Some(session.scope.task_id.clone()),
-            run_id: Some(session.scope.run_id.clone()),
+        let binding = match launch {
+            Some(launch) => super::binding::Binding::from(FerrusSession::bind(launch).await?),
+            None => super::binding::Binding::interactive_from_env().await?,
         };
-        let journal = FileJournal::create(session.data_dir(), &session_id, Quotas::default())?;
+        let session_id = binding.run_id().to_owned();
+        let journal = FileJournal::create(binding.data_dir(), &session_id, Quotas::default())?;
         let coding = CodingTools {
             workspace: workspace::Workspace::new(
-                session.workspace(),
+                binding.workspace(),
                 workspace::Limits::default(),
             )?,
             commands: commands::Commands::trusted_local(
-                session.workspace(),
+                binding.workspace(),
                 &session_id,
                 journal.directory(),
                 commands::Limits::default(),
             )?,
         };
         let mut native =
-            NativeTools::new(session.clone(), coding, instructions::Limits::default())?;
+            NativeTools::new(binding.clone(), coding, instructions::Limits::default())?;
         #[cfg(feature = "nano-mcp")]
         {
             native.mcp_config = mcp_config;
@@ -194,17 +258,22 @@ async fn launch(
         let journal = ObservedJournal {
             journal,
             output: output.clone(),
+            commands: Some(commands_rx),
+            streaming: (0, String::new()),
+            interactive,
+            preview_enabled,
         };
-        let end = super::managed::run(
-            session,
-            identity,
-            limits,
-            provider,
-            native,
-            journal,
-            &stop,
-        )
-        .await?;
+        let end = if let Some(session) = binding.managed() {
+            let identity = SessionIdentity {
+                session_id,
+                project_id: binding.project_id().into(),
+                task_id: Some(session.scope.task_id.clone()),
+                run_id: Some(session.scope.run_id.clone()),
+            };
+            Box::pin(super::managed::run(session.clone(), identity, limits, provider, native, journal, &stop)).await?
+        } else {
+            Box::pin(super::interactive::run(binding, limits, provider, native, journal, &stop)).await?
+        };
         output.publish(Event::Ended {
             reason: end.reason.clone(),
             durable: end.durable,
@@ -271,6 +340,30 @@ fn prefetch_seeds(paths: Vec<String>, symbols: Vec<String>) -> Result<Vec<serde_
 #[cfg(test)]
 mod working_set_tests {
     use super::*;
+    #[cfg(feature = "nano-openai")]
+    #[test]
+    fn launch_future_does_not_embed_the_session_engine() {
+        // Windows processes have a small main-thread stack. Keep the public
+        // launch state bounded so nested polling and moves leave room for tools.
+        for taskless in [false, true] {
+            let future = run(Command::Run {
+                config: None,
+                model: None,
+                no_working_set: false,
+                no_native_context: false,
+                prefetch_path: Vec::new(),
+                prefetch_symbol: Vec::new(),
+                interactive: true,
+                taskless,
+            });
+            let bytes = std::mem::size_of_val(&future);
+            assert!(bytes <= 8 * 1024, "Nano launch future uses {bytes} bytes");
+            let host = launch(PathBuf::new(), None, true, true, Vec::new(), true, taskless);
+            let bytes = std::mem::size_of_val(&host);
+            assert!(bytes <= 8 * 1024, "Nano host future uses {bytes} bytes");
+        }
+    }
+
     #[test]
     fn explicit_prefetch_is_opt_in_validated_bounded_and_sorted() {
         assert!(prefetch_seeds(vec![], vec![]).unwrap().is_empty());

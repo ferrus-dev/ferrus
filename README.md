@@ -1,6 +1,6 @@
 # ferrus
 
-[![Ferrus version](https://img.shields.io/badge/ferrus-0.5.0--alpha.1-orange)](https://crates.io/crates/ferrus)
+[![Ferrus version](https://img.shields.io/badge/ferrus-0.5.1--alpha.1-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
 [![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
@@ -29,7 +29,7 @@ Ferrus works with existing coding agents:
 - **Qwen Code** (experimental)
 - **goose** (experimental)
 - **opencode** (experimental; Supervisor and Reviewer only)
-- **Nano** (experimental; native headless Executor, requires `nano-openai`; [setup](docs/ferrus-nano-launch.md))
+- **Nano** (experimental; native headless and interactive Executor, requires `nano-openai`; [setup](docs/ferrus-nano-launch.md))
 
 Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limitations and configuration details.
@@ -93,7 +93,7 @@ Cargo installations use the smaller default feature set; to install Nano from cr
 both features explicitly:
 
 ```sh
-cargo install ferrus --version 0.5.0-alpha.1 --locked --profile dist --features nano-openai,nano-mcp
+cargo install ferrus --locked --profile dist --features nano-openai,nano-mcp
 ```
 
 HQ update notifications are enabled by default. To omit the update-check HTTP/TLS client:
@@ -130,6 +130,9 @@ Tasks advance independently through SQLite-backed states. Git projects use isola
 non-Git projects run in the project directory with one Executor. Checks run before submission, and rejected
 work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
 provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
+
+With Nano, `/executor` opens a direct workspace conversation without a queued task;
+`/attach NAME` opens a running or historical managed conversation. See [interactive Nano](docs/ferrus-nano-interactive.md).
 
 The full HQ command list, state transitions, CLI reference, configuration example, graph commands, and runtime file
 layout are in [docs/cli-and-runtime.md](docs/cli-and-runtime.md).

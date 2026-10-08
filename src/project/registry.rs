@@ -1084,6 +1084,45 @@ pub async fn find_non_terminal_task_by_origin(
     .await?
 }
 
+fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        role: row.get(2)?,
+        agent: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        pid: row.get::<_, Option<i64>>(7)?.map(|pid| pid as u32),
+        workspace_path: row.get(8)?,
+    })
+}
+
+pub(crate) async fn latest_run_for_agent_role(
+    agent: &str,
+    role: &str,
+) -> Result<Option<RunRecord>> {
+    let database_path = current_database_path().await?;
+    let (agent, role) = (agent.to_owned(), role.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let connection = open_runtime_database_for_read(&database_path)?;
+        Ok(connection
+            .query_row(
+                r#"
+                SELECT id, task_id, role, agent, status, started_at, updated_at, pid, workspace_path
+                FROM runs
+                WHERE agent = ?1 AND role = ?2
+                ORDER BY updated_at DESC, started_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![agent, role],
+                run_record_from_row,
+            )
+            .optional()?)
+    })
+    .await?
+}
+
 pub async fn list_runs(limit: usize) -> Result<Vec<RunRecord>> {
     let database_path = current_database_path().await?;
     tokio::task::spawn_blocking(move || -> Result<Vec<RunRecord>> {
@@ -1096,19 +1135,7 @@ pub async fn list_runs(limit: usize) -> Result<Vec<RunRecord>> {
             LIMIT ?1
             "#,
         )?;
-        let rows = statement.query_map([limit as i64], |row| {
-            Ok(RunRecord {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                role: row.get(2)?,
-                agent: row.get(3)?,
-                status: row.get(4)?,
-                started_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                pid: row.get::<_, Option<i64>>(7)?.map(|pid| pid as u32),
-                workspace_path: row.get(8)?,
-            })
-        })?;
+        let rows = statement.query_map([limit as i64], run_record_from_row)?;
 
         let mut runs = Vec::new();
         for row in rows {

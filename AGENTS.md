@@ -8,12 +8,12 @@ Coding guidance for AI agents working in this repository.
 Supervisor-Executor workflow: the Supervisor plans tasks and reviews submissions, while the
 Executor implements and checks its own work. SQLite is the runtime source of truth.
 Project-local `.ferrus/` files contain templates, task intent, scoped run artifacts, agent
-registry data, and logs; they are not a mirrored state machine. Coordination uses MCP as an
-implementation detail.
+registry data, and logs; they are not a mirrored state machine. Agents coordinate through
+native tools or MCP.
 
 Licensed under Apache 2.0.
 
-Runtime behavior for a Ferrus-managed agent is defined by its initial prompt and exposed MCP
+Runtime behavior for a Ferrus-managed agent is defined by its initial prompt and exposed Ferrus
 tools. This file is supporting context and must not override them. Read
 `.agents/skills/ferrus/SKILL.md` for the current Ferrus CLI, MCP tools, resources, state
 machine, and artifact layout.
@@ -48,6 +48,9 @@ cargo check                        # fast type-check
 
 Before submitting, `cargo clippy -- -D warnings`, `cargo fmt --check`, and `cargo test` must
 all pass.
+
+For Nano development, add `--features nano-openai` to build, test, and Clippy commands;
+include `nano-mcp` when testing external MCP peers.
 
 ## Ferrus CLI
 
@@ -94,6 +97,7 @@ src/
   agent_id.rs                 # stable agent IDs and MCP server names
   legacy_state.rs             # legacy STATE.json import shape
   agents/                     # agent launcher and config adapters
+  nano/                       # native Executor runtime, headless protocol, and HQ conversations
   platform/                   # OS-specific process and lifecycle helpers
   state/                      # scoped human-readable artifact helpers
   checks/                     # configured check runner
@@ -107,7 +111,7 @@ src/
 `pub const INPUT_SCHEMA: &str`, and `pub async fn handler(...)`. Register them manually with
 `app.map_tool()` in `server/mod.rs`; do not add macros for tool registration.
 
-**Runtime state**: SQLite is the runtime source of truth. MCP tools resolve the caller's
+**Runtime state**: SQLite is the runtime source of truth. Runtime tools resolve the caller's
 `RuntimeTaskContext` from `ferrus.db`, update task and run rows transactionally, and write only
 scoped artifacts under `.ferrus/tasks/` and `.ferrus/runs/`.
 
@@ -275,6 +279,9 @@ consistent.
 **File locking**: task claiming and heartbeat renewal are SQLite operations. Do not add
 `.ferrus/STATE.lock` or file locks for task leases. Canonical approval uses a separate
 machine-local file lock to serialize Git integration and rollback; graph refreshes use sidecar leases.
+Direct Nano writers share the canonical approval lock. Reserve their single canonical workspace
+slot transactionally in SQLite before spawning. Non-Git managed Executors share that slot;
+Git task worktrees retain independent capacity.
 
 **Spec selection**: `project_runtime_state` stores the selected spec. Task rows store
 `spec_path` and `milestone_id`; milestone display text is resolved from spec Markdown by
@@ -287,6 +294,7 @@ implement both role adapters, model normalization, headless prompt transport whe
 version and config behavior, registration wiring, and focused tests. `opencode` is
 experimental: it binds a project to one working directory by Git root commit, so it is
 currently reliable only for the Supervisor and Reviewer roles.
+Nano is Executor-only; keep its native runtime and adapter under `src/nano/`.
 
 Claude Code role-scoped MCP configuration is stored in `.claude/mcp-supervisor.json` and
 `.claude/mcp-executor.json`; permissions are stored in `.claude/settings.local.json`.

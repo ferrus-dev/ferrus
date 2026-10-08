@@ -2779,7 +2779,7 @@ async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
     let mut refresh = Refresh::default();
     refresh.invalidate();
     assert_eq!(
-        refresh.prepare(&session, false).await[0]["status"],
+        refresh.prepare(&session.clone().into(), false).await[0]["status"],
         "scheduled"
     );
     assert_eq!(refresh.settle().await.unwrap()["status"], "published");
@@ -2984,6 +2984,296 @@ async fn disabled_working_set_keeps_workspace_tools_but_never_schedules_refresh(
     assert_eq!(session.status().await.unwrap().repository_view, previous);
     assert!(tools.shutdown().await);
     assert_eq!(session.status().await.unwrap().repository_view, previous);
+}
+
+#[tokio::test]
+#[cfg(feature = "nano-openai")]
+async fn direct_mutations_and_running_commands_share_the_canonical_approval_lock() {
+    use crate::server::tools::approve::acquire_canonical_approval_lock_at;
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, false).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-lock",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-lock".into(),
+    };
+    let journal = FileJournal::create(&f.data, "direct-lock", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-lock",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut native =
+        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
+    native.working_set_enabled = false;
+    let patch = baseline_patch(&native, "DirectLockedEdit");
+    let mut tools =
+        crate::nano::interactive::InteractiveTools::new(native, binding, Cancellation::default());
+    let lock_path = f.data.join("canonical-approval.lock");
+    let approval = acquire_canonical_approval_lock_at(&lock_path, "t-review")
+        .await
+        .unwrap();
+    let before = std::fs::read(f.root.join("src/lib.rs")).unwrap();
+    let cancelled = Cancellation::default();
+    let signal = cancelled.clone();
+    let cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.cancel();
+    });
+    assert_eq!(
+        tools.execute(&patch, &cancelled).await,
+        ToolOutcome::Failed(ToolError::Interrupted)
+    );
+    cancel.await.unwrap();
+    assert_eq!(std::fs::read(f.root.join("src/lib.rs")).unwrap(), before);
+    drop(approval);
+    assert!(matches!(
+        tools.execute(&patch, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(!lock_path.exists());
+    let short = ValidatedCall {
+        call_id: "short".into(),
+        provider_call_id: "short".into(),
+        name: "exec".into(),
+        arguments: json!({"command":"echo done", "cwd":".", "timeout_ms":60000}),
+    };
+    assert!(matches!(
+        tools.execute(&short, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    // The process guard must release without another model turn or tool call.
+    let approval = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(approval);
+    #[cfg(unix)]
+    let command = "sleep 30";
+    #[cfg(windows)]
+    let command = "ping -n 30 127.0.0.1 >nul";
+    let exec = ValidatedCall {
+        call_id: "exec".into(),
+        provider_call_id: "exec".into(),
+        name: "exec".into(),
+        arguments: json!({"command":command, "cwd":".", "timeout_ms":60000}),
+    };
+    assert!(matches!(
+        tools.execute(&exec, &Cancellation::default()).await,
+        ToolOutcome::Success(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_canonical_approval_lock_at(&lock_path, "t-review")
+        )
+        .await
+        .is_err()
+    );
+    assert!(tools.shutdown().await);
+    let approval = tokio::time::timeout(
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(approval);
+    assert!(!lock_path.exists());
+}
+
+#[tokio::test]
+async fn taskless_mutation_persists_invalidation_without_scheduled_maintenance() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, true).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-invalidation",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-invalidation".into(),
+    };
+    let prior = binding.graph().await.unwrap().status().await.unwrap();
+    let journal = FileJournal::create(&f.data, "direct-invalidation", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-invalidation",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut tools =
+        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
+    tools.working_set_enabled = false;
+    let patch = baseline_patch(&tools, "CanonicalUnrefreshedEdit");
+    // Invalidation must use the bound database rather than the process working directory.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(elsewhere.path()).unwrap();
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    drop(tools);
+    std::env::set_current_dir(&f.root).unwrap();
+    let state = project::canonical_graph_reference().await.unwrap();
+    assert_eq!(state.status, project::CanonicalGraphStatus::Stale);
+    let invalidations: i64 = f.connection().query_row(
+        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-invalidation'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(invalidations, 1);
+    let after = binding.graph().await.unwrap().status().await.unwrap();
+    assert_eq!(after.snapshot_id, prior.snapshot_id);
+    assert_eq!(
+        after.freshness.freshness,
+        crate::repository_graph::domain::Freshness::Stale
+    );
+}
+
+#[tokio::test]
+async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_failure() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let _managed = git_session(&f, true).await;
+    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
+        .await
+        .unwrap();
+    project::record_run_started_for_task_with_workspace(
+        "direct-prefetch",
+        "executor",
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        f.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    let binding = crate::nano::binding::Binding::Interactive {
+        project_root: f.root.clone(),
+        project_id: "test-project".into(),
+        data_dir: f.data.clone(),
+        agent_id: "executor:nano:1".into(),
+        run_id: "direct-prefetch".into(),
+    };
+    let journal = FileJournal::create(&f.data, "direct-prefetch", Quotas::default()).unwrap();
+    let coding = CodingTools {
+        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
+        commands: commands::Commands::trusted_local(
+            &f.root,
+            "direct-prefetch",
+            journal.directory(),
+            commands::Limits::default(),
+        )
+        .unwrap(),
+    };
+    let mut tools = NativeTools::new(binding, coding, instructions::Limits::default()).unwrap();
+    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
+    let patch = baseline_patch(&tools, "CanonicalPrefetchedEdit");
+    assert!(
+        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
+    );
+    let messages = [Message::User {
+        text: "Inspect the changed symbol".into(),
+    }];
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "published"),
+        "{:?}",
+        prepared.observations
+    );
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "prefetch"),
+        "{:?}",
+        prepared.observations
+    );
+    assert_eq!(
+        project::canonical_graph_reference().await.unwrap().status,
+        project::CanonicalGraphStatus::Fresh
+    );
+
+    std::fs::write(
+        f.root.join("ferrus.toml"),
+        "[repository_graph]\nenabled = 'invalid'\n",
+    )
+    .unwrap();
+    tools.invalidate_unknown().await;
+    let prepared = tools
+        .prepare_context(&messages, &Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "failed")
+    );
+    assert!(
+        !prepared
+            .observations
+            .iter()
+            .any(|item| item["kind"] == "prefetch")
+    );
+    assert_eq!(
+        project::canonical_graph_reference().await.unwrap().status,
+        project::CanonicalGraphStatus::Stale
+    );
+    let invalidations: i64 = f.connection().query_row(
+        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-prefetch'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(invalidations, 2);
+    assert!(tools.shutdown().await);
 }
 
 #[tokio::test]

@@ -20,7 +20,7 @@ Last reviewed against the repository: 2026-09-07.
 | Windows support | Mostly implemented | Windows platform hooks, shell execution, installer, Windows CI, and smoke tests exist. Real agent-loop validation and support-policy docs still need tightening. |
 | Storage layer and SQLite backend | Done | Versioned SQLite migrations, tasks, runs, events, leases, counters, selected spec state, and recovery. Markdown remains scoped human-readable artifacts. |
 | Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
-| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits cover external backends and the opt-in native Nano headless Executor. Nano declares its launch capabilities; interactive native roles remain future work. |
+| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits cover external backends and the opt-in native Nano headless Executor. Nano declares its launch capabilities and supports a native interactive Executor conversation in HQ; other native roles remain future work. |
 | Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, frozen submissions, three-way integration with rollback, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
@@ -151,8 +151,9 @@ Definition of done:
 ## Milestone 5: Ferrus Nano-Agent
 
 Status: native session, engine/journal, provider, file/command tools, scoped native context,
-managed Executor lifecycle, and CLI/HQ headless launch implemented (#73-#80). Nano is opt-in
-through `nano-openai`; live model validation and later release gates remain outstanding.
+managed Executor lifecycle, context efficiency, MCP extensions, crash recovery, and offline
+evaluation/release gates implemented (#73-#85). Native HQ conversation is implemented (#86).
+Nano is opt-in through `nano-openai`; comparative live-model measurements remain outstanding.
 
 Goal: build `ferrus-nano` (backend `nano`) as a minimal Rust coding-agent harness. Start with a
 headless managed Executor, using Ferrus operations, repository graph, and project memory through
@@ -177,6 +178,8 @@ Implemented foundation:
 - headless backend registration, private provider configuration, versioned JSONL launch/events, and HQ process supervision ([contract](ferrus-nano-launch.md));
 - revision-aware evidence selection, bounded query reuse, explicit prefetch, and debounced overlay refresh ([contract](ferrus-nano-working-set.md));
 - external stdio MCP through neva and guarded crash resume with effect reconciliation;
+- native HQ conversation with queued steering, cancellation, scoped questions, bounded previews,
+  and reconnect from the durable journal ([contract](ferrus-nano-interactive.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -185,10 +188,11 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 
 | Stage | Issues | Remaining scope |
 | --- | --- | --- |
-| N1: headless Executor | #80 implemented; #85 validation | Live model validation and release gates |
-| N2: context efficiency | #81 and #82 implemented | Comparative context-quality and cache measurements (#85) |
-| N3: reliability and extensions | #83 and #84 implemented; #85 validation | Comparative evaluation and headless release gates |
-| N4/N5: interactive and standalone | #86-#88 | HQ interaction, standalone host/binary, and shared UI |
+| N1: headless Executor | #80 and #85 implemented | Comparative live model validation |
+| N2: context efficiency | #81, #82, and #85 implemented | Comparative context-quality and cache measurements |
+| N3: reliability and extensions | #83-#85 implemented | Comparative live evaluation |
+| N4: interactive HQ | #86 implemented | Live interactive Executor validation |
+| N5: standalone | #87-#88 | Standalone host/binary and shared UI |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
 
 Definition of done for the first headless release:
@@ -198,7 +202,7 @@ Definition of done for the first headless release:
 - a fixed task suite measures quality, token use, cost, and elapsed time against external integrations.
 
 Lower cost, higher determinism, and better throughput are hypotheses until evaluated. Interactive
-and standalone delivery remain planned extensions, not requirements to ship the headless Executor.
+HQ is available; standalone delivery remains a planned extension.
 
 ## Supporting Tracks
 

@@ -533,8 +533,8 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if let Some(recovery) = recovery {
         engine.inherit_budget(recovery.budget)?;
     }
-    let execution = engine.run(SessionCommand::Start { input }, &stop);
-    tokio::pin!(execution);
+    // Match direct sessions: keep the inference/tool future off the host stack.
+    let mut execution = Box::pin(engine.run(SessionCommand::Start { input }, &stop));
     // External cancellation must not wait behind a busy heartbeat transaction.
     let result = tokio::select! {
         biased;

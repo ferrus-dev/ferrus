@@ -399,6 +399,7 @@ fn run_git_records(
     operation: &'static str,
     mut visit: impl FnMut(&[u8]) -> Result<(), SourceError>,
 ) -> Result<(), SourceError> {
+    tracing::debug!(operation, "repository Git record scan started");
     let mut child = git_command(root, arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -437,6 +438,7 @@ fn run_git_records(
     let status = child
         .wait()
         .map_err(|_| SourceError::GitCommand { operation })?;
+    tracing::debug!(operation, "repository Git record scan finished");
     if status.success() {
         Ok(())
     } else {
@@ -449,6 +451,7 @@ fn git_has_output(
     arguments: &[&str],
     operation: &'static str,
 ) -> Result<bool, SourceError> {
+    tracing::debug!(operation, "repository Git output probe started");
     let mut child = git_command(root, arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -470,11 +473,13 @@ fn git_has_output(
     if read != 0 {
         let _ = child.kill();
         let _ = child.wait();
+        tracing::debug!(operation, "repository Git output probe found a record");
         return Ok(true);
     }
     let status = child
         .wait()
         .map_err(|_| SourceError::GitCommand { operation })?;
+    tracing::debug!(operation, "repository Git output probe finished");
     if status.success() {
         Ok(false)
     } else {
@@ -485,6 +490,9 @@ fn git_has_output(
 pub(super) fn git_command(root: &Path, arguments: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
+        // Graph commands never consume host input. In particular, streamed
+        // discovery must not inherit Nano's open control pipe on Windows.
+        .stdin(Stdio::null())
         .arg("-c")
         .arg("core.fsmonitor=false")
         .arg("-c")
@@ -579,6 +587,85 @@ mod tests {
             &["config", "user.email", "ferrus@example.invalid"],
         );
         directory
+    }
+
+    #[test]
+    fn git_commands_do_not_inherit_host_stdin() {
+        use std::{
+            io::Write,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        const CHILD: &str = "FERRUS_TEST_GRAPH_GIT_STDIN";
+        if std::env::var_os(CHILD).is_some() {
+            let directory = initialized_repository();
+            let (ready, received) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let mut input = BufReader::new(std::io::stdin());
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                ready.send(()).unwrap();
+                // Match Nano's blocked control reader while Git is spawned.
+                let _ = std::io::copy(&mut input, &mut std::io::sink());
+            });
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Batch mode waits for EOF. It must see a closed input even when
+            // the Ferrus host is waiting on an open control pipe.
+            let mut git = git_command(directory.path(), &["cat-file", "--batch"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = git.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = git.kill();
+                    let _ = git.wait();
+                    panic!("graph Git command inherited the open host stdin");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let log = output.reopen().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repository_graph::source::git::tests::git_commands_do_not_inherit_host_stdin",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "host control frame").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("graph stdin regression child did not finish");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(input);
+        assert!(
+            status.success(),
+            "{}",
+            fs::read_to_string(output.path()).unwrap()
+        );
     }
 
     #[test]

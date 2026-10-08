@@ -16,7 +16,7 @@ pub(super) struct StyledLine {
 }
 
 impl StyledLine {
-    fn plain(text: impl Into<String>, color: Color) -> Self {
+    pub(super) fn plain(text: impl Into<String>, color: Color) -> Self {
         Self {
             segments: vec![StyledSegment {
                 text: text.into(),
@@ -53,7 +53,7 @@ pub(super) struct DashboardLine {
 }
 
 impl DashboardLine {
-    fn new(line: StyledLine) -> Self {
+    pub(super) fn new(line: StyledLine) -> Self {
         Self {
             line,
             style: LineStyle::Normal,
@@ -188,6 +188,27 @@ pub(super) fn redraw_prompt_area(
 }
 
 pub(super) fn dashboard_lines(app: &App, width: usize, max_lines: usize) -> Vec<DashboardLine> {
+    if let Some(view) = &app.nano {
+        let mut panels = if app.question.is_some() {
+            question_lines(app, width)
+        } else {
+            Vec::new()
+        };
+        if let Some(error) = &app.last_error {
+            panels.extend(error_lines(error, width));
+        }
+        panels.truncate(max_lines);
+        let notice_rows = max_lines.saturating_sub(panels.len() + 3).min(36) / 3;
+        for block in recent_transcript_blocks(&view.notices, notice_rows) {
+            for line in block {
+                panels.push(DashboardLine::new(transcript_activity_line(line, width)));
+            }
+        }
+        let mut lines = nano::lines(view, width, max_lines.saturating_sub(panels.len()));
+        lines.extend(panels);
+        lines.truncate(max_lines);
+        return lines;
+    }
     let mut lines = Vec::new();
     lines.extend(header_lines(app, width));
     lines.extend(project_and_milestone_lines(app, width));

@@ -1557,16 +1557,25 @@ async fn queued_human_answers_follow_fifo_and_preserve_presented_task() {
     assert_eq!(questions.len(), 1);
     assert_eq!(questions[0].task_id, "t-022");
 
-    let error = dispatch_with_human_question_target("Stale answer", Some("t-021"), false, &mut ctx)
-        .await
-        .unwrap_err()
-        .to_string();
+    let error = dispatch_with_human_question_target(
+        "Stale answer",
+        Some("t-021"),
+        None,
+        None,
+        false,
+        &mut ctx,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("Task t-021 is not waiting"));
     assert!(!std::path::Path::new(".ferrus/runs/t-022/ANSWER.md").exists());
 
     let error = dispatch_with_human_question_target(
         "Use option B\n\n- preserve formatting",
         Some("t-022"),
+        None,
+        None,
         false,
         &mut ctx,
     )

@@ -242,6 +242,14 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
     task_id: String,
     run_id: Option<String>,
 ) {
+    let _ = refresh_canonical_graph_best_effort(project_root, task_id, run_id).await;
+}
+
+async fn refresh_canonical_graph_best_effort(
+    project_root: std::path::PathBuf,
+    task_id: String,
+    run_id: Option<String>,
+) -> &'static str {
     loop {
         let guard = match project::canonical_graph_refresh_guard().await {
             Ok(guard) => guard,
@@ -251,13 +259,13 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
                     error = ?error,
                     "failed to capture canonical graph refresh generation"
                 );
-                return;
+                return "failed";
             }
         };
         match refresh_canonical_graph_at(&project_root).await {
-            Ok(None) => return,
+            Ok(None) => return "disabled",
             Ok(Some((source, snapshot_id, build_id))) => {
-                match project::record_canonical_graph_refresh(
+                let status = match project::record_canonical_graph_refresh(
                     Some(&task_id),
                     run_id.as_deref(),
                     guard,
@@ -267,19 +275,25 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
                 )
                 .await
                 {
-                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => {}
-                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => tracing::debug!(
-                        task_id,
-                        "canonical graph refresh was superseded by a newer invalidation"
-                    ),
-                    Err(error) => tracing::warn!(
-                        task_id,
-                        error = ?error,
-                        "canonical graph refreshed but durable freshness state was not updated"
-                    ),
-                }
+                    Ok(project::CanonicalGraphRefreshOutcome::Recorded) => "published",
+                    Ok(project::CanonicalGraphRefreshOutcome::Superseded) => {
+                        tracing::debug!(
+                            task_id,
+                            "canonical graph refresh was superseded by a newer invalidation"
+                        );
+                        "superseded"
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            task_id,
+                            error = ?error,
+                            "canonical graph refreshed but durable freshness state was not updated"
+                        );
+                        "failed"
+                    }
+                };
                 maintain_graph_best_effort().await;
-                return;
+                return status;
             }
             Err(error) if error.downcast_ref::<RefreshAlreadyInProgress>().is_some() => {
                 tracing::debug!(
@@ -300,10 +314,18 @@ pub(crate) async fn refresh_canonical_graph_after_approval(
                     guard,
                 )
                 .await;
-                return;
+                return "failed";
             }
         }
     }
+}
+
+/// Interactive workspace edits use canonical maintenance without a task transition.
+pub(crate) async fn refresh_canonical_graph_after_workspace_change(
+    project_root: std::path::PathBuf,
+    run_id: String,
+) -> &'static str {
+    refresh_canonical_graph_best_effort(project_root, "current".into(), Some(run_id)).await
 }
 
 async fn refresh_canonical_graph_at(
@@ -364,11 +386,14 @@ async fn refresh_canonical_graph_at(
                 &config,
                 &identities,
             )?;
+            tracing::debug!("canonical graph source discovery started");
             let source = LocalRepositorySource::discover(project_root, context)?;
+            tracing::debug!("canonical graph source discovery finished");
             let source_identity = project::CanonicalSourceIdentity {
                 source_revision_id: source.manifest().revision.id.clone(),
                 manifest_digest: source.manifest().revision.manifest_digest.clone(),
             };
+            tracing::debug!("canonical graph indexing started");
             let outcome = IndexCoordinator::new(&mut sidecar).index(
                 &source,
                 &config,
@@ -378,9 +403,12 @@ async fn refresh_canonical_graph_at(
                     force_full: false,
                 },
             )?;
+            tracing::debug!("canonical graph indexing finished");
             Ok((source_identity, outcome))
         })();
+        tracing::debug!("stopping canonical graph lease heartbeat");
         let lease_healthy = heartbeat.finish();
+        tracing::debug!("canonical graph lease heartbeat stopped");
         let released =
             sidecar.release_refresh_lease(&indexed_repository, &view_name, build_id.as_str());
         let indexed = indexed?;

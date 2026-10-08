@@ -1,6 +1,6 @@
 //! Debounced host maintenance. Read-only retrieval never calls this scheduler.
 
-use super::ferrus::FerrusSession;
+use super::binding::Binding;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -32,7 +32,10 @@ impl Refresh {
 
     pub async fn settle(&mut self) -> Option<Value> {
         // Retain ownership if the caller is cancelled while awaiting maintenance.
-        let result = self.task.as_mut()?.await;
+        let task = self.task.as_mut()?;
+        tracing::debug!("Nano is waiting for repository graph refresh");
+        let result = task.await;
+        tracing::debug!("Nano repository graph refresh finished");
         self.task.take();
         Some(match result {
             Ok(value) => value,
@@ -40,7 +43,7 @@ impl Refresh {
         })
     }
 
-    pub async fn prepare(&mut self, session: &FerrusSession, writers: bool) -> Vec<Value> {
+    pub async fn prepare(&mut self, session: &Binding, writers: bool) -> Vec<Value> {
         let mut observations = Vec::new();
         if self.task.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(value) = self.settle().await
@@ -53,6 +56,18 @@ impl Refresh {
         let session = session.clone();
         self.task = Some(tokio::spawn(async move {
             tokio::time::sleep_until(tokio::time::Instant::from_std(dirty + DEBOUNCE)).await;
+            if session.managed().is_none() {
+                if session.status().await.is_err() {
+                    return json!({"kind":"canonical_refresh", "status":"failed"});
+                }
+                let status = crate::repository_graph_runtime::refresh_canonical_graph_after_workspace_change(
+                    session.project_root().to_path_buf(),
+                    session.run_id().into(),
+                )
+                .await;
+                return json!({"kind":"canonical_refresh", "status":status});
+            }
+            let session = session.managed().unwrap();
             let result = async {
                 let runtime = session.authorize().await?;
                 let Some(baseline) = session.baseline_tree() else {

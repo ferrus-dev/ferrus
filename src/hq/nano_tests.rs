@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::agents::{AgentRunMode, ExecutorAgent, HeadlessPromptTransport};
-use std::{path::PathBuf, process::Command as StdCommand, sync::Arc};
+use std::{path::PathBuf, process::Command as StdCommand, sync::Arc, time::Duration};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -66,6 +66,14 @@ struct FakeNative {
     reject: bool,
 }
 impl ExecutorAgent for FakeNative {
+    fn capabilities(&self) -> crate::agents::ExecutorCapabilities {
+        crate::agents::ExecutorCapabilities {
+            interactive: true,
+            headless: true,
+            native: true,
+            event_output: true,
+        }
+    }
     fn name(&self) -> &'static str {
         "nano"
     }
@@ -76,6 +84,10 @@ impl ExecutorAgent for FakeNative {
         HeadlessPromptTransport::Jsonl
     }
     fn validate_headless_launch(&self, _: &str, _: u32) -> Result<()> {
+        anyhow::ensure!(!self.reject, "invalid native config");
+        Ok(())
+    }
+    fn validate_interactive_launch(&self, _: &str, _: u32) -> Result<()> {
         anyhow::ensure!(!self.reject, "invalid native config");
         Ok(())
     }
@@ -215,4 +227,574 @@ exit 0
         crate::project::list_tasks().await.unwrap()[0].status,
         "pending"
     );
+}
+
+#[tokio::test]
+async fn native_conversation_attach_steer_detach_and_cancel_preserve_run_ownership() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let script = f.root.join("interactive fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+[ "$start" = '{"version":1,"command":"start"}' ] || exit 10
+if [ -f second_attach.marker ]; then
+    IFS= read -r cancel
+    [ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+    exit 0
+fi
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 11
+IFS= read -r steer
+[ "$steer" = '{"version":1,"command":{"steer":{"text":"Keep the API stable"}}}' ] || exit 12
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 13
+echo attached > second_attach.marker
+IFS= read -r cancel
+[ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+exit 0
+"#;
+    #[cfg(windows)]
+    let source = r#"$ErrorActionPreference = 'Stop'
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"start"}') { exit 10 }
+if (Test-Path 'second_attach.marker') {
+    if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+    exit 0
+}
+
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 11 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":{"steer":{"text":"Keep the API stable"}}}') { exit 12 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 13 }
+Set-Content -Path 'second_attach.marker' -Value 'attached'
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+exit 0
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    let name = "executor:nano:t-001";
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.nano_paused_tasks.insert("t-001".into());
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Consultation,
+    )
+    .await
+    .unwrap();
+    store::write_consult_response_for_run_dir(".ferrus/runs/t-001", "Keep the API stable")
+        .await
+        .unwrap();
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert!(ctx.headless.is_empty());
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Executing,
+    )
+    .await
+    .unwrap();
+    crate::project::record_task_human_question_requested(
+        "t-001",
+        crate::project::TaskStatus::Executing,
+        name,
+    )
+    .await
+    .unwrap();
+    crate::project::record_task_human_answer("t-001")
+        .await
+        .unwrap();
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert!(ctx.headless.is_empty());
+    assert_eq!(f.dispatches(), 0);
+    ctx.nano_paused_tasks.clear();
+    crate::project::record_task_status(
+        "t-001",
+        ".ferrus/tasks/t-001.md",
+        crate::project::TaskStatus::Pending,
+    )
+    .await
+    .unwrap();
+    ctx.spawn_headless_executor_for_task(name, "", 1, "t-001")
+        .await
+        .unwrap();
+    ctx.attach_nano_conversation(name).await.unwrap();
+    let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
+    assert!(
+        dispatch_with_human_question_target(
+            "Wrong run",
+            None,
+            Some("foreign"),
+            None,
+            false,
+            &mut ctx
+        )
+        .await
+        .is_err()
+    );
+    dispatch_with_human_question_target(
+        "Keep the API stable",
+        None,
+        Some(&run),
+        None,
+        false,
+        &mut ctx,
+    )
+    .await
+    .unwrap();
+    dispatch("/detach", &mut ctx).await.unwrap();
+    assert!(ctx.nano_view.is_none());
+    assert!(ctx.headless[name].is_alive());
+    ctx.attach_nano_conversation(name).await.unwrap();
+    assert_eq!(ctx.nano_view.as_ref().unwrap().run_id, run);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !f.root.join("second_attach.marker").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatch("/cancel", &mut ctx).await.unwrap();
+    let mut exit = ctx.headless[name].exit_rx.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exit.borrow().is_none() {
+            exit.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*exit.borrow(), Some(0));
+    assert_eq!(f.dispatches(), 1);
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(f.dispatches(), 1);
+    ctx.resume().await.unwrap();
+    assert!(ctx.nano_paused_tasks.is_empty());
+    assert_eq!(f.dispatches(), 2);
+    ctx.shutdown_all_headless().await;
+}
+
+#[tokio::test]
+async fn native_executor_opens_directly_without_consuming_ready_tasks() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("taskless fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"[ -z "$FERRUS_TASK_ID" ] && [ -z "$FERRUS_BASELINE_TREE" ] || exit 20
+echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+[ "$start" = '{"version":1,"command":"start"}' ] || exit 10
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 11
+IFS= read -r steer
+[ "$steer" = '{"version":1,"command":{"steer":{"text":"Inspect this workspace"}}}' ] || exit 12
+IFS= read -r open
+[ "$open" = '{"version":1,"command":"interact"}' ] || exit 13
+echo attached > direct_attach.marker
+IFS= read -r cancel
+[ "$cancel" = '{"version":1,"command":"cancel"}' ] || exit 14
+exit 0
+"#;
+    #[cfg(windows)]
+    let source = r#"$ErrorActionPreference = 'Stop'
+if ($env:FERRUS_TASK_ID -or $env:FERRUS_BASELINE_TREE) { exit 20 }
+[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"start"}') { exit 10 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 11 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":{"steer":{"text":"Inspect this workspace"}}}') { exit 12 }
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"interact"}') { exit 13 }
+Set-Content -Path 'direct_attach.marker' -Value 'attached'
+if ([Console]::In.ReadLine() -cne '{"version":1,"command":"cancel"}') { exit 14 }
+exit 0
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    dispatch("/executor", &mut ctx).await.unwrap();
+    let name = "executor:nano:1";
+    let run = ctx.nano_view.as_ref().unwrap().run_id.clone();
+    assert!(ctx.headless[name].task_id.is_none());
+    assert_eq!(fixture.dispatches(), 0);
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(fixture.dispatches(), 0);
+    dispatch_with_human_question_target(
+        "Inspect this workspace",
+        None,
+        Some(&run),
+        None,
+        false,
+        &mut ctx,
+    )
+    .await
+    .unwrap();
+    dispatch("/detach", &mut ctx).await.unwrap();
+    dispatch("/executor", &mut ctx).await.unwrap();
+    assert_eq!(ctx.nano_view.as_ref().unwrap().run_id, run);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !fixture.root.join("direct_attach.marker").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        StdCommand::new("git")
+            .args(["init", "-q", "--object-format=sha1"])
+            .current_dir(&fixture.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    dispatch("/cancel", &mut ctx).await.unwrap();
+    assert!(ctx.nano_paused_tasks.is_empty());
+    ctx.shutdown_all_headless().await;
+    assert_eq!(fixture.dispatches(), 0);
+    assert_eq!(
+        crate::project::list_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .find(|task| task.id == "t-001")
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert!(!fixture.data.join("worktrees").exists());
+}
+
+#[tokio::test]
+async fn direct_session_reservation_is_atomic_and_released_on_setup_failure() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let database = fixture.data.join("ferrus.db");
+    let (first, second) = tokio::join!(
+        crate::project::reserve_executor_session_at(
+            &database,
+            "direct-a",
+            "executor:nano:1",
+            &fixture.root,
+            "current",
+            true
+        ),
+        crate::project::reserve_executor_session_at(
+            &database,
+            "direct-b",
+            "executor:nano:1",
+            &fixture.root,
+            "current",
+            true
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let reservations: Vec<_> = [first, second].into_iter().filter_map(Result::ok).collect();
+    assert!(
+        crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR)
+            .await
+            .unwrap()
+            .contains("current")
+    );
+    drop(reservations);
+    assert!(
+        !crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR)
+            .await
+            .unwrap()
+            .contains("current")
+    );
+
+    let script = fixture.root.join("malformed-direct.ps1");
+    std::fs::write(&script, "echo malformed-event\n").unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    assert!(dispatch("/executor", &mut ctx).await.is_err());
+    assert!(ctx.headless.is_empty());
+    assert_eq!(fixture.dispatches(), 0);
+    assert!(
+        crate::project::list_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.status == "failed")
+    );
+    // A fresh claim can immediately replace the failed setup.
+    let _next = crate::project::reserve_executor_session_at(
+        &database,
+        "direct-next",
+        "executor:nano:1",
+        &fixture.root,
+        "current",
+        true,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shared_executor_reservations_exclude_managed_and_direct_runs() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let database = fixture.data.join("ferrus.db");
+    for (index, (first_task, second_task)) in [
+        ("current", "t-001"),
+        ("t-001", "current"),
+        ("t-001", "t-002"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let first = crate::project::reserve_executor_session_at(
+            &database,
+            &format!("first-{index}"),
+            "executor:nano:1",
+            &fixture.root,
+            first_task,
+            true,
+        )
+        .await
+        .unwrap();
+        let second = crate::project::reserve_executor_session_at(
+            &database,
+            &format!("second-{index}"),
+            "executor:codex:2",
+            &fixture.root,
+            second_task,
+            true,
+        )
+        .await;
+        assert!(second.is_err());
+        // Git direct sessions exclude only other taskless runs, not isolated managed runs.
+        if first_task != "current" {
+            let direct = crate::project::reserve_executor_session_at(
+                &database,
+                &format!("git-direct-{index}"),
+                "executor:nano:1",
+                &fixture.root,
+                "current",
+                false,
+            )
+            .await
+            .unwrap();
+            drop(direct);
+        }
+        drop(first);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_direct_and_managed_launches_share_one_non_git_slot() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("shared-slot.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+IFS= read -r start
+IFS= read -r cancel
+"#;
+    #[cfg(windows)]
+    let source = r#"[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+$null = [Console]::In.ReadLine()
+$null = [Console]::In.ReadLine()
+"#;
+    std::fs::write(&script, source).unwrap();
+    let direct_agent = FakeNative {
+        script: script.clone(),
+        reject: false,
+    };
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    // Both callers have already passed their independent HQ occupancy preflights.
+    let (managed, direct) = tokio::join!(
+        ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001"),
+        agent_manager::spawn_native_interactive_executor_with_env(
+            &direct_agent,
+            "executor:nano:1",
+            1,
+            false,
+            vec![(ENV_AGENT_ID, "executor:nano:1".into())],
+            Some(agent_manager::HeadlessWorkspace {
+                project_root: fixture.root.clone(),
+                workspace_dir: fixture.root.clone(),
+            }),
+        ),
+    );
+    assert_ne!(managed.is_ok(), direct.is_ok());
+    assert_eq!(fixture.dispatches(), i64::from(managed.is_ok()));
+    assert_eq!(
+        crate::project::list_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|run| run.status == "running")
+            .count(),
+        1
+    );
+    if let Ok(handle) = direct {
+        handle.terminate().await;
+    }
+    ctx.shutdown_all_headless().await;
+    // A failed managed setup also releases the same shared slot.
+    std::fs::write(&direct_agent.script, "echo malformed-event\n").unwrap();
+    assert!(
+        ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001")
+            .await
+            .is_err()
+    );
+    let _next = crate::project::reserve_executor_session_at(
+        &fixture.data.join("ferrus.db"),
+        "after-failed-managed",
+        "executor:nano:1",
+        &fixture.root,
+        "current",
+        true,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn foreign_taskless_executor_occupies_only_shared_workspaces() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let mut ctx = context(
+        FakeNative {
+            script: fixture.root.join("unused-script"),
+            reject: true,
+        },
+        false,
+    );
+    crate::project::record_run_started_for_task_with_workspace(
+        "foreign-taskless-run",
+        ROLE_EXECUTOR,
+        "executor:nano:1",
+        std::process::id(),
+        Some("current"),
+        fixture.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert!(ctx.headless.is_empty());
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.reconcile_runtime_schedule().await.unwrap();
+    assert_eq!(fixture.dispatches(), 0);
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("taskless Executor")
+    );
+    assert!(
+        StdCommand::new("git")
+            .args(["init", "-q", "--object-format=sha1"])
+            .current_dir(&fixture.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("taskless Executor")
+    );
+    // Only taskless runs are excluded; a foreign managed Executor still occupies a slot.
+    crate::project::record_run_started_for_task_with_workspace(
+        "foreign-managed-run",
+        ROLE_EXECUTOR,
+        "executor:nano:t-001",
+        std::process::id(),
+        Some("t-001"),
+        fixture.root.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    crate::project::record_run_finished("foreign-managed-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    crate::project::record_run_finished("foreign-taskless-run", 0)
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
+    // A terminal taskless run no longer blocks launch preflight.
+    assert!(
+        dispatch("/executor", &mut ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid native config")
+    );
+}
+
+#[tokio::test]
+async fn taskless_native_executor_waits_for_the_non_git_managed_executor() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new().await;
+    let script = fixture.root.join("shared workspace fixture.ps1");
+    #[cfg(unix)]
+    let source = r#"echo '{"version":1,"event":{"type":"ready"}}'
+while IFS= read -r command; do
+    [ "$command" = '{"version":1,"command":"cancel"}' ] && exit 0
+done
+"#;
+    #[cfg(windows)]
+    let source = r#"[Console]::Out.WriteLine('{"version":1,"event":{"type":"ready"}}')
+[Console]::Out.Flush()
+while ($null -ne ($command = [Console]::In.ReadLine())) {
+    if ($command -ceq '{"version":1,"command":"cancel"}') { exit 0 }
+}
+"#;
+    std::fs::write(&script, source).unwrap();
+    let mut ctx = context(
+        FakeNative {
+            script,
+            reject: false,
+        },
+        false,
+    );
+    ctx.supervisor = Some(crate::agents::parse_supervisor_agent("codex", None).unwrap());
+    ctx.spawn_headless_executor_for_task("executor:nano:t-001", "", 1, "t-001")
+        .await
+        .unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    let result = dispatch("/executor", &mut ctx).await;
+    ctx.shutdown_all_headless().await;
+    assert!(result.unwrap_err().to_string().contains("non-Git"));
+    assert!(ctx.nano_view.is_none());
+    assert_eq!(fixture.dispatches(), 1);
+    // Once the shared workspace is released, a direct session can start.
+    dispatch("/executor", &mut ctx).await.unwrap();
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 1);
+    ctx.shutdown_all_headless().await;
+    assert_eq!(ctx.occupied_executor_slots().await.unwrap(), 0);
 }

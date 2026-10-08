@@ -9,7 +9,7 @@ use crate::state::agents::{AgentEntry, AgentStatus, read_agents, write_agents};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -345,9 +345,11 @@ pub struct HeadlessHandle {
     platform_guard: Option<platform::HeadlessProcessGuard>,
     wait_thread: Option<std::thread::JoinHandle<()>>,
     output_threads: Vec<std::thread::JoinHandle<()>>,
-    native_stdin: Option<std::process::ChildStdin>,
     pub(super) native_events:
-        Option<tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>>,
+        Option<tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>>,
+    pub(super) native_control: Option<crate::nano::conversation::InputWriter>,
+    pub(super) run_id: Option<String>,
+    pub(super) task_id: Option<String>,
 }
 
 impl HeadlessHandle {
@@ -368,15 +370,10 @@ impl HeadlessHandle {
     }
 
     fn blocking_shutdown(&mut self, terminate: bool) {
-        if terminate
-            && self.is_alive()
-            && let Some(mut stdin) = self.native_stdin.take()
-        {
-            let _ = crate::nano::wire::write_command(
-                &mut stdin,
-                crate::nano::wire::CommandKind::Cancel,
-            );
-            // Give Nano time to stop owned effects and journal the outcome.
+        if terminate && let Some(control) = &self.native_control {
+            control.cancel();
+        }
+        if terminate && self.native_control.is_some() && self.is_alive() {
             for _ in 0..20 {
                 if !self.is_alive() {
                     break;
@@ -437,6 +434,43 @@ pub async fn spawn_headless_executor_with_env(
         role: ROLE_EXECUTOR,
         name,
         prompt,
+        debug,
+        env,
+        workspace,
+    })
+    .await
+}
+
+pub(super) async fn spawn_native_interactive_executor_with_env(
+    agent: &dyn ExecutorAgent,
+    name: &str,
+    index: u32,
+    debug: bool,
+    env: Vec<(&'static str, String)>,
+    workspace: Option<HeadlessWorkspace>,
+) -> Result<HeadlessHandle> {
+    anyhow::ensure!(
+        agent.capabilities().native && agent.capabilities().interactive,
+        "Native interactive Executor is unavailable"
+    );
+    agent.validate_interactive_launch(ROLE_EXECUTOR, index)?;
+    let mut command = agent.spawn_with_index(AgentRunMode::Interactive { prompt: None }, index)?;
+    if !env
+        .iter()
+        .any(|(key, value)| *key == ENV_TASK_ID && !value.is_empty())
+    {
+        command.arg("--taskless");
+        command
+            .env_remove(ENV_TASK_ID)
+            .env_remove(ENV_BASELINE_TREE);
+    }
+    spawn_headless(HeadlessSpawn {
+        agent_type: agent.name(),
+        command,
+        prompt_transport: HeadlessPromptTransport::Jsonl,
+        role: ROLE_EXECUTOR,
+        name,
+        prompt: "",
         debug,
         env,
         workspace,
@@ -546,6 +580,37 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         .to_string(),
     };
 
+    let mut executor_reservation = if request.role == ROLE_EXECUTOR && (native || task_id.is_some())
+    {
+        let root = match request.workspace.as_ref() {
+            Some(workspace) => workspace.project_root.clone(),
+            None => std::env::current_dir()?,
+        };
+        let root = std::fs::canonicalize(root)?;
+        if Path::new(&workspace_path) == root || (native && task_id.is_none()) {
+            // Managed runs in the canonical directory share its single writer slot.
+            // Git task worktrees do not compete with direct canonical sessions.
+            let shared_workspace =
+                task_id.is_some() || !super::workspace::git_is_work_tree(&root).await;
+            let registration = crate::project::read_project_registration_at(&root).await?;
+            Some(
+                crate::project::reserve_executor_session_at(
+                    &registration.data_dir.join("ferrus.db"),
+                    &run_id,
+                    request.name,
+                    Path::new(&workspace_path),
+                    task_id.as_deref().unwrap_or("current"),
+                    shared_workspace,
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Capture workload and index state before the child can change either one.
     let evaluation = if request.role.eq_ignore_ascii_case("executor") {
         match std::env::var("FERRUS_NANO_EVAL_CASE") {
@@ -630,7 +695,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         request.role,
         request.name,
         pid,
-        task_id.as_deref(),
+        if executor_reservation.is_some() && task_id.is_none() {
+            Some("current")
+        } else {
+            task_id.as_deref()
+        },
         workspace_path,
         crate::project::RunStartEvidence {
             baseline_tree: baseline_tree.as_deref(),
@@ -638,8 +707,8 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         },
     )
     .await;
-    if native && db_run_id.is_none() {
-        anyhow::bail!("Nano requires a persisted run before start");
+    if (native || executor_reservation.is_some()) && db_run_id.is_none() {
+        anyhow::bail!("Executor requires a persisted run before start");
     }
     let mut output_threads = Vec::new();
     let setup = async {
@@ -762,6 +831,9 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     };
 
     let (exit_tx, exit_rx) = tokio::sync::watch::channel::<Option<i32>>(None);
+    if let Some(reservation) = &mut executor_reservation {
+        reservation.started();
+    }
     let mut child = child.0.take().expect("owned child");
     let wait_logger = logger.clone();
     let wait_thread = std::thread::spawn(move || {
@@ -796,6 +868,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         }
     });
 
+    let native_control = native_stdin.map(crate::nano::conversation::InputWriter::new);
     Ok(HeadlessHandle {
         name: request.name.to_string(),
         log_path,
@@ -804,8 +877,10 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         platform_guard,
         wait_thread: Some(wait_thread),
         output_threads,
-        native_stdin,
         native_events,
+        native_control,
+        run_id: db_run_id,
+        task_id,
     })
 }
 
@@ -839,11 +914,11 @@ fn spawn_native_log_reader(
 ) -> (
     std::thread::JoinHandle<()>,
     tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::watch::Receiver<Option<crate::nano::wire::Event>>,
+    tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>,
 ) {
     use crate::nano::wire::{self, Event};
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    let (events_tx, events) = tokio::sync::watch::channel(None);
+    let (events_tx, events) = tokio::sync::watch::channel(wire::ObservedEvents::default());
     let thread = std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut ready_tx = Some(ready_tx);
@@ -853,11 +928,13 @@ fn spawn_native_log_reader(
                     let _ = ready_tx.take().unwrap().send(());
                 }
                 Ok(Some(event)) if ready_tx.is_none() && !matches!(event, Event::Ready) => {
-                    let _ = logger.lock().unwrap().log_event("Nano", event.summary());
+                    if !matches!(event, Event::Text { .. }) {
+                        let _ = logger.lock().unwrap().log_event("Nano", event.summary());
+                    }
                     // Fast tool results and the following model turn must not overwrite
                     // the useful activity before HQ's slower scheduler tick consumes it.
-                    if event.show_in_hq() {
-                        events_tx.send_replace(Some(event));
+                    if event.show_in_hq() || matches!(event, Event::Text { .. }) {
+                        events_tx.send_modify(|state| state.observe(event));
                     }
                 }
                 Ok(None) => break,

@@ -130,6 +130,8 @@ fn page_bytes() -> usize {
     MAX_PAGE
 }
 
+type WriterGuard = Arc<Mutex<Option<Arc<dyn Send + Sync>>>>;
+
 struct Entry {
     tree: Arc<Mutex<ProcessTree>>,
     cancel: Cancellation,
@@ -137,6 +139,7 @@ struct Entry {
     stdout: File,
     stderr: File,
     task: Option<JoinHandle<()>>,
+    _writer_guard: Option<WriterGuard>,
 }
 
 pub(crate) struct Commands<B: ExecutionBackend = TrustedLocal> {
@@ -148,6 +151,7 @@ pub(crate) struct Commands<B: ExecutionBackend = TrustedLocal> {
     entries: BTreeMap<String, Entry>,
     closed: bool,
     attempts: usize,
+    execution_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Commands<TrustedLocal> {
@@ -206,6 +210,7 @@ impl<B: ExecutionBackend> Commands<B> {
             entries: BTreeMap::new(),
             closed: false,
             attempts: 0,
+            execution_guard: None,
         })
     }
 
@@ -214,6 +219,12 @@ impl<B: ExecutionBackend> Commands<B> {
             .values()
             .filter(|entry| entry.status.borrow().potentially_writing())
             .count()
+    }
+
+    /// Retain a host workspace guard until each spawned process is definitively stopped.
+    #[cfg(feature = "nano-openai")]
+    pub(super) fn set_execution_guard(&mut self, guard: Option<Arc<dyn Send + Sync>>) {
+        self.execution_guard = guard;
     }
 
     pub(crate) async fn exec(
@@ -274,7 +285,7 @@ impl<B: ExecutionBackend> Commands<B> {
         let tree = process.tree.clone();
         let timeout = request.timeout_ms.min(self.limits.duration_ms);
 
-        let task = tokio::spawn(output::supervise(
+        let supervisor = output::supervise(
             process,
             stdout,
             stderr,
@@ -285,7 +296,21 @@ impl<B: ExecutionBackend> Commands<B> {
             Duration::from_millis(timeout),
             self.limits.clone(),
             self.charged.clone(),
-        ));
+        );
+        let (task, writer_guard) = if let Some(guard) = self.execution_guard.clone() {
+            let writer_guard: WriterGuard = Arc::new(Mutex::new(Some(guard)));
+            let held = writer_guard.clone();
+            let completion = receiver.clone();
+            let task = tokio::spawn(async move {
+                supervisor.await;
+                if !completion.borrow().potentially_writing() {
+                    held.lock().unwrap().take();
+                }
+            });
+            (task, Some(writer_guard))
+        } else {
+            (tokio::spawn(supervisor), None)
+        };
 
         self.entries.insert(
             id,
@@ -296,6 +321,7 @@ impl<B: ExecutionBackend> Commands<B> {
                 stdout: prepared.stdout,
                 stderr: prepared.stderr,
                 task: Some(task),
+                _writer_guard: writer_guard,
             },
         );
 

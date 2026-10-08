@@ -28,6 +28,41 @@ impl HqContext {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Executor agent is not configured"))?,
         );
+        if agent.capabilities().native {
+            let name = self.executor_agent_id()?;
+            if !self
+                .headless
+                .get(&name)
+                .is_some_and(agent_manager::HeadlessHandle::is_alive)
+            {
+                let root = crate::project::canonical_project_root().await?;
+                let live_executor_tasks =
+                    crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+                anyhow::ensure!(
+                    !live_executor_tasks.contains("current"),
+                    "Cannot start a direct Nano session while another taskless Executor uses the canonical workspace. Stop that session first."
+                );
+                anyhow::ensure!(
+                    git_is_work_tree(&root).await || self.occupied_executor_slots().await? == 0,
+                    "Cannot start a direct Nano session while an Executor uses the shared non-Git workspace. Stop the Executor first."
+                );
+                self.prepare_headless_slot(&name).await;
+                let handle = agent_manager::spawn_native_interactive_executor_with_env(
+                    agent.as_ref(),
+                    &name,
+                    DEFAULT_AGENT_INDEX,
+                    self.debug,
+                    vec![(ENV_AGENT_ID, name.clone())],
+                    Some(agent_manager::HeadlessWorkspace {
+                        workspace_dir: root.clone(),
+                        project_root: root,
+                    }),
+                )
+                .await?;
+                self.store_headless_handle(&name, handle);
+            }
+            return self.attach_nano_conversation(&name).await;
+        }
 
         self.display.info(format!(
             "Spawning executor ({}) interactively...",
@@ -36,6 +71,55 @@ impl HqContext {
 
         let executor_id = self.executor_agent_id()?;
         self.spawn_interactive_executor(&executor_id, None).await
+    }
+
+    pub(in crate::hq) async fn attach_nano_conversation(&mut self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            name.starts_with("executor:nano:"),
+            "Expected a Nano Executor identity"
+        );
+        let (run, events) = if let Some(handle) = self.headless.get(name) {
+            (
+                handle
+                    .run_id
+                    .clone()
+                    .context("Native run is not persisted")?,
+                handle.native_events.clone(),
+            )
+        } else {
+            let run = crate::project::latest_run_for_agent_role(name, ROLE_EXECUTOR)
+                .await?
+                .context("No persisted Nano run found")?;
+            (run.id, None)
+        };
+        if let Some(handle) = self.headless.get(name)
+            && handle.is_alive()
+        {
+            handle
+                .native_control
+                .as_ref()
+                .context("Native input pipe is unavailable")?
+                .open()?;
+        }
+        let data_dir = crate::project::current_project_data_dir().await?;
+        let path = data_dir
+            .join("nano/sessions")
+            .join(&run)
+            .join("events.jsonl");
+        let view = crate::nano::conversation::View::spawn(
+            name.into(),
+            path,
+            run,
+            data_dir.join("ferrus.db"),
+        );
+        let _ = self.display.0.send(tui::UiMessage::NanoOpen {
+            name: name.into(),
+            run_id: view.run_id.clone(),
+            snapshots: view.snapshots.clone(),
+            events,
+        });
+        self.nano_view = Some(view);
+        Ok(())
     }
 
     /// Handle a raw-text answer from the user when state is AwaitingHuman.
@@ -87,6 +171,12 @@ impl HqContext {
             .info(format!("Answer recorded for {}.", question.task_id));
 
         let owner = crate::project::task_human_question_owner(&question.task_id).await?;
+        if owner
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with(ROLE_EXECUTOR))
+        {
+            self.nano_paused_tasks.remove(&question.task_id);
+        }
         let agent_alive = owner
             .as_deref()
             .and_then(|agent_id| self.headless.get(agent_id))

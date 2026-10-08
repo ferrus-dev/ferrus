@@ -1,7 +1,7 @@
-//! Native, read-only graph and memory retrieval under the exact managed binding.
+//! Native, read-only graph and memory retrieval under an explicit session binding.
 
 use super::{
-    ferrus::FerrusSession,
+    binding::Binding,
     tools::*,
     workspace::{self, Workspace},
 };
@@ -11,7 +11,6 @@ use crate::{
         federation::{self, ContextDomain, FederatedContextSeed},
         query::MemoryContextPolicy,
     },
-    project_memory_runtime::LocalProjectContext,
     repository_graph::{
         config::QueryLimitsConfig,
         domain::{PageCursor, QueryBudget, RepoPath},
@@ -349,15 +348,15 @@ pub(crate) enum Response {
 }
 
 pub(crate) struct Context {
-    session: FerrusSession,
+    session: Binding,
     cache: std::sync::Mutex<super::working_set::QueryCache>,
     pub(super) cache_enabled: bool,
 }
 
 impl Context {
-    pub(crate) fn new(session: FerrusSession) -> Self {
+    pub(crate) fn new(session: impl Into<Binding>) -> Self {
         Self {
-            session,
+            session: session.into(),
             cache: Default::default(),
             cache_enabled: true,
         }
@@ -369,28 +368,25 @@ impl Context {
 
     pub(super) async fn revisions(&self) -> Result<Value> {
         let runtime = self.session.status().await?;
-        let graph = LocalGraphContext::load_for_runtime(
-            self.session.project_root(),
-            self.session.project_id(),
-            self.session.data_dir(),
-            &runtime,
-        )
-        .await;
+        let graph = self.session.graph().await;
         let snapshot = match graph {
-            Ok(graph) => graph.status().await.ok().and_then(|s| s.snapshot_id),
+            Ok(graph) => graph.status().await.ok().and_then(|s| {
+                if runtime.is_none()
+                    && s.freshness.freshness != crate::repository_graph::domain::Freshness::Fresh
+                {
+                    None
+                } else {
+                    s.snapshot_id
+                }
+            }),
             Err(_) => None,
         };
         // Optional sidecars must not prevent ordinary workspace tools from running.
         let memory = async {
-            let local = LocalProjectContext::load_for_runtime(
-                self.session.project_root(),
-                self.session.project_id(),
-                self.session.data_dir(),
-                &runtime,
-                ContextDomain::Memory,
-                false,
-            )
-            .await?;
+            let local = self
+                .session
+                .project_context(ContextDomain::Memory, false)
+                .await?;
             let budget = local.requested_budget(
                 Some(1),
                 Some(4096),
@@ -404,19 +400,12 @@ impl Context {
         .await
         .unwrap_or(None);
         Ok(
-            json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":super::working_set::view_identity(&runtime.repository_view)}),
+            json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":runtime.as_ref().map(|runtime| super::working_set::view_identity(&runtime.repository_view))}),
         )
     }
 
     async fn graph(&self) -> Result<LocalGraphContext> {
-        let runtime = self.session.status().await?;
-        LocalGraphContext::load_for_runtime(
-            self.session.project_root(),
-            self.session.project_id(),
-            self.session.data_dir(),
-            &runtime,
-        )
-        .await
+        self.session.graph().await
     }
 
     #[cfg(feature = "nano-mcp")]
@@ -435,16 +424,10 @@ impl Context {
 
     pub(crate) async fn retrieve(&self, name: &str, input: Request) -> Result<Response> {
         // Revalidate before constructing a view, including memory-only requests.
-        let runtime = self.session.status().await?;
+        self.session.status().await?;
 
         if name.starts_with("repository_") {
-            let graph = LocalGraphContext::load_for_runtime(
-                self.session.project_root(),
-                self.session.project_id(),
-                self.session.data_dir(),
-                &runtime,
-            )
-            .await?;
+            let graph = self.session.graph().await?;
 
             if name == "repository_graph_status" {
                 return Ok(Response::RepositoryStatus(graph.status().await?));
@@ -470,7 +453,7 @@ impl Context {
                 &graph.run_id,
                 format!("{:?}", graph.config),
                 self.session.project_id(),
-                &self.session.scope.task_id,
+                self.session.task_id(),
                 self.session.workspace(),
             ));
             if cacheable && let Some(value) = self.cache.lock().unwrap().get(&key) {
@@ -545,15 +528,10 @@ impl Context {
         }
 
         let domain = input.domain.unwrap_or(ContextDomain::Memory);
-        let local = LocalProjectContext::load_for_runtime(
-            self.session.project_root(),
-            self.session.project_id(),
-            self.session.data_dir(),
-            &runtime,
-            domain,
-            input.include_snippets,
-        )
-        .await?;
+        let local = self
+            .session
+            .project_context(domain, input.include_snippets)
+            .await?;
 
         let budget = local.requested_budget(
             Some(input.max_results.unwrap_or(32).min(64)),

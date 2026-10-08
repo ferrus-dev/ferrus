@@ -1,7 +1,8 @@
 # Ferrus Nano: Native Agent Harness
 
-Status: headless implementation through #84 is complete. #85 adds the
-[pinned evaluation workflow](ferrus-nano-evaluation.md) and release gates.
+Status: headless implementation through #85 and the native HQ conversation (#86) are
+implemented. See [interactive HQ](ferrus-nano-interactive.md) for its current contract.
+#85 adds the [pinned evaluation workflow](ferrus-nano-evaluation.md) and release gates.
 Live model validation and measured external comparisons remain opt-in.
 No measured performance claim.
 
@@ -60,7 +61,7 @@ Audit base: Ferrus commit `4f52783d6f5efa64ea1a2adf48b55c8b27c565be`.
 | Lifecycle | SQLite claims, leases, checks, submit, consultation, human questions, review | Expose native helpers in existing modules where needed; retain one implementation |
 | Workspace lifecycle | HQ worktrees, baseline preparation, process supervision and recovery | Native launch capabilities and structured output |
 | Checks | Ordered commands, log spooling, bounded feedback, final submit gate | Reuse the existing check path, with cancellation support |
-| Agent adapters | `ExecutorAgent` and `SupervisorAgent`, model overrides, stdin prompts | Executor-only/headless-only capability declarations; native registration |
+| Agent adapters | `ExecutorAgent` and `SupervisorAgent`, model overrides, stdin prompts | Executor capability declarations for headless and interactive HQ; native registration |
 | UI | Crossterm HQ, `UiMessage`, transcript and question handling | A session-event adapter and, later, a conversation view |
 | MCP | neva 0.5.6 with `server`, `di`, `legacy-spec` | Add client features for external tools, preserve protocol compatibility |
 | Agent engine | Sequential bounded core, provider/tool/host interfaces, durable journal, pure replay, and scripted tests | Live model validation, managed tool wiring, compaction, and live resume |
@@ -458,7 +459,7 @@ Introduce explicit adapter capabilities covering role, interaction mode, Ferrus 
 ```text
 executor/headless: supported
 supervisor/reviewer/consultant: unsupported
-interactive: unsupported
+executor/interactive HQ: supported (#86)
 Ferrus integration: native
 output: versioned session events
 ```

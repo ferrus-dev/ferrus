@@ -40,6 +40,18 @@ pub(crate) trait Journal {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record>;
 
     fn checkpoint(&mut self) -> Result<()>;
+
+    fn take_commands(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<super::session::SessionCommand>> {
+        None
+    }
+
+    fn interactive(&self) -> bool {
+        false
+    }
+
+    fn model_delta(&mut self, _: u64, _: &str) {}
 }
 
 #[derive(Debug, Serialize, Deserialize)]

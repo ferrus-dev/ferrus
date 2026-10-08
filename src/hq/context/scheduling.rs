@@ -157,6 +157,9 @@ impl HqContext {
         let answered_tasks = answered_consultation_tasks(tasks).await?;
         let mut spawn_tasks = Vec::new();
         for task in answered_tasks {
+            if self.nano_paused_tasks.contains(&task.id) {
+                continue;
+            }
             let name = self.executor_agent_id_for_task(&task.id)?;
             if task_claim_blocks_spawn(&task, &name, now, &live_run_task_ids)
                 || self
@@ -218,6 +221,11 @@ impl HqContext {
         let mut spawned = 0usize;
 
         for waiter in waiters {
+            if waiter.awaiting_human_by.starts_with(ROLE_EXECUTOR)
+                && self.nano_paused_tasks.contains(&waiter.task_id)
+            {
+                continue;
+            }
             if answered_human_owner_is_live(
                 &waiter.awaiting_human_by,
                 &live_run_agents,
@@ -274,10 +282,10 @@ impl HqContext {
         let live_run_task_ids = crate::project::live_active_run_task_ids().await?;
         let max_parallel = executor_parallel_limit(max_parallel).await?;
         let mut ready_tasks = Vec::new();
-        for task in tasks
-            .into_iter()
-            .filter(|task| is_executor_ready_task_status(&task.status))
-        {
+        for task in tasks.into_iter().filter(|task| {
+            is_executor_ready_task_status(&task.status)
+                && !self.nano_paused_tasks.contains(&task.id)
+        }) {
             let expected_agent_id = self.executor_agent_id_for_task(&task.id)?;
             if !task_claim_blocks_spawn(&task, &expected_agent_id, now, &live_run_task_ids) {
                 ready_tasks.push(task);
@@ -347,13 +355,34 @@ impl HqContext {
         Ok(spawned)
     }
 
-    pub(super) async fn occupied_executor_slots(&self) -> Result<usize> {
-        let live_db_task_ids =
+    pub(in crate::hq) async fn occupied_executor_slots(&self) -> Result<usize> {
+        let mut live_db_task_ids =
             crate::project::live_active_run_task_ids_for_role(ROLE_EXECUTOR).await?;
+        let local_taskless_executor = self.headless.iter().any(|(name, handle)| {
+            name.starts_with(ROLE_EXECUTOR)
+                && handle.is_alive()
+                && handle.native_control.is_some()
+                && handle.task_id.is_none()
+        });
+        let managed_workspaces_isolated =
+            if local_taskless_executor || live_db_task_ids.contains("current") {
+                git_is_work_tree(&crate::project::canonical_project_root().await?).await
+            } else {
+                false
+            };
+        // Git tasks use isolated worktrees. Otherwise only replace a row counted locally.
+        if managed_workspaces_isolated || local_taskless_executor {
+            live_db_task_ids.remove("current");
+        }
         Ok(occupied_executor_slots_from_handles(
             live_db_task_ids,
             self.headless.iter().filter_map(|(name, handle)| {
-                (name.starts_with(ROLE_EXECUTOR) && handle.is_alive()).then_some(name.as_str())
+                (name.starts_with(ROLE_EXECUTOR)
+                    && handle.is_alive()
+                    && !(managed_workspaces_isolated
+                        && handle.native_control.is_some()
+                        && handle.task_id.is_none()))
+                .then_some(name.as_str())
             }),
         ))
     }

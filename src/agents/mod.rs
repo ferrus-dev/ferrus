@@ -252,7 +252,7 @@ pub fn parse_supervisor_agent(
     model: Option<&str>,
 ) -> Result<Arc<dyn SupervisorAgent>> {
     match agent_type {
-        "nano" => bail!("Nano supports headless Executor sessions only"),
+        "nano" => bail!("Nano supports the Executor role only"),
         claude::NAME => Ok(Arc::new(claude::Supervisor::new(
             model,
             crate::config::load_claude_mcp_isolation(),

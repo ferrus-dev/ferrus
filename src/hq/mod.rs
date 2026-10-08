@@ -104,7 +104,7 @@ pub async fn run(debug: bool) -> Result<()> {
                     if let Some(events) = &mut handle.native_events {
                         let changed = events.has_changed();
                         if !matches!(changed, Ok(false)) {
-                            let event = events.borrow_and_update().clone();
+                            let event = events.borrow_and_update().latest.clone();
                             if changed.is_err() { handle.native_events = None; }
                             if debug && let Some(event) = event && event.show_in_hq() {
                                 ctx.display.muted(format!("{name}: {}", event.summary()));
@@ -136,11 +136,21 @@ pub async fn run(debug: bool) -> Result<()> {
                         if let Err(err) = dispatch_with_human_question_target(
                             line,
                             input.human_question_task_id.as_deref(),
+                            input.nano_run_id.as_deref(),
+                            input.nano_input_id.as_deref(),
                             false,
                             &mut ctx,
                         )
                         .await
                         {
+                            if !line.starts_with('/') && input.human_question_task_id.is_none()
+                                && let (Some(run_id), Some(input_id)) = (input.nano_run_id, input.nano_input_id)
+                            {
+                                let _ = ctx.display.0.send(tui::UiMessage::NanoInputRejected {
+                                    run_id,
+                                    input_id,
+                                });
+                            }
                             ctx.display.error(err.to_string());
                         }
                     }
@@ -280,16 +290,52 @@ fn normalize_agent_version(agent_name: &str, version: &str) -> Option<String> {
 
 #[cfg(test)]
 async fn dispatch(line: &str, ctx: &mut HqContext) -> Result<()> {
-    dispatch_with_human_question_target(line, None, true, ctx).await
+    dispatch_with_human_question_target(line, None, None, None, true, ctx).await
 }
 
 async fn dispatch_with_human_question_target(
     line: &str,
     human_question_task_id: Option<&str>,
+    nano_run_id: Option<&str>,
+    nano_input_id: Option<&str>,
     allow_fifo_fallback: bool,
     ctx: &mut HqContext,
 ) -> Result<()> {
     // When state is AwaitingHuman, non-command input is treated as the human's answer.
+    if line == "/detach" && ctx.nano_view.is_some() {
+        ctx.nano_view = None;
+        let _ = ctx.display.0.send(tui::UiMessage::NanoClose);
+        return Ok(());
+    }
+    if line == "/cancel"
+        && let Some(view) = &ctx.nano_view
+    {
+        let handle = ctx
+            .headless
+            .get(&view.name)
+            .context("Conversation process has exited")?;
+        anyhow::ensure!(
+            handle.run_id.as_deref() == Some(view.run_id.as_str()),
+            "Conversation run has changed; attach again"
+        );
+        anyhow::ensure!(
+            nano_run_id.is_none_or(|run| run == view.run_id),
+            "Conversation changed; cancel was not sent"
+        );
+        handle
+            .native_control
+            .as_ref()
+            .context("This conversation is read-only")?
+            .cancel();
+        if let Some(task) = &handle.task_id {
+            ctx.nano_paused_tasks.insert(task.clone());
+            ctx.display.info("Nano cancelled; automatic dispatch for this task is paused in this HQ. Use /resume for paused work.");
+        } else {
+            ctx.display
+                .info("Nano conversation cancelled. Use /executor to open a new session.");
+        }
+        return Ok(());
+    }
     if !line.starts_with('/') {
         if human_question_task_id.is_some() {
             return ctx
@@ -299,6 +345,32 @@ async fn dispatch_with_human_question_target(
         if allow_fifo_fallback && ctx.has_pending_human_question().await? {
             return ctx.answer(line.to_string()).await;
         }
+        if let Some(view) = &ctx.nano_view {
+            anyhow::ensure!(
+                nano_run_id.is_none_or(|run| run == view.run_id),
+                "Conversation changed; input was not sent"
+            );
+            let handle = ctx
+                .headless
+                .get(&view.name)
+                .context("Conversation process has exited; use /executor for ready work")?;
+            anyhow::ensure!(handle.is_alive(), "Conversation has ended");
+            anyhow::ensure!(
+                handle.run_id.as_deref() == Some(view.run_id.as_str()),
+                "Conversation run has changed; attach again"
+            );
+            handle
+                .native_control
+                .as_ref()
+                .context("Headless conversation is read-only")?
+                .steer(line.to_string(), nano_input_id.map(str::to_owned))?;
+            ctx.display.muted("Input queued for the next model turn.");
+            return Ok(());
+        }
+        anyhow::ensure!(
+            nano_run_id.is_none(),
+            "Conversation detached; input was not sent"
+        );
         anyhow::bail!("Commands must start with '/' -- try /status, /task, /quit");
     }
 
@@ -364,6 +436,8 @@ async fn dispatch_with_human_question_target(
                 "  /check --force     Compatibility form of /check; same behavior\n",
                 "  /supervisor        Open an interactive supervisor session\n",
                 "  /executor          Open an interactive executor session\n",
+                "  /detach            Return from a Nano conversation to the dashboard\n",
+                "  /cancel            Cancel the attached Nano attempt\n",
                 "  /resume            Resume the executor headlessly; recovers Consultation too\n",
                 "  /review            Manually spawn supervisor in review mode\n",
                 "  /status            Show task state, agent list, and session log paths\n",
@@ -403,6 +477,9 @@ async fn dispatch_with_human_question_target(
         ShellCommand::Resume => ctx.resume().await?,
         ShellCommand::Review => ctx.review().await?,
         ShellCommand::Attach { name } => {
+            if name.starts_with("executor:nano:") {
+                return ctx.attach_nano_conversation(&name).await;
+            }
             if let Some(handle) = ctx.headless.get(&name) {
                 let log = handle.log_path.display().to_string();
                 ctx.display.info(format!(
@@ -611,6 +688,8 @@ pub(crate) struct HqContext {
     state_rx: watch::Receiver<Option<WatchedState>>,
     pub(crate) display: Display,
     announced_completed_tasks: HashSet<String>,
+    nano_view: Option<crate::nano::conversation::View>,
+    nano_paused_tasks: HashSet<String>,
 }
 
 mod context;
