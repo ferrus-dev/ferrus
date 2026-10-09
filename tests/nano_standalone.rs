@@ -281,8 +281,8 @@ fn standalone_non_git_uses_native_tools_without_orchestration_state() {
 }
 
 #[test]
-fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
-    let fixture = Fixture::new();
+fn standalone_git_graph_is_explicit_local_and_snapshot_bound_after_workspace_move() {
+    let mut fixture = Fixture::new();
     success(
         Command::new("git")
             .arg("init")
@@ -316,6 +316,11 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
         String::from_utf8_lossy(&output.stderr)
     );
     let index: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let moved = fixture.root.with_file_name("moved-workspace");
+    fs::rename(&fixture.root, &moved).unwrap();
+    // The historical pathname may now refer to a different directory.
+    fs::create_dir(&fixture.root).unwrap();
+    fixture.root = moved.canonicalize().unwrap();
     let provider = Provider::new(vec![
         calls(&[
             ("repository_search", json!({"query":"standalone_symbol"})),
@@ -331,6 +336,10 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
                 "repository_search",
                 json!({"query":"standalone-fixture","kinds":["cargo_package"]}),
             ),
+            (
+                "repository_context",
+                json!({"seeds":[{"type":"path","value":"lib.rs"}],"cursor":"obsolete-cursor","include_snippets":true}),
+            ),
         ]),
         calls(&[(
             "apply_patch",
@@ -345,12 +354,18 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
         "Inspect standalone_symbol.",
     ]));
     let requests = provider.finish();
+    let binding: Value =
+        serde_json::from_slice(&fs::read(fixture.store.join("workspace.json")).unwrap()).unwrap();
+    assert_eq!(
+        PathBuf::from(binding["workspace"].as_str().unwrap()),
+        fixture.root
+    );
     let results: Vec<_> = fixture
         .records("graph-query")
         .into_iter()
         .filter(|record| record["event"]["event"] == "tool_result")
         .collect();
-    assert_eq!(results.len(), 5);
+    assert_eq!(results.len(), 6);
     for result in &results {
         assert_eq!(result["event"]["outcome"]["status"], "success");
     }
@@ -381,6 +396,10 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
             .iter()
             .any(|item| item["kind"] == "cargo_package")
     );
+    let error = &results[4]["event"]["outcome"]["content"]["result"]["Err"];
+    assert_eq!(error["code"], "stale_cursor");
+    assert_eq!(error["retryable"], false);
+    assert!(error["message"].as_str().unwrap().contains("snapshot"));
     let tool_contents = |request: &Value| {
         request["messages"]
             .as_array()
@@ -393,7 +412,7 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
             .collect::<Vec<_>>()
     };
     let selected = tool_contents(&requests[1]);
-    assert_eq!(selected.len(), 4);
+    assert_eq!(selected.len(), 5);
     for (selected, recorded) in selected.iter().zip(&results) {
         assert_eq!(selected, &recorded["event"]["outcome"]);
     }
@@ -406,8 +425,8 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
 }
 
 #[test]
-fn resume_preserves_history_and_budget_without_replaying_effects() {
-    let fixture = Fixture::new();
+fn resume_preserves_history_and_budget_after_workspace_move_without_replaying_effects() {
+    let mut fixture = Fixture::new();
     let provider = Provider::new(vec![
         answer("The first request is complete."),
         answer("The second request is complete."),
@@ -420,6 +439,12 @@ fn resume_preserves_history_and_budget_without_replaying_effects() {
     );
     let previous_path = fixture.store.join("nano/sessions/first/events.jsonl");
     let previous = fs::read(&previous_path).unwrap();
+    let previous_binding: Value =
+        serde_json::from_slice(&fs::read(fixture.store.join("workspace.json")).unwrap()).unwrap();
+    let moved = fixture.root.with_file_name("moved-workspace");
+    fs::rename(&fixture.root, &moved).unwrap();
+    assert!(!fixture.root.exists());
+    fixture.root = moved.canonicalize().unwrap();
     success(fixture.command("second").args([
         "--resume",
         "first",
@@ -427,6 +452,13 @@ fn resume_preserves_history_and_budget_without_replaying_effects() {
         "Continue with the second request.",
     ]));
     assert_eq!(fs::read(&previous_path).unwrap(), previous);
+    let binding: Value =
+        serde_json::from_slice(&fs::read(fixture.store.join("workspace.json")).unwrap()).unwrap();
+    assert_eq!(binding["workspace_id"], previous_binding["workspace_id"]);
+    assert_eq!(
+        PathBuf::from(binding["workspace"].as_str().unwrap()),
+        fixture.root
+    );
     let requests = provider.finish();
     assert!(
         requests[1]["messages"][1]["content"]

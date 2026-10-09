@@ -271,16 +271,18 @@ impl LocalContext {
                     },
                     page,
                 };
-                let mut response = graph_query.context(&request)?;
-                if input.include_snippets {
+                let mut response = graph_query.context(&request);
+                if let Ok(response) = &mut response
+                    && input.include_snippets
+                {
                     self.snippets(
                         graph.as_ref().context("Graph unavailable")?,
-                        &mut response,
+                        response,
                         input.max_snippet_bytes.unwrap_or(4096).min(8192),
                         request.scope.budget.max_diagnostics.get() as usize,
                     )?;
                 }
-                Response::RepositoryContext(Ok(response))
+                Response::RepositoryContext(response)
             };
             return Ok(serde_json::to_value(response)?);
         }

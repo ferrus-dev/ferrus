@@ -91,7 +91,7 @@ impl Storage {
             workspace_id: workspace_id.clone(),
         };
         let marker = path.join("workspace.json");
-        if marker.try_exists()? {
+        let write_binding = if marker.try_exists()? {
             let mut bytes = Vec::new();
             private::read_only_file(&marker)?
                 .take(16 * 1024 + 1)
@@ -99,24 +99,17 @@ impl Storage {
             ensure!(bytes.len() <= 16 * 1024, "Storage binding exceeds limit");
             let previous: Binding = serde_json::from_slice(&bytes)?;
             ensure!(
-                previous.version == binding.version
-                    && previous.workspace_id == workspace_id
-                    && super::super::workspace::directory_identity(&previous.workspace)?
-                        == super::super::workspace::directory_identity(workspace)?,
+                previous.version == binding.version && previous.workspace_id == workspace_id,
                 "Storage belongs to another workspace"
             );
+            // Directory identity survives same-filesystem moves. The old path
+            // is descriptive and need not exist or still name that directory.
+            previous.workspace != binding.workspace
         } else {
-            let mut file = private::file(&marker, true)?;
-            if let Err(error) = (|| -> Result<()> {
-                file.write_all(&journal::encode(&binding, 16 * 1024)?)?;
-                file.sync_all()?;
-                private::sync_directory(&path)?;
-                Ok(())
-            })() {
-                drop(file);
-                let _ = std::fs::remove_file(&marker);
-                return Err(error);
-            }
+            true
+        };
+        if write_binding {
+            persist_binding(&marker, &binding)?;
         }
         Ok(Self {
             path,
@@ -125,6 +118,30 @@ impl Storage {
             workspace_lock,
         })
     }
+}
+
+fn persist_binding(marker: &Path, binding: &Binding) -> Result<()> {
+    let bytes = journal::encode(binding, 16 * 1024)?;
+    let temporary = marker.with_file_name(format!("workspace-{}.tmp", fresh_id()?));
+    let mut file = private::file(&temporary, true)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Unlike immutable journal publication, this replaces an existing
+        // binding atomically on both Unix and Windows while holding the lock.
+        std::fs::rename(&temporary, marker)?;
+        private::sync_directory(
+            marker
+                .parent()
+                .context("Storage requires a parent directory")?,
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 impl Drop for Storage {
     fn drop(&mut self) {

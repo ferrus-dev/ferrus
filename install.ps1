@@ -171,6 +171,8 @@ function Install-Binary {
     $nanoPath = Join-Path $TempDir "ferrus-$Target\ferrus-nano.exe"
     if (Test-Path $nanoPath) {
         Copy-Item $nanoPath (Join-Path $InstallDir "ferrus-nano.exe") -Force
+    } elseif (Test-Path (Join-Path $InstallDir "ferrus-nano.exe")) {
+        Write-Warning "this release does not include ferrus-nano; existing $(Join-Path $InstallDir 'ferrus-nano.exe') was retained and may be incompatible. Remove it or install a release that includes Nano."
     }
 }
 
