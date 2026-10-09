@@ -226,6 +226,7 @@ impl Context {
         }
 
         let scope = local.pinned_scope(domain, budget).await?;
+        let (repository_kinds, memory_kinds) = input.search_kind_filters()?;
         let cursor = input.cursor.map(FederationPageCursor::new).transpose()?;
 
         if name == "project_context_search" {
@@ -234,17 +235,13 @@ impl Context {
                     .search(federation::FederatedSearchRequest {
                         scope,
                         text: MemoryQueryText::new(input.query.context("Missing query")?.trim())?,
-                        repository_kinds: input
-                            .kinds
-                            .into_iter()
-                            .map(crate::project_memory::domain::MemoryStatusToken::new)
-                            .collect::<Result<_, _>>()?,
+                        repository_kinds,
                         repository_paths: input
                             .paths
                             .into_iter()
                             .map(RepoPath::new)
                             .collect::<Result<_, _>>()?,
-                        memory_kinds: vec![],
+                        memory_kinds,
                         memory_sources: vec![],
                         cursor,
                     })

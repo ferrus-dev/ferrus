@@ -151,6 +151,9 @@ pin its published revision, report freshness independently, and cross into repos
 facts only through exact revision/snapshot link sets. Standalone does not discover,
 index, or author memory sources. Memory source snippets have no standalone verified
 content adapter yet; use structural memory context with `include_snippets = false`.
+For `project_context_search`, `kinds` selects memory entity kinds in the memory domain
+and repository node kinds in the repository domain. In `all`, recognized memory kinds
+filter memory; other kind tokens filter repository nodes independently.
 
 Optional external peers use `mcp_config_file` in provider settings and the existing
 [bounded MCP client](ferrus-nano-mcp.md). Managed-binding peers are omitted before

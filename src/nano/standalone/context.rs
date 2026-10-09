@@ -150,7 +150,8 @@ impl LocalContext {
         }
         match graph::sqlite::open_for_query_at(&self.sidecar)? {
             graph::sqlite::OpenQuerySidecarResult::Ready(sidecar) => Ok(Some(sidecar)),
-            _ => Ok(None),
+            graph::sqlite::OpenQuerySidecarResult::Absent => Ok(None),
+            _ => anyhow::bail!("Standalone graph sidecar requires migration or rebuild"),
         }
     }
 
@@ -186,10 +187,14 @@ impl LocalContext {
         let dirty = self.dirty || self.invalidation.try_exists()?;
         let mut scope = self.scope(input.graph_budget(&config.query_limits)?)?;
         if name.starts_with("repository_") {
-            let mut status = graph_query.status(&StatusRequest {
+            let mut status = match graph_query.status(&StatusRequest {
                 scope: scope.clone(),
-            })?;
-            if dirty {
+            }) {
+                Ok(status) => status,
+                Err(error) if error.code == QueryErrorCode::NotBuilt => self.not_built_status()?,
+                Err(error) => return Err(error.into()),
+            };
+            if dirty && status.snapshot_id.is_some() {
                 status.freshness.freshness = Freshness::Stale;
                 status
                     .freshness
@@ -330,6 +335,7 @@ impl LocalContext {
             None,
         );
         let scope = FederatedScope::current(project.clone(), target, budget);
+        let (repository_kinds, memory_kinds) = input.search_kind_filters()?;
         let cursor = input
             .cursor
             .map(memory::domain::FederationPageCursor::new)
@@ -342,17 +348,13 @@ impl LocalContext {
                         text: memory::domain::MemoryQueryText::new(
                             input.query.context("Missing query")?,
                         )?,
-                        repository_kinds: input
-                            .kinds
-                            .into_iter()
-                            .map(memory::domain::MemoryStatusToken::new)
-                            .collect::<Result<_, _>>()?,
+                        repository_kinds,
                         repository_paths: input
                             .paths
                             .into_iter()
                             .map(RepoPath::new)
                             .collect::<Result<_, _>>()?,
-                        memory_kinds: vec![],
+                        memory_kinds,
                         memory_sources: vec![],
                         cursor,
                     })
@@ -387,6 +389,37 @@ impl LocalContext {
             )
         };
         Ok(serde_json::to_value(response)?)
+    }
+
+    fn not_built_status(&self) -> Result<StatusResponse> {
+        Ok(StatusResponse {
+            wire_version: graph::QUERY_WIRE_VERSION,
+            repository: self.repository.clone(),
+            snapshot_id: None,
+            source_revision: None,
+            task_view: None,
+            freshness: FreshnessEnvelope {
+                freshness: Freshness::NotApplicable,
+                compared_manifest: None,
+                reason_codes: vec!["standalone.not_built".into()],
+            },
+            diagnostics: DiagnosticsEnvelope::default(),
+            page: PageInfo {
+                next_cursor: None,
+                truncation: None,
+            },
+            data: StatusData {
+                availability: Availability::NotBuilt,
+                build_state: None,
+                build_id: None,
+                published_view: Some(PublishedViewName::new("standalone")?),
+                graph_model_version: None,
+                statistics: None,
+                recommended_action: Some(RetrievalAction::Index),
+                task_view_status: None,
+                fallback: Some(RetrievalFallback::DirectSourceInspection),
+            },
+        })
     }
 
     fn snippets(

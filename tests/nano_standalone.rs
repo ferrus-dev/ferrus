@@ -99,6 +99,15 @@ struct Fixture {
     home: PathBuf,
 }
 impl Fixture {
+    fn standalone_home(&self) -> PathBuf {
+        // Windows Known Folders ignores HOME/USERPROFILE overrides. Use the
+        // same resolver as production, without changing the production policy.
+        #[cfg(windows)]
+        let home = dirs::home_dir().unwrap();
+        #[cfg(not(windows))]
+        let home = self.home.clone();
+        home.join(".ferrus/standalone")
+    }
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
@@ -555,7 +564,7 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
             .arg(&fixture.root),
     );
     fs::create_dir_all(fixture.root.join("docs/specs")).unwrap();
-    fs::write(fixture.root.join("docs/specs/standalone.md"), "# Standalone memory\n\n- [ ] Implement portable retrieval\n\nID: standalone-memory\nDepends on: none\n").unwrap();
+    fs::write(fixture.root.join("docs/specs/standalone.md"), "# Standalone memory\n\n- [ ] #1.0 Standalone memory milestone\n\nID: standalone-memory\nDepends on: none\n").unwrap();
     success(Command::new("git").current_dir(&fixture.root).args([
         "add",
         "--",
@@ -583,6 +592,18 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
     drop(sidecar);
     let path = memory_data.join("project-memory.db");
     let before = fs::read(&path).unwrap();
+    success(
+        Command::new(env!("CARGO_BIN_EXE_ferrus-nano"))
+            .env("HOME", &fixture.home)
+            .env("USERPROFILE", &fixture.home)
+            .args([
+                "--workspace",
+                fixture.root.to_str().unwrap(),
+                "--storage",
+                fixture.store.to_str().unwrap(),
+                "--index-graph",
+            ]),
+    );
     let provider = Provider::new(vec![
         calls(&[
             ("project_memory_status", json!({})),
@@ -590,11 +611,20 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
                 "project_context_search",
                 json!({"domain":"memory","query":"Standalone memory"}),
             ),
+            (
+                "project_context_search",
+                json!({"domain":"memory","query":"Standalone memory","kinds":["milestone"]}),
+            ),
+            (
+                "project_context_search",
+                json!({"domain":"all","query":"Standalone memory","kinds":["milestone"]}),
+            ),
         ]),
         answer("Read structural memory."),
     ]);
     fixture.configure(&provider.url, "");
     success(fixture.command("memory-query").args([
+        "--graph",
         "--memory-sidecar",
         path.to_str().unwrap(),
         "--memory-namespace",
@@ -617,7 +647,74 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
     );
     assert_eq!(results[1]["event"]["outcome"]["status"], "success");
     assert!(results[1]["event"]["outcome"]["content"]["result"]["Ok"].is_object());
+    let unfiltered = results[1]["event"]["outcome"]["content"]["result"]["Ok"]["results"]
+        .as_array()
+        .unwrap();
+    assert!(
+        unfiltered
+            .iter()
+            .any(|hit| hit["result"]["entity"]["data"]["type"] == "specification")
+    );
+    assert!(
+        unfiltered
+            .iter()
+            .any(|hit| hit["result"]["entity"]["data"]["type"] == "milestone")
+    );
+    for filtered in &results[2..] {
+        let hits = filtered["event"]["outcome"]["content"]["result"]["Ok"]["results"]
+            .as_array()
+            .unwrap();
+        let memory: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit["domain"] == "memory")
+            .collect();
+        assert!(!memory.is_empty());
+        assert!(
+            memory
+                .iter()
+                .all(|hit| hit["result"]["entity"]["data"]["type"] == "milestone")
+        );
+    }
     assert!(!find_database(&memory_data));
+    fixture.assert_unregistered();
+}
+
+#[test]
+fn graph_status_without_an_index_reports_availability_and_preserves_fallback() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("lib.rs"), "pub fn current_symbol() {}\n").unwrap();
+    let provider = Provider::new(vec![
+        calls(&[
+            ("repository_graph_status", json!({})),
+            (
+                "repository_fallback",
+                json!({"operation":"search","reason":"missing","input":{"query":"current_symbol"}}),
+            ),
+        ]),
+        answer("Used current workspace evidence."),
+    ]);
+    fixture.configure(&provider.url, "");
+    success(fixture.command("missing-graph").args([
+        "--graph",
+        "--prompt",
+        "Check graph availability and inspect current_symbol.",
+    ]));
+    provider.finish();
+    let results: Vec<_> = fixture
+        .records("missing-graph")
+        .into_iter()
+        .filter(|r| r["event"]["event"] == "tool_result")
+        .collect();
+    assert!(
+        results
+            .iter()
+            .all(|r| r["event"]["outcome"]["status"] == "success")
+    );
+    let status = &results[0]["event"]["outcome"]["content"]["result"];
+    assert_eq!(status["data"]["availability"], "not_built");
+    assert_eq!(status["data"]["recommended_action"], "index");
+    assert!(status["snapshot_id"].is_null());
+    assert!(!fixture.store.join("repo-graph.db").exists());
     fixture.assert_unregistered();
 }
 
@@ -722,8 +819,25 @@ fn stdin_requests_use_default_private_storage_without_creating_project_state() {
             .unwrap()
             .contains("bounded request on stdin")
     );
-    assert!(fixture.home.join(".ferrus/standalone").exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let journal = PathBuf::from(
+        stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Nano journal: "))
+            .unwrap(),
+    );
+    assert!(journal.starts_with(fixture.standalone_home().canonicalize().unwrap()));
+    let default_store = journal.ancestors().nth(3).unwrap();
+    let binding: Value =
+        serde_json::from_slice(&fs::read(default_store.join("workspace.json")).unwrap()).unwrap();
+    assert_eq!(
+        PathBuf::from(binding["workspace"].as_str().unwrap()),
+        fixture.root
+    );
+    assert!(!find_database(default_store));
     fixture.assert_unregistered();
+    // Only remove this test's workspace-bound storage, never the shared home.
+    fs::remove_dir_all(default_store).unwrap();
 }
 
 #[test]
@@ -738,8 +852,12 @@ fn workspace_lock_applies_across_storage_paths_and_releases_on_setup_failure() {
         .output()
         .unwrap();
     assert!(!failed.status.success());
-    let locks = fixture.home.join(".ferrus/standalone/locks");
-    let lock_path = fs::read_dir(locks).unwrap().next().unwrap().unwrap().path();
+    let binding: Value =
+        serde_json::from_slice(&fs::read(fixture.store.join("workspace.json")).unwrap()).unwrap();
+    let lock_path = fixture.standalone_home().join("locks").join(format!(
+        "{}.lock",
+        binding["workspace_id"].as_str().unwrap()
+    ));
     let lock = private::file(&lock_path, false).unwrap();
     lock.try_lock_exclusive().unwrap();
     let other = fixture._temp.path().join("other-storage");

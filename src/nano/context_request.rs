@@ -1,7 +1,10 @@
 //! Shared bounded repository and memory request contracts.
 
 use crate::{
-    project_memory::federation::{self, ContextDomain, FederatedContextSeed},
+    project_memory::{
+        domain::{MemoryEntityKind, MemoryStatusToken},
+        federation::{self, ContextDomain, FederatedContextSeed},
+    },
     repository_graph::{
         config::QueryLimitsConfig,
         domain::{QueryBudget, RepoPath},
@@ -263,7 +266,30 @@ impl Request {
             ensure!(n > 0, "Query limits must be positive");
         }
 
+        if name == "project_context_search" {
+            r.search_kind_filters()?;
+        }
         Ok(r)
+    }
+
+    /// Memory has a closed kind vocabulary; repository kinds are backend tokens.
+    pub(crate) fn search_kind_filters(
+        &self,
+    ) -> Result<(Vec<MemoryStatusToken>, Vec<MemoryEntityKind>)> {
+        let domain = self.domain.context("Explicit domain is required")?;
+        let mut repository = Vec::new();
+        let mut memory = Vec::new();
+        for kind in &self.kinds {
+            let parsed = serde_json::from_value::<MemoryEntityKind>(Value::String(kind.clone()));
+            match (domain, parsed) {
+                (ContextDomain::Memory, parsed) => {
+                    memory.push(parsed.context("Unknown memory kind")?)
+                }
+                (ContextDomain::All, Ok(kind)) => memory.push(kind),
+                _ => repository.push(MemoryStatusToken::new(kind)?),
+            }
+        }
+        Ok((repository, memory))
     }
 
     pub(crate) fn graph_budget(&self, limits: &QueryLimitsConfig) -> Result<QueryBudget> {
@@ -341,4 +367,47 @@ pub(crate) enum Response {
     MemoryStatus(crate::project_memory::query::MemoryStatusResponse),
     ProjectSearch(std::result::Result<federation::FederatedSearchResponse, String>),
     ProjectContext(std::result::Result<federation::FederatedContextResponse, String>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn search_kind_filters_follow_the_selected_domain() {
+        let parse = |domain, kinds| {
+            Request::parse(
+                "project_context_search",
+                json!({
+                    "domain":domain,"query":"context","kinds":kinds
+                }),
+            )
+        };
+        let (repository, memory) = parse("memory", vec!["milestone"])
+            .unwrap()
+            .search_kind_filters()
+            .unwrap();
+        assert!(repository.is_empty());
+        assert_eq!(memory, vec![MemoryEntityKind::Milestone]);
+        assert!(parse("memory", vec!["function"]).is_err());
+        let (repository, memory) = parse("all", vec!["function", "milestone"])
+            .unwrap()
+            .search_kind_filters()
+            .unwrap();
+        assert_eq!(
+            repository,
+            vec![MemoryStatusToken::new("function").unwrap()]
+        );
+        assert_eq!(memory, vec![MemoryEntityKind::Milestone]);
+        let (repository, memory) = parse("repository", vec!["milestone"])
+            .unwrap()
+            .search_kind_filters()
+            .unwrap();
+        assert_eq!(
+            repository,
+            vec![MemoryStatusToken::new("milestone").unwrap()]
+        );
+        assert!(memory.is_empty());
+    }
 }
