@@ -116,12 +116,15 @@ impl Tools for StandaloneTools {
         if !self.working_set_enabled {
             return Ok(None);
         }
-        // No publication is claimed fresh without a current manifest comparison.
-        // Reuse only source-verified workspace evidence between explicit queries.
+        let revisions = self
+            .context
+            .revisions()
+            .await
+            .map_err(|_| ToolError::Failed)?;
         super::super::working_set::prepare(
             messages,
             &json!({"workspace":"standalone"}),
-            &json!({"snapshot_id":null,"memory_revision_id":null,"task_view":null}),
+            &revisions,
             &self.coding.workspace,
             self.coding.commands.potentially_active_writers() > 0,
         )

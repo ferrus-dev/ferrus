@@ -332,7 +332,11 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
                 json!({"query":"standalone-fixture","kinds":["cargo_package"]}),
             ),
         ]),
-        answer("Read the explicit standalone index."),
+        calls(&[(
+            "apply_patch",
+            json!({"edits":[{"operation":"create","path":"new.rs","content":"pub fn new_symbol() {}\n"}]}),
+        )]),
+        answer("Read the explicit standalone index and updated the workspace."),
     ]);
     fixture.configure(&provider.url, "");
     success(fixture.command("graph-query").args([
@@ -340,13 +344,13 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
         "--prompt",
         "Inspect standalone_symbol.",
     ]));
-    provider.finish();
+    let requests = provider.finish();
     let results: Vec<_> = fixture
         .records("graph-query")
         .into_iter()
         .filter(|record| record["event"]["event"] == "tool_result")
         .collect();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 5);
     for result in &results {
         assert_eq!(result["event"]["outcome"]["status"], "success");
     }
@@ -377,6 +381,27 @@ fn standalone_git_graph_is_explicit_local_and_snapshot_bound() {
             .iter()
             .any(|item| item["kind"] == "cargo_package")
     );
+    let tool_contents = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| {
+                serde_json::from_str::<Value>(message["content"].as_str().unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let selected = tool_contents(&requests[1]);
+    assert_eq!(selected.len(), 4);
+    for (selected, recorded) in selected.iter().zip(&results) {
+        assert_eq!(selected, &recorded["event"]["outcome"]);
+    }
+    let invalidated = tool_contents(&requests[2]);
+    for result in &invalidated[..4] {
+        assert_eq!(result["content"]["kind"], "evidence_unavailable");
+        assert_eq!(result["content"]["reason"], "publication_changed");
+    }
     fixture.assert_unregistered();
 }
 
@@ -634,7 +659,7 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
         "--prompt",
         "Inspect explicit project memory.",
     ]));
-    provider.finish();
+    let requests = provider.finish();
     assert_eq!(before, fs::read(&path).unwrap());
     let results: Vec<_> = fixture
         .records("memory-query")
@@ -674,6 +699,17 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
                 .iter()
                 .all(|hit| hit["result"]["entity"]["data"]["type"] == "milestone")
         );
+    }
+    let selected: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| serde_json::from_str::<Value>(message["content"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(selected.len(), results.len());
+    for (selected, recorded) in selected.iter().zip(&results) {
+        assert_eq!(selected, &recorded["event"]["outcome"]);
     }
     assert!(!find_database(&memory_data));
     fixture.assert_unregistered();

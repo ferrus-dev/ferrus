@@ -169,6 +169,28 @@ impl LocalContext {
         tokio::task::spawn_blocking(move || local.retrieve_local(&name, input)).await?
     }
 
+    pub async fn revisions(&self) -> Result<serde_json::Value> {
+        let local = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Inspect the same publications used by retrieval, without indexing
+            // or claiming workspace freshness. Optional sidecar failures remove
+            // only that domain's identity; known dirty graph evidence stays out.
+            let graph_request = Request::parse("repository_graph_status", serde_json::json!({}))?;
+            let memory_request = Request::parse("project_memory_status", serde_json::json!({}))?;
+            let snapshot = local
+                .retrieve_local("repository_graph_status", graph_request)
+                .ok()
+                .filter(|status| status["result"]["freshness"]["freshness"] != "stale")
+                .map(|status| status["result"]["snapshot_id"].clone());
+            let memory = local
+                .retrieve_local("project_memory_status", memory_request)
+                .ok()
+                .map(|status| status["result"]["revision_id"].clone());
+            Ok(serde_json::json!({"snapshot_id":snapshot,"memory_revision_id":memory,"task_view":null}))
+        })
+        .await?
+    }
+
     fn retrieve_local(&self, name: &str, input: Request) -> Result<serde_json::Value> {
         let config = self.config();
         let includes_graph = name.starts_with("repository_")
