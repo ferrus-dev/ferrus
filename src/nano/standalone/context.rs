@@ -322,10 +322,31 @@ impl LocalContext {
             .memory
             .as_ref()
             .context("No explicit memory sidecar configured")?;
-        let sidecar = match memory::sqlite::open_for_query_at(path)? {
-            memory::sqlite::OpenMemoryQuerySidecarResult::Ready(sidecar) => sidecar,
-            _ => anyhow::bail!("Memory sidecar unavailable"),
-        };
+        let sidecar =
+            if name != "project_memory_status" && input.domain == Some(ContextDomain::Repository) {
+                None
+            } else {
+                use memory::query::{MemoryAvailability, MemoryRetrievalAction};
+                use memory::sqlite::OpenMemoryQuerySidecarResult;
+                match memory::sqlite::open_for_query_at(path)? {
+                    OpenMemoryQuerySidecarResult::Ready(sidecar) => Some(sidecar),
+                    unavailable if name == "project_memory_status" => {
+                        let (availability, action) = match unavailable {
+                            OpenMemoryQuerySidecarResult::Absent => {
+                                (MemoryAvailability::NotBuilt, MemoryRetrievalAction::Build)
+                            }
+                            _ => (
+                                MemoryAvailability::Incompatible,
+                                MemoryRetrievalAction::Rebuild,
+                            ),
+                        };
+                        return Ok(serde_json::to_value(Response::MemoryStatus(
+                            unavailable_memory_status(project.clone(), availability, action),
+                        ))?);
+                    }
+                    _ => anyhow::bail!("Memory sidecar unavailable"),
+                }
+            };
         let limits = graph::config::QueryLimitsConfig::default();
         let budget = memory::query::MemoryQueryBudget {
             max_results: NonZeroU32::new(input.max_results.unwrap_or(32).min(64)).unwrap(),
@@ -338,7 +359,9 @@ impl LocalContext {
                 .unwrap(),
             max_diagnostics: NonZeroU32::new(input.max_diagnostics.unwrap_or(16).min(16)).unwrap(),
         };
-        let query = memory::query_sqlite::SqliteMemoryQuery::new(&sidecar, limits.clone());
+        let query = sidecar
+            .as_deref()
+            .map(|sidecar| memory::query_sqlite::SqliteMemoryQuery::new(sidecar, limits.clone()));
         let memory_scope = memory::query::MemoryQueryScope::current(
             project.clone(),
             memory::query::MemoryRevisionSelector::Published(memory::domain::MemoryViewName::new(
@@ -346,11 +369,18 @@ impl LocalContext {
             )?),
             budget,
         );
-        let status = query.status(memory::query::MemoryStatusRequest {
-            scope: memory_scope,
-        })?;
+        let status = query
+            .as_ref()
+            .map(|query| {
+                query.status(memory::query::MemoryStatusRequest {
+                    scope: memory_scope,
+                })
+            })
+            .transpose()?;
         if name == "project_memory_status" {
-            return Ok(serde_json::to_value(Response::MemoryStatus(status))?);
+            return Ok(serde_json::to_value(Response::MemoryStatus(
+                status.context("Memory sidecar unavailable")?,
+            ))?);
         }
         ensure!(
             !input.include_snippets,
@@ -359,8 +389,8 @@ impl LocalContext {
         let memory = || -> Result<_> {
             Ok(memory::query::MemoryRevisionSelector::Revision(
                 status
-                    .revision_id
-                    .clone()
+                    .as_ref()
+                    .and_then(|status| status.revision_id.clone())
                     .context("Memory has no publication")?,
             ))
         };
@@ -388,8 +418,8 @@ impl LocalContext {
             }
         };
         let backend = memory::local_query::OptionalMemoryBackend {
-            query: Some(query),
-            sidecar: Some(&sidecar),
+            query,
+            sidecar: sidecar.as_deref(),
         };
         let service = memory::federation_service::FederatedContextService::new(
             &graph_query,
@@ -558,5 +588,44 @@ impl LocalContext {
             }
         }
         Ok(())
+    }
+}
+
+fn unavailable_memory_status(
+    project: memory::domain::ProjectRef,
+    availability: memory::query::MemoryAvailability,
+    action: memory::query::MemoryRetrievalAction,
+) -> memory::query::MemoryStatusResponse {
+    use memory::{domain::MemorySourceCategory, policy::MemoryPolicy, query::*};
+
+    let policy = MemoryPolicy::default();
+    MemoryStatusResponse {
+        wire_version: memory::MEMORY_QUERY_WIRE_VERSION,
+        project,
+        revision_id: None,
+        freshness: MemoryFreshnessEnvelope {
+            freshness: MemoryFreshness::Unknown,
+            compared_source_set_digest: None,
+            reason_codes: vec![],
+        },
+        diagnostics: vec![],
+        data: MemoryStatusData {
+            availability,
+            build_state: None,
+            build_id: None,
+            memory_model_version: None,
+            statistics: None,
+            retention: None,
+            recommended_action: Some(action),
+            source_policy: MemorySourceCategory::ALL
+                .into_iter()
+                .filter_map(|category| {
+                    policy
+                        .category(category)
+                        .copied()
+                        .map(|policy| MemorySourcePolicyStatus { category, policy })
+                })
+                .collect(),
+        },
     }
 }
