@@ -748,6 +748,158 @@ fn memory_context_is_explicit_read_only_and_independent_of_registration() {
 }
 
 #[test]
+fn repository_domain_context_does_not_require_a_memory_publication() {
+    use ferrus::project_memory::sqlite::MemorySidecar;
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("lib.rs"), "pub fn current_symbol() {}\n").unwrap();
+    let memory_data = fixture.root.parent().unwrap().join("memory");
+    fs::create_dir(&memory_data).unwrap();
+    drop(MemorySidecar::open_at(&memory_data).unwrap());
+    let memory_path = memory_data.join("project-memory.db");
+    let before = fs::read(&memory_path).unwrap();
+    success(
+        Command::new(env!("CARGO_BIN_EXE_ferrus-nano"))
+            .env("HOME", &fixture.home)
+            .env("USERPROFILE", &fixture.home)
+            .args([
+                "--workspace",
+                fixture.root.to_str().unwrap(),
+                "--storage",
+                fixture.store.to_str().unwrap(),
+                "--index-graph",
+            ]),
+    );
+    let graph_before = fs::read(fixture.store.join("repo-graph.db")).unwrap();
+    let provider = Provider::new(vec![
+        calls(&[
+            ("project_memory_status", json!({})),
+            (
+                "project_context_search",
+                json!({"domain":"repository","query":"lib.rs"}),
+            ),
+            (
+                "project_context",
+                json!({"domain":"repository","seeds":[{"type":"path","value":"lib.rs"}]}),
+            ),
+            (
+                "project_context_search",
+                json!({"domain":"memory","query":"lib.rs"}),
+            ),
+            (
+                "project_context",
+                json!({"domain":"all","seeds":[{"type":"path","value":"lib.rs"}]}),
+            ),
+        ]),
+        answer("Read repository context without a memory publication."),
+    ]);
+    fixture.configure(&provider.url, "");
+    success(fixture.command("repository-only").args([
+        "--graph",
+        "--memory-sidecar",
+        memory_path.to_str().unwrap(),
+        "--memory-namespace",
+        "local:standalone-test",
+        "--memory-project",
+        "empty-memory",
+        "--prompt",
+        "Inspect repository context.",
+    ]));
+    provider.finish();
+    let results: Vec<_> = fixture
+        .records("repository-only")
+        .into_iter()
+        .filter(|record| record["event"]["event"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 5);
+    let status = &results[0]["event"]["outcome"]["content"]["result"];
+    assert!(status["revision_id"].is_null());
+    assert_eq!(status["data"]["availability"], "not_built");
+    for (result, field) in results[1..3].iter().zip(["results", "items"]) {
+        assert_eq!(result["event"]["outcome"]["status"], "success");
+        let response = &result["event"]["outcome"]["content"]["result"]["Ok"];
+        assert!(!response[field].as_array().unwrap().is_empty());
+        assert!(response["repository"]["snapshot_id"].is_string());
+        assert!(response["memory"].is_null());
+    }
+    for result in &results[3..] {
+        assert_eq!(result["event"]["outcome"]["status"], "failed");
+    }
+    assert_eq!(before, fs::read(&memory_path).unwrap());
+    assert_eq!(
+        graph_before,
+        fs::read(fixture.store.join("repo-graph.db")).unwrap()
+    );
+    fixture.assert_unregistered();
+}
+
+#[test]
+fn incompatible_graph_status_is_structured_and_does_not_migrate_the_store() {
+    use ferrus::repository_graph::sqlite::SIDECAR_SCHEMA_VERSION;
+    for (version, action) in [(3, "index"), (SIDECAR_SCHEMA_VERSION + 1, "rebuild")] {
+        let fixture = Fixture::new();
+        private::directory(&fixture.store, true).unwrap();
+        let path = fixture.store.join("repo-graph.db");
+        let database = rusqlite::Connection::open(&path).unwrap();
+        database
+            .pragma_update(None, "application_id", 0x4652_4731u32)
+            .unwrap();
+        database
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        database
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+            .unwrap();
+        database
+            .execute("INSERT INTO schema_migrations VALUES (?1)", [version])
+            .unwrap();
+        drop(database);
+        let before = fs::read(&path).unwrap();
+        let provider = Provider::new(vec![
+            calls(&[
+                ("repository_graph_status", json!({})),
+                ("repository_search", json!({"query":"lib.rs"})),
+            ]),
+            answer("The graph requires maintenance."),
+        ]);
+        fixture.configure(&provider.url, "");
+        success(fixture.command("incompatible").args([
+            "--graph",
+            "--prompt",
+            "Inspect graph availability.",
+        ]));
+        let requests = provider.finish();
+        let results: Vec<_> = fixture
+            .records("incompatible")
+            .into_iter()
+            .filter(|record| record["event"]["event"] == "tool_result")
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["event"]["outcome"]["status"], "success");
+        let status = &results[0]["event"]["outcome"]["content"]["result"];
+        assert_eq!(status["data"]["availability"], "incompatible");
+        assert_eq!(status["data"]["recommended_action"], action);
+        assert!(status["snapshot_id"].is_null());
+        assert!(status["source_revision"].is_null());
+        assert_eq!(status["data"]["fallback"], "direct_source_inspection");
+        let projected: Value = serde_json::from_str(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected, results[0]["event"]["outcome"]);
+        assert_eq!(results[1]["event"]["outcome"]["status"], "failed");
+        assert_eq!(before, fs::read(&path).unwrap());
+        fixture.assert_unregistered();
+    }
+}
+
+#[test]
 fn graph_status_without_an_index_reports_availability_and_preserves_fallback() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("lib.rs"), "pub fn current_symbol() {}\n").unwrap();

@@ -144,15 +144,11 @@ impl LocalContext {
         }
     }
 
-    fn graph(&self) -> Result<Option<graph::sqlite::Sidecar>> {
+    fn graph(&self) -> Result<graph::sqlite::OpenQuerySidecarResult> {
         if !self.graph_enabled {
-            return Ok(None);
+            return Ok(graph::sqlite::OpenQuerySidecarResult::Absent);
         }
-        match graph::sqlite::open_for_query_at(&self.sidecar)? {
-            graph::sqlite::OpenQuerySidecarResult::Ready(sidecar) => Ok(Some(sidecar)),
-            graph::sqlite::OpenQuerySidecarResult::Absent => Ok(None),
-            _ => anyhow::bail!("Standalone graph sidecar requires migration or rebuild"),
-        }
+        graph::sqlite::open_for_query_at(&self.sidecar)
     }
 
     fn scope(&self, budget: QueryBudget) -> Result<QueryScope> {
@@ -198,7 +194,37 @@ impl LocalContext {
                 input.domain,
                 Some(ContextDomain::Repository | ContextDomain::All)
             );
-        let graph = if includes_graph { self.graph()? } else { None };
+        let opened = if includes_graph {
+            self.graph()?
+        } else {
+            graph::sqlite::OpenQuerySidecarResult::Absent
+        };
+        let (graph, unavailable) = match opened {
+            graph::sqlite::OpenQuerySidecarResult::Ready(sidecar) => (Some(sidecar), None),
+            graph::sqlite::OpenQuerySidecarResult::Absent => (None, None),
+            graph::sqlite::OpenQuerySidecarResult::NeedsMigration {
+                found_schema_version,
+            } => (
+                None,
+                Some(self.unavailable_status(
+                    Availability::Incompatible,
+                    RetrievalAction::Index,
+                    format!("schema_{found_schema_version}_needs_migration"),
+                )?),
+            ),
+            graph::sqlite::OpenQuerySidecarResult::RequiresRebuild(_) => (
+                None,
+                Some(self.unavailable_status(
+                    Availability::Incompatible,
+                    RetrievalAction::Rebuild,
+                    "incompatible_schema".into(),
+                )?),
+            ),
+        };
+        ensure!(
+            unavailable.is_none() || name == "repository_graph_status",
+            "Standalone graph sidecar requires migration or rebuild"
+        );
         // Match latency-bounded native retrieval: external writers make
         // freshness unknown. Do not rescan the repository on every model query.
         let graph_query = memory::local_query::OptionalGraphQuery::new(
@@ -209,11 +235,17 @@ impl LocalContext {
         let dirty = self.dirty || self.invalidation.try_exists()?;
         let mut scope = self.scope(input.graph_budget(&config.query_limits)?)?;
         if name.starts_with("repository_") {
-            let mut status = match graph_query.status(&StatusRequest {
-                scope: scope.clone(),
+            let mut status = match unavailable.map(Ok).unwrap_or_else(|| {
+                graph_query.status(&StatusRequest {
+                    scope: scope.clone(),
+                })
             }) {
                 Ok(status) => status,
-                Err(error) if error.code == QueryErrorCode::NotBuilt => self.not_built_status()?,
+                Err(error) if error.code == QueryErrorCode::NotBuilt => self.unavailable_status(
+                    Availability::NotBuilt,
+                    RetrievalAction::Index,
+                    "not_built".into(),
+                )?,
                 Err(error) => return Err(error.into()),
             };
             if dirty && status.snapshot_id.is_some() {
@@ -324,11 +356,16 @@ impl LocalContext {
             !input.include_snippets,
             "Standalone memory snippets require a verified content adapter; use structural memory context"
         );
-        let memory = memory::query::MemoryRevisionSelector::Revision(
-            status.revision_id.context("Memory has no publication")?,
-        );
+        let memory = || -> Result<_> {
+            Ok(memory::query::MemoryRevisionSelector::Revision(
+                status
+                    .revision_id
+                    .clone()
+                    .context("Memory has no publication")?,
+            ))
+        };
         let target = match input.domain.context("Explicit context domain required")? {
-            ContextDomain::Memory => FederatedTarget::Memory { memory },
+            ContextDomain::Memory => FederatedTarget::Memory { memory: memory()? },
             domain => {
                 let status = graph_query.status(&StatusRequest {
                     scope: scope.clone(),
@@ -343,7 +380,10 @@ impl LocalContext {
                 if domain == ContextDomain::Repository {
                     FederatedTarget::Repository { repository }
                 } else {
-                    FederatedTarget::All { repository, memory }
+                    FederatedTarget::All {
+                        repository,
+                        memory: memory()?,
+                    }
                 }
             }
         };
@@ -415,7 +455,12 @@ impl LocalContext {
         Ok(serde_json::to_value(response)?)
     }
 
-    fn not_built_status(&self) -> Result<StatusResponse> {
+    fn unavailable_status(
+        &self,
+        availability: Availability,
+        action: RetrievalAction,
+        reason: String,
+    ) -> Result<StatusResponse> {
         Ok(StatusResponse {
             wire_version: graph::QUERY_WIRE_VERSION,
             repository: self.repository.clone(),
@@ -425,7 +470,7 @@ impl LocalContext {
             freshness: FreshnessEnvelope {
                 freshness: Freshness::NotApplicable,
                 compared_manifest: None,
-                reason_codes: vec!["standalone.not_built".into()],
+                reason_codes: vec![format!("standalone.{reason}")],
             },
             diagnostics: DiagnosticsEnvelope::default(),
             page: PageInfo {
@@ -433,13 +478,13 @@ impl LocalContext {
                 truncation: None,
             },
             data: StatusData {
-                availability: Availability::NotBuilt,
+                availability,
                 build_state: None,
                 build_id: None,
                 published_view: Some(PublishedViewName::new("standalone")?),
                 graph_model_version: None,
                 statistics: None,
-                recommended_action: Some(RetrievalAction::Index),
+                recommended_action: Some(action),
                 task_view_status: None,
                 fallback: Some(RetrievalFallback::DirectSourceInspection),
             },
