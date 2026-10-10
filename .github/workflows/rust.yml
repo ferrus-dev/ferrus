@@ -107,8 +107,8 @@ jobs:
       - name: Test Nano unit suite
         run: "cargo test --locked --features nano-openai,nano-mcp --bin ferrus nano::"
 
-      - name: Test Nano headless integration
-        run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless
+      - name: Test Nano headless and standalone integration
+        run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless --test nano_standalone
 
   macos-release:
     runs-on: macos-latest

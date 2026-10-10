@@ -80,19 +80,19 @@ fn graph_response(name: &str, value: &Value) -> Result<Value> {
     let parsed: Value = serde_json::from_str(text)?;
     let response = match name {
         "repository_graph_status" => {
-            super::context::Response::RepositoryStatus(serde_json::from_value(parsed)?)
+            super::context_request::Response::RepositoryStatus(serde_json::from_value(parsed)?)
         }
         "repository_search" => {
             let result = serde_json::from_value::<query::SearchResponse>(parsed.clone())
                 .map(Ok)
                 .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
-            super::context::Response::RepositorySearch(result)
+            super::context_request::Response::RepositorySearch(result)
         }
         "repository_context" => {
             let result = serde_json::from_value::<query::ContextResponse>(parsed.clone())
                 .map(Ok)
                 .or_else(|_| serde_json::from_value::<query::QueryError>(parsed).map(Err))?;
-            super::context::Response::RepositoryContext(result)
+            super::context_request::Response::RepositoryContext(result)
         }
         _ => anyhow::bail!("Unsupported graph peer tool"),
     };
@@ -101,6 +101,10 @@ fn graph_response(name: &str, value: &Value) -> Result<Value> {
 
 impl Config {
     fn load(path: &Path) -> Result<Self> {
+        Self::load_scoped(path, false)
+    }
+
+    fn load_scoped(path: &Path, taskless: bool) -> Result<Self> {
         ensure!(path.is_absolute(), "MCP config path must be absolute");
         let mut bytes = Vec::new();
         private::read_only_file(path)
@@ -111,9 +115,12 @@ impl Config {
         ensure!(bytes.len() <= 32 * 1024, "MCP config exceeds size limit");
         let text =
             std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("Invalid MCP config"))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(text).map_err(|_| anyhow::anyhow!("Invalid MCP config"))?;
         ensure!(config.servers.len() <= MAX_SERVERS, "Too many MCP servers");
+        if taskless {
+            config.servers.retain(|peer| !peer.inherit_managed_binding);
+        }
         let mut ids = BTreeSet::new();
         for server in &config.servers {
             ensure!(
@@ -206,7 +213,15 @@ pub(crate) fn validate_config(path: &Path) -> Result<()> {
 /// private peer replaces that environment and bounds stdout frames before
 /// neva's stdio transport reads and deserializes them.
 pub(crate) fn run_peer(config_path: &Path, server_id: &str) -> Result<()> {
-    let config = Config::load(config_path)?;
+    run_peer_scoped(config_path, server_id, false)
+}
+
+pub(crate) fn run_taskless_peer(config_path: &Path, server_id: &str) -> Result<()> {
+    run_peer_scoped(config_path, server_id, true)
+}
+
+fn run_peer_scoped(config_path: &Path, server_id: &str, taskless: bool) -> Result<()> {
+    let config = Config::load_scoped(config_path, taskless)?;
     let server = config
         .servers
         .iter()
@@ -383,7 +398,9 @@ impl Drop for McpTools {
 }
 
 enum Launch {
-    Peer,
+    Peer {
+        taskless: bool,
+    },
     #[cfg(test)]
     Direct {
         command: &'static str,
@@ -473,17 +490,20 @@ impl McpTools {
         cancellation: &Cancellation,
         taskless: bool,
     ) -> Result<Self> {
-        let mut config = Config::load(config_path)?;
-        if taskless {
-            config.servers.retain(|peer| !peer.inherit_managed_binding);
-        }
+        let config = Config::load_scoped(config_path, taskless)?;
         let mut this = Self {
             servers: Vec::new(),
             entries: BTreeMap::new(),
             active: None,
         };
         let result = this
-            .discover(config_path, config, native, Launch::Peer, cancellation)
+            .discover(
+                config_path,
+                config,
+                native,
+                Launch::Peer { taskless },
+                cancellation,
+            )
             .await;
         if result.is_err() {
             let _ = this.shutdown().await;
@@ -500,25 +520,26 @@ impl McpTools {
         cancellation: &Cancellation,
     ) -> Result<()> {
         let mut reserved: BTreeSet<_> = native.iter().map(|tool| tool.name.as_str()).collect();
-        reserved.extend(super::lifecycle::NAMES.iter().copied());
+        reserved.extend(super::descriptors::MANAGED_NAMES.iter().copied());
         for peer in config.servers {
             ensure!(!cancellation.is_cancelled(), "MCP discovery interrupted");
             // neva's stdio API takes static strings. These bounded, non-secret
             // launcher arguments live until this Nano process exits.
             let (command, args): (&'static str, Vec<&'static str>) = match &launch {
-                Launch::Peer => {
+                Launch::Peer { taskless } => {
                     let command = std::env::current_exe()?;
                     let command =
                         Box::leak(command.to_string_lossy().into_owned().into_boxed_str());
                     let config_arg =
                         Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
                     let id_arg = Box::leak(peer.id.clone().into_boxed_str());
-                    (
-                        command,
-                        vec![
-                            "nano", "mcp-peer", "--config", config_arg, "--server", id_arg,
-                        ],
-                    )
+                    let mut args = vec![
+                        "nano", "mcp-peer", "--config", config_arg, "--server", id_arg,
+                    ];
+                    if *taskless {
+                        args.push("--taskless");
+                    }
+                    (command, args)
                 }
                 #[cfg(test)]
                 Launch::Direct { command, args } => (*command, args.clone()),
@@ -588,7 +609,7 @@ impl McpTools {
                         "Invalid MCP input schema"
                     );
                     let provider_descriptor = if peer.inherit_managed_binding {
-                        let mut descriptor = super::native::descriptor(&tool.name);
+                        let mut descriptor = super::descriptors::descriptor(&tool.name);
                         descriptor.name = name.clone();
                         descriptor
                     } else {

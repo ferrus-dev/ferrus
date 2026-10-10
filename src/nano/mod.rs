@@ -8,7 +8,10 @@ pub(crate) mod coding;
 pub(crate) mod commands;
 pub(crate) mod compaction;
 pub(crate) mod context;
+mod context_request;
 pub(crate) mod conversation;
+mod descriptors;
+mod effect_recovery;
 pub(crate) mod instructions;
 #[cfg(feature = "nano-openai")]
 mod interactive;

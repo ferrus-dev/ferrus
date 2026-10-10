@@ -8,6 +8,7 @@ mkdir -p dist
 staging="dist/ferrus-${TARGET}"
 mkdir -p "${staging}"
 cp "target/${TARGET}/dist/ferrus" "${staging}/ferrus"
+cp "target/${TARGET}/dist/ferrus-nano" "${staging}/ferrus-nano"
 cp README.md LICENSE NOTICE "${staging}/"
 tar -C dist -czf "dist/${ARCHIVE}" "ferrus-${TARGET}"
 (

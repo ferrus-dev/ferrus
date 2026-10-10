@@ -136,6 +136,7 @@ jobs:
           $staging = Join-Path "dist" "ferrus-$env:TARGET"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "target/$env:TARGET/dist/ferrus.exe" "$staging/ferrus.exe"
+          Copy-Item "target/$env:TARGET/dist/ferrus-nano.exe" "$staging/ferrus-nano.exe"
           Copy-Item README.md, LICENSE, NOTICE $staging
           Compress-Archive -Path $staging -DestinationPath "dist/$env:ARCHIVE" -Force
           $hash = (Get-FileHash "dist/$env:ARCHIVE" -Algorithm SHA256).Hash.ToLowerInvariant()

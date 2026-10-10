@@ -1,6 +1,6 @@
 //! Bounded, freshly loaded constraints. Supporting files never grant runtime authority.
 
-use super::{binding::Binding, workspace::instruction_file};
+use super::workspace::instruction_file;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -64,81 +64,66 @@ impl InstructionSet {
     }
 }
 
-pub(crate) struct Instructions {
-    session: Binding,
+/// Host-owned instruction scope; supporting files never provide session authority.
+pub(crate) struct ScopeSnapshot {
+    pub task_id: String,
+    pub run_id: Option<String>,
+    pub task_status: String,
+    pub policy: &'static str,
+    pub task_path: Option<String>,
+    pub review_path: Option<String>,
+}
+
+pub(crate) trait InstructionScope {
+    async fn snapshot(&self) -> Result<ScopeSnapshot>;
+    fn project_root(&self) -> &std::path::Path;
+    fn workspace(&self) -> &std::path::Path;
+}
+
+pub(crate) struct Instructions<S> {
+    session: S,
     limits: Limits,
 }
 
-impl Instructions {
-    pub(crate) fn new(session: impl Into<Binding>, limits: Limits) -> Result<Self> {
+impl<S: InstructionScope> Instructions<S> {
+    pub(crate) fn new(session: S, limits: Limits) -> Result<Self> {
         ensure!(
             (1..=64 * 1024).contains(&limits.file_bytes)
                 && (1024..=256 * 1024).contains(&limits.total_bytes)
                 && (3..=64).contains(&limits.documents),
             "Invalid instruction limits"
         );
-
-        Ok(Self {
-            session: session.into(),
-            limits,
-        })
+        Ok(Self { session, limits })
     }
 
-    /// Paths are intended workspace file targets (including not-yet-created files).
-    /// Skills are explicit names under .agents/skills; no catalog or body preloading.
+    /// Paths select file scopes; skills are explicit names, never preloaded catalogs.
     pub(crate) async fn load(&self, paths: &[String], skills: &[String]) -> Result<InstructionSet> {
         ensure!(
             paths.len() <= 16 && skills.len() <= 8,
             "Too many instruction selections"
         );
-
-        let runtime = self.session.status().await?;
-        let policy = if runtime.is_some() {
-            ROLE_POLICY
-        } else {
-            INTERACTIVE_POLICY
-        };
+        let scope = self.session.snapshot().await?;
         let mut set = InstructionSet {
-            task_id: self.session.task_id().unwrap_or_default().into(),
-            run_id: Some(self.session.run_id().into()),
-            task_status: runtime
-                .as_ref()
-                .map_or("interactive", |runtime| runtime.status.as_str())
-                .into(),
+            task_id: scope.task_id,
+            run_id: scope.run_id,
+            task_status: scope.task_status,
             documents: vec![Document {
                 kind: Kind::RuntimePolicy,
                 origin: "host",
                 path: "nano:executor-policy".into(),
                 scope: ".".into(),
-                digest: Sha256::digest(policy.as_bytes())
+                digest: Sha256::digest(scope.policy.as_bytes())
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect(),
-                text: policy.into(),
+                text: scope.policy.into(),
             }],
         };
-
-        if let Some(runtime) = runtime {
-            let task_path = format!(".ferrus/tasks/{}.md", runtime.task_id);
-            ensure!(
-                runtime.task_path == task_path,
-                "Unexpected managed task artifact"
-            );
-
-            self.add(&mut set, Kind::Task, "project", &task_path, ".", true)?;
-            let rejection = runtime.status == "addressing"
-                || runtime.paused_status.as_deref() == Some("addressing");
-
-            if rejection || runtime.review_cycles > 0 {
-                self.add(
-                    &mut set,
-                    Kind::Rejection,
-                    "project",
-                    &format!(".ferrus/runs/{}/REVIEW.md", runtime.task_id),
-                    ".",
-                    true,
-                )?;
-            }
+        if let Some(path) = scope.task_path {
+            self.add(&mut set, Kind::Task, "project", &path, ".", true)?;
+        }
+        if let Some(path) = scope.review_path {
+            self.add(&mut set, Kind::Rejection, "project", &path, ".", true)?;
         }
 
         let mut directories = BTreeSet::from([String::new()]);

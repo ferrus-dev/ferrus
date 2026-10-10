@@ -25,7 +25,7 @@ Last reviewed against the repository: 2026-09-07.
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
 | Distributed context data plane | Prototype implemented | Opt-in contracts and local prototype adapters for authorized jobs, encrypted storage, publication, queries, and maintenance. No deployed remote service is implied. |
-| Ferrus nano-agent | Headless Executor implemented; release validation pending | #73-#80 add native binding, bounded sessions and tools, an opt-in Chat Completions provider, graph/memory context, managed lifecycle, and CLI/HQ launch. Live model validation, release gates, interactive UI, and standalone delivery remain pending. |
+| Ferrus nano-agent | Headless Executor, HQ conversations, and standalone host implemented | #73-#87 deliver native tools/context, managed lifecycle/recovery, evaluation tooling, HQ interaction, and `ferrus-nano`. Comparative live validation, standalone UI, and additional roles remain pending. |
 
 ## Milestone 1: Windows Support
 
@@ -180,6 +180,7 @@ Implemented foundation:
 - external stdio MCP through neva and guarded crash resume with effect reconciliation;
 - native HQ conversation with queued steering, cancellation, scoped questions, bounded previews,
   and reconnect from the durable journal ([contract](ferrus-nano-interactive.md));
+- standalone headless host/binary without registration or orchestration state, explicit local context, and guarded continuation ([contract](ferrus-nano-standalone.md));
 - regression coverage for bindings, lease ownership, MCP parity, engine limits, effect ordering, journal recovery, and offline provider protocols. The live provider smoke test remains opt-in.
 
 Delivery is tracked in [Ferrus nano-agents](https://github.com/ferrus-dev/ferrus/milestone/6).
@@ -192,7 +193,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | N2: context efficiency | #81, #82, and #85 implemented | Comparative context-quality and cache measurements |
 | N3: reliability and extensions | #83-#85 implemented | Comparative live evaluation |
 | N4: interactive HQ | #86 implemented | Live interactive Executor validation |
-| N5: standalone | #87-#88 | Standalone host/binary and shared UI |
+| N5: standalone | #87 implemented; #88 pending | Shared standalone UI |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
 
 Definition of done for the first headless release:
@@ -202,7 +203,7 @@ Definition of done for the first headless release:
 - a fixed task suite measures quality, token use, cost, and elapsed time against external integrations.
 
 Lower cost, higher determinism, and better throughput are hypotheses until evaluated. Interactive
-HQ is available; standalone delivery remains a planned extension.
+HQ and headless standalone are available; standalone interactive UI remains planned.
 
 ## Supporting Tracks
 
@@ -272,7 +273,7 @@ See [project memory](project_memory/project-memory.md), [architecture](project_m
 3. Close real Windows agent-loop validation and support-documentation gaps.
 4. Define task dependency, decomposition, conflict-routing, and partial-failure policies beyond current milestone scheduling.
 5. Improve runtime history, archive inspection/export, and explicit external-backend capability metadata.
-6. Add nano interaction and standalone delivery (#86-#88), then additional roles (#89-#90).
+6. Add standalone interactive UI (#88), then additional roles (#89-#90).
 7. Evolve the distributed prototype only through explicit deployment and security/operational acceptance gates.
 
 ## Non-goals for now

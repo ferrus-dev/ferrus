@@ -895,8 +895,7 @@ async fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub(crate) fn global_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
-    Ok(home.join(".ferrus"))
+    crate::user_paths::ferrus_home()
 }
 
 fn project_data_dir(project_id: &str) -> Result<PathBuf> {

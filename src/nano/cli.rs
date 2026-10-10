@@ -45,6 +45,8 @@ pub(crate) enum Command {
         config: PathBuf,
         #[arg(long)]
         server: String,
+        #[arg(long, hide = true)]
+        taskless: bool,
     },
 }
 
@@ -80,7 +82,17 @@ pub(crate) async fn run(command: Command) -> Result<()> {
             taskless,
         ),
         #[cfg(feature = "nano-mcp")]
-        Command::McpPeer { config, server } => return super::mcp::run_peer(&config, &server),
+        Command::McpPeer {
+            config,
+            server,
+            taskless,
+        } => {
+            return if taskless {
+                super::mcp::run_taskless_peer(&config, &server)
+            } else {
+                super::mcp::run_peer(&config, &server)
+            };
+        }
     };
     let seeds = prefetch_seeds(prefetch_path, prefetch_symbol)?;
     anyhow::ensure!(

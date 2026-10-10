@@ -22,14 +22,18 @@ tar -xzf "dist/${ARCHIVE}" -C "$smoke_root/unpacked"
 package_dir="$smoke_root/unpacked/ferrus-${TARGET}"
 bin_path="$package_dir/ferrus"
 test -x "$bin_path"
+test -x "$package_dir/ferrus-nano"
+env HOME="$smoke_root/home" "$package_dir/ferrus-nano" --version
 test -f "$package_dir/README.md"
 test -f "$package_dir/LICENSE"
 test -f "$package_dir/NOTICE"
-file "$bin_path"
-test "$(lipo -archs "$bin_path")" = arm64
-minos="$(otool -l "$bin_path" | awk '$1 == "cmd" && $2 == "LC_BUILD_VERSION" { build_version = 1; next } build_version && $1 == "minos" { print $2; build_version = 0 }')"
-echo "Packaged macOS deployment target: $minos"
-test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
+for executable in "$bin_path" "$package_dir/ferrus-nano"; do
+  file "$executable"
+  test "$(lipo -archs "$executable")" = arm64
+  minos="$(otool -l "$executable" | awk '$1 == "cmd" && $2 == "LC_BUILD_VERSION" { build_version = 1; next } build_version && $1 == "minos" { print $2; build_version = 0 }')"
+  echo "Packaged macOS deployment target: $minos"
+  test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
+done
 
 env HOME="$smoke_root/home" "$bin_path" --version
 (

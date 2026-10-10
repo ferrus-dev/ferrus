@@ -131,6 +131,7 @@ non-Git projects run in the project directory with one Executor. Checks run befo
 work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
 provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
 
+`ferrus-nano` runs headlessly in an unregistered Git or non-Git directory; see [standalone Nano](docs/ferrus-nano-standalone.md).
 With Nano, `/executor` opens a direct workspace conversation without a queued task;
 `/attach NAME` opens a running or historical managed conversation. See [interactive Nano](docs/ferrus-nano-interactive.md).
 

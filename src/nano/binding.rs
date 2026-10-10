@@ -173,3 +173,63 @@ impl Binding {
         }
     }
 }
+
+pub(super) fn view_identity(view: &crate::project::RepositoryViewReference) -> serde_json::Value {
+    serde_json::json!({"baseline_snapshot_id":view.baseline_snapshot_id, "overlay_revision_id":view.overlay_revision_id,
+        "view_snapshot_id":view.view_snapshot_id, "lifecycle":view.lifecycle, "status":view.status.as_str()})
+}
+
+impl super::instructions::InstructionScope for Binding {
+    async fn snapshot(&self) -> anyhow::Result<super::instructions::ScopeSnapshot> {
+        use super::instructions::{INTERACTIVE_POLICY, ROLE_POLICY, ScopeSnapshot};
+        let runtime = self.status().await?;
+        let mut scope = ScopeSnapshot {
+            task_id: self.task_id().unwrap_or_default().into(),
+            run_id: Some(self.run_id().into()),
+            task_status: runtime
+                .as_ref()
+                .map_or("interactive", |r| r.status.as_str())
+                .into(),
+            policy: if runtime.is_some() {
+                ROLE_POLICY
+            } else {
+                INTERACTIVE_POLICY
+            },
+            task_path: None,
+            review_path: None,
+        };
+        if let Some(runtime) = runtime {
+            let task_path = format!(".ferrus/tasks/{}.md", runtime.task_id);
+            anyhow::ensure!(
+                runtime.task_path == task_path,
+                "Unexpected managed task artifact"
+            );
+            scope.task_path = Some(task_path);
+            if runtime.status == "addressing"
+                || runtime.paused_status.as_deref() == Some("addressing")
+                || runtime.review_cycles > 0
+            {
+                scope.review_path = Some(format!(".ferrus/runs/{}/REVIEW.md", runtime.task_id));
+            }
+        }
+        Ok(scope)
+    }
+    fn project_root(&self) -> &std::path::Path {
+        Binding::project_root(self)
+    }
+    fn workspace(&self) -> &std::path::Path {
+        Binding::workspace(self)
+    }
+}
+
+impl super::instructions::InstructionScope for super::ferrus::FerrusSession {
+    async fn snapshot(&self) -> anyhow::Result<super::instructions::ScopeSnapshot> {
+        Binding::from(self.clone()).snapshot().await
+    }
+    fn project_root(&self) -> &std::path::Path {
+        super::ferrus::FerrusSession::project_root(self)
+    }
+    fn workspace(&self) -> &std::path::Path {
+        super::ferrus::FerrusSession::workspace(self)
+    }
+}

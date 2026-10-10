@@ -18,11 +18,6 @@ pub(super) fn identity(value: &impl Serialize) -> String {
         .collect()
 }
 
-pub(super) fn view_identity(view: &crate::project::RepositoryViewReference) -> Value {
-    json!({"baseline_snapshot_id":view.baseline_snapshot_id, "overlay_revision_id":view.overlay_revision_id,
-        "view_snapshot_id":view.view_snapshot_id, "lifecycle":view.lifecycle, "status":view.status.as_str()})
-}
-
 /// Host observations are journaled before the corresponding model attempt.
 /// They do not masquerade as model calls or rewrite historical tool results.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

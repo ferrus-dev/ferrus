@@ -239,6 +239,13 @@ install_binary() {
 
     warn_existing_install
     install "$BIN_PATH" "$INSTALL_DIR/ferrus"
+    # Older releases contain only ferrus; install the companion when present.
+    nano_path="$TMP_DIR/ferrus-${TARGET}/ferrus-nano"
+    if [ -f "$nano_path" ]; then
+        install "$nano_path" "$INSTALL_DIR/ferrus-nano"
+    elif [ -e "$INSTALL_DIR/ferrus-nano" ]; then
+        echo "warning: this release does not include ferrus-nano; existing $INSTALL_DIR/ferrus-nano was retained and may be incompatible. Remove it or install a release that includes Nano." >&2
+    fi
 }
 
 print_success() {
