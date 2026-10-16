@@ -203,7 +203,7 @@ Definition of done for the first headless release:
 - a fixed task suite measures quality, token use, cost, and elapsed time against external integrations.
 
 Lower cost, higher determinism, and better throughput are hypotheses until evaluated. Interactive
-HQ and headless standalone are available; standalone interactive UI remains planned.
+HQ and both headless and interactive standalone modes are implemented.
 
 ## Supporting Tracks
 
