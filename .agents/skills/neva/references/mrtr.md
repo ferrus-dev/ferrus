@@ -32,7 +32,7 @@ Three consequences, all load-bearing:
 3. **State travels in an AEAD-sealed `requestState` blob** the client
    echoes back, so any round can land on any server instance.
 
-On the client side neva drives the loop inside `call_tool`; the caller
+On the client side neva drives the loop inside `tools().call`; the caller
 sees one call.
 
 ## Guarding side effects
@@ -55,7 +55,7 @@ struct Shipping {
 }
 
 #[tool(descr = "Places an order")]
-async fn place_order(mut ctx: Context) -> Result<String, Error> {
+async fn place_order(ctx: Context) -> Result<String, Error> {
     // Fetched once; replayed on every later round.
     let quote_cents: u32 = ctx.memo("quote", async { Ok(1299) }).await?;
 
@@ -102,7 +102,7 @@ caller did not declare ends the call with `MissingRequiredClientCapability`
 use neva::prelude::*;
 
 #[tool(descr = "Greets, asking for a name when it can")]
-async fn greet(mut ctx: Context) -> Result<String, Error> {
+async fn greet(ctx: Context) -> Result<String, Error> {
     if ctx.client_capabilities().elicitation.is_none() {
         return Ok("Hello, stranger!".to_string());
     }
@@ -130,7 +130,7 @@ async fn greet(mut ctx: Context) -> Result<String, Error> {
 use neva::prelude::*;
 
 #[tool(descr = "Takes a payment")]
-async fn pay(mut ctx: Context) -> Result<String, Error> {
+async fn pay(ctx: Context) -> Result<String, Error> {
     let params: ElicitRequestParams = ElicitRequestParams::url(
         "https://example.com/pay",
         "Please pay your bill",
@@ -160,7 +160,7 @@ struct Contact {
 }
 
 #[tool(descr = "Generates a business card")]
-async fn generate_business_card(mut ctx: Context) -> Result<String, Error> {
+async fn generate_business_card(ctx: Context) -> Result<String, Error> {
     let params = ElicitRequestParams::form("Your contact information")
         .with_schema::<Contact>();
 
@@ -186,7 +186,7 @@ For an action the user performs elsewhere — a payment, an SSO redirect:
 use neva::prelude::*;
 
 #[tool(descr = "Pays a bill")]
-async fn pay_a_bill(mut ctx: Context) -> Result<&'static str, Error> {
+async fn pay_a_bill(ctx: Context) -> Result<&'static str, Error> {
     let params = ElicitRequestParams::url(
         "https://example.com/pay",
         "Please pay your bill",
@@ -226,7 +226,7 @@ A task genuinely suspends rather than re-running, so
 use neva::prelude::*;
 
 #[tool(task_support = "required", descr = "Asks mid-task")]
-async fn confirm_in_task(mut ctx: Context, task: Meta<RelatedTaskMetadata>) -> String {
+async fn confirm_in_task(ctx: Context, task: Meta<RelatedTaskMetadata>) -> String {
     let params = ElicitRequestParams::form("Are you sure?")
         .with_related_task(task);
 
@@ -292,7 +292,8 @@ implement it with a real distributed lock for the same reason it must share
 the MRTR secret.
 
 **Bind the state to this service.** A sealed state is bound to its request and
-principal, but not by itself to the service — so where several services share
+principal — the token's issuer and subject together (since 0.8.0; the subject
+alone before) — but not by itself to the service — so where several services share
 one `with_request_state_secret`, a state minted by one is a state the others
 accept. `App::with_request_state_audience("https://weather.example.com/mcp")`
 closes that. It must be identical on every instance of the same service; a

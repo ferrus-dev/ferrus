@@ -153,6 +153,7 @@ impl Drop for Storage {
 pub(super) struct Recovery {
     pub transcript: String,
     pub budget: Budget,
+    pub display: super::super::conversation::Snapshot,
 }
 
 pub(super) fn resume(store: &Storage, id: &str) -> Result<Recovery> {
@@ -187,7 +188,15 @@ pub(super) fn resume(store: &Storage, id: &str) -> Result<Recovery> {
     // Explicit continuation is a new attempt with a fresh wall-clock deadline.
     budget.elapsed_ms = 0;
     budget.no_progress = 0;
-    Ok(Recovery { transcript, budget })
+    let mut display = super::super::conversation::Snapshot::default();
+    for record in &records {
+        display.apply(record);
+    }
+    Ok(Recovery {
+        transcript,
+        budget,
+        display,
+    })
 }
 
 fn lock_file(path: &Path) -> Result<File> {

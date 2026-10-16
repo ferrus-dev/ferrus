@@ -379,9 +379,4 @@ pub(super) fn display_width(text: &str) -> usize {
     text.chars().count()
 }
 
-pub(super) fn is_multiline_enter(modifiers: KeyModifiers) -> bool {
-    let multiline = KeyModifiers::SHIFT | KeyModifiers::ALT;
-    let disallowed =
-        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
-    modifiers.intersects(multiline) && !modifiers.intersects(disallowed)
-}
+pub(super) use crate::shared::input::multiline_enter as is_multiline_enter;

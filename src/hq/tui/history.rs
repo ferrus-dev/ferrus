@@ -89,10 +89,3 @@ pub(super) fn abbreviate_home(path: &Path) -> String {
         path.display().to_string()
     }
 }
-
-pub(super) fn byte_index_for_char(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| s.len())
-}

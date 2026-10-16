@@ -5,6 +5,8 @@ mod commands;
 mod compaction;
 mod config;
 mod context_request;
+#[path = "conversation/projection.rs"]
+pub(crate) mod conversation;
 mod descriptors;
 mod effect_recovery;
 mod engine;
@@ -18,7 +20,7 @@ mod providers;
 mod replay;
 mod session;
 mod tools;
-mod wire;
+pub(crate) mod wire;
 mod working_set;
 mod workspace;
 

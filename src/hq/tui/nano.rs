@@ -1,22 +1,22 @@
 //! Native conversation rendering reuses HQ input geometry and terminal primitives.
 
 use super::*;
-use crate::nano::{
-    conversation::{Snapshot, display_text},
-    wire::{Event as NativeEvent, ObservedEvents},
-};
+use crate::nano::{conversation::Snapshot, wire::ObservedEvents};
 
 pub(super) struct NanoConversation {
-    name: String,
-    pub(super) run_id: String,
-    snapshots: watch::Receiver<Option<Snapshot>>,
-    events: Option<watch::Receiver<ObservedEvents>>,
-    pub(super) snapshot: Snapshot,
-    preview: Option<(u64, String)>,
-    pub(super) scroll: usize,
+    conversation: crate::shared::conversation::Conversation,
     pub(super) notices: Vec<TranscriptLine>,
-    seen_notice: u64,
-    pub(super) rejected_input: Option<String>,
+}
+impl std::ops::Deref for NanoConversation {
+    type Target = crate::shared::conversation::Conversation;
+    fn deref(&self) -> &Self::Target {
+        &self.conversation
+    }
+}
+impl std::ops::DerefMut for NanoConversation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conversation
+    }
 }
 impl NanoConversation {
     pub(super) fn new(
@@ -25,130 +25,39 @@ impl NanoConversation {
         snapshots: watch::Receiver<Option<Snapshot>>,
         events: Option<watch::Receiver<ObservedEvents>>,
     ) -> Self {
-        let snapshot = snapshots.borrow().clone().unwrap_or_else(|| Snapshot {
-            status: "Waiting for durable session records".into(),
-            ..Default::default()
-        });
         Self {
-            name,
-            run_id,
-            snapshots,
-            events,
-            snapshot,
-            preview: None,
-            scroll: 0,
+            conversation: crate::shared::conversation::Conversation::new(
+                name, run_id, snapshots, events,
+            ),
             notices: Vec::new(),
-            seen_notice: 0,
-            rejected_input: None,
         }
-    }
-    pub(super) fn scroll_up(&mut self, width: usize) {
-        let maximum = self
-            .snapshot
-            .entries
-            .iter()
-            .map(|entry| wrap(entry, width).len() + 1)
-            .sum::<usize>()
-            + self
-                .preview
-                .as_ref()
-                .map_or(0, |(_, text)| wrap(text, width).len());
-        self.scroll = self
-            .scroll
-            .saturating_add(10)
-            .min(maximum.saturating_sub(1));
     }
     pub(super) fn poll(&mut self) -> bool {
-        let mut changed = false;
-        if !matches!(self.snapshots.has_changed(), Ok(false))
-            && let Some(snapshot) = self.snapshots.borrow_and_update().clone()
-            && snapshot != self.snapshot
-        {
-            self.snapshot = snapshot;
-            if !self.snapshot.status.starts_with("Generating") {
-                self.preview = None;
-            }
-            changed = true;
-        }
-        if let Some(events) = &mut self.events
-            && !matches!(events.has_changed(), Ok(false))
-        {
-            let state = events.borrow_and_update().clone();
-            self.rejected_input = state.rejected_input.clone();
-            let event = state.latest;
-            if let Some(NativeEvent::Text { turn, text }) = &event
-                && *turn == self.snapshot.turn
-                && self.snapshot.status.starts_with("Generating")
-            {
-                let preview = Some((*turn, display_text(text, 512)));
-                changed |= preview != self.preview;
-                self.preview = preview;
-            }
-            if let Some(NativeEvent::Ended { reason, durable }) = &event
-                && !self.snapshot.ended
-            {
-                self.snapshot.status = format!("Process ended: {reason:?}, durable={durable}");
-                self.snapshot.ended = true;
-                changed = true;
-            }
-            if state.notice_sequence > self.seen_notice {
-                self.seen_notice = state.notice_sequence;
-                if let Some(code) = state.notice {
-                    self.notices.push(TranscriptLine {
-                        text: format!("Nano diagnostic: {}", display_text(&code, 128)),
-                        kind: TranscriptKind::Error,
-                        continuation: false,
-                    });
-                    trim_notices(&mut self.notices);
-                    changed = true;
-                }
-            }
-            if events.has_changed().is_err() {
-                self.events = None;
-            }
-        }
+        let changed = self.conversation.poll();
+        self.notices.extend(
+            self.conversation
+                .notices
+                .drain(..)
+                .map(|text| TranscriptLine {
+                    text,
+                    kind: TranscriptKind::Error,
+                    continuation: false,
+                }),
+        );
+        trim_notices(&mut self.notices);
         changed
     }
 }
-
 pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec<DashboardLine> {
-    let plain = |text: String, color| {
-        DashboardLine::new(StyledLine::plain(truncate_to_width(&text, width), color))
-    };
-    let mut lines = vec![
-        plain(format!("Nano conversation: {}", view.name), orange()),
-        plain(display_text(&view.snapshot.status, 256), Color::Grey),
-        plain(
-            format!(
-                "Tokens: {}  Turns: {}  Tools: {}  PgUp/PgDn scroll; /cancel; /detach",
-                view.snapshot.budget.tokens(),
-                view.snapshot.budget.model_turns,
-                view.snapshot.budget.tool_calls
-            ),
-            Color::DarkGrey,
-        ),
-    ];
-    let mut body = Vec::new();
-    for entry in &view.snapshot.entries {
-        body.extend(wrap(entry, width));
-        body.push(String::new());
-    }
-    if let Some((_, preview)) = &view.preview {
-        body.extend(wrap(&format!("Nano (streaming preview): {preview}"), width));
-    }
-    let available = height.saturating_sub(lines.len());
-    let end = body
-        .len()
-        .saturating_sub(view.scroll.min(body.len().saturating_sub(available)));
-    let start = end.saturating_sub(available);
-    lines.extend(
-        body[start..end]
-            .iter()
-            .cloned()
-            .map(|text| plain(text, Color::Grey)),
-    );
-    lines.truncate(height);
-    lines
+    crate::shared::conversation::lines(
+        &view.conversation,
+        width,
+        height,
+        "PgUp/PgDn scroll; /cancel; /detach",
+    )
+    .into_iter()
+    .map(|(text, color)| DashboardLine::new(StyledLine::plain(text, color)))
+    .collect()
 }
 
 pub(super) fn trim_notices(notices: &mut Vec<TranscriptLine>) {
@@ -162,29 +71,10 @@ pub(super) fn trim_notices(notices: &mut Vec<TranscriptLine>) {
     }
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        let mut current = String::new();
-        let mut used = 0;
-        for ch in line.chars() {
-            let next = 1; // Same character-cell convention as the existing HQ renderer.
-            if used + next > width && !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                used = 0;
-            }
-            current.push(ch);
-            used += next;
-        }
-        lines.push(current);
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nano::wire::Event as NativeEvent;
 
     fn view(run: &str) -> NanoConversation {
         let (_, snapshots) = watch::channel(Some(Snapshot {

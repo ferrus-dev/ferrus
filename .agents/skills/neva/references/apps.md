@@ -10,7 +10,7 @@ Behind the `apps` feature, which is in `server-full` and `client-full`.
 Additive — it pulls in no new dependencies.
 
 ```toml
-neva = { version = "0.6", features = ["server-macros", "apps"] }
+neva = { version = "0.8", features = ["server-macros", "apps"] }
 ```
 
 ## The single most important fact
@@ -136,6 +136,7 @@ things with confusable names:
 |---|---|
 | `with_ui_permissions(UiPermissions::..)` | What the **iframe** may ask the browser for (camera, geolocation, …). A request, not a grant |
 | `with_permissions(["reports:read"])` | Which **callers** may read the resource, checked against JWT claims |
+| `with_scopes(["reports:read"])` | Which OAuth **scopes** the caller's token must grant to read it (0.8.0) |
 
 `UiResourceMeta::with_permissions` is unchanged — it is the `_meta.ui` block
 itself, not the registration builder.
@@ -313,7 +314,8 @@ usually right — the document is a template a host prefetches and reviews,
 while the data comes from a tool, which carries its own requirement.
 
 When the markup itself is sensitive, state the requirement on the resource.
-Since **0.6.0** `add_ui_resource` takes the same pair as any other resource:
+Since **0.6.0** `add_ui_resource` takes the same roles and permissions as any
+other resource, and since **0.8.0** the same `with_scopes`:
 
 ```rust
 use neva::prelude::*;
@@ -331,9 +333,11 @@ async fn main() {
 }
 ```
 
-A caller holding none of the roles is refused on `resources/read`; both
-gates must be satisfied. Both builders need the `http-server` feature —
-roles and permissions come from a validated token. On 0.5.x, register with
+A caller holding none of the roles is refused on `resources/read`; every
+gate must be satisfied. `with_scopes([..])` requires every listed scope, and a
+token short of one is answered `403 insufficient_scope` — a step-up, not a
+plain refusal (`http.md`). The builders need the `http-server` feature —
+roles, permissions and scopes come from a validated token. On 0.5.x, register with
 `map_ui_resource` and put the requirement on the returned `ResourceTemplate`
 instead.
 
@@ -354,7 +358,7 @@ async fn main() -> Result<(), Error> {
 
     client.connect().await?;
 
-    let tools = client.list_tools(None).await?;
+    let tools = client.tools().list(None).await?;
 
     for tool in tools.tools.iter() {
         let Some(ui) = tool.ui() else { continue };
@@ -371,7 +375,7 @@ async fn main() -> Result<(), Error> {
         .and_then(|tool| tool.ui())
         .and_then(|ui| ui.resource_uri)
     {
-        let result = client.read_resource(uri).await?;
+        let result = client.resources().read(uri).await?;
         for contents in result.contents.iter() {
             println!("{} [{}]", contents.uri(), contents.mime().unwrap_or("?"));
             println!("  _meta.ui: {:?}", contents.ui());

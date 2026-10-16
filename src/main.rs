@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod hq;
 mod legacy_state;
+mod shared;
 // Optional native frontend/provider entry points also build without nano-openai.
 #[allow(dead_code)]
 mod nano;

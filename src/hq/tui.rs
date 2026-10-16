@@ -11,16 +11,10 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
-    },
+    event::{self, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     queue,
     style::{Attribute, Color, Print, PrintStyledContent, Stylize, style},
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size,
-    },
+    terminal::{Clear, ClearType, size},
 };
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -297,7 +291,7 @@ pub async fn run_tui(
     refresh_dashboard_snapshot(&mut app, true).await;
 
     let mut stdout = io::stdout();
-    enter_tui()?;
+    let _terminal = crate::shared::terminal::Guard::enter()?;
 
     let mut ui = TerminalUi {
         cursor_row: 0,
@@ -391,7 +385,7 @@ pub async fn run_tui(
     queue!(&mut stdout, Show)?;
     stdout.flush()?;
     save_history(&app.history);
-    leave_tui()?;
+    _terminal.finish()?;
     Ok(())
 }
 

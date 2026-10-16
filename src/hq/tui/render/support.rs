@@ -3,28 +3,10 @@
 use super::*;
 
 pub(in crate::hq::tui) fn enter_tui() -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    queue!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        Clear(ClearType::All),
-        MoveTo(0, 0),
-        Hide
-    )?;
-    platform::enter_tui(&mut stdout);
-    let _ = stdout.flush();
-    Ok(())
+    Ok(crate::shared::terminal::enter()?)
 }
-
 pub(in crate::hq::tui) fn leave_tui() -> Result<()> {
-    let mut stdout = io::stdout();
-    platform::leave_tui(&mut stdout);
-    queue!(stdout, Show, DisableBracketedPaste, LeaveAlternateScreen)?;
-    let _ = stdout.flush();
-    disable_raw_mode()?;
-    Ok(())
+    Ok(crate::shared::terminal::leave()?)
 }
 
 pub(in crate::hq::tui) fn flush_stdin_input_buffer() {
@@ -62,49 +44,11 @@ pub(in crate::hq::tui) fn render_prompt_with_prefix(
     width: usize,
     prefix: &str,
 ) -> DashboardPrompt {
+    let prompt = crate::shared::input::prompt(&app.input, app.cursor_pos, width, prefix);
     let prefix_width = prefix.chars().count();
-    let available = width.saturating_sub(prefix_width).max(1);
-    let chars: Vec<char> = app.input.chars().collect();
-    let mut raw_lines = Vec::new();
-    let mut cursor_row = 0u16;
-    let mut cursor_col = prefix_width as u16;
-    let mut line = String::new();
-    let mut line_width = 0usize;
-    let mut row = 0u16;
-
-    for (idx, ch) in chars.iter().enumerate() {
-        if idx == app.cursor_pos {
-            cursor_row = row;
-            cursor_col = prefix_width as u16 + line_width as u16;
-        }
-
-        if *ch == '\n' {
-            raw_lines.push(std::mem::take(&mut line));
-            line_width = 0;
-            row += 1;
-            continue;
-        }
-
-        if line_width == available {
-            raw_lines.push(std::mem::take(&mut line));
-            line_width = 0;
-            row += 1;
-            if idx == app.cursor_pos {
-                cursor_row = row;
-                cursor_col = prefix_width as u16;
-            }
-        }
-
-        line.push(*ch);
-        line_width += 1;
-    }
-
-    if app.cursor_pos == chars.len() {
-        cursor_row = row;
-        cursor_col = prefix_width as u16 + line_width as u16;
-    }
-
-    raw_lines.push(line);
+    let raw_lines = prompt.lines;
+    let cursor_row = prompt.cursor_row;
+    let cursor_col = prompt.cursor_col;
     let lines = raw_lines
         .into_iter()
         .enumerate()
