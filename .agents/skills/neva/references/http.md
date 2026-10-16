@@ -89,13 +89,51 @@ async fn main() {
 
 | Method | Purpose |
 |---|---|
-| `set_decoding_key()` | Secret or public key verifying signatures |
+| `set_decoding_key()` | HMAC secret (`HS256`/`HS384`/`HS512`) |
+| `with_decoding_key()` | Any `neva::auth::DecodingKey` — HMAC, or an RSA / EC / Ed25519 **public** key from PEM or a JWK (0.8.0) |
+| `with_alg()` | Accepted algorithms. The first call **replaces** the default `HS256` (0.8.0; it added on 0.7) |
 | `with_aud()` | Accepted audiences |
-| `with_iss()` | Accepted issuers |
+| `with_iss()` | Accepted issuers. A token **without** `iss` is refused (0.8.0) |
 | `validate_exp()` | Validate expiry (default `true`) |
 
-Roles and permissions then gate individual primitives, answering `403` when
-a token does not satisfy them:
+A key whose family does not match the algorithms — an EC key left on the
+default `HS256` — **fails the server start**. A static key and `with_oauth`
+together also fail the start ("Bearer auth is ambiguous"): pick one.
+
+**An issuer's public key** (no route to the issuer at all) — ship it with the
+deployment. It does not follow key rotations; a re-keyed issuer means a
+restart:
+
+```rust
+use neva::{prelude::*, auth::{Algorithm, DecodingKey}};
+
+#[tokio::main]
+async fn main() {
+    let key = DecodingKey::from_pem_file("/etc/mcp/issuer.pem"); // or DecodingKey::from_jwk(json)?
+
+    App::new()
+        .with_options(|opt| opt
+            .with_http(|http| http
+                .with_auth(|auth| auth
+                    .with_decoding_key(key)
+                    .with_alg(Algorithm::ES256)
+                    .with_iss(["https://auth.example.com"])
+                    .with_aud(["https://mcp.example.com/mcp"]))))
+        .run()
+        .await;
+}
+```
+
+### Roles, permissions and scopes
+
+Three gates on a tool, prompt or resource, checked against the token's claims
+on every call. They differ in what satisfies them and in how they refuse:
+
+| Gate | Satisfied by | Refused with |
+|---|---|---|
+| `roles = [..]` | **any one**, in `role` or `roles` | `InvalidParams` (-32602) in a `200` — not a `403` |
+| `permissions = [..]` | **any one**, in `permissions` | `InvalidParams` (-32602) in a `200` |
+| `scopes = [..]` (0.8.0) | **every one**, in the token's `scope` | `403` + `WWW-Authenticate: Bearer error="insufficient_scope", scope="<every required scope>"`, body `InsufficientScope` (-31403) with `data.requiredScopes` / `data.missingScopes` |
 
 ```rust
 use neva::prelude::*;
@@ -109,7 +147,70 @@ async fn admin_tool(name: String) {
 async fn restricted_resource(uri: Uri, name: String) -> (String, String) {
     (uri.to_string(), name)
 }
+
+#[tool(scopes = ["memory:read", "memory:write"])]
+async fn forget(fact: String) -> String {
+    format!("forgot {fact}")
+}
+
+#[tokio::main]
+async fn main() {
+    let mut app = App::new().with_options(|opt| opt.with_default_http());
+
+    // The builder form: with_roles / with_permissions / with_scopes on
+    // Tool, Prompt, ResourceTemplate and UiResource.
+    app.map_tool("recall", |topic: String| async move { topic })
+        .with_arg_names(["topic"])
+        .with_scopes(["memory:read"]);
+
+    app.run().await;
+}
 ```
+
+* **A scope refusal is a step-up, the others are not.** No new token changes a
+  role, so a missing role is a plain refusal — and it **outranks** a missing
+  scope, so no client re-authorizes for a call that would fail anyway.
+* **The scope check runs before dispatch.** That is what lets a request that
+  would have streamed, or a batch, get its `403`. A batch with any refused
+  request is refused whole, challenge naming the union of scopes; its other
+  requests come back "not processed".
+* **A gated tool stays in `tools/list`** — a client has to see it to step up.
+* **`-31403` is neva's own code**, outside the JSON-RPC reserved range, since
+  MCP allocates none for this. A neva client that gets one has no OAuth
+  session to widen (`with_auth(token)`).
+* All gates need the `http-server` feature; over stdio a gated item is refused
+  for want of claims.
+
+### Who is calling
+
+`ctx.claims()` (0.8.0) is the caller's token, decoded and validated —
+`None` without bearer auth or without an HTTP transport (it still compiles
+there). `MwContext::claims()` is the same in middleware.
+
+```rust
+use neva::prelude::*;
+use neva::auth::DefaultClaims;
+
+#[tool]
+async fn whoami(ctx: Context) -> Result<String, Error> {
+    let Some(caller) = ctx.claims() else {
+        return Err(Error::new(ErrorCode::InvalidRequest, "no authenticated caller"));
+    };
+    // a subject is unique only within its issuer: key per-user data by both
+    let owner = (caller.issuer(), caller.subject());
+    let agent = caller.client_id();                    // RFC 9068: the OAuth client acting for the user
+    let granted: &[String] = caller.scopes();
+    let audiences: &[String] = caller.audience();      // every `aud`, one or several
+    // claims the trait does not expose: downcast to the engine's type
+    let expires = caller.downcast_ref::<DefaultClaims>().and_then(|c| c.exp);
+    Ok(format!("{owner:?} via {agent:?}: {granted:?} for {audiences:?}, exp {expires:?}"))
+}
+```
+
+`neva::auth::{Claims, DefaultClaims}` are under `server` since 0.8.0, not
+`http-server`. The bundled Volga engine always decodes `DefaultClaims`; a
+custom engine inserts its own `Arc<dyn Claims>` type, and `downcast_ref` gets
+it back.
 
 ### OAuth 2.1 — server side
 
@@ -172,13 +273,47 @@ async fn main() {
 | On `with_oauth(..)` | |
 |---|---|
 | `with_issuer(..)` | Issuer whose keys validate tokens. Mandatory |
+| `with_jwks_uri(..)` | Fetch the key set from this URL and **skip discovery** (0.8.0) |
 | `with_refresh_cooldown(..)` | Minimum interval between JWKS refreshes (default 60 s) |
 | `with_max_key_age(..)` | Re-fetch the key set even for known kids after this (default 15 min) |
-| `with_config(\|cfg\| cfg.with_client_config(\|c\| c.require_https(false)))` | Local dev issuer over plain http |
+| `with_config(\|cfg\| cfg.with_client_config(\|c\| c.require_https(false)))` | Local dev issuer over plain http — applies to the `with_jwks_uri` URL too |
 
-The metadata document, its well-known path and the challenge are
-engine-neutral, so a custom `HttpEngine` serves identical bytes; token
-*validation* is the engine's job.
+**An issuer the server reaches under another name** — issuer on the host as
+`http://localhost:8787`, server in a container reaching it as
+`http://host.docker.internal:8787`, or a k8s service behind a public ingress.
+Discovery cannot work there: the metadata names the unreachable host as its
+`issuer` (which must equal the URL it was fetched from) and in its `jwks_uri`.
+Keep `with_issuer` as the public identifier — it is still what `iss` must
+carry and where clients are sent — and point at the keys directly:
+
+```rust
+use neva::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    App::new()
+        .with_options(|opt| opt
+            .with_http(|http| http
+                .with_auth(|auth| auth
+                    .with_oauth(|oauth| oauth
+                        .with_issuer("http://localhost:8787")
+                        .with_jwks_uri("http://host.docker.internal:8787/jwks")
+                        .with_config(|cfg| cfg
+                            .with_client_config(|c| c.require_https(false)))))))
+        .run()
+        .await;
+}
+```
+
+**`scopes_supported` defaults to the declared scopes** (0.8.0): without
+`with_oauth_metadata(|m| m.with_scopes([..]))`, the document lists every scope
+a tool, prompt or resource requires. Set `with_scopes` to have clients start
+narrower and step up; an empty list advertises none. Built once at start —
+items added at runtime are not in it.
+
+The metadata document, its well-known path and the challenges (`401` and the
+`403` step-up) are engine-neutral, so a custom `HttpEngine` serves identical
+bytes; token *validation* is the engine's job.
 
 ### OAuth 2.1 — client side
 
@@ -327,8 +462,17 @@ proof covers one method and one URL, so a `3xx` is surfaced as itself), and
 DPoP is scored as an extension — SEP-1932 is unmerged and it appears
 nowhere in the 2026-07-28 text.
 
+**Step-up is automatic.** A `403` whose challenge says `insufficient_scope`
+is handled like a `401`: the client re-authorizes for the scopes it held
+**plus** the challenged ones (SEP-2350 — never trade a grant away), then
+retries the call once. Concurrent refusals share one flow. It ends in an
+error instead when the challenge names a scope outside a configured
+`with_scopes([..])` ("add it to `with_scopes`"), or when the client holds a
+static `with_auth(token)` — that caller gets `InsufficientScope` (-31403)
+with `requiredScopes` / `missingScopes` in `data`.
+
 **Other knobs:** `with_scopes([..])` (defaults to the resource's
-`scopes_supported`), `require_https(false)` (local dev issuers only),
+`scopes_supported`; also the ceiling for a step-up), `require_https(false)` (local dev issuers only),
 `with_token_store(..)` (the default is in-process; the key is
 `{issuer}|{client}|{resource}`, the whole identity a credential belongs to, so
 two servers never share a slot), `with_handler(..)` (replace
@@ -444,7 +588,7 @@ axum, hyper, actix-web or your own adapter, implement `HttpEngine` and wire
 it in:
 
 ```toml
-neva = { version = "0.6", features = ["server-macros", "http-server", "tracing", "di", "tasks"] }
+neva = { version = "0.8", features = ["server-macros", "http-server", "tracing", "di", "tasks"] }
 axum = "0.8"
 ```
 
@@ -655,8 +799,10 @@ Five things to get right:
 title, exact versions rather than ranges, the `format: uri` fields, an icon
 source that must be HTTPS and ≤ 255 characters, a `{template}` nothing
 declares, a manifest with nothing to install and nothing to call, a remote over
-stdio. It is **not** a registry's validator — host rules, base URLs and
-loopback policy belong to the registry, which says which of its own rules was
+stdio, and (0.7.1) publisher metadata (`with_publisher_metadata`) that is not a
+JSON object. It is **not** a registry's validator — host rules, base URLs,
+loopback policy and how much publisher metadata it keeps (4 KB on the official
+registry) belong to the registry, which says which of its own rules was
 broken.
 
 Beyond the cargo package: `Package::new(RegistryType::Oci | Mcpb | Other(..), ..)`
@@ -665,7 +811,10 @@ for other distributions, `with_package_argument` / `with_runtime_argument` /
 Transport::streamable_http(url))` for a server that is already running (never
 stdio; every `{placeholder}` in the URL must be declared beside it). Prefer
 `KeyValueInput` environment variables over arguments for anything
-user-supplied — arguments reach a command line.
+user-supplied — arguments reach a command line. `Argument` is in
+`neva::prelude` too (the completion one), so beside `use neva::registry::*;`
+it is ambiguous (E0659): import it by name, `use neva::registry::Argument;`,
+which shadows both globs.
 
 Publishing, once `server.json` is written:
 
@@ -717,13 +866,13 @@ Minimal builds worth knowing:
 
 ```toml
 # stdio-only server, macros, no HTTP
-neva = { version = "0.6", features = ["server-macros", "tracing"] }
+neva = { version = "0.8", features = ["server-macros", "tracing"] }
 
 # lightweight HTTP client
-neva = { version = "0.6", features = ["http-client"] }
+neva = { version = "0.8", features = ["http-client"] }
 
 # a server that is also a client (agent pattern)
-neva = { version = "0.6", features = ["server-full", "http-client"] }
+neva = { version = "0.8", features = ["server-full", "http-client"] }
 ```
 
 ## Testing a server

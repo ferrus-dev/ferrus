@@ -100,7 +100,8 @@ Rules:
 * A `blocking` body is **not cancelled** when the request is; a panic inside
   it propagates to the awaiting task.
 * A handler that needs `Context` (elicitation, sampling, progress,
-  `ctx.memo`) has to await, so it must be an `async fn`.
+  `ctx.memo`, the `ctx.tools()` / `resources()` / `prompts()` namespaces) has
+  to await, so it must be an `async fn`.
 
 The shape is a defaulted type-level marker — `neva::marker::Async` or
 `marker::Immediate` — on the handler traits
@@ -138,7 +139,8 @@ async fn greet(name: String) -> String {
 | `input_schema` | JSON string overriding the generated `inputSchema` |
 | `output_schema` | JSON string overriding the generated `outputSchema` |
 | `annotations` | `ToolAnnotations` as JSON: `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
-| `roles` / `permissions` | Access gates, checked against JWT claims (HTTP only) |
+| `roles` / `permissions` | Access gates, checked against JWT claims (HTTP only). Any one listed is enough |
+| `scopes` | OAuth scopes the token must grant — **every** one; a shortfall is a `403` step-up (0.8.0, HTTP only). Also on `#[prompt]` / `#[resource]` |
 | `middleware` | `[fn, fn]` — per-handler middleware |
 | `task_support` | `"required"` marks a tool that must be called as a task |
 | `ui` | A `ui://` resource that renders this tool — [MCP Apps](apps.md), `apps` feature |
@@ -475,26 +477,61 @@ async fn search(query: String) -> Result<CallToolResponse, Error> {
 
 ## The Context
 
-Inject `Context` into any handler to reach the server itself:
+Inject `Context` into any handler to reach the server itself. Take it as
+`ctx: Context` — its methods take `&self`, and `mut ctx` only warns:
 
 ```rust
 use neva::prelude::*;
 
 #[tool(descr = "Reads a resource this server also exposes")]
 async fn read_resource(ctx: Context, res: Uri) -> Result<Content, Error> {
-    let result = ctx.resource(res).await?;
+    let result = ctx.resources().read(res).await?;
     let resource = result.contents.into_iter().next()
         .ok_or_else(|| Error::new(ErrorCode::InternalError, "no contents"))?;
     Ok(Content::resource(resource))
 }
 ```
 
-`Context` also mutates the registries at runtime — `add_tool`,
-`remove_tool`, `add_prompt`, `remove_prompt`, `add_resource`,
-`remove_resource`, `resource_updated` — and each mutation notifies every
-subscriber that asked for that category. `add_tool` / `add_prompt` run the
-same argument-name check `App::run` does and return an error rather than
-publishing something no peer could call.
+Since **0.7.0** the server's own primitives are reached one namespace per
+kind, the same shape a client sees them in:
+
+| Namespace | Read | Run | Change |
+|---|---|---|---|
+| `ctx.tools()` | `list()`, `find(name)`, `find_many(names)` | `call(ToolUse)`, `call_all(tool_uses)` | `add(tool)`, `remove(name)` |
+| `ctx.resources()` | `is_subscribed(&uri)` | `read(uri)` | `add(resource)`, `remove(uri)`, `notify_updated(uri)` |
+| `ctx.prompts()` | `list()` | `get(name, args)` | `add(prompt)`, `remove(name)` |
+
+```rust
+use neva::prelude::*;
+
+#[tool(descr = "Publishes a greeting tool and a report")]
+async fn publish(ctx: Context) -> Result<String, Error> {
+    ctx.tools()
+        .add(Tool::new("hello", || async { "hello" }))
+        .await?;
+
+    let resources = ctx.resources();
+    resources.add(Resource::new("res://report", "report")).await?;
+    resources.notify_updated("res://report").await?;
+
+    Ok(format!("{} tools", ctx.tools().list().await.len()))
+}
+```
+
+Each change notifies every subscriber that asked for that category.
+`tools().add` / `prompts().add` run the same argument-name check `App::run`
+does and return an error rather than publishing something no peer could call.
+`call` / `read` / `get` go through the handler that serves the primitive, as a
+client's request would.
+
+**`ctx.tools()` is the namespace, not a listing**: `ctx.tools().await` was the
+0.6 listing call and no longer compiles — write `ctx.tools().list().await`. The
+other flat 0.6 methods (`find_tool`, `use_tools`, `add_tool`, `resource`,
+`resource_updated`, `prompt`, …) still compile, `#[deprecated]`. On a 0.6 crate
+the namespaces do not exist; write the flat form there.
+
+With the `svir` feature, `ctx.tools().toolbox()` hands the server's other tools
+to a model from inside a handler — see `svir.md`.
 
 For asking the *client* for input (`elicit`, `sample`, `list_roots`) and
 the re-run primitives (`memo`, `once`, `on_commit`), read `mrtr.md`.
@@ -650,8 +687,22 @@ async fn main() {
 
 `wrap` is global, `wrap_tools` covers every `tools/call`, and
 `middleware = [f]` on `#[tool]` / `#[prompt]` / `#[handler]` is
-per-handler. They run in that order, handler last. Short-circuit by
-returning `Response::error(ctx.id(), err)` instead of calling `next`.
+per-handler. They run in that order, handler last.
+
+What reaches the caller:
+
+* **Short-circuit** by returning `Response::error(ctx.id(), err)` without
+  calling `next` — that answer is sent, over any transport and in a batch.
+  (On 0.7 and earlier it was dropped and the caller waited out its timeout.)
+* **After `next`**, the caller gets the handler's reply; a different
+  `Response` returned afterwards is **not** sent. Do not try to rewrite a
+  reply in middleware.
+* **A timeout around `next`** that fires before the reply is out sends the
+  middleware's own answer instead.
+* A notification gets no reply either way.
+
+`ctx.claims()` on `MwContext` (0.8.0) is the caller's token, as in a handler —
+see Access control below.
 
 ## Logging and progress
 
@@ -739,12 +790,12 @@ A category the client asks for but the server does not advertise is
 **dropped from the acknowledgment**, not refused — the subscription still
 opens.
 
-`Context::is_subscribed(&uri)` answers from the live streams, so you can
-skip **expensive local work** nobody will receive. Do not use it to decide
+`ctx.resources().is_subscribed(&uri)` answers from the live streams, so you
+can skip **expensive local work** nobody will receive. Do not use it to decide
 whether to notify: it is node-local, and it can only answer for the instance
-running the handler. `Context::resource_updated` therefore does not pre-check
-it — it publishes unconditionally and lets the subscription filters route the
-result, which is what they already do.
+running the handler. `ctx.resources().notify_updated(uri)` therefore does not
+pre-check it — it publishes unconditionally and lets the subscription filters
+route the result, which is what they already do.
 
 ### Fanning out across instances
 
@@ -826,11 +877,13 @@ result survives a runtime dropped right after.
 
 ## Access control
 
-`roles` and `permissions` on a primitive are checked against JWT claims and
-answer `403` when unsatisfied. See `http.md` for configuring the auth that
-produces those claims — either a locally minted JWT (`set_decoding_key`) or
-an OAuth 2.1 issuer (`with_oauth(|o| o.with_issuer(..))`). The gates are the
-same either way.
+`roles`, `permissions` and `scopes` on a primitive are checked against the
+caller's token claims. A role or permission shortfall is `InvalidParams`
+(-32602) in a `200`; a scope shortfall is a `403 insufficient_scope` step-up
+the client can re-authorize on. See `http.md` for the table, and for
+configuring the auth that produces the claims — a static key
+(`set_decoding_key` / `with_decoding_key`) or an OAuth 2.1 issuer
+(`with_oauth(|o| o.with_issuer(..))`). The gates are the same either way.
 
 ```rust
 use neva::prelude::*;
@@ -838,5 +891,29 @@ use neva::prelude::*;
 #[tool(roles = ["admin"], permissions = ["read"])]
 async fn admin_tool(name: String) {
     tracing::info!("admin tool for {name}");
+}
+
+#[prompt(scopes = ["notes:read"])]
+async fn summarize(topic: String) -> PromptMessage {
+    PromptMessage::user().with(format!("Summarize the notes on {topic}"))
+}
+```
+
+A handler that needs to know **who** called — to scope data per user, to log
+the calling agent — reads `ctx.claims()` (0.8.0): `subject()`, `issuer()`,
+`audience()`, `client_id()`, `scopes()`. Key per-user data by issuer **and**
+subject; a subject is unique only within its issuer. It is `None` without an
+authenticated caller, including on stdio, where it still compiles:
+
+```rust
+use neva::prelude::*;
+
+#[tool(descr = "Remembers a fact for the caller")]
+async fn remember(ctx: Context, fact: String) -> Result<String, Error> {
+    let Some(caller) = ctx.claims() else {
+        return Err(Error::new(ErrorCode::InvalidRequest, "no authenticated caller"));
+    };
+    let owner = (caller.issuer(), caller.subject());
+    Ok(format!("{owner:?} remembers {fact}"))
 }
 ```

@@ -61,6 +61,7 @@ async fn search(query: String) -> Result<CallToolResponse, Error> {
 | `MissingRequiredClientCapability` | -32021 | The request needs a capability the caller did not declare |
 | `UnsupportedProtocolVersion` | -32022 | The named protocol version is not supported |
 | `UrlElicitationRequiredError` | -32042 | The interaction requires URL elicitation |
+| `InsufficientScope` | -31403 | The token lacks a scope the item requires (0.8.0). neva's own code — MCP allocates none |
 
 The three MCP 2026-07-28 codes answer HTTP `400` and carry structured
 `data`:
@@ -81,7 +82,10 @@ fn main() {
 
 `HeaderMismatch` carries none, `MissingRequiredClientCapability` carries
 `requiredCapabilities`, `UnsupportedProtocolVersion` carries `supported`
-and `requested`.
+and `requested`. `InsufficientScope` answers HTTP **`403`** instead, with a
+`WWW-Authenticate: Bearer error="insufficient_scope", scope=".."` challenge,
+and carries `requiredScopes` and `missingScopes`. An exhaustive `match` on
+`ErrorCode` written before 0.8.0 needs an arm for it.
 
 **`ResourceNotFound` is deprecated.** MCP 2026-07-28 dropped the dedicated
 `-32002`; "resource not found" is `InvalidParams` now. Use the
@@ -180,7 +184,7 @@ and it still happens, check the bus does not suppress echo — local delivery
 goes through `subscribe()` too, so an implementation that hides an
 instance's own publishes silences that instance's own subscribers.
 
-Also: do not gate the notification on `ctx.is_subscribed(..)`. It is
+Also: do not gate the notification on `ctx.resources().is_subscribed(..)`. It is
 node-local and answers only for the instance running the handler.
 
 ### `SubscriptionEnd::Abrupt` when the server shuts down
@@ -432,6 +436,166 @@ was broken. Act on that message, not on the local `Ok`.
 The `registry` feature is off, or the crate is 0.6.0 or older. It is in
 `server-full` from **0.6.1**; add `registry` explicitly to a hand-picked
 feature list.
+
+### `ctx.tools().await` — "`Tools<'_>` is not a future"
+
+0.7.0 made `ctx.tools()` the tools **namespace**; in 0.6 it was the listing
+call. Write `ctx.tools().list().await`. It is the one 0.6 call on `Context`
+that breaks rather than warns, because the namespace took its name.
+
+### Deprecation warnings on `call_tool`, `read_resource`, `find_tool`, …
+
+0.7.0 code written against the 0.6 flat API. Each warning names its
+replacement — `client.call_tool(..)` → `client.tools().call(..)`,
+`ctx.resource_updated(uri)` → `ctx.resources().notify_updated(uri)`, and so
+on; `legacy.md` has the whole list. `client.batch().call_tool(..)` is **not**
+deprecated: the batch builder keeps its flat names.
+
+### `unused_mut` on `mut ctx: Context`
+
+`Context`'s methods take `&self` since 0.7.0. Drop the `mut`.
+
+### A request times out, and the server stopped working on it too
+
+Since 0.7.0 a request the client stops waiting for is **cancelled**, not
+abandoned: on a timeout, or when the call's future is dropped. Over Streamable
+HTTP the client closes the request's stream and the server stops the handler.
+For work that legitimately runs long, raise `with_timeout` or make the tool a
+task (`task_support = "required"` + `client.tools().as_task().call(..)`).
+
+### A custom `TaskApi` implementation stops compiling
+
+Its methods take `&self` since 0.7.0, and `wait_to_completion` takes `&A`.
+Match the new signatures; nothing else changed.
+
+### `neva::svir`, `into_toolbox` or `ctx.tools().toolbox()` not found
+
+The `svir` feature is off — and it is in **no preset**, not even `full`, so it
+has to be named: `features = ["full", "svir"]`. A separate "unresolved crate
+`svir`" means svir itself is missing from `[dependencies]`: neva pulls it in
+without its HTTP client, so to call a model add `svir = "0.1.6"` yourself.
+
+### "Tool `…` cannot be offered to a model"
+
+A function name a model API accepts is `[a-zA-Z0-9_-]{1,64}`; MCP also allows
+`.` and up to 128 characters. The bridge fails the snapshot rather than rename
+silently. `.rename(|n| n.replace('.', "_"))` or `.filter(..)` on the toolbox.
+The same failure for two tools under one name — usually two servers' tools in
+one request, which `.with_prefix("a_")` separates.
+
+### A tool is missing from the toolbox
+
+By design, the bridge never offers: a task-only tool
+(`task_support = "required"`); with `apps`, a tool hidden from the model; a
+tool requiring roles, permissions or scopes the caller does not hold — and a toolbox
+from `App::into_toolbox` / `with_toolbox` holds none; and, in
+`ctx.tools().toolbox()`, the tool it was taken in (`with_caller()` keeps it).
+A snapshot is also only as new as the last `load()` / `refresh()`.
+
+### "in-process tool calls nest at most 4 deep"
+
+A tool driving a model called a tool that drives a model, and so on. The bound
+is per toolbox — `with_max_depth(n)` raises it — but hitting it usually means
+two tools calling each other in a loop.
+
+### `LocalTools::load` fails with "The server stopped before it ran"
+
+A toolbox from `App::with_toolbox()` binds to the server once `run` has built
+it. Spawn `app.run()` before awaiting `load()`, and keep the app alive.
+
+### A tool works over MCP but the model is told it "returned an image"
+
+A tool result reaches a model as a string. Images, audio and binary resources
+cannot be passed on, and the bridge says so instead of dropping them. Return
+text (or a resource link) for the model, and keep the image for a UI.
+
+### `403 insufficient_scope` / `InsufficientScope` (-31403)
+
+The token is valid but lacks a scope the tool, prompt or resource requires
+(`scopes = [..]`, every one of them). A neva client with an OAuth session
+steps up by itself, so seeing the error on the client means it could not:
+
+* it holds a static `with_auth(token)` — get a token with the scopes in
+  `data.requiredScopes`;
+* it configured `with_scopes([..])` without the scope — the error says "add it
+  to `with_scopes`".
+
+On the server, read the token's `scope` claim: a space-delimited string (or an
+array), split into `claims.scopes()`. A scope named in `roles` or
+`permissions` is checked against other claims entirely.
+
+### "Subject is not authorized to invoke this" / "Claims are not provided" (-32602)
+
+A **role or permission** gate, answered `InvalidParams` in a `200` — not a
+`403`, and no step-up: no new token changes who the caller is. "Claims are
+not provided" means no claims reached the gate at all — stdio, a server
+without `with_auth`, or a custom engine that did not insert
+`Arc<dyn Claims>` into the request extensions. When an item requires both a
+role and a scope, the missing role is what the caller hears about.
+
+### `ctx.claims()` is always `None`
+
+No authenticated caller: no `with_auth(..)` on the HTTP server, a stdio
+server (it compiles there and answers `None`), or a custom engine that does
+not insert the claims. It is not a feature problem since 0.8.0 —
+`neva::auth::{Claims, DefaultClaims}` are under `server`.
+
+### `expected Option<String>, found Vec<String>` on `DefaultClaims.aud`
+
+0.8.0 made `aud` a `Vec<String>`: a token names one audience or several, and
+an array used to fail to decode. Read `claims.audience()`. `DefaultClaims`
+also gained `client_id` and `scope`, so a literal naming every field needs
+them — or `..Default::default()`.
+
+### The server will not start: "the decoding key is an EC key, which cannot verify HS256 tokens"
+
+Since 0.8.0 a static key that cannot serve every accepted algorithm fails
+the start; the message names the ones it can. The default is `HS256`, so a
+public key needs its own: `.with_alg(Algorithm::ES256)` (or `RS256`,
+`EdDSA`, …). `with_alg` now **replaces** `HS256` rather than adding to it, and
+naming an algorithm of another family next to it fails the same way. With
+`tracing` on and no subscriber the message still reaches stderr.
+
+### "Bearer auth is ambiguous"
+
+Both a static key (`set_decoding_key` / `with_decoding_key`) and
+`with_oauth(..)` are configured. Pick one: a static key validates against one
+key that never rotates; OAuth mode fetches the issuer's key set.
+
+### Every token is `401` after upgrading to 0.8.0
+
+Two validation changes, both from volga 0.13.3: `with_iss([..])` now refuses
+a token **without** `iss`, and `with_alg` replaces the default `HS256` instead
+of adding to it. Check the tokens carry `iss`, and that the algorithm they are
+signed with is named.
+
+### OAuth discovery fails in a container, or the issuer "does not match"
+
+The server reaches the issuer under another name than the one tokens carry
+(`localhost` vs `host.docker.internal`, an internal service vs a public
+ingress). Discovery cannot work there — the metadata names the public URL.
+Keep `with_issuer(<public>)` and add `.with_jwks_uri(<reachable>/jwks)`
+(0.8.0); a plain-http URL also needs `require_https(false)`.
+
+### `principal mismatch` on a `requestState` during a rolling upgrade
+
+0.8.0 binds a state to the caller's issuer **and** subject; 0.7 bound the
+subject alone. A multi-round elicitation that straddles the two versions is
+refused and starts over. It settles once every instance runs 0.8.0, and
+in-flight states lapse within the 5-minute TTL.
+
+### A middleware's short-circuit used to time out, and now answers
+
+Before 0.8.0 a `Response` a middleware returned without calling `next` — or
+after a timeout around `next` — was dropped, and the caller waited out its own
+timeout. It is sent now. A `Response` returned **after** `next` completed is
+still not sent: the handler's reply already was.
+
+### `scopes_supported` changed after the upgrade
+
+Without `with_oauth_metadata(|m| m.with_scopes([..]))` the document now lists
+every scope the server's items declare (0.8.0), so clients ask for all of them
+up front. Set `with_scopes` to have them start narrower and step up.
 
 ### `proto-2026-07-28-rc` is not a known feature
 

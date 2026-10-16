@@ -1,9 +1,9 @@
 ---
 name: neva
-description: Build, review and debug MCP (Model Context Protocol) servers and clients in Rust with the neva crate — tools, prompts, resources, elicitation and multi round-trip requests, MCP Apps (`ui://` UI resources), Streamable HTTP and stdio transports, OAuth 2.1 auth, DI, deployment and publishing to the MCP Registry. Use whenever Rust code imports `neva`, whenever the task is to expose something as an MCP server or to talk to one from Rust, and when upgrading such code across neva or MCP-spec versions.
+description: Build, review and debug MCP (Model Context Protocol) servers and clients in Rust with the neva crate — tools, prompts, resources, elicitation and multi round-trip requests, MCP Apps (`ui://` UI resources), Streamable HTTP and stdio transports, OAuth 2.1 auth, DI, deployment and publishing to the MCP Registry, and handing MCP tools to a model through the svir bridge. Use whenever Rust code imports `neva`, whenever the task is to expose something as an MCP server, to talk to one from Rust, or to let a model call an MCP server's tools, and when upgrading such code across neva or MCP-spec versions.
 license: MIT
 metadata:
-  neva-version: "0.6.1"
+  neva-version: "0.8.0"
   mcp-protocol: "2026-07-28"
   docs: "https://romanemreis.github.io/neva-docs/"
   api-reference: "https://docs.rs/neva"
@@ -15,7 +15,7 @@ metadata:
 sides: `App` builds servers, `Client` builds clients, and a single process
 can run both.
 
-**This skill describes neva 0.6.x, which speaks MCP `2026-07-28` by
+**This skill describes neva 0.8.x, which speaks MCP `2026-07-28` by
 default.** That protocol generation broke compatibility with everything
 before it. Most MCP knowledge in circulation — and every other MCP SDK —
 describes the *older* generation, so the failure mode here is not "you
@@ -37,9 +37,10 @@ In an existing project, read `Cargo.toml`:
 
 | What you find | What it means |
 |---|---|
-| `neva = "0.6"` and no `legacy-spec` | Default profile, MCP 2026-07-28. This skill applies as written |
-| `neva = "0.6.0"` exactly | Same API, minus the `registry` feature and a retryable `Client::connect` — both 0.6.1. Prefer 0.6.1; it is drop-in |
-| `neva = "0.5"` and no `legacy-spec` | Same protocol and same API, minus synchronous handlers and per-request extensions. Everything here still applies; see [Handler shapes](#handler-shapes) for what 0.6 added |
+| `neva = "0.8"` and no `legacy-spec` | Default profile, MCP 2026-07-28. This skill applies as written |
+| `neva = "0.7"` and no `legacy-spec` | As 0.8, minus knowing the caller: no `ctx.claims()`, no `scopes = [..]` gates, no `with_decoding_key` / `with_jwks_uri`. `DefaultClaims.aud` is an `Option<String>`, `with_alg` adds to `HS256` instead of replacing it, and a middleware's answer without `next` never reaches the caller. `references/legacy.md` has the upgrade |
+| `neva = "0.6"` and no `legacy-spec` | Same protocol, but the client and `Context` calls are **flat** — `client.call_tool(..)`, `ctx.find_tool(..)` — where 0.7+ has [namespaces](#the-namespaced-api). Write the flat ones on 0.6; no `svir` feature. `registry` and a retryable `Client::connect` need 0.6.1, not 0.6.0 |
+| `neva = "0.5"` and no `legacy-spec` | As 0.6, minus synchronous handlers and per-request extensions; see [Handler shapes](#handler-shapes) for what 0.6 added |
 | `features = [… "legacy-spec" …]` | **Legacy profile**, MCP 2024-11-05 … 2025-11-25. A *different* API. Read `references/legacy.md` before touching anything |
 | `neva = "0.4"` or older | Pre-2026-07-28 by default. Read `references/legacy.md` for the upgrade |
 | `proto-2026-07-28-rc` | A flag that no longer exists — remove it |
@@ -64,12 +65,14 @@ Load only what the task calls for; each file is self-contained.
 | Long-running work, `tasks/get` polling | `references/mrtr.md` |
 | Transport choice, TLS, JWT auth, DNS-rebinding, multi-instance deploy | `references/http.md` |
 | OAuth 2.1 — protecting a server, authorizing a client, DPoP, CIMD, grants | `references/http.md` |
+| Who is calling (`ctx.claims()`); roles, permissions and scope gates; `403 insufficient_scope` step-up | `references/http.md` |
 | Stopping a server from code; graceful shutdown; draining subscriptions | `references/http.md` |
 | A custom HTTP stack (axum, hyper, actix-web) | `references/http.md` |
 | Publishing a server: `server.json`, the MCP Registry, `mcp-publisher` | `references/http.md` |
 | Giving a tool a UI; `ui://` resources; `_meta.ui`; MCP Apps | `references/apps.md` |
+| Letting a model call MCP tools; an agent loop over a server's tools; answering sampling with a model (`svir` feature) | `references/svir.md` |
 | An error code, a `-320xx` on the wire, or "why is this rejected" | `references/troubleshooting.md` |
-| `legacy-spec`, MCP ≤ 2025-11-25, upgrading from 0.4.x | `references/legacy.md` |
+| `legacy-spec`, MCP ≤ 2025-11-25, upgrading across releases (0.4 → 0.8) | `references/legacy.md` |
 
 ## A server that works
 
@@ -110,17 +113,37 @@ async fn main() -> Result<(), Error> {
 
     client.connect().await?;
 
-    let tools = client.list_tools(None).await?;
-    for tool in &tools.tools {
+    for tool in client.tools().list_all().await? {
         println!("{}", tool.name);
     }
 
-    let result = client.call_tool("greet", ("name", "World")).await?;
+    let result = client.tools().call("greet", ("name", "World")).await?;
     println!("{:?}", result.content);
 
     client.disconnect().await
 }
 ```
+
+## The namespaced API
+
+Since **0.7.0** the calls on `Client` and on a handler's `Context` are grouped
+one namespace per MCP method prefix — `client.tools().call(..)` sends
+`tools/call`:
+
+| On | Namespaces |
+|---|---|
+| `Client` | `tools()` — `list`, `list_all`, `call`, `call_raw`, `as_task` · `resources()` — `list`, `list_all`, `templates`, `read` · `prompts()` — `list`, `list_all`, `get` · `tasks()` — `get`, `update`, `cancel` |
+| `Context` | `tools()` — `list`, `find`, `find_many`, `call`, `call_all`, `add`, `remove` · `resources()` — `read`, `add`, `remove`, `notify_updated`, `is_subscribed` · `prompts()` — `list`, `get`, `add`, `remove` |
+
+* **Write the namespaced form on 0.7 and later.** The flat 0.6 spellings
+  (`client.call_tool`, `client.read_resource`, `ctx.find_tool`,
+  `ctx.resource_updated`, …) still compile but are `#[deprecated]`.
+  `client.batch()` keeps its flat builder methods — they are current.
+* **`ctx.tools()` is the namespace, not a listing.** `ctx.tools().await` does
+  not compile since 0.7; it is `ctx.tools().list().await`.
+* **Everything takes `&self`.** A handler takes `ctx: Context`, never
+  `mut ctx` (it warns). A connected client is shared as `Arc<Client>`;
+  only setup — `connect`, `map_*`, `on_*` — needs `&mut`.
 
 ## Handler shapes
 
@@ -177,12 +200,13 @@ Four things to get right:
   awaiting task, as it would inline.
 
 Both shapes work on the client too: `Client::map_sampling`,
-`Client::map_elicitation`, `#[sampling]` and `#[elicitation]`.
+`Client::map_elicitation`, `#[sampling]` and `#[elicitation]`. Since 0.7.0 a
+sampling handler may also return `Result<CreateMessageResult, Error>`.
 
 The shape rides as a defaulted type-level marker (`neva::marker::Async` /
 `marker::Immediate`) on the handler traits, inferred at the registration
 site. It never appears in handler code. The one place it surfaces: a call
-site that spells its generics out needs one more argument on 0.6 —
+site that spells its generics out needs one more argument since 0.6 —
 `map_tool::<_, _, (String,), _>(..)` — and fails with E0107 until it gets one.
 
 ## Non-negotiables
@@ -274,6 +298,10 @@ For HTTP, start the server and point the Inspector at
 
 * `use neva::prelude::*;` is the intended import — it carries `App`,
   `Client`, `Context`, the macros, the types and the error model.
+* A handler that needs the server takes `ctx: Context` and goes through its
+  namespaces — `ctx.resources().read(uri)`, `ctx.tools().add(tool)`. Who is
+  calling is `ctx.claims()` (0.8.0): the caller's token claims over
+  authenticated HTTP, `None` everywhere else.
 * A handler is an `async fn` or a plain `fn` — see [Handler shapes](#handler-shapes).
   Returning a plain `String`, `&str`, `Json<T>`, `Content` or
   `CallToolResponse` all work; prefer the simplest that fits.

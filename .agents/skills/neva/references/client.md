@@ -113,6 +113,75 @@ The version the client offers is a proposal: a server answering with a
 different one it does speak is fine, and only a version neva does not know
 at all ends the connection.
 
+## The namespaces
+
+Since **0.7.0** a server's primitives are reached one namespace per MCP
+method prefix — `client.tools()` is `tools/*`:
+
+| Namespace | Calls |
+|---|---|
+| `client.tools()` | `list(cursor)`, `list_all()`, `call(name, args)`, `call_raw(params)`, `as_task()` |
+| `client.resources()` | `list(cursor)`, `list_all()`, `templates(cursor)`, `read(uri)` — and the legacy `subscribe(uri)` / `unsubscribe(uri)` |
+| `client.prompts()` | `list(cursor)`, `list_all()`, `get(name, args)` |
+| `client.tasks()` | `get(id)`, `update(id, responses)`, `cancel(id)` (feature `tasks`) |
+
+Each is a `Copy` view borrowed from the client, so several can be held at
+once. The flat 0.6 methods — `call_tool`, `list_tools`, `read_resource`,
+`get_prompt`, `list_resources`, `list_resource_templates`, `list_prompts`,
+`call_tool_raw`, `call_tool_as_task`, `task()` — still compile but are
+`#[deprecated]`; write the namespaced form. On a 0.6 crate the namespaces do
+not exist and the flat form is the only one.
+
+### Sharing a connected client
+
+Request methods take `&self`, so an `Arc<Client>` serves any number of tasks.
+Only setup — `connect`, `map_*`, `on_*`, roots — takes `&mut self`, so do it
+before wrapping:
+
+```rust
+use neva::prelude::*;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let mut client = Client::new().with_options(|opt| opt.with_default_http());
+    client.connect().await?;
+
+    let client = Arc::new(client);
+    let calls: Vec<_> = ["London", "Paris"]
+        .into_iter()
+        .map(|city| {
+            let client = client.clone();
+            tokio::spawn(async move { client.tools().call("weather", ("city", city)).await })
+        })
+        .collect();
+
+    for call in calls {
+        let result = call.await.map_err(|e| Error::new(ErrorCode::InternalError, e.to_string()))??;
+        println!("{:?}", result.content);
+    }
+    Ok(())
+}
+```
+
+`disconnect(self)` consumes the client, so it needs the `Arc` back
+(`Arc::into_inner`) — or simply drop the last handle.
+
+### Timeouts and cancellation
+
+A request the client stops waiting for is **cancelled** on the server: when it
+outlives `with_timeout` (10 s by default), and when its future is dropped —
+`tokio::time::timeout`, a losing `select!` branch, an aborted task. Over
+Streamable HTTP under 2026-07-28 the client closes the request's stream, which
+*is* the cancellation there, and sends no `notifications/cancelled`; over stdio
+and to a legacy peer it sends the notification. An abandoned `call_batch`
+cancels every request in it; the legacy `initialize` is never cancelled. A late
+answer to a cancelled request is dropped.
+
+So a timeout is not "stop waiting while the server finishes" — the server stops
+too. Raise the timeout for a call that is meant to run long, or make it a
+[task](#tasks).
+
 ## Calling tools
 
 ```rust
@@ -124,13 +193,13 @@ async fn main() -> Result<(), Error> {
     client.connect().await?;
 
     // One argument
-    let result = client.call_tool("greet", ("name", "John")).await?;
+    let result = client.tools().call("greet", ("name", "John")).await?;
 
     // Several
-    let result = client.call_tool("greet", [("name", "John"), ("say", "Hi")]).await?;
+    let result = client.tools().call("greet", [("name", "John"), ("say", "Hi")]).await?;
 
     // None
-    let result = client.call_tool("now", ()).await?;
+    let result = client.tools().call("now", ()).await?;
 
     println!("{:?}", result.content);
     client.disconnect().await
@@ -140,6 +209,11 @@ async fn main() -> Result<(), Error> {
 Arguments accept a `(name, value)` tuple, an array/`Vec` of them, or a
 `HashMap`. Mixed value types need a `HashMap<&str, serde_json::Value>` or
 one call per type.
+
+`client.tools().call_raw(CallToolRequestParams::new(name).with_args(..))`
+returns the raw `Response`, error responses included, and sends the params'
+own `_meta` (a `traceparent`, say) as given — only the progress token is
+replaced by the client's.
 
 ### Structured results
 
@@ -157,7 +231,7 @@ async fn main() -> Result<(), Error> {
     let mut client = Client::new().with_options(|opt| opt.with_default_http());
     client.connect().await?;
 
-    let result = client.call_tool("weather", ("location", "London")).await?;
+    let result = client.tools().call("weather", ("location", "London")).await?;
 
     // Raw structured content
     println!("{:?}", result.struct_content);
@@ -187,11 +261,11 @@ async fn main() -> Result<(), Error> {
     let mut client = Client::new().with_options(|opt| opt.with_default_http());
     client.connect().await?;
 
-    let tools = client.list_tools(None).await?;
+    let tools = client.tools().list(None).await?;
     let tool = tools.get("weather")
         .ok_or_else(|| Error::new(ErrorCode::InvalidParams, "no weather tool"))?;
 
-    let result = client.call_tool(&tool.name, ("location", "London")).await?;
+    let result = client.tools().call(&tool.name, ("location", "London")).await?;
     let weather: Weather = tool.validate(&result).and_then(|res| res.as_json())?;
     println!("{weather:?}");
 
@@ -212,23 +286,25 @@ async fn main() -> Result<(), Error> {
     let mut client = Client::new().with_options(|opt| opt.with_default_http());
     client.connect().await?;
 
-    let tools = client.list_tools(None).await?;
-    let resources = client.list_resources(None).await?;
-    let templates = client.list_resource_templates(None).await?;
-    let prompts = client.list_prompts(None).await?;
+    let tools = client.tools().list_all().await?;
+    let resources = client.resources().list_all().await?;
+    let templates = client.resources().templates(None).await?;
+    let prompts = client.prompts().list_all().await?;
 
-    let resource = client.read_resource("res://config").await?;
+    let resource = client.resources().read("res://config").await?;
     println!("{:?}", resource.contents);
 
-    let prompt = client.get_prompt("greeting", ("name", "Neva")).await?;
+    let prompt = client.prompts().get("greeting", ("name", "Neva")).await?;
     println!("{:?}", prompt.messages);
 
     client.disconnect().await
 }
 ```
 
-The `None` is the pagination cursor. Feed the previous result's
-`next_cursor` back in for the next page:
+`list_all()` walks every page and returns the items together; a server still
+paging after 64 pages is an **error**, not a truncated list. `list(cursor)`
+asks for one page — `None` for the first, the previous result's
+`next_cursor` for the next:
 
 ```rust
 use neva::prelude::*;
@@ -240,7 +316,7 @@ async fn main() -> Result<(), Error> {
 
     let mut cursor = None;
     loop {
-        let page = client.list_resources(cursor).await?;
+        let page = client.resources().list(cursor).await?;
         for res in &page.resources {
             println!("{}", res.name);
         }
@@ -296,7 +372,12 @@ async fn main() -> Result<(), Error> {
 `.notify(method, params)` are fire-and-forget and produce no slot.
 Available builders mirror the single calls: `list_tools`, `call_tool`,
 `list_resources`, `read_resource`, `list_resource_templates`,
-`list_prompts`, `get_prompt`, `notify`.
+`list_prompts`, `get_prompt`, `notify`. These flat names are the batch
+builder's own and are **not** deprecated.
+
+`client.call_batch(envelopes)` is the layer underneath. It numbers every
+request on the wire with ids of its own and puts the caller's ids back on the
+responses, so an id of yours can never collide with one still in flight.
 
 Two constraints: routing headers must not be sent with a batch (neva omits
 them), and `subscriptions/listen` is rejected inside one — use
@@ -370,7 +451,7 @@ Logging and progress need no subscription; they are request-scoped.
 ## Answering the server's input requests
 
 A server can ask the client for input mid-call. The client answers and
-re-issues the call — neva runs that whole loop inside `call_tool`, so the
+re-issues the call — neva runs that whole loop inside `tools().call`, so the
 caller still sees a single call. See `mrtr.md` for the model; the client
 side is one handler plus a capability declaration.
 
@@ -464,6 +545,15 @@ async fn main() -> Result<(), Error> {
 arity across 0.5 → 0.6, but their second generic parameter is now the shape
 marker rather than the handler's future type.
 
+### A sampling handler can fail
+
+Since **0.7.0** `map_sampling` takes a handler returning
+`Result<CreateMessageResult, Error>` as well as a bare `CreateMessageResult`.
+Under 2026-07-28 an `Err` fails the call that asked for the sample; under
+`legacy-spec` it answers the server's request. To answer with a real model,
+`neva::svir::sampling_request` / `sampling_result` do the conversion — see
+`svir.md`.
+
 ### What this client declares, per request
 
 There is no handshake on 2026-07-28, so the client stamps its capabilities
@@ -493,9 +583,10 @@ async fn main() -> Result<(), Error> {
     client.connect().await?;
 
     let result = client
-        .task()
+        .tools()
+        .as_task()
         .with_ttl(10_000)                       // ms; omit for unlimited
-        .call_tool("slow_tool", ("input", "value"))
+        .call("slow_tool", ("input", "value"))
         .await;
 
     println!("{result:?}");
@@ -504,12 +595,14 @@ async fn main() -> Result<(), Error> {
 }
 ```
 
-`call_tool` on the builder drives the `tasks/get` polling loop for you and
+`call` on the builder drives the `tasks/get` polling loop for you and
 resolves to the terminal outcome, so most code never issues the task
-methods directly. `tasks/get` is the single polling method, `tasks/update`
-answers a task's input requests, and `tasks/cancel` acknowledges a
-cancellation request — cancellation is cooperative, so the outcome is
-learned by polling.
+methods directly. When it must — a task id kept across a restart — they are on
+`client.tasks()`: `get(id)` (`tasks/get`, the single polling method),
+`update(id, responses)` (`tasks/update`, answering a task's input requests) and
+`cancel(id)` (`tasks/cancel`, an acknowledgement — cancellation is cooperative,
+so the outcome is learned by polling). A refused `update` or `cancel` is an
+`Err`.
 
 **There is no `tasks/list` and no `Client::list_tasks`.** A task id is a
 durable handle you already hold; enumeration is your job. Task status is
@@ -523,5 +616,5 @@ the spec but not in neva's filter yet.
 | `Client::ping`, `BatchBuilder::ping` | A `#[handler]` under your own method name on the server |
 | `Client::on_elicitation_completed`, `ElicitationCompleteParams` | Answering the request *is* the completion signal |
 | The standalone SSE `GET` stream | `Client::listen(filter)` |
-| `subscribe_to_resource` / `unsubscribe_from_resource` | `SubscriptionFilter::with_resource(uri)`. The methods still compile for the legacy fallback but a 2026-07-28 peer answers `MethodNotFound` |
+| `resources().subscribe(uri)` / `unsubscribe(uri)` | `SubscriptionFilter::with_resource(uri)`. The methods still compile for the legacy fallback but a 2026-07-28 peer answers `MethodNotFound` |
 | `set_log_level` | The client sets a level in the request's `_meta` |
