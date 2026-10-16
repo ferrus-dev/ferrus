@@ -1143,3 +1143,21 @@ fn workspace_lock_applies_across_storage_paths_and_releases_on_setup_failure() {
     provider.finish();
     fixture.assert_unregistered();
 }
+
+#[cfg(unix)]
+#[path = "nano_standalone/terminal.rs"]
+mod terminal;
+
+#[test]
+fn interactive_requires_a_terminal_before_creating_storage() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command("no-terminal")
+        .arg("--interactive")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires terminal input and output"));
+    assert!(!fixture.store.exists());
+    fixture.assert_unregistered();
+}

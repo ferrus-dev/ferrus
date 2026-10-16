@@ -1,8 +1,8 @@
 # Standalone Nano
 
-`ferrus-nano` runs a headless coding session in an explicitly selected directory.
+`ferrus-nano` runs headless requests or an interactive coding conversation in an explicitly selected directory.
 Git and Ferrus registration are optional. It does not start HQ, load a selected spec,
-claim a task, or open/create `ferrus.db`. Interactive standalone UI is tracked in #88.
+claim a task, or open/create `ferrus.db`.
 
 ## Installation and provider settings
 
@@ -59,6 +59,40 @@ Root `AGENTS.md` is loaded automatically; nested guidance and explicit skills us
 same bounded instruction loader as managed Nano. The system policy is standalone:
 there is no `wait_for_task`, `check`, `submit`, consultation, or task-backed human wait.
 Validation commands run through `exec`; they do not issue managed check receipts.
+
+### Interactive conversation
+
+```sh
+ferrus-nano --workspace /absolute/path/to/repository --interactive
+ferrus-nano --workspace /absolute/path/to/repository --interactive --graph \
+  --prompt "Inspect the parser"
+ferrus-nano --workspace /absolute/path/to/repository --interactive --resume PREVIOUS_ID
+```
+
+Interactive mode requires terminal stdin and stdout. An omitted prompt opens an idle
+conversation without reading a headless request from stdin. `--prompt` sends the first
+request automatically. Enter sends text or steering for the next safe engine boundary;
+Alt/Shift-Enter and bracketed paste support multiline requests. Left/Right, Home/End,
+Backspace/Delete edit the draft; Up/Down recall accepted requests. PgUp/PgDn scroll the
+bounded transcript. Resize preserves the prompt and cursor inside terminal geometry.
+
+The view shares HQ's conversation rendering, prompt geometry, and editing primitives.
+It displays tool calls/results, streaming previews, cumulative usage, and input requests.
+Preview text is transient; only successfully appended journal records confirm input.
+The editor retains requests until durable acceptance, including on queue/size failures.
+No HQ slash commands, task questions, or managed lifecycle controls are available.
+
+Ctrl-C, `/cancel`, or `/quit` cancels the session, stops/joins owned processes, and exits
+after the engine records its terminal result. A clean user cancellation exits zero.
+Other terminal outcomes remain visible until exit and return a failure status. The
+terminal screen, cursor, paste handling, and cooked input are restored on normal/error
+exits; a forced process kill cannot run cleanup. Diagnostics during the conversation
+use `<session-directory>/diagnostics.log`, keeping terminal output with the frontend.
+
+`--resume` retains the same standalone recovery policy and cumulative budgets described
+below, shows the bounded prior transcript, and creates a new journal. It never restarts
+old commands. Without `--interactive`, stdout/stderr and one-request behavior stay the
+same; the managed HQ JSONL transport is unchanged.
 
 ### Trusted-local execution
 

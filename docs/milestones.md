@@ -25,7 +25,7 @@ Last reviewed against the repository: 2026-09-07.
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
 | Distributed context data plane | Prototype implemented | Opt-in contracts and local prototype adapters for authorized jobs, encrypted storage, publication, queries, and maintenance. No deployed remote service is implied. |
-| Ferrus nano-agent | Headless Executor, HQ conversations, and standalone host implemented | #73-#87 deliver native tools/context, managed lifecycle/recovery, evaluation tooling, HQ interaction, and `ferrus-nano`. Comparative live validation, standalone UI, and additional roles remain pending. |
+| Ferrus nano-agent | Headless Executor, HQ and standalone conversations implemented | #73-#88 deliver native tools/context, managed lifecycle/recovery, evaluation tooling, HQ interaction, and `ferrus-nano`. Comparative live validation and additional roles remain pending. |
 
 ## Milestone 1: Windows Support
 
@@ -193,7 +193,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | N2: context efficiency | #81, #82, and #85 implemented | Comparative context-quality and cache measurements |
 | N3: reliability and extensions | #83-#85 implemented | Comparative live evaluation |
 | N4: interactive HQ | #86 implemented | Live interactive Executor validation |
-| N5: standalone | #87 implemented; #88 pending | Shared standalone UI |
+| N5: standalone | #87-#88 implemented | Live standalone interactive validation |
 | N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
 
 Definition of done for the first headless release:
@@ -273,7 +273,7 @@ See [project memory](project_memory/project-memory.md), [architecture](project_m
 3. Close real Windows agent-loop validation and support-documentation gaps.
 4. Define task dependency, decomposition, conflict-routing, and partial-failure policies beyond current milestone scheduling.
 5. Improve runtime history, archive inspection/export, and explicit external-backend capability metadata.
-6. Add standalone interactive UI (#88), then additional roles (#89-#90).
+6. Validate standalone interactive UI (#88), then add additional roles (#89-#90).
 7. Evolve the distributed prototype only through explicit deployment and security/operational acceptance gates.
 
 ## Non-goals for now

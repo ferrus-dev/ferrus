@@ -19,3 +19,6 @@ mod platform;
 
 #[cfg(feature = "nano-openai")]
 mod user_paths;
+
+#[cfg(feature = "nano-openai")]
+mod shared;

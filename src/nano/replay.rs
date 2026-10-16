@@ -37,6 +37,7 @@ pub(crate) struct Replay {
     latest_steering: Option<usize>,
     interactive: bool,
     taskless: bool,
+    initial_model_turns: u64,
     submitted: bool,
     calls: VecDeque<ToolCall>,
 }
@@ -172,6 +173,7 @@ impl Replay {
                     "Duplicate or charged session start"
                 );
                 limits.validate()?;
+                self.initial_model_turns = after.model_turns;
                 ensure!(
                     input
                         .len()
@@ -253,7 +255,7 @@ impl Replay {
                 self.interactive = true;
             }
             SessionEvent::InputRequested => {
-                let initial = self.taskless && self.budget.model_turns == 0;
+                let initial = self.taskless && self.budget.model_turns == self.initial_model_turns;
                 ensure!(
                     self.checkpoint_ready()
                         && (self.final_response_ready || initial)

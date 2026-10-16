@@ -107,6 +107,9 @@ jobs:
       - name: Test Nano unit suite
         run: "cargo test --locked --features nano-openai,nano-mcp --bin ferrus nano::"
 
+      - name: Test standalone conversation state
+        run: cargo test --locked --features nano-openai,nano-mcp --lib nano::standalone::frontend
+
       - name: Test Nano headless and standalone integration
         run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless --test nano_standalone
 

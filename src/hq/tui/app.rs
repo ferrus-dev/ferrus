@@ -165,9 +165,7 @@ impl App {
             self.answering_question_task_id = self.question_task_id.clone();
             self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
-        let idx = byte_index_for_char(&self.input, self.cursor_pos);
-        self.input.insert(idx, ch);
-        self.cursor_pos += 1;
+        crate::shared::input::insert(&mut self.input, &mut self.cursor_pos, ch);
         self.history_idx = None;
         self.update_command_context();
     }
@@ -180,9 +178,7 @@ impl App {
             self.answering_question_task_id = self.question_task_id.clone();
             self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
-        let idx = byte_index_for_char(&self.input, self.cursor_pos);
-        self.input.insert(idx, '\n');
-        self.cursor_pos += 1;
+        crate::shared::input::insert(&mut self.input, &mut self.cursor_pos, '\n');
         self.history_idx = None;
         self.update_command_context();
     }
@@ -207,10 +203,7 @@ impl App {
         if self.cursor_pos == 0 {
             return;
         }
-        let end = byte_index_for_char(&self.input, self.cursor_pos);
-        let start = byte_index_for_char(&self.input, self.cursor_pos - 1);
-        self.input.replace_range(start..end, "");
-        self.cursor_pos -= 1;
+        crate::shared::input::delete(&mut self.input, &mut self.cursor_pos, true);
         if self.input.is_empty() {
             self.answering_question_task_id = None;
             self.answering_nano_run_id = None;
@@ -223,9 +216,7 @@ impl App {
         if self.cursor_pos >= self.input.chars().count() {
             return;
         }
-        let start = byte_index_for_char(&self.input, self.cursor_pos);
-        let end = byte_index_for_char(&self.input, self.cursor_pos + 1);
-        self.input.replace_range(start..end, "");
+        crate::shared::input::delete(&mut self.input, &mut self.cursor_pos, false);
         if self.input.is_empty() {
             self.answering_question_task_id = None;
             self.answering_nano_run_id = None;
