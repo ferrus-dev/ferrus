@@ -221,6 +221,7 @@ pub(crate) enum LimitKind {
 #[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
 pub(crate) enum EndReason {
     ModelFinished,
+    DefinitionCompleted,
     Submitted,
     TaskFailed,
     Paused,

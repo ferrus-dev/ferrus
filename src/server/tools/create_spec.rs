@@ -30,7 +30,7 @@ pub async fn handler(markdown: String) -> Result<String, Error> {
     run(markdown).await.map_err(tool_err)
 }
 
-async fn run(markdown: String) -> Result<String> {
+pub(crate) async fn run(markdown: String) -> Result<String> {
     project::clear_last_spec_path().await?;
 
     if markdown.trim().is_empty() {

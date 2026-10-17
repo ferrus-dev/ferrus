@@ -106,6 +106,24 @@ impl Terminal {
     fn send(&mut self, text: &[u8]) {
         self.master.write_all(text).unwrap();
     }
+    fn wait_for_display(&mut self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            self.drain();
+            if String::from_utf8_lossy(&self.output).contains(expected) {
+                return;
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "Nano exited before rendering {expected:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "Nano did not render {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn wait_for(&mut self, fixture: &Fixture, id: &str, predicate: impl Fn(&[Value]) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -223,8 +241,8 @@ fn terminal_conversation_steers_runs_tools_cancels_and_resumes_without_registrat
         waiting_after(records, 0)
     });
     // Resumed context is visible before the first new request.
-    terminal.drain();
-    assert!(String::from_utf8_lossy(&terminal.output).contains("Second answer"));
+    // A durable record can precede its asynchronous terminal redraw.
+    terminal.wait_for_display("Second answer");
     terminal.send(b"Continue\r");
     terminal.wait_for(&fixture, "terminal-resume", |records| {
         waiting_after(records, 1)
@@ -305,4 +323,206 @@ fn terminal_provider_failure_restores_modes_and_returns_nonzero() {
     terminal.finish_status(false);
     provider.finish();
     fixture.assert_unregistered();
+}
+
+fn supervisor_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    success(
+        Command::new(env!("CARGO_BIN_EXE_ferrus"))
+            .current_dir(&fixture.root)
+            .env("HOME", &fixture.home)
+            .env("USERPROFILE", &fixture.home)
+            .arg("init"),
+    );
+    let local: toml::Value =
+        toml::from_str(&fs::read_to_string(fixture.root.join(".ferrus/project.toml")).unwrap())
+            .unwrap();
+    fixture.store = PathBuf::from(local["data_dir"].as_str().unwrap());
+    fixture
+}
+fn supervisor_command(fixture: &Fixture, mode: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferrus"));
+    command
+        .current_dir(&fixture.root)
+        .env("HOME", &fixture.home)
+        .env("USERPROFILE", &fixture.home)
+        .env("FERRUS_AGENT_ID", "supervisor:nano:1");
+    for key in [
+        "FERRUS_TASK_ID",
+        "FERRUS_RUN_ID",
+        "FERRUS_BASELINE_TREE",
+        "FERRUS_SUPERVISOR_MODE",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .args(["nano", "supervisor", "--mode", mode, "--config"])
+        .arg(&fixture.config)
+        .args(["--prompt", "Draft the requested approved change"]);
+    command
+}
+fn supervisor_run(fixture: &Fixture) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(db) = rusqlite::Connection::open(fixture.store.join("ferrus.db"))
+            && let Ok(id) = db.query_row(
+                "SELECT id FROM runs WHERE role='supervisor' ORDER BY started_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Supervisor did not persist its run"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+impl Terminal {
+    fn approval_code(&mut self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.drain();
+            let text = String::from_utf8_lossy(&self.output);
+            if let Some((_, tail)) = text.rsplit_once("Type approve ") {
+                let code: String = tail.chars().take(8).collect();
+                if code.len() == 8 && code.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return code;
+                }
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "Supervisor exited before requesting approval: {text}"
+            );
+            assert!(Instant::now() < deadline, "No approval prompt: {text}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+#[test]
+fn native_supervisor_requires_human_approval_then_returns_to_hq_after_authoring() {
+    for (mode, name, arguments) in [
+        (
+            "task",
+            "enqueue_task",
+            json!({"input":{"description":"Implement the approved task"}}),
+        ),
+        (
+            "spec",
+            "create_spec",
+            json!({"markdown":"# Approved feature\n\n## Milestones\n\n- [ ] #1.0 Implement feature\n  - ID: m1.0\n  - Depends on: none\n"}),
+        ),
+    ] {
+        let fixture = supervisor_fixture();
+        let provider = Provider::new(vec![calls(&[(name, arguments)])]);
+        fixture.configure(&provider.url, "");
+        let mut terminal = Terminal::start(&mut supervisor_command(&fixture, mode));
+        let run = supervisor_run(&fixture);
+        let code = terminal.approval_code();
+        let records = fixture.records(&run);
+        assert!(
+            records
+                .iter()
+                .any(|record| record["event"]["event"] == "tool_intent")
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["event"]["event"] == "tool_started")
+        );
+        let db = rusqlite::Connection::open(fixture.store.join("ferrus.db")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id != 'current'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        terminal.send(format!("approve {code}\r").as_bytes());
+        terminal.finish();
+        let requests = provider.finish();
+        assert_eq!(requests.len(), 1);
+        let tools: Vec<_> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(tools.contains(&name));
+        assert!(
+            !tools.contains(&"apply_patch")
+                && !tools.contains(&"exec")
+                && !tools.contains(&"submit")
+        );
+        let records = fixture.records(&run);
+        assert_eq!(
+            records.last().unwrap()["event"]["reason"]["reason"],
+            "definition_completed"
+        );
+        assert_eq!(
+            db.query_row("SELECT status FROM runs WHERE id=?1", [&run], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "completed"
+        );
+        if mode == "task" {
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id != 'current' AND status='pending'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        } else {
+            let files = fs::read_dir(fixture.root.join("docs/specs"))
+                .unwrap()
+                .count();
+            assert_eq!(files, 1);
+        }
+    }
+}
+
+#[test]
+fn declining_native_supervisor_approval_creates_no_task() {
+    let fixture = supervisor_fixture();
+    let provider = Provider::new(vec![
+        calls(&[(
+            "enqueue_task",
+            json!({"input":{"description":"Do not create without approval"}}),
+        )]),
+        answer("The draft was declined."),
+    ]);
+    fixture.configure(&provider.url, "");
+    let mut terminal = Terminal::start(&mut supervisor_command(&fixture, "task"));
+    let run = supervisor_run(&fixture);
+    terminal.approval_code();
+    terminal.send(b"reject\r");
+    terminal.wait_for(&fixture, &run, |records| waiting_after(records, 2));
+    terminal.send(b"\x03");
+    terminal.finish();
+    provider.finish();
+    let db = rusqlite::Connection::open(fixture.store.join("ferrus.db")).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id != 'current'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let records = fixture.records(&run);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"]["event"] == "tool_started")
+    );
 }

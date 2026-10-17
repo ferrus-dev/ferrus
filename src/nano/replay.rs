@@ -39,6 +39,7 @@ pub(crate) struct Replay {
     taskless: bool,
     initial_model_turns: u64,
     submitted: bool,
+    definition_completed: bool,
     calls: VecDeque<ToolCall>,
 }
 
@@ -390,6 +391,12 @@ impl Replay {
                 let call = self.calls.pop_front().expect("intent checked call queue");
                 self.submitted = call.name == "submit"
                     && matches!(outcome, ToolOutcome::Success(value) if value["status"] == "submitted" && value["task_state"] == "reviewing");
+                self.definition_completed = self.taskless
+                    && matches!(
+                        call.name.as_str(),
+                        "enqueue_task" | "create_spec" | "archive_spec"
+                    )
+                    && matches!(outcome, ToolOutcome::Success(value) if value["status"] == "definition_saved");
                 self.messages.push(Message::Tool {
                     provider_call_id: call.provider_call_id,
                     outcome: outcome.clone(),
@@ -402,6 +409,15 @@ impl Replay {
                 self.effect_started = false;
             }
             SessionEvent::Ended { reason } => {
+                if *reason == EndReason::DefinitionCompleted {
+                    ensure!(
+                        self.definition_completed
+                            && self.taskless
+                            && self.pending_effect.is_none()
+                            && !self.model_active,
+                        "Definition finish requires a confirmed taskless authoring operation"
+                    );
+                }
                 if *reason == EndReason::Submitted {
                     ensure!(
                         self.submitted && self.pending_effect.is_none() && !self.model_active,

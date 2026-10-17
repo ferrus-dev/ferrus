@@ -1,7 +1,8 @@
 # Nano headless launch and HQ events
 
 Status: Nano supports headless managed Executors and [interactive HQ](ferrus-nano-interactive.md)
-workspace conversations. Supervisor support and standalone packaging are deferred. Live crash
+workspace conversations, [Supervisor authoring](ferrus-nano-supervisor.md), and a
+[standalone host](ferrus-nano-standalone.md). Live crash
 recovery and reconciliation are implemented for #84.
 The process lifecycle is tested with a local mock API; live LM Studio validation remains opt-in.
 
@@ -73,7 +74,9 @@ an override, Nano uses the model in its provider file. HQ displays the same sele
 `ferrus nano --version` reports the bundled Ferrus version without loading provider settings.
 
 Use the ordinary HQ task/run workflow. `/executor` opens the native
-[conversation](ferrus-nano-interactive.md); Supervisor selection remains unsupported. A build without `nano-openai` reports the missing feature before task setup.
+[conversation](ferrus-nano-interactive.md). Supervisor selection supports taskless planning,
+task definition, specification, and archive profiles; Reviewer and Consultant remain unsupported.
+A build without `nano-openai` reports the missing feature before task setup.
 HQ checks launch configuration before preparing a worktree or consuming a dispatch attempt.
 
 ## Process protocol

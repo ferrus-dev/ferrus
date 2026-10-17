@@ -349,7 +349,7 @@ fn strip_date_prefix(stem: &str) -> Option<&str> {
     }
 }
 
-fn parse_milestone_header(line: &str) -> Option<(bool, &str, &str)> {
+pub(crate) fn parse_milestone_header(line: &str) -> Option<(bool, &str, &str)> {
     let trimmed = line.trim_start();
     let rest = trimmed.strip_prefix("- [")?;
     let (mark, rest) = rest.split_once("] ")?;

@@ -46,7 +46,7 @@ pub async fn handler(input: Json<ArchiveSpecInput>) -> Result<String, Error> {
     run(input.spec_path, input.outcome).await.map_err(tool_err)
 }
 
-async fn run(spec_path: String, outcome: String) -> Result<String> {
+pub(crate) async fn run(spec_path: String, outcome: String) -> Result<String> {
     let result = project::archive_completed_spec(&spec_path, &outcome).await?;
     Ok(complete_after_archive(
         result,

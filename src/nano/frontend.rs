@@ -1,6 +1,6 @@
-//! Standalone terminal composition. Commands and durable records use the core protocol.
+//! Native terminal composition. Commands and durable records use the core protocol.
 
-use super::super::{
+use super::{
     conversation::{Snapshot, display_text},
     journal::{FileJournal, Journal},
     session::*,
@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
-pub(super) fn require_terminal() -> Result<()> {
+pub(crate) fn require_terminal() -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "--interactive requires terminal input and output; omit it for a headless request"
@@ -36,7 +36,7 @@ pub(super) fn require_terminal() -> Result<()> {
 }
 
 /// Display updates follow successful durable appends; a slow renderer cannot block persistence.
-pub(super) struct DisplayJournal {
+pub(crate) struct DisplayJournal {
     pub inner: FileJournal,
     snapshots: watch::Sender<Option<Snapshot>>,
     events: watch::Sender<wire::ObservedEvents>,
@@ -85,7 +85,7 @@ impl Journal for DisplayJournal {
     }
 }
 
-pub(super) fn session(
+pub(crate) fn session(
     journal: FileJournal,
     session_id: &str,
     interactive: bool,
@@ -126,11 +126,25 @@ pub(super) fn session(
             saved: String::new(),
             error: None,
             quitting: false,
+            approvals: None,
+            approval: None,
+            approval_text: String::new(),
+            approval_scroll: 0,
+            exit_on_end: false,
         },
     )
 }
 
-pub(super) struct Frontend {
+/// A one-shot host request bound to immutable tool arguments. Only the terminal
+/// frontend owns its reply; model text and steering are never approval commands.
+pub(crate) struct Approval {
+    pub id: String,
+    pub tool: String,
+    pub content: String,
+    pub reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+pub(crate) struct Frontend {
     view: Conversation,
     sender: mpsc::Sender<SessionCommand>,
     text: String,
@@ -141,8 +155,122 @@ pub(super) struct Frontend {
     saved: String,
     error: Option<String>,
     quitting: bool,
+    approvals: Option<mpsc::Receiver<Approval>>,
+    approval: Option<Approval>,
+    approval_text: String,
+    approval_scroll: usize,
+    exit_on_end: bool,
 }
 impl Frontend {
+    pub(crate) fn authoring(mut self, approvals: mpsc::Receiver<Approval>) -> Self {
+        self.approvals = Some(approvals);
+        self.exit_on_end = true;
+        self
+    }
+    fn receive_approval(&mut self) -> bool {
+        if self.approval.is_some() {
+            return false;
+        }
+        if let Some(approval) = self.approvals.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.approval = Some(approval);
+            self.approval_text.clear();
+            self.approval_scroll = 0;
+            self.error = None;
+            return true;
+        }
+        false
+    }
+    fn approval_event(&mut self, event: Event, stop: &Cancellation) {
+        match event {
+            Event::Paste(text) => {
+                let remaining = 64usize.saturating_sub(self.approval_text.len());
+                self.approval_text.extend(
+                    text.chars()
+                        .filter(|ch| ch.is_ascii_graphic() || *ch == ' ')
+                        .take(remaining),
+                );
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
+            {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.quit(stop),
+                (KeyCode::PageUp, _) => {
+                    self.approval_scroll = self.approval_scroll.saturating_sub(10)
+                }
+                (KeyCode::PageDown, _) => {
+                    self.approval_scroll = self.approval_scroll.saturating_add(10)
+                }
+                (KeyCode::Backspace, _) => {
+                    self.approval_text.pop();
+                }
+                (KeyCode::Esc, _) => {
+                    if let Some(request) = self.approval.take() {
+                        let _ = request.reply.send(false);
+                    }
+                }
+                (KeyCode::Enter, _) => {
+                    let approved = self.approval.as_ref().is_some_and(|request| {
+                        self.approval_text.trim() == format!("approve {}", request.id)
+                    });
+                    if approved || self.approval_text.trim() == "reject" {
+                        if let Some(request) = self.approval.take() {
+                            let _ = request.reply.send(approved);
+                        }
+                        self.approval_text.clear();
+                        self.error = None;
+                    } else {
+                        self.error = Some("Type the displayed approval code or reject.".into());
+                    }
+                }
+                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                    if (ch.is_ascii_graphic() || ch == ' ') && self.approval_text.len() < 64 =>
+                {
+                    self.approval_text.push(ch);
+                }
+                _ => (),
+            },
+            _ => (),
+        }
+    }
+    fn approval_rows(&self, width: usize, height: usize) -> (Vec<(String, Color)>, (u16, u16)) {
+        let request = self.approval.as_ref().unwrap();
+        let mut rows = vec![(format!("Human approval: {}", request.tool), Color::Yellow)];
+        let content = conversation::wrap(&request.content, width);
+        let available = height.saturating_sub(3);
+        let start = self
+            .approval_scroll
+            .min(content.len().saturating_sub(available));
+        rows.extend(
+            content
+                .iter()
+                .skip(start)
+                .take(available)
+                .cloned()
+                .map(|line| (line, Color::Grey)),
+        );
+        rows.resize(height.saturating_sub(2), (String::new(), Color::Grey));
+        rows.push((
+            self.error.clone().unwrap_or_else(|| {
+                format!(
+                    "Type approve {} or reject. PgUp/PgDn reviews; Esc declines.",
+                    request.id
+                )
+            }),
+            Color::Yellow,
+        ));
+        rows.push((format!("> {}", self.approval_text), Color::White));
+        rows.truncate(height);
+        for (text, _) in &mut rows {
+            *text = text.chars().take(width).collect();
+        }
+        (
+            rows,
+            (
+                (height - 1) as u16,
+                (2 + self.approval_text.len()).min(width - 1) as u16,
+            ),
+        )
+    }
+
     fn submit(&mut self) {
         if self.pending.is_some() || self.text.trim().is_empty() {
             return;
@@ -242,6 +370,11 @@ impl Frontend {
         // A receipt can arrive while EventStream is asleep. Settle it before
         // editing, so the next draft cannot be appended to already accepted text.
         self.poll();
+        self.receive_approval();
+        if self.approval.is_some() {
+            self.approval_event(event, stop);
+            return;
+        }
         match event {
             Event::Paste(text) => self.insert(&text),
             Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
@@ -279,7 +412,7 @@ impl Frontend {
         stop.cancel();
     }
 
-    pub(super) async fn run(
+    pub(crate) async fn run(
         mut self,
         stop: &Cancellation,
         mut done: watch::Receiver<bool>,
@@ -301,6 +434,7 @@ impl Frontend {
         let mut dirty = true;
         loop {
             dirty |= self.poll();
+            dirty |= self.receive_approval();
             if initial && self.view.snapshot.status == "Waiting for your input" {
                 initial = false;
                 self.submit();
@@ -312,7 +446,7 @@ impl Frontend {
                     "Session stopped; inspect the journal and diagnostics".into();
                 dirty = true;
             }
-            if self.quitting && *done.borrow() {
+            if (self.quitting || self.exit_on_end) && *done.borrow() {
                 _terminal.finish()?;
                 return Ok(());
             }
@@ -352,6 +486,9 @@ impl Frontend {
         Ok(())
     }
     fn rows(&self, width: usize, height: usize) -> (Vec<(String, Color)>, (u16, u16)) {
+        if self.approval.is_some() {
+            return self.approval_rows(width, height);
+        }
         let prompt = input::prompt(
             &display_text(&self.text, wire::FRAME_BYTES),
             self.cursor,
@@ -416,7 +553,7 @@ impl Frontend {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::journal::Quotas;
+    use super::super::journal::Quotas;
     use super::*;
 
     fn frontend() -> (tempfile::TempDir, DisplayJournal, Frontend) {
@@ -571,5 +708,108 @@ mod tests {
                 .is_err()
         );
         assert!(journal.snapshots.borrow().is_none());
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    #[tokio::test]
+    async fn approval_requires_the_current_code_and_never_uses_queued_steering() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FileJournal::create(
+            &temp.path().canonicalize().unwrap(),
+            "approval-ui",
+            super::super::journal::Quotas::default(),
+        )
+        .unwrap();
+        let (_journal, ui) = session(journal, "approval-ui", true, None, None);
+        let (tx, rx) = mpsc::channel(1);
+        let mut ui = ui.authoring(rx);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        tx.send(Approval {
+            id: "0123abcd".into(),
+            tool: "create_spec".into(),
+            content: "Full final specification\nNo omitted content".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        let stop = Cancellation::default();
+        ui.sender
+            .try_send(SessionCommand::Steer {
+                text: "approve 0123abcd".into(),
+                input_id: None,
+            })
+            .unwrap();
+        assert!(ui.receive_approval());
+        assert!(result.try_recv().is_err());
+        for text in ["y", "approve deadbeef"] {
+            ui.approval_text = text.into();
+            ui.event(
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )),
+                &stop,
+                80,
+            );
+            assert!(result.try_recv().is_err());
+            assert!(ui.approval.is_some());
+        }
+        for width in [1, 2, 8, 80] {
+            for height in [1, 3, 24] {
+                let (rows, (row, col)) = ui.rows(width, height);
+                assert!(rows.len() <= height);
+                assert!(rows.iter().all(|(text, _)| text.chars().count() <= width));
+                assert!((row as usize) < height && (col as usize) < width);
+            }
+        }
+        ui.approval_text.clear();
+        ui.event(Event::Paste("approve 0123abcd\n".into()), &stop, 80);
+        assert!(result.try_recv().is_err());
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            &stop,
+            80,
+        );
+        assert!(result.await.unwrap());
+        assert!(ui.approval.is_none());
+    }
+    #[tokio::test]
+    async fn escape_declines_without_altering_the_normal_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FileJournal::create(
+            &temp.path().canonicalize().unwrap(),
+            "decline-ui",
+            super::super::journal::Quotas::default(),
+        )
+        .unwrap();
+        let (_, mut ui) = session(journal, "decline-ui", true, None, None);
+        ui.insert("Unsent user draft");
+        let (tx, rx) = mpsc::channel(1);
+        ui = ui.authoring(rx);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        tx.send(Approval {
+            id: "abcd0123".into(),
+            tool: "archive_spec".into(),
+            content: "Approved Outcome draft".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+            &Cancellation::default(),
+            80,
+        );
+        assert!(!result.await.unwrap());
+        assert_eq!(ui.text, "Unsent user draft");
     }
 }

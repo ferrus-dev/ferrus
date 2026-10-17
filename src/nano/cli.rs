@@ -5,6 +5,19 @@ use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum Command {
+    /// Run a taskless native Supervisor conversation in the selected HQ profile
+    Supervisor {
+        #[arg(long, value_enum)]
+        mode: crate::agents::DefinitionMode,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        task_count: usize,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Summarize a pinned, opt-in headless evaluation manifest without inference
     Eval {
         /// JSON manifest with attempts and authoritative Ferrus database paths
@@ -61,6 +74,29 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         interactive,
         taskless,
     ) = match command {
+        Command::Supervisor {
+            mode,
+            prompt,
+            task_count,
+            config,
+            model,
+        } => {
+            super::agent::validate_config(config.as_deref(), model.as_deref())?;
+            #[cfg(feature = "nano-openai")]
+            return Box::pin(super::supervisor::launch(
+                mode,
+                prompt,
+                task_count,
+                super::agent::config_path(config.as_deref())?,
+                model,
+            ))
+            .await;
+            #[cfg(not(feature = "nano-openai"))]
+            {
+                let _ = (mode, prompt, task_count, config, model);
+                unreachable!("feature validated above");
+            }
+        }
         Command::Eval { manifest } => return super::eval::report(&manifest),
         Command::Run {
             interactive,

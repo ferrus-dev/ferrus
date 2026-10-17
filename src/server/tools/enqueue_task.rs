@@ -52,7 +52,7 @@ pub struct EnqueueTaskInput {
     milestone_id: Option<String>,
 }
 
-async fn run(
+pub(crate) async fn run(
     description: String,
     spec_path: Option<String>,
     milestone_id: Option<String>,

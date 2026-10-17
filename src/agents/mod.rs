@@ -87,11 +87,42 @@ pub struct ExecutorCapabilities {
     pub event_output: bool,
 }
 
+/// Taskless authoring profiles; task-scoped review and consultation are separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DefinitionMode {
+    Plan,
+    Task,
+    Spec,
+    Archive,
+}
+impl DefinitionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Task => "task",
+            Self::Spec => "spec",
+            Self::Archive => "archive",
+        }
+    }
+}
+
 /// Behavior required from a supervisor-capable agent implementation.
 ///
 /// Supervisor agents support both interactive sessions for humans and
 /// headless sessions for HQ-managed workflows.
 pub trait SupervisorAgent: Send + Sync {
+    fn native_definition(&self) -> bool {
+        false
+    }
+    fn spawn_definition(
+        &self,
+        _profile: DefinitionMode,
+        prompt: Option<&str>,
+        _task_count: usize,
+    ) -> Result<Command> {
+        self.spawn(AgentRunMode::Interactive { prompt })
+    }
+
     /// Returns the stable configuration name for this agent backend.
     fn name(&self) -> &'static str;
 
@@ -252,7 +283,7 @@ pub fn parse_supervisor_agent(
     model: Option<&str>,
 ) -> Result<Arc<dyn SupervisorAgent>> {
     match agent_type {
-        "nano" => bail!("Nano supports the Executor role only"),
+        "nano" => Ok(Arc::new(crate::nano::agent::Supervisor::new(model))),
         claude::NAME => Ok(Arc::new(claude::Supervisor::new(
             model,
             crate::config::load_claude_mcp_isolation(),
@@ -262,7 +293,7 @@ pub fn parse_supervisor_agent(
         opencode::NAME => Ok(Arc::new(opencode::Supervisor::new(model))),
         qwen::NAME => Ok(Arc::new(qwen::Supervisor::new(model))),
         other => bail!(
-            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\"."
+            "Unknown supervisor agent '{other}'. Supported values: \"claude-code\", \"codex\", \"goose\", \"opencode\", \"qwen-code\", \"nano\"."
         ),
     }
 }

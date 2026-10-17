@@ -1104,13 +1104,6 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
         &settings,
         "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'local-model'\n",
     );
-    let unsupported = ferrus(&f.root)
-        .args(["register", "--supervisor", "nano"])
-        .env("FERRUS_NANO_CONFIG", &settings)
-        .output()
-        .unwrap();
-    assert!(!unsupported.status.success());
-    assert_eq!(fs::read(f.root.join("ferrus.toml")).unwrap(), before);
     let invalid = ferrus(&f.root)
         .args(["register", "--executor", "nano"])
         .env("FERRUS_NANO_CONFIG", f.data.join("missing.toml"))
@@ -1129,8 +1122,32 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
             ])
             .env("FERRUS_NANO_CONFIG", &settings),
     );
+    success(
+        ferrus(&f.root)
+            .args([
+                "register",
+                "--supervisor",
+                "nano",
+                "--supervisor-model",
+                "supervisor-model",
+            ])
+            .env("FERRUS_NANO_CONFIG", &settings),
+    );
     let config: toml::Value =
         toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(config["hq"]["supervisor"]["agent"].as_str(), Some("nano"));
+    assert_eq!(
+        config["hq"]["supervisor"]["model"].as_str(),
+        Some("supervisor-model")
+    );
+    success(
+        ferrus(&f.root)
+            .args(["register", "--supervisor", "nano"])
+            .env("FERRUS_NANO_CONFIG", &settings),
+    );
+    let updated: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+    assert_eq!(updated["hq"]["supervisor"]["model"].as_str(), Some(""));
     assert_eq!(config["hq"]["executor"]["agent"].as_str(), Some("nano"));
     assert_eq!(config["hq"]["executor"]["model"].as_str(), Some("override"));
     success(
@@ -1250,6 +1267,48 @@ fn native_registration_provisions_default_local_provider_once() {
         toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
     assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
     assert_eq!(fs::read_to_string(&settings).unwrap(), changed_settings);
+}
+
+#[cfg(unix)]
+#[test]
+fn registering_both_native_roles_shares_the_bootstrap_model_but_preserves_overrides() {
+    for supervisor_model in [None, Some("supervisor-model")] {
+        let f = Fixture::new();
+        let home = f.data.join("home");
+        fs::create_dir(&home).unwrap();
+        let mut command = ferrus(&f.root);
+        command.args([
+            "register",
+            "--supervisor",
+            "nano",
+            "--executor",
+            "nano",
+            "--executor-model",
+            "executor-model",
+        ]);
+        if let Some(model) = supervisor_model {
+            command.args(["--supervisor-model", model]);
+        }
+        success(command.env_remove("FERRUS_NANO_CONFIG").env("HOME", &home));
+        let settings: toml::Value =
+            toml::from_str(&fs::read_to_string(home.join(".ferrus/nano.toml")).unwrap()).unwrap();
+        assert_eq!(
+            settings["model"].as_str(),
+            Some(supervisor_model.unwrap_or("executor-model"))
+        );
+        let config: toml::Value =
+            toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
+        assert_eq!(config["hq"]["supervisor"]["agent"].as_str(), Some("nano"));
+        assert_eq!(config["hq"]["supervisor"]["model"].as_str(), Some(""));
+        assert_eq!(
+            config["hq"]["executor"]["model"].as_str(),
+            Some(if supervisor_model.is_some() {
+                "executor-model"
+            } else {
+                ""
+            })
+        );
+    }
 }
 
 #[test]

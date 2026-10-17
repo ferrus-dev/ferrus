@@ -12,6 +12,8 @@ mod context_request;
 pub(crate) mod conversation;
 mod descriptors;
 mod effect_recovery;
+#[cfg(feature = "nano-openai")]
+mod frontend;
 pub(crate) mod instructions;
 #[cfg(feature = "nano-openai")]
 mod interactive;
@@ -23,6 +25,8 @@ pub(crate) mod native;
 mod private;
 mod refresh;
 mod resume;
+#[cfg(feature = "nano-openai")]
+mod supervisor;
 pub(crate) mod wire;
 
 #[cfg(feature = "nano-openai")]
