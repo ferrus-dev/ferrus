@@ -989,7 +989,12 @@ async fn replay_rejects_authoring_and_submit_ends_without_confirmed_effects() {
     let (_directory, mut engine) =
         setup(scripted(vec![response("done", vec![])]), Limits::default());
     run(&mut engine, &Cancellation::default()).await;
-    for reason in [EndReason::Submitted, EndReason::DefinitionCompleted] {
+    for reason in [
+        EndReason::Submitted,
+        EndReason::DefinitionCompleted,
+        EndReason::ReviewCompleted,
+        EndReason::ConsultationResponded,
+    ] {
         let mut records = engine.host.records.clone();
         records.last_mut().unwrap().event = SessionEvent::Ended { reason };
         assert!(Replay::from_records(&records).is_err());

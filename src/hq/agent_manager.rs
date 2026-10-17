@@ -708,7 +708,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     )
     .await;
     if (native || executor_reservation.is_some()) && db_run_id.is_none() {
-        anyhow::bail!("Executor requires a persisted run before start");
+        anyhow::bail!("Native agent requires a persisted run before start");
     }
     let mut output_threads = Vec::new();
     let setup = async {

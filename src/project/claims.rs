@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Host-owned authority for one managed Executor run. Never deserialize tool arguments into this.
+/// Host-owned exact-run fence shared by native task-scoped agents. Never deserialize tool arguments into this.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutorSessionScope {
     pub database_path: PathBuf,
@@ -116,6 +116,35 @@ where
         + Send
         + 'static,
 {
+    with_role_session(scope, write, "executor", operation).await
+}
+
+pub(crate) async fn with_supervisor_session<T, F>(
+    scope: &ExecutorSessionScope,
+    write: bool,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Transaction<'_>, &ExecutorSessionScope, RuntimeTaskContext) -> Result<T>
+        + Send
+        + 'static,
+{
+    with_role_session(scope, write, "supervisor", operation).await
+}
+
+async fn with_role_session<T, F>(
+    scope: &ExecutorSessionScope,
+    write: bool,
+    role: &'static str,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Transaction<'_>, &ExecutorSessionScope, RuntimeTaskContext) -> Result<T>
+        + Send
+        + 'static,
+{
     let scope = scope.clone();
     tokio::task::spawn_blocking(move || {
         let flags = if write {
@@ -138,7 +167,7 @@ where
             runtime_schema_version(&transaction)? == RUNTIME_SCHEMA_VERSION,
             "Managed session requires the current runtime schema"
         );
-        let context = executor_context_in_transaction(&transaction, &scope)?;
+        let context = executor_context_in_transaction(&transaction, &scope, role)?;
         let result = operation(&transaction, &scope, context)?;
         transaction.commit()?;
         Ok(result)
@@ -179,6 +208,7 @@ pub(crate) fn executor_event(
 fn executor_context_in_transaction(
     transaction: &Transaction<'_>,
     scope: &ExecutorSessionScope,
+    role: &str,
 ) -> Result<RuntimeTaskContext> {
     let run = transaction
         .query_row(
@@ -198,10 +228,7 @@ fn executor_context_in_transaction(
         .context("Bound run is missing")?;
     anyhow::ensure!(run.0 == scope.task_id, "Run task binding mismatch");
     anyhow::ensure!(run.1 == scope.agent_id, "Run agent binding mismatch");
-    anyhow::ensure!(
-        run.2 == crate::agent_id::ROLE_EXECUTOR,
-        "Run role must be executor"
-    );
+    anyhow::ensure!(run.2 == role, "Run role mismatch");
     anyhow::ensure!(
         matches!(run.3.as_str(), "running" | "checking"),
         "Bound run is no longer active"
@@ -210,7 +237,7 @@ fn executor_context_in_transaction(
         Path::new(&run.4).is_absolute() && std::fs::canonicalize(&run.4)? == scope.workspace_path,
         "Run workspace binding mismatch"
     );
-    transaction
+    let mut context = transaction
         .query_row(
             "SELECT path, spec_path, milestone_id, status, paused_status, check_retries,
                 review_cycles, failure_reason, baseline_snapshot_id, overlay_revision_id,
@@ -239,7 +266,13 @@ fn executor_context_in_transaction(
             },
         )
         .optional()?
-        .context("Bound task is missing")
+        .context("Bound task is missing")?;
+    if role == "supervisor" && matches!(context.status.as_str(), "reviewing" | "awaiting_human") {
+        context.repository_view = transaction.query_row(
+            "SELECT baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id, repository_view_tree_algorithm, repository_view_tree_digest, repository_view_lifecycle, repository_view_status FROM runs WHERE id = ?1",
+            [&scope.run_id], |row| graph::repository_view_reference_from_row(row, 0))?;
+    }
+    Ok(context)
 }
 
 pub async fn claim_task(
@@ -945,4 +978,55 @@ pub(super) fn default_task_path_for_id(task_id: &str) -> String {
     } else {
         format!(".ferrus/tasks/{task_id}.md")
     }
+}
+
+/// Claim/attach only the exact native Supervisor run. Consultants never own the Executor lease.
+pub(crate) async fn start_supervisor_session(
+    scope: &ExecutorSessionScope,
+    reviewer: bool,
+    ttl: u64,
+) -> Result<()> {
+    with_supervisor_session(scope, true, move |tx, scope, context| {
+        let competing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE task_id=?1 AND role='supervisor' AND status IN ('running','checking','reviewing') AND id != ?2)", params![scope.task_id,scope.run_id], |row| row.get(0))?;
+        anyhow::ensure!(!competing, "Another Supervisor run is attached to this task");
+        if context.status == "awaiting_human" {
+            let (owner,resume): (Option<String>,Option<String>) = tx.query_row("SELECT awaiting_human_by, awaiting_human_status FROM tasks WHERE id=?1", [&scope.task_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            anyhow::ensure!(owner.as_deref()==Some(&scope.agent_id) && resume.as_deref()==Some(if reviewer {"reviewing"} else {"consultation"}), "Human waiter binding mismatch");
+        } else {
+            anyhow::ensure!(context.status == if reviewer {"reviewing"} else {"consultation"}, "Supervisor task phase mismatch");
+        }
+        if reviewer {
+            anyhow::ensure!(!matches!(claim_ready_task_in_transaction(tx, &scope.task_id, &scope.agent_id, ttl, &[TaskStatus::Reviewing,TaskStatus::AwaitingHuman], false)?, ReadyTaskClaim::NoAvailable), "Reviewer lease unavailable");
+        } else {
+            let workspace = latest_executor_workspace_for_task(tx,&scope.task_id)?.context("Missing consultation Executor workspace")?;
+            anyhow::ensure!(std::fs::canonicalize(workspace)? == scope.workspace_path, "Consultant workspace mismatch");
+        }
+        Ok(())
+    }).await
+}
+
+pub(crate) async fn renew_supervisor_session(
+    scope: &ExecutorSessionScope,
+    ttl: u64,
+) -> Result<bool> {
+    with_supervisor_session(scope, true, move |tx, scope, context| {
+        if !matches!(context.status.as_str(), "reviewing" | "awaiting_human") {
+            return Ok(false);
+        }
+        require_executor_owner(tx, scope)?;
+        let lease: Option<String> = tx.query_row(
+            "SELECT lease_until FROM tasks WHERE id=?1",
+            [&scope.task_id],
+            |row| row.get(0),
+        )?;
+        Ok(renew_task_lease_in_transaction(
+            tx,
+            &scope.task_id,
+            &scope.agent_id,
+            ttl,
+            lease.as_deref(),
+        )?
+        .is_some())
+    })
+    .await
 }

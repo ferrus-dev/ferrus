@@ -184,8 +184,15 @@ impl LocalGraphContext {
         let contents = tokio::fs::read_to_string(root.join("ferrus.toml")).await?;
         let config = RepositoryGraphConfig::from_ferrus_toml(&contents)?;
         anyhow::ensure!(
-            runtime.run_role.as_deref() == Some("executor"),
-            "Expected Executor view"
+            matches!(runtime.run_role.as_deref(), Some("executor" | "supervisor")),
+            "Expected a managed repository view"
+        );
+        anyhow::ensure!(
+            !config.enabled
+                || runtime.run_role.as_deref() != Some("supervisor")
+                || runtime.status != "reviewing"
+                || runtime.repository_view.lifecycle == TaskViewLifecycle::FrozenSubmitted,
+            "Reviewer frozen graph view is unavailable"
         );
         let workspace = runtime
             .repository_workspace_path

@@ -31,6 +31,9 @@ pub(crate) struct NativeTools<B: ExecutionBackend> {
 }
 
 impl<B: ExecutionBackend> NativeTools<B> {
+    pub(super) fn belongs_to_supervisor(&self, session: &super::review::Session) -> bool {
+        matches!(&self.session, Binding::Supervisor(bound) if bound.project_id==session.project_id && bound.root==session.root && bound.data==session.data && bound.scope.database_path==session.scope.database_path && bound.scope.run_id==session.scope.run_id && bound.scope.agent_id==session.scope.agent_id && bound.scope.task_id==session.scope.task_id && bound.scope.workspace_path==session.scope.workspace_path && bound.source.path==session.source.path && bound.mode==session.mode)
+    }
     pub(super) fn belongs_to(&self, session: &FerrusSession) -> bool {
         self.session.managed().is_some_and(|bound| {
             bound.scope.database_path == session.scope.database_path

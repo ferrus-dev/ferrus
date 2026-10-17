@@ -51,10 +51,31 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
+    run_for_context(context, project_root, None).await
+}
+
+pub(crate) async fn run_for_context(
+    context: RuntimeTaskContext,
+    project_root: PathBuf,
+    native_scope: Option<project::ExecutorSessionScope>,
+) -> Result<String> {
     // Observe both manifests while integration is serialized, then release the
     // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
+        if let Some(scope) = native_scope {
+            let expected = context.repository_view.frozen_source_tree.clone();
+            project::with_supervisor_session(&scope, false, move |tx, scope, current| {
+                project::require_executor_owner(tx, scope)?;
+                anyhow::ensure!(
+                    current.status == "reviewing"
+                        && current.repository_view.frozen_source_tree == expected,
+                    "Native review binding changed before integration"
+                );
+                Ok(())
+            })
+            .await?;
+        }
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
         let integration_result = integrate_approved_task(&context, &project_root).await;
         let refresh_canonical_graph = observer

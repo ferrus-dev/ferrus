@@ -26,6 +26,9 @@ pub(crate) enum Command {
     },
     /// Run a native Executor; HQ sends versioned commands over open stdin
     Run {
+        /// Run the task-scoped Reviewer or Consultant selected by SQLite
+        #[arg(long, conflicts_with_all = ["taskless", "interactive"])]
+        supervise: bool,
         /// Keep the conversation open for queued user steering
         #[arg(long)]
         interactive: bool,
@@ -73,6 +76,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         prefetch_symbol,
         interactive,
         taskless,
+        supervise,
     ) = match command {
         Command::Supervisor {
             mode,
@@ -99,6 +103,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         }
         Command::Eval { manifest } => return super::eval::report(&manifest),
         Command::Run {
+            supervise,
             interactive,
             taskless,
             config,
@@ -116,6 +121,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
             prefetch_symbol,
             interactive,
             taskless,
+            supervise,
         ),
         #[cfg(feature = "nano-mcp")]
         Command::McpPeer {
@@ -145,7 +151,13 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         !no_native_context,
         seeds,
         interactive,
-        taskless,
+        if supervise {
+            Profile::Supervisor
+        } else if taskless {
+            Profile::Taskless
+        } else {
+            Profile::Executor
+        },
     ))
     .await;
     #[cfg(not(feature = "nano-openai"))]
@@ -156,9 +168,18 @@ pub(crate) async fn run(command: Command) -> Result<()> {
             seeds,
             interactive,
             taskless,
+            supervise,
         );
         unreachable!("feature validated above");
     }
+}
+
+#[cfg(feature = "nano-openai")]
+#[derive(Clone, Copy)]
+enum Profile {
+    Executor,
+    Taskless,
+    Supervisor,
 }
 
 #[cfg(feature = "nano-openai")]
@@ -169,8 +190,10 @@ async fn launch(
     native_context: bool,
     seeds: Vec<serde_json::Value>,
     interactive: bool,
-    taskless: bool,
+    profile: Profile,
 ) -> Result<()> {
+    let taskless = matches!(profile, Profile::Taskless);
+    let supervise = matches!(profile, Profile::Supervisor);
     use super::{
         coding::CodingTools,
         commands,
@@ -276,6 +299,7 @@ async fn launch(
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), start_rx).await???;
         let binding = match launch {
+            Some(launch) if supervise => super::binding::Binding::Supervisor(super::review::Session::bind(launch).await?),
             Some(launch) => super::binding::Binding::from(FerrusSession::bind(launch).await?),
             None => super::binding::Binding::interactive_from_env().await?,
         };
@@ -311,7 +335,9 @@ async fn launch(
             interactive,
             preview_enabled,
         };
-        let end = if let Some(session) = binding.managed() {
+        let end = if let super::binding::Binding::Supervisor(session) = &binding {
+            Box::pin(super::review::run(session.clone(), limits, provider, native, journal, &stop)).await?
+        } else if let Some(session) = binding.managed() {
             let identity = SessionIdentity {
                 session_id,
                 project_id: binding.project_id().into(),
@@ -395,6 +421,7 @@ mod working_set_tests {
         // launch state bounded so nested polling and moves leave room for tools.
         for taskless in [false, true] {
             let future = run(Command::Run {
+                supervise: false,
                 config: None,
                 model: None,
                 no_working_set: false,
@@ -406,7 +433,19 @@ mod working_set_tests {
             });
             let bytes = std::mem::size_of_val(&future);
             assert!(bytes <= 8 * 1024, "Nano launch future uses {bytes} bytes");
-            let host = launch(PathBuf::new(), None, true, true, Vec::new(), true, taskless);
+            let host = launch(
+                PathBuf::new(),
+                None,
+                true,
+                true,
+                Vec::new(),
+                true,
+                if taskless {
+                    Profile::Taskless
+                } else {
+                    Profile::Executor
+                },
+            );
             let bytes = std::mem::size_of_val(&host);
             assert!(bytes <= 8 * 1024, "Nano host future uses {bytes} bytes");
         }

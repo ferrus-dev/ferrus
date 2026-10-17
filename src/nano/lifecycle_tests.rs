@@ -3448,3 +3448,8 @@ async fn explicit_prefetch_is_read_only_host_evidence_and_rechecks_source_bytes(
     f.assert_no_effect(tasks, events).await;
     assert!(tools.shutdown().await);
 }
+
+mod reviewer_profiles {
+    use super::*;
+    include!("review/lifecycle_tests.rs");
+}

@@ -1099,3 +1099,5 @@ fn live_active_run_task_ids_from_database(
 #[cfg(test)]
 #[path = "project_tests.rs"]
 mod tests;
+
+pub(crate) use graph::repository_view_reference_from_row;

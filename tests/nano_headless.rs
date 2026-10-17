@@ -1833,3 +1833,124 @@ fn taskless_interactive_rejects_a_managed_run_binding_before_inference() {
         .unwrap();
     assert_eq!(state, "pending");
 }
+
+#[test]
+fn headless_native_reviewer_uses_the_managed_protocol_and_stops_after_approval() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let settings = f.data.join("review-provider.toml");
+    private_config(
+        &settings,
+        &format!("base_url='{endpoint}'\nmodel='review-model'\n"),
+    );
+    let db = Connection::open(f.data.join("ferrus.db")).unwrap();
+    db.execute("UPDATE tasks SET status='reviewing',baseline_snapshot_id='snapshot:fixture',repository_view_snapshot_id='snapshot:fixture',repository_view_status='unavailable',repository_view_lifecycle='frozen_submitted',repository_view_tree_algorithm='git-sha1',repository_view_tree_digest=?1 WHERE id='t-001'",[&f.baseline]).unwrap();
+    db.execute("INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path,baseline_snapshot_id,repository_view_snapshot_id,repository_view_status,repository_view_lifecycle,repository_view_tree_algorithm,repository_view_tree_digest) VALUES('native-review','t-001','supervisor','supervisor:nano:t-001','running','2026-10-17T00:00:00Z','2026-10-17T00:00:00Z',?1,'snapshot:fixture','snapshot:fixture','unavailable','frozen_submitted','git-sha1',?2)",rusqlite::params![f.root.to_str().unwrap(),f.baseline]).unwrap();
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        for name in ["review_pending", "approve"] {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("review mock: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!((1..512 * 1024).contains(&length));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let names: Vec<_> = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            for denied in [
+                "exec",
+                "apply_patch",
+                "submit",
+                "enqueue_task",
+                "create_spec",
+                "archive_spec",
+                "respond_consult",
+            ] {
+                assert!(!names.contains(&denied));
+            }
+            assert!(names.contains(&"approve"));
+            let data = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":name,"type":"function","function":{"name":name,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
+            let body = format!("data: {data}\n\ndata: [DONE]\n\n");
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let mut command = ferrus(&f.root);
+    command
+        .args(["nano", "run", "--supervise", "--config"])
+        .arg(&settings)
+        .env("FERRUS_PROJECT_ROOT", &f.root)
+        .env("FERRUS_AGENT_ID", "supervisor:nano:t-001")
+        .env("FERRUS_TASK_ID", "t-001")
+        .env("FERRUS_RUN_ID", "native-review")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = Process::spawn(&mut command);
+    let mut input = child.0.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.0.stdout.take().unwrap());
+    let mut ready = String::new();
+    reader.read_line(&mut ready).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready).unwrap()["event"]["type"],
+        "ready"
+    );
+    writeln!(input, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let output = std::thread::spawn(move || {
+        reader
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{}", child.stderr());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let events = output.join().unwrap();
+    server.join().unwrap();
+    assert!(events.iter().any(|frame| frame["event"]["type"] == "ended"
+        && frame["event"]["reason"]["reason"] == "review_completed"
+        && frame["event"]["durable"] == true));
+    assert_eq!(
+        db.query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        "complete"
+    );
+}

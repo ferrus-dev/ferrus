@@ -683,7 +683,7 @@ fn repository_view_reference_from_database(
     Ok(reference)
 }
 
-pub(super) fn repository_view_reference_from_row(
+pub(crate) fn repository_view_reference_from_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
 ) -> rusqlite::Result<RepositoryViewReference> {

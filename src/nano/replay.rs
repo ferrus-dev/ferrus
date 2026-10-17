@@ -40,6 +40,7 @@ pub(crate) struct Replay {
     initial_model_turns: u64,
     submitted: bool,
     definition_completed: bool,
+    role_completed: Option<EndReason>,
     calls: VecDeque<ToolCall>,
 }
 
@@ -397,6 +398,20 @@ impl Replay {
                         "enqueue_task" | "create_spec" | "archive_spec"
                     )
                     && matches!(outcome, ToolOutcome::Success(value) if value["status"] == "definition_saved");
+                self.role_completed = match (call.name.as_str(), outcome) {
+                    ("approve", ToolOutcome::Success(value)) if value["status"] == "approved" => {
+                        Some(EndReason::ReviewCompleted)
+                    }
+                    ("reject", ToolOutcome::Success(value)) if value["status"] == "rejected" => {
+                        Some(EndReason::ReviewCompleted)
+                    }
+                    ("respond_consult", ToolOutcome::Success(value))
+                        if value["status"] == "consulted" =>
+                    {
+                        Some(EndReason::ConsultationResponded)
+                    }
+                    _ => None,
+                };
                 self.messages.push(Message::Tool {
                     provider_call_id: call.provider_call_id,
                     outcome: outcome.clone(),
@@ -409,6 +424,18 @@ impl Replay {
                 self.effect_started = false;
             }
             SessionEvent::Ended { reason } => {
+                if matches!(
+                    reason,
+                    EndReason::ReviewCompleted | EndReason::ConsultationResponded
+                ) {
+                    ensure!(
+                        self.role_completed.as_ref() == Some(reason)
+                            && !self.taskless
+                            && self.pending_effect.is_none()
+                            && !self.model_active,
+                        "Role completion requires a confirmed lifecycle effect"
+                    );
+                }
                 if *reason == EndReason::DefinitionCompleted {
                     ensure!(
                         self.definition_completed

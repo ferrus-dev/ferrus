@@ -50,6 +50,14 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
+    run_for_context(context, notes, config).await
+}
+
+pub(crate) async fn run_for_context(
+    context: RuntimeTaskContext,
+    notes: String,
+    config: Config,
+) -> Result<String> {
     write_review(&context, &notes).await?;
 
     let rejection =
