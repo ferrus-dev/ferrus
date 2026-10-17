@@ -43,8 +43,8 @@ their requested count; planning remains open until cancelled. SQLite run identit
 are checked independently of conversation content. Archive retains normal provenance and
 best-effort memory refresh; a failed refresh does not undo a successful archive.
 
-Reviewer and Consultant execution are deferred to #90. Selecting Nano as Supervisor does
-not yet support the complete autonomous Supervisor-Executor loop: switch to a supported
-external Supervisor before review or consultation. Executor and standalone MCP support are
-unchanged. Live-model validation of these authoring profiles remains opt-in; automated tests
-use a local mock provider and exercise terminal confirmation without contacting an LLM.
+HQ also launches [task-scoped Reviewer and Consultant profiles](ferrus-nano-review.md).
+Those profiles use independent run bindings and authority; taskless conversations do not
+gain review or consultation tools. Executor and standalone MCP support are unchanged.
+Live-model validation remains opt-in; automated authoring tests use a local mock provider
+and exercise terminal confirmation without contacting an LLM.

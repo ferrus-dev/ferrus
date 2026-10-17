@@ -295,10 +295,11 @@ implement both role adapters, model normalization, headless prompt transport whe
 version and config behavior, registration wiring, and focused tests. `opencode` is
 experimental: it binds a project to one working directory by Git root commit, so it is
 currently reliable only for the Supervisor and Reviewer roles.
-Nano supports managed Executors and taskless Supervisor planning/task/spec/archive profiles;
-Reviewer and Consultant remain unsupported. Keep its runtime and adapters under `src/nano/`.
-Supervisor authoring requires host UI confirmation of exact arguments; expose no shell, raw writes,
-or external MCP tools in those profiles. See [Supervisor contract](docs/ferrus-nano-supervisor.md).
+Nano supports managed Executors, taskless Supervisor authoring, and task-scoped Reviewer/Consultant
+profiles. Keep its runtime and adapters under `src/nano/`. Taskless authoring requires host UI
+confirmation; review/consultation reuse Ferrus operations and stop after a confirmed decision.
+Expose no shell, raw writes, or external MCP tools in Supervisor profiles. See
+[Supervisor contract](docs/ferrus-nano-supervisor.md) and [review contract](docs/ferrus-nano-review.md).
 `ferrus-nano` is a separate trusted-local headless/interactive host: no registration, task lease, or
 `ferrus.db`. Share core tools/contracts while keeping standalone completion separate from submit.
 

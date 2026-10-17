@@ -75,7 +75,8 @@ an override, Nano uses the model in its provider file. HQ displays the same sele
 
 Use the ordinary HQ task/run workflow. `/executor` opens the native
 [conversation](ferrus-nano-interactive.md). Supervisor selection supports taskless planning,
-task definition, specification, and archive profiles; Reviewer and Consultant remain unsupported.
+task definition, specification, and archive profiles, plus managed
+[Reviewer and Consultant sessions](ferrus-nano-review.md).
 A build without `nano-openai` reports the missing feature before task setup.
 HQ checks launch configuration before preparing a worktree or consuming a dispatch attempt.
 

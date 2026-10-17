@@ -21,7 +21,7 @@ pub(crate) struct ToolDescriptor {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidatedCall {
     pub call_id: String,
     pub provider_call_id: String,
