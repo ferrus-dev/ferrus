@@ -41,6 +41,11 @@ pub async fn run(
     executor: Option<Agent>,
     executor_model: Option<String>,
 ) -> Result<()> {
+    let supervisor_model = if supervisor == Some(Agent::Nano) {
+        supervisor_model.map(|model| model.trim().to_string())
+    } else {
+        supervisor_model
+    };
     let executor_model = if executor == Some(Agent::Nano) {
         executor_model.map(|model| model.trim().to_string())
     } else {
@@ -53,9 +58,21 @@ pub async fn run(
         anyhow::bail!("--executor-model requires --executor");
     }
     // Validate native selection before writing any role configuration.
-    if supervisor == Some(Agent::Nano) {
-        anyhow::bail!("Nano supports headless Executor sessions only");
-    }
+    let nano_seed = supervisor_model
+        .as_deref()
+        .filter(|_| supervisor == Some(Agent::Nano))
+        .and_then(|model| normalize_model(Some(model)))
+        .or_else(|| {
+            executor_model
+                .as_deref()
+                .filter(|_| executor == Some(Agent::Nano))
+                .and_then(|model| normalize_model(Some(model)))
+        });
+    let created_nano_supervisor = if supervisor == Some(Agent::Nano) {
+        crate::nano::agent::prepare_registration_config(nano_seed)?
+    } else {
+        false
+    };
     let created_nano_config = if executor == Some(Agent::Nano) {
         crate::nano::agent::prepare_registration_config(executor_model.as_deref())?
     } else {
@@ -73,7 +90,11 @@ pub async fn run(
         update_hq_agent_config(
             HqRole::Supervisor,
             Some(agent.name()),
-            normalize_model_update(supervisor_model.as_deref()),
+            if *agent == Agent::Nano && (created_nano_supervisor || supervisor_model.is_none()) {
+                Some(None)
+            } else {
+                normalize_model_update(supervisor_model.as_deref())
+            },
         )
         .await?;
     }
@@ -88,7 +109,12 @@ pub async fn run(
         update_hq_agent_config(
             HqRole::Executor,
             Some(agent.name()),
-            if *agent == Agent::Nano && (created_nano_config || executor_model.is_none()) {
+            if *agent == Agent::Nano
+                && (created_nano_config
+                    || executor_model.is_none()
+                    || (created_nano_supervisor
+                        && normalize_model(executor_model.as_deref()) == nano_seed))
+            {
                 Some(None)
             } else {
                 normalize_model_update(executor_model.as_deref())
@@ -234,8 +260,8 @@ async fn register_role(
     match agent {
         Agent::Nano => {
             anyhow::ensure!(
-                role == ROLE_EXECUTOR,
-                "Nano supports headless Executor sessions only"
+                role == ROLE_EXECUTOR || role == ROLE_SUPERVISOR,
+                "Unsupported Nano role"
             );
             crate::nano::agent::validate_config(None, model)
         }

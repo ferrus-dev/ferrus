@@ -1,7 +1,7 @@
 //! Explicit trusted-local host. No project registration, task authority, or HQ daemon.
 
 mod context;
-mod frontend;
+use super::frontend;
 mod storage;
 mod tools;
 

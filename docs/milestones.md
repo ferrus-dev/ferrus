@@ -20,12 +20,12 @@ Last reviewed against the repository: 2026-09-07.
 | Windows support | Mostly implemented | Windows platform hooks, shell execution, installer, Windows CI, and smoke tests exist. Real agent-loop validation and support-policy docs still need tightening. |
 | Storage layer and SQLite backend | Done | Versioned SQLite migrations, tasks, runs, events, leases, counters, selected spec state, and recovery. Markdown remains scoped human-readable artifacts. |
 | Event log and observability | Baseline done | Runtime events, task/run/event CLI views, HQ dashboard panels, and recovery inspection are implemented. Replay/export and richer historical views remain future work. |
-| Pluggable agent adapters | Partially done | Shared `SupervisorAgent`/`ExecutorAgent` traits cover external backends and the opt-in native Nano headless Executor. Nano declares its launch capabilities and supports a native interactive Executor conversation in HQ; other native roles remain future work. |
+| Pluggable agent adapters | Partially done | Shared traits cover external backends and opt-in Nano Executor and taskless Supervisor planning/spec/archive profiles. Native Reviewer and Consultant remain pending. |
 | Multi-agent flow | Partially done | `/run`, queued tasks, `max_parallel_tasks`, per-task leases, worktree isolation, independent review, frozen submissions, three-way integration with rollback, and integration-error reporting exist. Full task graph, decomposition contracts, and final integration policy remain open. |
 | Spec closure and project memory | Local baseline implemented | Outcome archival, curated memory indexing, revision-pinned queries, and evidence-backed repository links exist. Raw runtime bodies are excluded from default ingestion. |
 | Repository graph and indexed context | Local baseline implemented | Optional SQLite sidecar, incremental extraction, bounded CLI/MCP retrieval, task overlays, and frozen review views. Rust/Cargo and generic file structure are supported. |
 | Distributed context data plane | Prototype implemented | Opt-in contracts and local prototype adapters for authorized jobs, encrypted storage, publication, queries, and maintenance. No deployed remote service is implied. |
-| Ferrus nano-agent | Headless Executor, HQ and standalone conversations implemented | #73-#88 deliver native tools/context, managed lifecycle/recovery, evaluation tooling, HQ interaction, and `ferrus-nano`. Comparative live validation and additional roles remain pending. |
+| Ferrus nano-agent | Executor, Supervisor authoring, HQ and standalone conversations implemented | #73-#89 deliver native tools/context, managed lifecycle/recovery, evaluation tooling, and interactive hosts. Comparative live validation, Reviewer, and Consultant remain pending. |
 
 ## Milestone 1: Windows Support
 
@@ -194,7 +194,7 @@ contains one issue per planned PR, dependencies, and acceptance criteria:
 | N3: reliability and extensions | #83-#85 implemented | Comparative live evaluation |
 | N4: interactive HQ | #86 implemented | Live interactive Executor validation |
 | N5: standalone | #87-#88 implemented | Live standalone interactive validation |
-| N5: additional roles | #89-#90 | Supervisor planning/spec/archive, Reviewer, and Consultant |
+| N5: additional roles | #89 implemented; #90 pending | Live Supervisor authoring validation; Reviewer and Consultant |
 
 Definition of done for the first headless release:
 
@@ -203,7 +203,7 @@ Definition of done for the first headless release:
 - a fixed task suite measures quality, token use, cost, and elapsed time against external integrations.
 
 Lower cost, higher determinism, and better throughput are hypotheses until evaluated. Interactive
-HQ and both headless and interactive standalone modes are implemented.
+HQ, both standalone modes, and [Supervisor authoring](ferrus-nano-supervisor.md) are implemented.
 
 ## Supporting Tracks
 
@@ -273,7 +273,7 @@ See [project memory](project_memory/project-memory.md), [architecture](project_m
 3. Close real Windows agent-loop validation and support-documentation gaps.
 4. Define task dependency, decomposition, conflict-routing, and partial-failure policies beyond current milestone scheduling.
 5. Improve runtime history, archive inspection/export, and explicit external-backend capability metadata.
-6. Validate standalone interactive UI (#88), then add additional roles (#89-#90).
+6. Validate standalone UI and Supervisor authoring (#88-#89), then add Reviewer and Consultant (#90).
 7. Evolve the distributed prototype only through explicit deployment and security/operational acceptance gates.
 
 ## Non-goals for now

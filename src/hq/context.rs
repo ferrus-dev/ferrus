@@ -628,7 +628,7 @@ impl HqContext {
             agent.name(),
             name,
             agent
-                .spawn(AgentRunMode::Interactive { prompt })
+                .spawn_definition(crate::agents::DefinitionMode::Plan, prompt, 0)
                 .with_context(|| {
                     format!(
                         "Failed to resolve launcher for supervisor agent {}",
@@ -677,9 +677,11 @@ impl HqContext {
         agent.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
         let mut cmd = Command::from(
             agent
-                .spawn(AgentRunMode::Interactive {
-                    prompt: Some(prompt),
-                })
+                .spawn_definition(
+                    crate::agents::DefinitionMode::Task,
+                    Some(prompt),
+                    expected_count,
+                )
                 .with_context(|| {
                     format!(
                         "Failed to resolve launcher for supervisor agent {}",
@@ -723,12 +725,10 @@ impl HqContext {
                             child_status = Some(status);
                             break;
                         }
-                        self.stop_interactive_child(
-                            &mut child,
-                            stop_message,
-                        )
-                        .await?;
-                        break;
+                        if !agent.native_definition() {
+                            self.stop_interactive_child(&mut child, stop_message).await?;
+                            break;
+                        }
                     }
                 }
             }
@@ -747,6 +747,9 @@ impl HqContext {
                 status,
                 &stderr
             ));
+        }
+        if created_task_ids.is_empty() {
+            created_task_ids = new_task_ids_since(existing_task_ids).await?;
         }
         Ok(created_task_ids)
     }

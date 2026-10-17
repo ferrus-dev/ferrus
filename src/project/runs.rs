@@ -93,19 +93,25 @@ pub(crate) async fn reserve_executor_session_at(
     .await?
 }
 
-/// Taskless Executor runs use the same legacy bookkeeping row as external interactive
+/// Taskless runs use the same legacy bookkeeping row as external interactive
 /// agents. That row grants no task lease, task intent, or lifecycle authority.
-pub(crate) async fn authorize_taskless_executor_run_at(
+pub(crate) async fn authorize_taskless_run_at(
     database: &Path,
     run_id: &str,
     agent_id: &str,
     workspace: &Path,
+    role: &str,
 ) -> Result<()> {
     let (database, run_id, agent_id, workspace) = (
         database.to_path_buf(),
         run_id.to_owned(),
         agent_id.to_owned(),
         workspace.to_path_buf(),
+    );
+    let role = role.to_owned();
+    anyhow::ensure!(
+        matches!(role.as_str(), "executor" | "supervisor"),
+        "Invalid taskless role"
     );
     tokio::task::spawn_blocking(move || {
         let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -125,7 +131,7 @@ pub(crate) async fn authorize_taskless_executor_run_at(
         )?;
         anyhow::ensure!(
             run.0 == CURRENT_TASK_ID
-                && run.1 == "executor"
+                && run.1 == role
                 && run.2 == agent_id
                 && run.3 == "running"
                 && Path::new(&run.4).is_absolute()

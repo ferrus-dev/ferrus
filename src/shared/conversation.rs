@@ -162,7 +162,7 @@ pub(crate) fn lines(
     lines
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for line in text.lines() {

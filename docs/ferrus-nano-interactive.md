@@ -53,8 +53,9 @@ Steering and cancellation bind to a run ID; HQ rejects input when the selected r
 `ask_human` displays the existing scoped question panel. Plain text typed for that question is
 recorded as its answer, ahead of ordinary steering. The task ID captured when typing begins
 prevents a newly arriving question from stealing an answer. Consultation still follows the
-managed Supervisor workflow. Nano currently has no separate tool-approval workflow; opening a
-conversation does not expand its trusted-local workspace authority or expose review/archive tools.
+managed Supervisor workflow. Executor conversations have no separate tool-approval workflow;
+opening one does not expand its trusted-local workspace authority or expose review/archive tools.
+[Supervisor authoring](ferrus-nano-supervisor.md) uses separate profiles with explicit confirmation.
 
 The managed host continues to own task claims, heartbeat, worktrees, baseline bindings, checks,
 submission, recovery, and dispatch accounting. The frontend cannot complete a task by rendering

@@ -15,6 +15,7 @@ pub(crate) enum Binding {
         data_dir: PathBuf,
         agent_id: String,
         run_id: String,
+        definition: Option<crate::agents::DefinitionMode>,
     },
 }
 
@@ -61,6 +62,7 @@ impl Binding {
             data_dir: registration.data_dir,
             agent_id: required(ENV_AGENT_ID)?,
             run_id: required(ENV_RUN_ID)?,
+            definition: None,
         };
         binding.status().await?;
         Ok(binding)
@@ -107,13 +109,21 @@ impl Binding {
         match self {
             Self::Managed(session) => session.status().await.map(Some),
             Self::Interactive {
-                agent_id, run_id, ..
+                agent_id,
+                run_id,
+                definition,
+                ..
             } => {
-                crate::project::authorize_taskless_executor_run_at(
+                crate::project::authorize_taskless_run_at(
                     &self.data_dir().join("ferrus.db"),
                     run_id,
                     agent_id,
                     self.workspace(),
+                    if definition.is_some() {
+                        "supervisor"
+                    } else {
+                        "executor"
+                    },
                 )
                 .await?;
                 Ok(None)
@@ -190,7 +200,15 @@ impl super::instructions::InstructionScope for Binding {
                 .as_ref()
                 .map_or("interactive", |r| r.status.as_str())
                 .into(),
-            policy: if runtime.is_some() {
+            policy: if matches!(
+                self,
+                Self::Interactive {
+                    definition: Some(_),
+                    ..
+                }
+            ) {
+                super::agent::SUPERVISOR_POLICY
+            } else if runtime.is_some() {
                 ROLE_POLICY
             } else {
                 INTERACTIVE_POLICY

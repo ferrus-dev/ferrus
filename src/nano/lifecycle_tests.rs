@@ -3007,6 +3007,7 @@ async fn direct_mutations_and_running_commands_share_the_canonical_approval_lock
     .await
     .unwrap();
     let binding = crate::nano::binding::Binding::Interactive {
+        definition: None,
         project_root: f.root.clone(),
         project_id: "test-project".into(),
         data_dir: f.data.clone(),
@@ -3125,6 +3126,7 @@ async fn taskless_mutation_persists_invalidation_without_scheduled_maintenance()
     .await
     .unwrap();
     let binding = crate::nano::binding::Binding::Interactive {
+        definition: None,
         project_root: f.root.clone(),
         project_id: "test-project".into(),
         data_dir: f.data.clone(),
@@ -3189,6 +3191,7 @@ async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_
     .await
     .unwrap();
     let binding = crate::nano::binding::Binding::Interactive {
+        definition: None,
         project_root: f.root.clone(),
         project_id: "test-project".into(),
         data_dir: f.data.clone(),

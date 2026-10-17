@@ -146,9 +146,11 @@ impl HqContext {
 
         let mut cmd = Command::from(
             supervisor
-                .spawn(AgentRunMode::Interactive {
-                    prompt: Some(agent_manager::supervisor_spec_prompt()),
-                })
+                .spawn_definition(
+                    crate::agents::DefinitionMode::Spec,
+                    Some(agent_manager::supervisor_spec_prompt()),
+                    0,
+                )
                 .with_context(|| {
                     format!(
                         "Failed to resolve launcher for supervisor agent {}",
@@ -192,12 +194,10 @@ impl HqContext {
                         && !path.is_empty()
                     {
                         created_path = Some(path);
-                        self.stop_interactive_child(
-                            &mut child,
-                            "Spec created -- waiting for supervisor to exit...",
-                        )
-                        .await?;
-                        break;
+                        if !supervisor.native_definition() {
+                            self.stop_interactive_child(&mut child, "Spec created -- waiting for supervisor to exit...").await?;
+                            break;
+                        }
                     }
                 }
             }
@@ -345,9 +345,7 @@ impl HqContext {
         supervisor.validate_interactive_launch(ROLE_SUPERVISOR, DEFAULT_AGENT_INDEX)?;
         let mut cmd = Command::from(
             supervisor
-                .spawn(AgentRunMode::Interactive {
-                    prompt: Some(&prompt),
-                })
+                .spawn_definition(crate::agents::DefinitionMode::Archive, Some(&prompt), 0)
                 .with_context(|| {
                     format!(
                         "Failed to resolve launcher for supervisor agent {}",
@@ -391,9 +389,10 @@ impl HqContext {
                         && !path.is_empty()
                     {
                         archive_path = Some(path);
-                        self.stop_interactive_child(&mut child, "")
-                        .await?;
-                        break;
+                        if !supervisor.native_definition() {
+                            self.stop_interactive_child(&mut child, "").await?;
+                            break;
+                        }
                     }
                 }
             }

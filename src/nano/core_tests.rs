@@ -985,15 +985,15 @@ async fn native_workspace_tools_run_through_the_durable_engine() {
 }
 
 #[tokio::test]
-async fn replay_rejects_a_submitted_end_without_a_confirmed_handoff() {
+async fn replay_rejects_authoring_and_submit_ends_without_confirmed_effects() {
     let (_directory, mut engine) =
         setup(scripted(vec![response("done", vec![])]), Limits::default());
     run(&mut engine, &Cancellation::default()).await;
-    let mut records = engine.host.records.clone();
-    records.last_mut().unwrap().event = SessionEvent::Ended {
-        reason: EndReason::Submitted,
-    };
-    assert!(Replay::from_records(&records).is_err());
+    for reason in [EndReason::Submitted, EndReason::DefinitionCompleted] {
+        let mut records = engine.host.records.clone();
+        records.last_mut().unwrap().event = SessionEvent::Ended { reason };
+        assert!(Replay::from_records(&records).is_err());
+    }
 }
 
 struct EvidenceTools {

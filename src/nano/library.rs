@@ -10,6 +10,7 @@ pub(crate) mod conversation;
 mod descriptors;
 mod effect_recovery;
 mod engine;
+mod frontend;
 mod instructions;
 mod journal;
 #[cfg(feature = "nano-mcp")]
