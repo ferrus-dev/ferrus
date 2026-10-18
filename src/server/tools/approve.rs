@@ -1344,7 +1344,10 @@ async fn cleanup_approved_workspace(
     }
 
     if tokio::fs::try_exists(&canonical_workspace).await? {
+        // Git for Windows can prompt when a path cannot be removed. Never let
+        // best-effort cleanup read the agent's open command-protocol pipe.
         let output = Command::new("git")
+            .stdin(Stdio::null())
             .arg("-C")
             .arg(project_root)
             .args(["worktree", "remove", "--force"])
