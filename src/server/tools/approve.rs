@@ -62,7 +62,15 @@ pub(crate) async fn run_for_context(
     // Observe both manifests while integration is serialized, then release the
     // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: acquiring canonical lock"
+        );
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: canonical lock acquired"
+        );
         if let Some(scope) = native_scope {
             let expected = context.repository_view.frozen_source_tree.clone();
             project::with_supervisor_session(&scope, false, move |tx, scope, current| {
@@ -76,16 +84,41 @@ pub(crate) async fn run_for_context(
             })
             .await?;
         }
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: native binding validated"
+        );
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: canonical source observed"
+        );
         let integration_result = integrate_approved_task(&context, &project_root).await;
+        tracing::debug!(
+            task_id = context.task_id,
+            success = integration_result.is_ok(),
+            "approval: integration finished"
+        );
         let refresh_canonical_graph = observer
             .finish(&context, &project_root, integration_result.is_ok())
             .await;
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: source observation finished"
+        );
         (integration_result, refresh_canonical_graph)
     };
     if integration_result.is_ok() {
         crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: submitted tree pin released"
+        );
         cleanup_approved_workspace_best_effort(&context, &project_root).await;
+        tracing::debug!(
+            task_id = context.task_id,
+            "approval: worktree cleanup finished"
+        );
     }
     if refresh_canonical_graph {
         crate::repository_graph_runtime::refresh_canonical_graph_after_approval(

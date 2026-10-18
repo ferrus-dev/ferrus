@@ -1914,6 +1914,7 @@ fn headless_native_reviewer_uses_the_managed_protocol_and_stops_after_approval()
         .env("FERRUS_AGENT_ID", "supervisor:nano:t-001")
         .env("FERRUS_TASK_ID", "t-001")
         .env("FERRUS_RUN_ID", "native-review")
+        .env("RUST_LOG", "ferrus=debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let mut child = Process::spawn(&mut command);
