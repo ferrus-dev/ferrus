@@ -996,13 +996,46 @@ pub(crate) async fn start_supervisor_session(
             anyhow::ensure!(context.status == if reviewer {"reviewing"} else {"consultation"}, "Supervisor task phase mismatch");
         }
         if reviewer {
-            anyhow::ensure!(!matches!(claim_ready_task_in_transaction(tx, &scope.task_id, &scope.agent_id, ttl, &[TaskStatus::Reviewing,TaskStatus::AwaitingHuman], false)?, ReadyTaskClaim::NoAvailable), "Reviewer lease unavailable");
+            match claim_ready_task_in_transaction(tx, &scope.task_id, &scope.agent_id, ttl, &[TaskStatus::Reviewing,TaskStatus::AwaitingHuman], false)? {
+                ReadyTaskClaim::NoAvailable => anyhow::bail!("Reviewer lease unavailable"),
+                ReadyTaskClaim::AlreadyClaimed(lease) => {
+                    anyhow::ensure!(renew_task_lease_in_transaction(tx, &scope.task_id, &scope.agent_id, ttl, Some(&lease.lease_until.to_rfc3339()))?.is_some(), "Inherited Reviewer lease expired");
+                }
+                ReadyTaskClaim::Claimed(_) => {}
+            }
         } else {
             let workspace = latest_executor_workspace_for_task(tx,&scope.task_id)?.context("Missing consultation Executor workspace")?;
             anyhow::ensure!(std::fs::canonicalize(workspace)? == scope.workspace_path, "Consultant workspace mismatch");
         }
         Ok(())
     }).await
+}
+
+pub(crate) async fn reject_supervisor_session(
+    scope: &ExecutorSessionScope,
+    expected_tree: Option<Digest>,
+    max_cycles: u32,
+) -> Result<TaskReviewRejection> {
+    with_supervisor_session(scope, true, move |tx, scope, context| {
+        require_executor_owner(tx, scope)?;
+        anyhow::ensure!(
+            context.status == "reviewing"
+                && expected_tree.is_some()
+                && context.repository_view.frozen_source_tree == expected_tree,
+            "Native review binding changed before rejection"
+        );
+        let current_tree: Option<String> = tx.query_row(
+            "SELECT repository_view_tree_digest FROM tasks WHERE id = ?1",
+            [&scope.task_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            current_tree.as_deref() == expected_tree.as_ref().map(|tree| tree.value()),
+            "Review submission changed before rejection"
+        );
+        task::record_task_review_rejected_in_transaction(tx, &scope.task_id, max_cycles)
+    })
+    .await
 }
 
 pub(crate) async fn renew_supervisor_session(

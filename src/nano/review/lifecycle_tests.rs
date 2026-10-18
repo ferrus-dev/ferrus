@@ -55,6 +55,91 @@ fn tool(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
         arguments: args.to_string(),
     }
 }
+
+#[tokio::test]
+async fn native_rejection_revalidates_the_lease_phase_and_submission_at_commit() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let executor = git_session(&f, true).await;
+    lifecycle::submit(&executor, "Submission".into(), &Cancellation::default())
+        .await
+        .unwrap();
+    let session = reviewer(&f, "stalled-review", &f.root).await;
+    let context = session.authorize().await.unwrap();
+    let db = f.connection();
+    let (owner, lease, tree): (String, String, String) = db
+        .query_row(
+            "SELECT claimed_by, lease_until, repository_view_tree_digest FROM tasks WHERE id=?1",
+            [TASK],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    for change in [
+        "lease_until='2000-01-01T00:00:00Z'",
+        "claimed_by='supervisor:codex:other'",
+        "status='complete'",
+        "repository_view_tree_digest='0000000000000000000000000000000000000000'",
+    ] {
+        db.execute(
+            "UPDATE tasks SET status='reviewing', claimed_by=?2, lease_until=?3, repository_view_tree_digest=?4 WHERE id=?1",
+            rusqlite::params![TASK, owner, lease, tree],
+        ).unwrap();
+        db.execute(&format!("UPDATE tasks SET {change} WHERE id=?1"), [TASK])
+            .unwrap();
+        let before = project::list_tasks().await.unwrap();
+        let result = crate::server::tools::reject::run_for_context(
+            context.clone(),
+            "Stale feedback".into(),
+            Config::load_from(&f.root).await.unwrap(),
+            Some(session.scope.clone()),
+        )
+        .await;
+        assert!(result.is_err(), "{change}");
+        assert_eq!(project::list_tasks().await.unwrap(), before, "{change}");
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM events WHERE type IN ('task_rejected','task_review_limit_exceeded')", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn relaunched_native_reviewer_renews_its_inherited_lease_before_heartbeat() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let executor = git_session(&f, true).await;
+    lifecycle::submit(&executor, "Submission".into(), &Cancellation::default())
+        .await
+        .unwrap();
+    let first = reviewer(&f, "crashed-review", &f.root).await;
+    project::record_run_finished(&first.scope.run_id, 1)
+        .await
+        .unwrap();
+    let lease = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+    f.connection()
+        .execute(
+            "UPDATE tasks SET lease_until=?1 WHERE id=?2",
+            rusqlite::params![lease, TASK],
+        )
+        .unwrap();
+    let resumed = reviewer(&f, "recovered-review", &f.root).await;
+    for human_wait in [false, true] {
+        if human_wait {
+            f.connection().execute("UPDATE tasks SET status='awaiting_human',awaiting_human_status='reviewing',awaiting_human_by=?1,lease_until=?2 WHERE id=?3", rusqlite::params![resumed.scope.agent_id,lease,TASK]).unwrap();
+            project::start_supervisor_session(&resumed.scope, true, resumed.ttl)
+                .await
+                .unwrap();
+        }
+        resumed.authorize().await.unwrap();
+        let renewed: String = f
+            .connection()
+            .query_row("SELECT lease_until FROM tasks WHERE id=?1", [TASK], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&renewed).unwrap()
+                > chrono::Utc::now() + chrono::Duration::seconds(resumed.ttl as i64 - 5)
+        );
+    }
+}
 async fn decide(f: &Fixture, session: ReviewSession, calls: Vec<ToolCall>) -> SessionEnd {
     let (native, journal) = review_native(f, &session);
     review::run(

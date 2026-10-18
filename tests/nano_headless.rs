@@ -1908,7 +1908,7 @@ fn headless_native_reviewer_uses_the_managed_protocol_and_stops_after_approval()
     });
     let mut command = ferrus(&f.root);
     command
-        .args(["nano", "run", "--supervise", "--config"])
+        .args(["--debug", "nano", "run", "--supervise", "--config"])
         .arg(&settings)
         .env("FERRUS_PROJECT_ROOT", &f.root)
         .env("FERRUS_AGENT_ID", "supervisor:nano:t-001")
@@ -1926,22 +1926,31 @@ fn headless_native_reviewer_uses_the_managed_protocol_and_stops_after_approval()
         "ready"
     );
     writeln!(input, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    let (tx, rx) = mpsc::channel();
     let output = std::thread::spawn(move || {
-        reader
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-            .collect::<Vec<_>>()
+        for line in reader.lines() {
+            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .unwrap();
+        }
     });
+    let mut events = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        events.extend(rx.try_iter());
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "{}", child.stderr());
             break;
         }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+        assert!(
+            Instant::now() < deadline,
+            "{}\nevents: {events:?}\njournal: {:?}",
+            child.failure_diagnostics(),
+            log_tail(&f.data.join("nano/sessions/native-review/events.jsonl"))
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let events = output.join().unwrap();
+    output.join().unwrap();
+    events.extend(rx.try_iter());
     server.join().unwrap();
     assert!(events.iter().any(|frame| frame["event"]["type"] == "ended"
         && frame["event"]["reason"]["reason"] == "review_completed"

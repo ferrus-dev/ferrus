@@ -261,6 +261,7 @@ async fn operation(session: &Session, call: &ValidatedCall, stop: &Cancellation)
                 context,
                 call.arguments["notes"].as_str().unwrap().into(),
                 Config::load_from(&session.root).await?,
+                Some(session.scope.clone()),
             )
             .await?;
             Ok(json!({"status":"rejected","task_id":session.scope.task_id}))
