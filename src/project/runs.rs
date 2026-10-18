@@ -854,6 +854,7 @@ pub async fn remove_executor_baseline(
 ) -> Result<()> {
     let baseline_ref = executor_baseline_ref(task_id);
     let exists = Command::new("git")
+        .stdin(std::process::Stdio::null())
         .arg("-C")
         .arg(project_root)
         .args(["show-ref", "--verify", "--quiet", &baseline_ref])
@@ -861,6 +862,7 @@ pub async fn remove_executor_baseline(
         .await;
     if matches!(exists, Ok(output) if output.status.success()) {
         let output = Command::new("git")
+            .stdin(std::process::Stdio::null())
             .arg("-C")
             .arg(project_root)
             .args(["update-ref", "-d", &baseline_ref])

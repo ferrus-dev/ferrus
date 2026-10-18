@@ -104,14 +104,14 @@ jobs:
       - name: Check Nano stdio MCP integration
         run: cargo clippy --locked --features nano-openai,nano-mcp -- -D warnings
 
-      - name: Test Nano headless and standalone integration
-        run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless --test nano_standalone
-
       - name: Test Nano unit suite
         run: "cargo test --locked --features nano-openai,nano-mcp --bin ferrus nano::"
 
       - name: Test standalone conversation state
         run: cargo test --locked --features nano-openai,nano-mcp --lib nano::frontend
+
+      - name: Test Nano headless and standalone integration
+        run: cargo test --locked --features nano-openai,nano-mcp --test nano_headless --test nano_standalone
 
   macos-release:
     runs-on: macos-latest

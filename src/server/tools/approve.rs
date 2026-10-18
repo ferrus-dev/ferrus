@@ -62,15 +62,7 @@ pub(crate) async fn run_for_context(
     // Observe both manifests while integration is serialized, then release the
     // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: acquiring canonical lock"
-        );
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: canonical lock acquired"
-        );
         if let Some(scope) = native_scope {
             let expected = context.repository_view.frozen_source_tree.clone();
             project::with_supervisor_session(&scope, false, move |tx, scope, current| {
@@ -84,41 +76,16 @@ pub(crate) async fn run_for_context(
             })
             .await?;
         }
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: native binding validated"
-        );
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: canonical source observed"
-        );
         let integration_result = integrate_approved_task(&context, &project_root).await;
-        tracing::debug!(
-            task_id = context.task_id,
-            success = integration_result.is_ok(),
-            "approval: integration finished"
-        );
         let refresh_canonical_graph = observer
             .finish(&context, &project_root, integration_result.is_ok())
             .await;
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: source observation finished"
-        );
         (integration_result, refresh_canonical_graph)
     };
     if integration_result.is_ok() {
         crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: submitted tree pin released"
-        );
         cleanup_approved_workspace_best_effort(&context, &project_root).await;
-        tracing::debug!(
-            task_id = context.task_id,
-            "approval: worktree cleanup finished"
-        );
     }
     if refresh_canonical_graph {
         crate::repository_graph_runtime::refresh_canonical_graph_after_approval(
@@ -141,6 +108,14 @@ pub(crate) async fn run_for_context(
 
     info!("Task approved, state -> Complete");
     Ok("Task approved. State: Complete. Well done!".to_string())
+}
+
+// Tokio output() inherits stdin. Git must never receive an agent's open
+// command-protocol pipe; commands requiring input explicitly replace this with a pipe.
+fn approval_git_command() -> Command {
+    let mut command = Command::new("git");
+    command.stdin(Stdio::null());
+    command
 }
 
 async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Path) -> Result<()> {
@@ -336,7 +311,7 @@ async fn capture_canonical_worktree_tree(project_root: &Path) -> Result<String> 
 }
 
 async fn ignored_untracked_paths(project_root: &Path) -> Result<Vec<Vec<u8>>> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -368,7 +343,7 @@ struct CanonicalIndexSnapshot {
 
 impl CanonicalIndexSnapshot {
     async fn capture(project_root: &Path) -> Result<Self> {
-        let output = Command::new("git")
+        let output = approval_git_command()
             .arg("-C")
             .arg(project_root)
             .args(["rev-parse", "--git-path", "index"])
@@ -544,7 +519,7 @@ async fn task_baseline_tree(
 }
 
 async fn resolve_tree(project_root: &Path, revision: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["rev-parse", "--verify"])
@@ -556,7 +531,7 @@ async fn resolve_tree(project_root: &Path, revision: &str) -> Result<String> {
 
 async fn verify_tree(project_root: &Path, tree: &str) -> Result<()> {
     let object = format!("{tree}^{{tree}}");
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["cat-file", "-e"])
@@ -574,7 +549,7 @@ async fn submitted_tree_from_patch(
     let index = TemporaryIntegrationIndex::new();
     read_tree(project_root, index.path(), baseline, false).await?;
     let patch_path = store::resolve_project_path(Path::new(&context.run_dir).join("PATCH.diff"));
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -583,7 +558,7 @@ async fn submitted_tree_from_patch(
         .output()
         .await?;
     git_success(&output, "apply submitted patch to its baseline")?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -605,7 +580,7 @@ async fn merge_trees(
     let ours_commit = commit_tree(project_root, ours, Some(&baseline_commit), "canonical").await?;
     let theirs_commit =
         commit_tree(project_root, theirs, Some(&baseline_commit), "submitted").await?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["merge-tree", "--write-tree", "--messages"])
@@ -643,7 +618,7 @@ async fn tree_changes(
     current_tree: &str,
     target_tree: &str,
 ) -> Result<Vec<TreeChange>> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -699,7 +674,7 @@ async fn reject_ignored_path_collisions(project_root: &Path, changes: &[TreeChan
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -756,7 +731,7 @@ async fn reject_sparse_checkout_exclusions(
         .map(|change| change.path.as_slice())
         .collect();
     let input = nul_terminated_paths(paths.iter().copied());
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -775,7 +750,7 @@ async fn reject_sparse_checkout_exclusions(
 }
 
 async fn sparse_checkout_enabled(project_root: &Path) -> Result<bool> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["config", "--bool", "--get", "core.sparseCheckout"])
@@ -821,7 +796,7 @@ async fn commit_tree(
     parent: Option<&str>,
     role: &str,
 ) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -862,7 +837,7 @@ async fn tree_without_paths(
     let index = TemporaryIntegrationIndex::new();
     read_tree(project_root, index.path(), tree, false).await?;
     let input = nul_terminated_paths(excluded_paths.iter().map(Vec::as_slice));
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -873,7 +848,7 @@ async fn tree_without_paths(
         &output,
         "exclude pre-integration ignored paths from rollback",
     )?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -924,7 +899,7 @@ async fn read_tree(
     tree: &str,
     update_worktree: bool,
 ) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -1377,10 +1352,7 @@ async fn cleanup_approved_workspace(
     }
 
     if tokio::fs::try_exists(&canonical_workspace).await? {
-        // Git for Windows can prompt when a path cannot be removed. Never let
-        // best-effort cleanup read the agent's open command-protocol pipe.
-        let output = Command::new("git")
-            .stdin(Stdio::null())
+        let output = approval_git_command()
             .arg("-C")
             .arg(project_root)
             .args(["worktree", "remove", "--force"])
