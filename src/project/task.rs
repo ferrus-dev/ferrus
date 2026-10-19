@@ -184,29 +184,44 @@ pub async fn record_task_status_with_origin(
     let milestone_id = milestone_id.map(str::to_string);
     tokio::task::spawn_blocking(move || -> Result<()> {
         let connection = open_runtime_database(&database_path)?;
-        upsert_task(
+        record_task_status_on_connection(
             &connection,
             &task_id,
             &task_path,
             status,
             spec_path.as_deref(),
             milestone_id.as_deref(),
-        )?;
-        if status.clears_lease() {
-            clear_task_lease(&connection, &task_id)?;
-        }
-        insert_event(
-            &connection,
-            None,
-            "task_status_changed",
-            &serde_json::json!({
-                "task_id": task_id,
-                "status": status.as_str(),
-            }),
-        )?;
-        Ok(())
+        )
     })
     .await?
+}
+
+pub(crate) fn record_task_status_on_connection(
+    connection: &Connection,
+    task_id: &str,
+    task_path: &str,
+    status: TaskStatus,
+    spec_path: Option<&str>,
+    milestone_id: Option<&str>,
+) -> Result<()> {
+    upsert_task(
+        connection,
+        task_id,
+        task_path,
+        status,
+        spec_path,
+        milestone_id,
+    )?;
+    if status.clears_lease() {
+        clear_task_lease(connection, task_id)?;
+    }
+    insert_event(
+        connection,
+        None,
+        "task_status_changed",
+        &serde_json::json!({"task_id": task_id, "status": status.as_str()}),
+    )?;
+    Ok(())
 }
 
 /// Completes the normal submit transition and, when available, pins the exact

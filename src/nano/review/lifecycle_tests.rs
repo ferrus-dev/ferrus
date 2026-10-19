@@ -494,6 +494,215 @@ async fn native_approval_preserves_integration_rollback_and_allows_review_feedba
     );
 }
 
+const APPROVAL_CHECK_HELPER: &str =
+    "nano::ferrus::tests::lifecycle_tests::reviewer_profiles::approval_check_barrier";
+
+#[tokio::test]
+async fn native_approval_commits_completion_only_if_the_milestone_update_succeeds() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for invalid_spec in [false, true] {
+        let f = Fixture::new().await;
+        let executor = git_session(&f, true).await;
+        lifecycle::submit(
+            &executor,
+            "No source changes".into(),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        let spec = f.root.join("spec.md");
+        if invalid_spec {
+            std::fs::create_dir(&spec).unwrap();
+        } else {
+            std::fs::write(&spec, "- [ ] #1.0 Deliver\n  - ID: m1.0\n").unwrap();
+        }
+        f.connection()
+            .execute(
+                "UPDATE tasks SET spec_path='spec.md', milestone_id='m1.0' WHERE id=?1",
+                [TASK],
+            )
+            .unwrap();
+        let session = reviewer(&f, "milestone-review", &f.root).await;
+        let before = project::list_tasks().await.unwrap();
+        let result = crate::server::tools::approve::run_for_context(
+            session.authorize().await.unwrap(),
+            f.root.clone(),
+            Some(session.scope.clone()),
+        )
+        .await;
+        if invalid_spec {
+            assert!(result.is_err());
+            assert_eq!(project::list_tasks().await.unwrap(), before);
+        } else {
+            result.unwrap();
+            let tasks = project::list_tasks().await.unwrap();
+            let task = tasks.iter().find(|task| task.id == TASK).unwrap();
+            assert_eq!(task.status, "complete");
+            assert!(task.claimed_by.is_none());
+            assert!(
+                std::fs::read_to_string(&spec)
+                    .unwrap()
+                    .contains("- [x] #1.0")
+            );
+        }
+    }
+}
+
+#[test]
+fn approval_check_barrier() {
+    // Only wait when invoked as the integration check subprocess, not in the suite.
+    if !std::env::args().any(|arg| arg == APPROVAL_CHECK_HELPER) {
+        return;
+    }
+    std::fs::write(".ferrus/approval-check-started", "ready").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !std::path::Path::new(".ferrus/approval-check-release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "check was not released"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[tokio::test]
+async fn native_approval_rolls_back_when_its_final_review_fence_is_lost() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    for change in ["reject", "lease", "owner", "run", "submission"] {
+        let f = Fixture::new().await;
+        let spec = "- [ ] #1.0 Deliver\n  - ID: m1.0\n  - Depends on: none\n";
+        std::fs::write(f.root.join("spec.md"), spec).unwrap();
+        let executor = isolated(&f).await;
+        std::fs::write(
+            executor.workspace().join("src/lib.rs"),
+            "pub struct ProposedChange;\n",
+        )
+        .unwrap();
+        lifecycle::submit(
+            &executor,
+            "Proposed change".into(),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        f.connection()
+            .execute(
+                "UPDATE tasks SET spec_path='spec.md', milestone_id='m1.0' WHERE id=?1",
+                [TASK],
+            )
+            .unwrap();
+        // Use a relative executable without shell quoting, including on Windows.
+        let helper = if cfg!(windows) {
+            ".ferrus/approval-check.exe"
+        } else {
+            ".ferrus/approval-check"
+        };
+        let executable = std::env::current_exe().unwrap();
+        let helper_path = f.root.join(helper);
+        if std::fs::hard_link(&executable, &helper_path).is_err() {
+            std::fs::copy(&executable, &helper_path).unwrap();
+        }
+        let helper = if cfg!(windows) {
+            helper.replace('/', "\\")
+        } else {
+            format!("./{helper}")
+        };
+        let command = format!("{helper} --exact {APPROVAL_CHECK_HELPER} --nocapture");
+        configure(&f, &[&command], 3);
+        let session = reviewer(&f, "stalled-approval", &f.root).await;
+        let context = session.authorize().await.unwrap();
+        let before = std::fs::read(f.root.join("src/lib.rs")).unwrap();
+        let index_before = std::fs::read(f.root.join(".git/index")).unwrap();
+        let approval = crate::server::tools::approve::run_for_context(
+            context,
+            f.root.clone(),
+            Some(session.scope.clone()),
+        );
+        let lose_fence = async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !f.root.join(".ferrus/approval-check-started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("approval never reached integration checks");
+            assert!(
+                std::fs::read_to_string(f.root.join("src/lib.rs"))
+                    .unwrap()
+                    .contains("ProposedChange")
+            );
+            let db = f.connection();
+            match change {
+                "reject" => {
+                    db.execute(
+                        "UPDATE tasks SET lease_until='2000-01-01T00:00:00Z' WHERE id=?1",
+                        [TASK],
+                    )
+                    .unwrap();
+                    project::claim_task(
+                        TASK,
+                        ".ferrus/tasks/t-001.md",
+                        "supervisor:codex:other",
+                        60,
+                    )
+                    .await
+                    .unwrap();
+                    project::record_task_review_rejected(TASK, 3).await.unwrap();
+                }
+                "lease" => {
+                    db.execute(
+                        "UPDATE tasks SET lease_until='2000-01-01T00:00:00Z' WHERE id=?1",
+                        [TASK],
+                    )
+                    .unwrap();
+                }
+                "owner" => {
+                    db.execute(
+                        "UPDATE tasks SET claimed_by='supervisor:codex:other' WHERE id=?1",
+                        [TASK],
+                    )
+                    .unwrap();
+                }
+                "run" => {
+                    project::record_run_finished(&session.scope.run_id, 1)
+                        .await
+                        .unwrap();
+                }
+                "submission" => {
+                    db.execute("UPDATE tasks SET repository_view_tree_digest='0000000000000000000000000000000000000000' WHERE id=?1", [TASK]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let tasks = project::list_tasks().await.unwrap();
+            std::fs::write(f.root.join(".ferrus/approval-check-release"), "done").unwrap();
+            tasks
+        };
+        let (result, tasks_after_loss) = tokio::join!(approval, lose_fence);
+        assert!(result.is_err(), "accepted stale approval after {change}");
+        assert_eq!(
+            project::list_tasks().await.unwrap(),
+            tasks_after_loss,
+            "{change}"
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("src/lib.rs")).unwrap(),
+            before,
+            "{change}"
+        );
+        assert_eq!(
+            std::fs::read(f.root.join(".git/index")).unwrap(),
+            index_before,
+            "{change}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("spec.md")).unwrap(),
+            spec,
+            "{change}"
+        );
+        assert!(!f.events().iter().any(|(kind, _)| kind == "approved"));
+    }
+}
+
 #[tokio::test]
 async fn native_consultant_human_wait_cancels_and_relaunches_without_taking_a_lease() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();

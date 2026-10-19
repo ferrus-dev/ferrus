@@ -1017,25 +1017,36 @@ pub(crate) async fn reject_supervisor_session(
     max_cycles: u32,
 ) -> Result<TaskReviewRejection> {
     with_supervisor_session(scope, true, move |tx, scope, context| {
-        require_executor_owner(tx, scope)?;
-        anyhow::ensure!(
-            context.status == "reviewing"
-                && expected_tree.is_some()
-                && context.repository_view.frozen_source_tree == expected_tree,
-            "Native review binding changed before rejection"
-        );
-        let current_tree: Option<String> = tx.query_row(
-            "SELECT repository_view_tree_digest FROM tasks WHERE id = ?1",
-            [&scope.task_id],
-            |row| row.get(0),
-        )?;
-        anyhow::ensure!(
-            current_tree.as_deref() == expected_tree.as_ref().map(|tree| tree.value()),
-            "Review submission changed before rejection"
-        );
+        require_supervisor_review(tx, scope, &context, expected_tree.as_ref())?;
         task::record_task_review_rejected_in_transaction(tx, &scope.task_id, max_cycles)
     })
     .await
+}
+
+// Call only inside with_supervisor_session, which validates the exact run binding.
+pub(crate) fn require_supervisor_review(
+    tx: &Transaction<'_>,
+    scope: &ExecutorSessionScope,
+    context: &RuntimeTaskContext,
+    expected_tree: Option<&Digest>,
+) -> Result<()> {
+    require_executor_owner(tx, scope)?;
+    anyhow::ensure!(
+        context.status == "reviewing"
+            && expected_tree.is_some()
+            && context.repository_view.frozen_source_tree.as_ref() == expected_tree,
+        "Native review binding changed before decision"
+    );
+    let current_tree: Option<String> = tx.query_row(
+        "SELECT repository_view_tree_digest FROM tasks WHERE id = ?1",
+        [&scope.task_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        current_tree.as_deref() == expected_tree.map(|tree| tree.value()),
+        "Review submission changed before decision"
+    );
+    Ok(())
 }
 
 pub(crate) async fn renew_supervisor_session(

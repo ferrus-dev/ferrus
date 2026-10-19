@@ -63,21 +63,16 @@ pub(crate) async fn run_for_context(
     // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
-        if let Some(scope) = native_scope {
+        if let Some(scope) = native_scope.as_ref() {
             let expected = context.repository_view.frozen_source_tree.clone();
-            project::with_supervisor_session(&scope, false, move |tx, scope, current| {
-                project::require_executor_owner(tx, scope)?;
-                anyhow::ensure!(
-                    current.status == "reviewing"
-                        && current.repository_view.frozen_source_tree == expected,
-                    "Native review binding changed before integration"
-                );
-                Ok(())
+            project::with_supervisor_session(scope, false, move |tx, scope, current| {
+                project::require_supervisor_review(tx, scope, &current, expected.as_ref())
             })
             .await?;
         }
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
-        let integration_result = integrate_approved_task(&context, &project_root).await;
+        let integration_result =
+            integrate_approved_task(&context, &project_root, native_scope.as_ref()).await;
         let refresh_canonical_graph = observer
             .finish(&context, &project_root, integration_result.is_ok())
             .await;
@@ -118,7 +113,11 @@ fn approval_git_command() -> Command {
     command
 }
 
-async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Path) -> Result<()> {
+async fn integrate_approved_task(
+    context: &RuntimeTaskContext,
+    project_root: &Path,
+    native_scope: Option<&project::ExecutorSessionScope>,
+) -> Result<()> {
     let canonical_snapshot = apply_approved_patch(context, project_root).await?;
     if let Some(canonical_snapshot) = canonical_snapshot.as_ref() {
         // The approved patch may have changed ferrus.toml, so run the integration
@@ -155,6 +154,32 @@ async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Pa
         }
     }
     let transition = async {
+        if let Some(scope) = native_scope {
+            // Checks can outlive the lease. Fence completion and its milestone
+            // update together, then use the normal rollback path on lost authority.
+            let expected = context.repository_view.frozen_source_tree.clone();
+            let project_root = project_root.to_path_buf();
+            return project::with_supervisor_session(scope, true, move |tx, scope, current| {
+                project::require_supervisor_review(tx, scope, &current, expected.as_ref())?;
+                project::record_task_status_on_connection(
+                    tx,
+                    &current.task_id,
+                    &current.task_path,
+                    project::TaskStatus::Complete,
+                    None,
+                    None,
+                )?;
+                if let (Some(spec_path), Some(milestone_id)) = (
+                    current.spec_path.as_deref(),
+                    current.milestone_id.as_deref(),
+                ) {
+                    let spec_path = canonical_approval_path(&project_root, spec_path);
+                    specs::complete_milestone_blocking(&spec_path.to_string_lossy(), milestone_id)?;
+                }
+                Ok(())
+            })
+            .await;
+        }
         if let (Some(spec_path), Some(milestone_id)) = (
             context.spec_path.as_deref(),
             context.milestone_id.as_deref(),
