@@ -106,6 +106,7 @@ impl Session {
                 path: workspace,
                 owned: false,
                 omitted_links: 0,
+                omitted_paths: 0,
             })
         };
         project::start_supervisor_session(&scope, mode == Mode::Review, ttl).await?;

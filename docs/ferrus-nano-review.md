@@ -22,8 +22,9 @@ Individual artifacts are limited to 1 MiB and pages to 4 KiB.
 
 The Reviewer reads a private inspection workspace built from submitted Git blobs without
 checkout filters. Subsequent canonical/worktree edits cannot alter those reads. Inspection
-is bounded to 20,000 entries, 8 MiB per blob, and 128 MiB total; omitted symlinks/gitlinks are
-reported in context metadata. Missing frozen submission evidence or an invalid binding fails
+is bounded to 20,000 entries, 8 MiB per blob, and 128 MiB total. Omitted symlinks/gitlinks and
+unsupported filename encodings are reported separately in context metadata.
+Missing frozen submission evidence or an invalid binding fails
 before inference, with no canonical fallback. Arrange a successful graph freeze at submit;
 a graph-disabled or failed freeze does not provide this evidence. This requires a submitted Git tree;
 non-Git managed review has no equivalent immutable source and fails explicitly.

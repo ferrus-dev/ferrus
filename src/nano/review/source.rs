@@ -11,6 +11,7 @@ pub(crate) struct Source {
     pub path: PathBuf,
     pub owned: bool,
     pub omitted_links: usize,
+    pub omitted_paths: usize,
 }
 impl Drop for Source {
     fn drop(&mut self) {
@@ -43,6 +44,7 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         path: destination.canonicalize()?,
         owned: true,
         omitted_links: 0,
+        omitted_paths: 0,
     };
     let mut list = Child(
         git(root)
@@ -78,8 +80,12 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         .enumerate()
     {
         ensure!(index < 20000, "Reviewer tree file quota exceeded");
-        let text = std::str::from_utf8(entry)?;
-        let (header, path) = text.split_once('\t').context("Invalid tree entry")?;
+        let separator = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("Invalid tree entry")?;
+        let header = std::str::from_utf8(&entry[..separator])?;
+        let path = &entry[separator + 1..];
         let fields: Vec<_> = header.split_whitespace().collect();
         // Never materialize symlinks or gitlinks into the inspection workspace.
         if fields
@@ -99,7 +105,19 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             size <= 8 * 1024 * 1024 && total <= 128 * 1024 * 1024,
             "Reviewer source exceeds quota"
         );
-        let relative = Path::new(path);
+        #[cfg(unix)]
+        let relative = {
+            use std::os::unix::ffi::OsStrExt;
+            Path::new(std::ffi::OsStr::from_bytes(path))
+        };
+        #[cfg(not(unix))]
+        let relative = match std::str::from_utf8(path) {
+            Ok(path) => Path::new(path),
+            Err(_) => {
+                source.omitted_paths += 1;
+                continue;
+            }
+        };
         ensure!(
             !relative.is_absolute()
                 && relative
@@ -108,7 +126,18 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             "Unsafe submitted path"
         );
         let target = source.path.join(relative);
-        fs::create_dir_all(target.parent().context("Missing source parent")?)?;
+        let create = || -> Result<fs::File> {
+            fs::create_dir_all(target.parent().context("Missing source parent")?)?;
+            super::super::private::file(&target, true)
+        };
+        let mut file = match create() {
+            Ok(file) => file,
+            Err(error) if unsupported_name(&error) => {
+                source.omitted_paths += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         writeln!(input, "{}", fields[2])?;
         input.flush()?;
         let mut reply = String::new();
@@ -117,7 +146,6 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             reply.trim() == format!("{} blob {}", fields[2], size),
             "Unexpected Git blob identity"
         );
-        let mut file = super::super::private::file(&target, true)?;
         ensure!(
             std::io::copy(&mut output.by_ref().take(size), &mut file)? == size,
             "Incomplete submitted blob"
@@ -129,4 +157,85 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
     drop(input);
     ensure!(batch.0.wait()?.success(), "Cannot read submitted blobs");
     Ok(source)
+}
+
+fn unsupported_name(error: &anyhow::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::EILSEQ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    fn object(root: &Path, args: &[&str], bytes: &[u8]) -> String {
+        let mut child = git(root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[test]
+    fn snapshot_preserves_non_utf8_paths_or_reports_host_restrictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            git(root)
+                .args(["init", "--object-format=sha1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let blob = object(
+            root,
+            &["hash-object", "-w", "--stdin"],
+            b"frozen contents\n",
+        );
+        let mut entries = format!("100644 blob {blob}\tname-").into_bytes();
+        entries.extend_from_slice(b"\xff\tfile.txt\0");
+        entries.extend_from_slice(format!("100644 blob {blob}\tordinary.txt\0").as_bytes());
+        let tree = object(root, &["mktree", "-z"], &entries);
+        let source = snapshot(root, &root.join("inspection"), &tree).unwrap();
+        assert_eq!(
+            fs::read(source.path.join("ordinary.txt")).unwrap(),
+            b"frozen contents\n"
+        );
+        #[cfg(unix)]
+        {
+            let path = source.path.join(OsStr::from_bytes(b"name-\xff\tfile.txt"));
+            match fs::read(&path) {
+                Ok(contents) => {
+                    assert_eq!(contents, b"frozen contents\n");
+                    assert_eq!(source.omitted_paths, 0);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::EILSEQ) =>
+                {
+                    assert_eq!(source.omitted_paths, 1);
+                }
+                Err(error) => panic!("unexpected native-path error: {error}"),
+            }
+        }
+        #[cfg(not(unix))]
+        assert_eq!(source.omitted_paths, 1);
+        assert_eq!(source.omitted_links, 0);
+    }
 }

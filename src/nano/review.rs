@@ -236,7 +236,7 @@ async fn packet(session: &Session) -> Result<Value> {
         }
     }
     Ok(
-        json!({"task_id":context.task_id,"review_cycles":context.review_cycles,"check_retries":context.check_retries,"view":super::binding::view_identity(&context.repository_view),"artifacts":artifacts,"inspection":{"omitted_links":session.source.omitted_links}}),
+        json!({"task_id":context.task_id,"review_cycles":context.review_cycles,"check_retries":context.check_retries,"view":super::binding::view_identity(&context.repository_view),"artifacts":artifacts,"inspection":{"omitted_links":session.source.omitted_links,"omitted_paths":session.source.omitted_paths}}),
     )
 }
 async fn operation(session: &Session, call: &ValidatedCall, stop: &Cancellation) -> Result<Value> {

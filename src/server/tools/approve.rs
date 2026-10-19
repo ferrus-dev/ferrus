@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -159,7 +159,9 @@ async fn integrate_approved_task(
             // update together, then use the normal rollback path on lost authority.
             let expected = context.repository_view.frozen_source_tree.clone();
             let project_root = project_root.to_path_buf();
-            return project::with_supervisor_session(scope, true, move |tx, scope, current| {
+            let milestone_backup = Arc::new(Mutex::new(None::<(PathBuf, Vec<u8>)>));
+            let backup_for_transaction = Arc::clone(&milestone_backup);
+            let result = project::with_supervisor_session(scope, true, move |tx, scope, current| {
                 project::require_supervisor_review(tx, scope, &current, expected.as_ref())?;
                 project::record_task_status_on_connection(
                     tx,
@@ -174,11 +176,34 @@ async fn integrate_approved_task(
                     current.milestone_id.as_deref(),
                 ) {
                     let spec_path = canonical_approval_path(&project_root, spec_path);
+                    match std::fs::read(&spec_path) {
+                        Ok(contents) => {
+                            // Keep this outside the transaction result: COMMIT can
+                            // fail after the closure has successfully written the spec.
+                            *backup_for_transaction.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((spec_path.clone(), contents));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error).context("Failed to back up approval milestone"),
+                    }
                     specs::complete_milestone_blocking(&spec_path.to_string_lossy(), milestone_id)?;
                 }
                 Ok(())
             })
             .await;
+            if let Err(error) = result {
+                let backup = milestone_backup.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some((path, contents)) = backup
+                    && let Err(rollback_error) = tokio::fs::write(&path, contents).await
+                {
+                    anyhow::bail!(
+                        "{error}\n\nAdditionally failed to restore approval milestone {}: {rollback_error}",
+                        path.display()
+                    );
+                }
+                return Err(error);
+            }
+            return Ok(());
         }
         if let (Some(spec_path), Some(milestone_id)) = (
             context.spec_path.as_deref(),
