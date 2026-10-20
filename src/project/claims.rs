@@ -1011,14 +1011,23 @@ pub(crate) async fn start_supervisor_session(
     }).await
 }
 
-pub(crate) async fn reject_supervisor_session(
+pub(crate) async fn reject_supervisor_session<F>(
     scope: &ExecutorSessionScope,
     expected_tree: Option<Digest>,
     max_cycles: u32,
-) -> Result<TaskReviewRejection> {
+    publish_review: F,
+) -> Result<TaskReviewRejection>
+where
+    F: FnOnce(&RuntimeTaskContext) -> Result<()> + Send + 'static,
+{
     with_supervisor_session(scope, true, move |tx, scope, context| {
         require_supervisor_review(tx, scope, &context, expected_tree.as_ref())?;
-        task::record_task_review_rejected_in_transaction(tx, &scope.task_id, max_cycles)
+        let rejection =
+            task::record_task_review_rejected_in_transaction(tx, &scope.task_id, max_cycles)?;
+        // Keep publication behind the live review fence and before the new
+        // work phase becomes visible to another claimant.
+        publish_review(&context)?;
+        Ok(rejection)
     })
     .await
 }

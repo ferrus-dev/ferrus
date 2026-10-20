@@ -90,6 +90,16 @@ pub async fn write_review_for_run_dir(run_dir: &str, content: &str) -> Result<()
     write_path(&run_file(run_dir, "REVIEW.md"), content).await
 }
 
+// Native rejection publishes feedback inside its SQLite write transaction.
+pub(crate) fn write_review_for_run_dir_blocking(run_dir: &str, content: &str) -> Result<()> {
+    let path = resolve_project_path(run_file(run_dir, "REVIEW.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
 pub async fn read_submission_for_run_dir(run_dir: &str) -> Result<String> {
     read_path_or_empty(&run_file(run_dir, "SUBMISSION.md")).await
 }

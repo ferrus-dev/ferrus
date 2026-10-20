@@ -112,6 +112,11 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         };
         #[cfg(not(unix))]
         let relative = match std::str::from_utf8(path) {
+            #[cfg(windows)]
+            Ok(path) if !windows_path_supported(path) => {
+                source.omitted_paths += 1;
+                continue;
+            }
             Ok(path) => Path::new(path),
             Err(_) => {
                 source.omitted_paths += 1;
@@ -126,13 +131,24 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             "Unsafe submitted path"
         );
         let target = source.path.join(relative);
+        if target.is_dir() {
+            source.omitted_paths += 1;
+            continue;
+        }
         let create = || -> Result<fs::File> {
             fs::create_dir_all(target.parent().context("Missing source parent")?)?;
             super::super::private::file(&target, true)
         };
         let mut file = match create() {
             Ok(file) => file,
-            Err(error) if unsupported_name(&error) => {
+            Err(error)
+                if unsupported_name(&error)
+                    || target
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|parent| *parent != source.path.as_path())
+                        .any(Path::is_file) =>
+            {
                 source.omitted_paths += 1;
                 continue;
             }
@@ -160,17 +176,56 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
 }
 
 fn unsupported_name(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+    ) {
+        return true;
+    }
     #[cfg(unix)]
     {
-        error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.raw_os_error() == Some(libc::EILSEQ))
+        error.raw_os_error() == Some(libc::EILSEQ)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = error;
-        false
+        use windows_sys::Win32::Foundation::{
+            ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME,
+        };
+        error.raw_os_error().is_some_and(|code| {
+            matches!(
+                code as u32,
+                ERROR_BAD_PATHNAME
+                    | ERROR_DIRECTORY
+                    | ERROR_FILENAME_EXCED_RANGE
+                    | ERROR_INVALID_NAME
+            )
+        })
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_supported(path: &str) -> bool {
+    // Do not let CreateFileW reinterpret a Git name as a device or data stream.
+    path.split('/').all(|component| {
+        let lower = component.to_uppercase().to_ascii_lowercase();
+        let stem = lower.split('.').next().unwrap_or_default();
+        !component.is_empty()
+            && !component.ends_with(['.', ' '])
+            && !component
+                .chars()
+                .any(|c| c < ' ' || ":*?\"<>|\\".contains(c))
+            && !matches!(stem, "con" | "prn" | "aux" | "nul" | "conin$" | "conout$")
+            && !["com", "lpt"].iter().any(|prefix| {
+                stem.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.chars().count() == 1 && "123456789\u{b9}\u{b2}\u{b3}".contains(suffix)
+                })
+            })
+    })
 }
 
 #[cfg(test)]
@@ -181,6 +236,7 @@ mod tests {
 
     fn object(root: &Path, args: &[&str], bytes: &[u8]) -> String {
         let mut child = git(root)
+            .args(["-c", "core.protectNTFS=false"])
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -190,6 +246,118 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[test]
+    fn windows_paths_exclude_devices_streams_and_unsupported_components() {
+        for path in [
+            "CON",
+            "con.txt",
+            "dir/AUX.rs",
+            "NUL",
+            "COM1",
+            "LPT9.log",
+            "COM\u{b2}",
+            "CONIN$",
+            "con\u{131}n$",
+            "name:stream",
+            "dir\\file",
+            "trailing.",
+            "trailing ",
+            "name?",
+            "line\nfeed",
+        ] {
+            assert!(!windows_path_supported(path), "{path:?}");
+        }
+        for path in [
+            "src/lib.rs",
+            "console.txt",
+            "COM10",
+            "dir/notes~old",
+            "caf\u{e9}.txt",
+        ] {
+            assert!(windows_path_supported(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_omits_case_collisions_without_overwriting_the_first_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            git(root)
+                .args(["init", "--object-format=sha1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let first = object(root, &["hash-object", "-w", "--stdin"], b"first\n");
+        let second = object(root, &["hash-object", "-w", "--stdin"], b"second\n");
+        let subtree = object(
+            root,
+            &["mktree", "-z"],
+            format!("100644 blob {second}\tchild.txt\0").as_bytes(),
+        );
+        let entries = format!(
+            "100644 blob {first}\tA.txt\0\
+            100644 blob {first}\tREADME\0\
+            100644 blob {second}\ta.txt\0\
+            100644 blob {second}\tordinary.txt\0\
+            040000 tree {subtree}\treadme\0"
+        );
+        let tree = object(root, &["mktree", "-z"], entries.as_bytes());
+        let source = snapshot(root, &root.join("inspection"), &tree).unwrap();
+        fs::write(source.path.join("CaseProbe"), "probe").unwrap();
+        let case_insensitive = source.path.join("caseprobe").exists();
+        assert_eq!(fs::read(source.path.join("A.txt")).unwrap(), b"first\n");
+        assert_eq!(fs::read(source.path.join("README")).unwrap(), b"first\n");
+        assert_eq!(
+            fs::read(source.path.join("ordinary.txt")).unwrap(),
+            b"second\n"
+        );
+        assert_eq!(source.omitted_paths, if case_insensitive { 2 } else { 0 });
+        if !case_insensitive {
+            assert_eq!(fs::read(source.path.join("a.txt")).unwrap(), b"second\n");
+            assert_eq!(
+                fs::read(source.path.join("readme/child.txt")).unwrap(),
+                b"second\n"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_omits_windows_devices_and_stream_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            git(root)
+                .args(["init", "--object-format=sha1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let blob = object(root, &["hash-object", "-w", "--stdin"], b"contents\n");
+        let names = [
+            "CON",
+            "CON.txt",
+            "file:stream.txt",
+            "NUL",
+            "trailing.",
+            "ordinary.txt",
+        ];
+        let entries = names
+            .iter()
+            .map(|name| format!("100644 blob {blob}\t{name}\0"))
+            .collect::<String>();
+        let tree = object(root, &["mktree", "-z"], entries.as_bytes());
+        let source = snapshot(root, &root.join("inspection"), &tree).unwrap();
+        assert_eq!(source.omitted_paths, names.len() - 1);
+        assert_eq!(
+            fs::read(source.path.join("ordinary.txt")).unwrap(),
+            b"contents\n"
+        );
+        assert!(!source.path.join("file").exists());
     }
 
     #[test]

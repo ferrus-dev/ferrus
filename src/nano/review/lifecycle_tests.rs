@@ -66,6 +66,8 @@ async fn native_rejection_revalidates_the_lease_phase_and_submission_at_commit()
         .unwrap();
     let session = reviewer(&f, "stalled-review", &f.root).await;
     let context = session.authorize().await.unwrap();
+    let review_path = f.root.join(".ferrus/runs/t-001/REVIEW.md");
+    std::fs::write(&review_path, "Accepted replacement feedback\n").unwrap();
     let db = f.connection();
     let (owner, lease, tree): (String, String, String) = db
         .query_row(
@@ -78,6 +80,7 @@ async fn native_rejection_revalidates_the_lease_phase_and_submission_at_commit()
         "lease_until='2000-01-01T00:00:00Z'",
         "claimed_by='supervisor:codex:other'",
         "status='complete'",
+        "status='addressing'",
         "repository_view_tree_digest='0000000000000000000000000000000000000000'",
     ] {
         db.execute(
@@ -95,9 +98,38 @@ async fn native_rejection_revalidates_the_lease_phase_and_submission_at_commit()
         )
         .await;
         assert!(result.is_err(), "{change}");
+        assert_eq!(
+            std::fs::read_to_string(&review_path).unwrap(),
+            "Accepted replacement feedback\n",
+            "{change}"
+        );
         assert_eq!(project::list_tasks().await.unwrap(), before, "{change}");
         assert_eq!(db.query_row("SELECT COUNT(*) FROM events WHERE type IN ('task_rejected','task_review_limit_exceeded')", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
     }
+}
+
+#[tokio::test]
+async fn native_rejection_keeps_review_open_when_feedback_publication_fails() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let executor = git_session(&f, true).await;
+    lifecycle::submit(&executor, "Submission".into(), &Cancellation::default())
+        .await
+        .unwrap();
+    let session = reviewer(&f, "publication-failure-review", &f.root).await;
+    std::fs::create_dir(f.root.join(".ferrus/runs/t-001/REVIEW.md")).unwrap();
+    let before = project::list_tasks().await.unwrap();
+    let error = crate::server::tools::reject::run_for_context(
+        session.authorize().await.unwrap(),
+        "Feedback".into(),
+        Config::load_from(&f.root).await.unwrap(),
+        Some(session.scope.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("REVIEW.md"), "{error:#}");
+    assert_eq!(project::list_tasks().await.unwrap(), before);
+    assert!(!f.events().iter().any(|(kind, _)| kind == "task_rejected"));
 }
 
 #[tokio::test]
