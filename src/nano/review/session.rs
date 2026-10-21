@@ -96,6 +96,10 @@ impl Session {
             let parent = parent.join("review-sources");
             super::super::private::directory(&parent, false)?;
             let target = parent.join(&scope.run_id);
+            project::with_supervisor_session(&scope, true, move |tx, _, _| {
+                source::reclaim(&parent, tx)
+            })
+            .await?;
             let owned_root = root.clone();
             Arc::new(
                 tokio::task::spawn_blocking(move || source::snapshot(&owned_root, &target, &tree))

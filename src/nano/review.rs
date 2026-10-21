@@ -58,9 +58,17 @@ impl<B: ExecutionBackend> ReviewTools<B> {
             }
             Ok(Err(error)) if self.pending_name == "approve" => {
                 self.context_seen = false;
-                ToolOutcome::Failed(ToolError::Lifecycle(
-                    json!({"code":"approval_failed","message":super::conversation::display_text(&error.to_string(),2048)}),
-                ))
+                let unknown = error.is::<crate::server::tools::approve::ApprovalEffectUnknown>();
+                let diagnostic = ToolError::Lifecycle(json!({
+                    "code": if unknown {"approval_effect_unknown"} else {"approval_failed"},
+                    "message":super::conversation::display_text(&error.to_string(),2048)
+                }));
+                if unknown {
+                    self.terminal = Some(EndReason::EffectUnknown);
+                    ToolOutcome::Unknown(diagnostic)
+                } else {
+                    ToolOutcome::Failed(diagnostic)
+                }
             }
             _ if matches!(
                 self.pending_name.as_str(),

@@ -141,6 +141,8 @@ async fn relaunched_native_reviewer_renews_its_inherited_lease_before_heartbeat(
         .await
         .unwrap();
     let first = reviewer(&f, "crashed-review", &f.root).await;
+    let abandoned_source = first.source.path.clone();
+    assert!(abandoned_source.is_dir());
     project::record_run_finished(&first.scope.run_id, 1)
         .await
         .unwrap();
@@ -152,6 +154,8 @@ async fn relaunched_native_reviewer_renews_its_inherited_lease_before_heartbeat(
         )
         .unwrap();
     let resumed = reviewer(&f, "recovered-review", &f.root).await;
+    assert!(!abandoned_source.exists());
+    assert!(resumed.source.path.is_dir());
     for human_wait in [false, true] {
         if human_wait {
             f.connection().execute("UPDATE tasks SET status='awaiting_human',awaiting_human_status='reviewing',awaiting_human_by=?1,lease_until=?2 WHERE id=?3", rusqlite::params![resumed.scope.agent_id,lease,TASK]).unwrap();
@@ -523,6 +527,60 @@ async fn native_approval_preserves_integration_rollback_and_allows_review_feedba
             .unwrap()
             .status,
         "addressing"
+    );
+}
+
+#[tokio::test]
+async fn native_approval_seals_the_session_when_rollback_fails() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let executor = isolated(&f).await;
+    std::fs::write(
+        executor.workspace().join("src/lib.rs"),
+        "pub struct ProposedChange;\n",
+    )
+    .unwrap();
+    lifecycle::submit(
+        &executor,
+        "Proposed change".into(),
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    // Leave an index lock behind after applying the change. The failed check
+    // triggers rollback, which cannot restore the canonical index through it.
+    configure(&f, &["git rev-parse --git-dir > .git/index.lock", "exit 1"], 3);
+    let session = reviewer(&f, "failed-rollback-review", &f.root).await;
+    let end = decide(
+        &f,
+        session,
+        vec![
+            tool("context", "review_pending", json!({})),
+            tool("approve", "approve", json!({})),
+            tool("reread", "review_pending", json!({})),
+            tool(
+                "reject",
+                "reject",
+                json!({"notes":"Must not reach this decision"}),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(end.reason, EndReason::EffectUnknown);
+    assert!(end.durable);
+    assert_eq!(end.budget.tool_calls, 2);
+    let task = project::list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == TASK)
+        .unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.failure_reason.as_deref(), Some("nano_effect_unknown"));
+    assert!(
+        !f.events()
+            .iter()
+            .any(|(kind, _)| kind == "task_rejected" || kind == "approved")
     );
 }
 

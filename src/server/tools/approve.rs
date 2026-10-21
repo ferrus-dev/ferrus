@@ -30,6 +30,18 @@ use super::{
 pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing -> Complete. \
      Must be called after /review_pending.";
 
+/// Approval changed external state and could not confirm that rollback restored it.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}\n\nApproval rollback failed; manual reconciliation is required: {rollback}")]
+pub(crate) struct ApprovalEffectUnknown {
+    error: anyhow::Error,
+    rollback: anyhow::Error,
+}
+
+fn rollback_failed(error: anyhow::Error, rollback: anyhow::Error) -> anyhow::Error {
+    ApprovalEffectUnknown { error, rollback }.into()
+}
+
 pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
     handler_for_agent(ctx.agent_id()).await
 }
@@ -127,9 +139,7 @@ async fn integrate_approved_task(
             Ok(config) => config,
             Err(err) => {
                 if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                    anyhow::bail!(
-                        "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                    );
+                    return Err(rollback_failed(err, rollback_err));
                 }
                 return Err(err);
             }
@@ -138,17 +148,13 @@ async fn integrate_approved_task(
             run_post_apply_integration_checks(context, &post_apply_config, project_root).await;
         if let Err(err) = integration_checks {
             if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                anyhow::bail!(
-                    "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                );
+                return Err(rollback_failed(err, rollback_err));
             }
             return Err(err);
         }
         if let Err(err) = canonical_snapshot.restore_index().await {
             if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                anyhow::bail!(
-                    "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                );
+                return Err(rollback_failed(err, rollback_err));
             }
             return Err(err).context("Failed to preserve the pre-integration canonical index");
         }
@@ -161,45 +167,59 @@ async fn integrate_approved_task(
             let project_root = project_root.to_path_buf();
             let milestone_backup = Arc::new(Mutex::new(None::<(PathBuf, Vec<u8>)>));
             let backup_for_transaction = Arc::clone(&milestone_backup);
-            let result = project::with_supervisor_session(scope, true, move |tx, scope, current| {
-                project::require_supervisor_review(tx, scope, &current, expected.as_ref())?;
-                project::record_task_status_on_connection(
-                    tx,
-                    &current.task_id,
-                    &current.task_path,
-                    project::TaskStatus::Complete,
-                    None,
-                    None,
-                )?;
-                if let (Some(spec_path), Some(milestone_id)) = (
-                    current.spec_path.as_deref(),
-                    current.milestone_id.as_deref(),
-                ) {
-                    let spec_path = canonical_approval_path(&project_root, spec_path);
-                    match std::fs::read(&spec_path) {
-                        Ok(contents) => {
-                            // Keep this outside the transaction result: COMMIT can
-                            // fail after the closure has successfully written the spec.
-                            *backup_for_transaction.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some((spec_path.clone(), contents));
+            let result =
+                project::with_supervisor_session(scope, true, move |tx, scope, current| {
+                    project::require_supervisor_review(tx, scope, &current, expected.as_ref())?;
+                    project::record_task_status_on_connection(
+                        tx,
+                        &current.task_id,
+                        &current.task_path,
+                        project::TaskStatus::Complete,
+                        None,
+                        None,
+                    )?;
+                    if let (Some(spec_path), Some(milestone_id)) = (
+                        current.spec_path.as_deref(),
+                        current.milestone_id.as_deref(),
+                    ) {
+                        let spec_path = canonical_approval_path(&project_root, spec_path);
+                        match std::fs::read(&spec_path) {
+                            Ok(contents) => {
+                                // Keep this outside the transaction result: COMMIT can
+                                // fail after the closure has successfully written the spec.
+                                *backup_for_transaction
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) =
+                                    Some((spec_path.clone(), contents));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(error).context("Failed to back up approval milestone");
+                            }
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error).context("Failed to back up approval milestone"),
+                        specs::complete_milestone_blocking(
+                            &spec_path.to_string_lossy(),
+                            milestone_id,
+                        )?;
                     }
-                    specs::complete_milestone_blocking(&spec_path.to_string_lossy(), milestone_id)?;
-                }
-                Ok(())
-            })
-            .await;
+                    Ok(())
+                })
+                .await;
             if let Err(error) = result {
-                let backup = milestone_backup.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let backup = milestone_backup
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
                 if let Some((path, contents)) = backup
                     && let Err(rollback_error) = tokio::fs::write(&path, contents).await
                 {
-                    anyhow::bail!(
-                        "{error}\n\nAdditionally failed to restore approval milestone {}: {rollback_error}",
-                        path.display()
-                    );
+                    return Err(rollback_failed(
+                        error,
+                        anyhow::Error::new(rollback_error).context(format!(
+                            "Failed to restore approval milestone {}",
+                            path.display()
+                        )),
+                    ));
                 }
                 return Err(error);
             }
@@ -224,9 +244,7 @@ async fn integrate_approved_task(
         if let Some(canonical_snapshot) = canonical_snapshot.as_ref()
             && let Err(rollback_err) = canonical_snapshot.restore(project_root).await
         {
-            anyhow::bail!(
-                "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-            );
+            return Err(rollback_failed(err, rollback_err));
         }
         return Err(err);
     }
@@ -498,18 +516,22 @@ async fn apply_approved_patch(
                 project_root.display(),
                 detail
             );
-            write_integration_error(context, &reason).await?;
+            if let Err(report_error) = write_integration_error(context, &reason).await {
+                return Err(error).context(format!(
+                    "{reason}\n\nFailed to save integration diagnostics: {report_error}"
+                ));
+            }
             project::record_task_integration_failed_best_effort(
                 &context.task_id,
                 context.run_id.as_deref(),
                 &reason,
             )
             .await;
-            anyhow::bail!(
+            return Err(error).context(format!(
                 "{reason}\n\nIntegration error was saved to {}/INTEGRATION_ERROR.md. \
              Reject this review with the conflict details so an Executor can address it.",
                 context.run_dir
-            );
+            ));
         }
     };
     Ok(Some(snapshot))
@@ -542,9 +564,7 @@ async fn integrate_patch_three_way(
     validate_tree_materialization(project_root, &snapshot.tree, &merged).await?;
     if let Err(error) = materialize_tree(project_root, &snapshot.tree, &merged).await {
         if let Err(restore_error) = snapshot.restore(project_root).await {
-            anyhow::bail!(
-                "{error}\n\nAdditionally failed to restore the pre-integration canonical workspace: {restore_error}"
-            );
+            return Err(rollback_failed(error, restore_error));
         }
         return Err(error);
     }

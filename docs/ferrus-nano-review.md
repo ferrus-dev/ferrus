@@ -24,6 +24,7 @@ The Reviewer reads a private inspection workspace built from submitted Git blobs
 checkout filters. Subsequent canonical/worktree edits cannot alter those reads. Inspection
 is bounded to 20,000 entries, 8 MiB per blob, and 128 MiB total. Omitted symlinks/gitlinks and
 host-incompatible paths are reported separately in context metadata.
+Reviewer startup reclaims inspection directories without a live Supervisor run.
 Missing frozen submission evidence or an invalid binding fails
 before inference, with no canonical fallback. Arrange a successful graph freeze at submit;
 a graph-disabled or failed freeze does not provide this evidence. This requires a submitted Git tree;
@@ -33,6 +34,7 @@ Only `approve` integrates code, using the existing canonical lock, checks, merge
 source observation, and graph refresh. Rejection retains review-cycle limits, retry/dispatch
 resets, and the mutable successor without rewriting the old frozen run. Successful decisions
 stop the engine before later calls or another inference.
+Failed approval rollbacks stop with an unknown effect requiring manual reconciliation.
 
 Reviewer leases renew independently of inference. Consultants attach exclusively to the exact
 run and never claim or renew the Executor lease. A human question pauses the existing task

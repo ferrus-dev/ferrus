@@ -38,6 +38,41 @@ fn git(root: &Path) -> Command {
         .stderr(Stdio::null());
     command
 }
+
+/// The caller holds a SQLite write transaction so new run reservations cannot
+/// race the live-run check and removal of an existing inspection directory.
+pub(super) fn reclaim(parent: &Path, tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+    let mut statement = tx.prepare(
+        "SELECT id, pid FROM runs WHERE role='supervisor' AND status IN ('running','checking','reviewing')",
+    )?;
+    let mut live = std::collections::HashSet::new();
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<u32>>(1)?))
+    })? {
+        let (id, pid) = row?;
+        if pid.is_some_and(crate::platform::pid_is_alive) {
+            live.insert(id);
+        }
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else { continue };
+        if !super::super::journal::valid_id(id) || live.contains(id) || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(run_id = id, error = ?error, "failed to reclaim review source");
+            }
+        }
+    }
+    Ok(removed)
+}
+
 pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<Source> {
     super::super::private::directory(destination, true)?;
     let mut source = Source {
@@ -233,6 +268,53 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    #[test]
+    fn reclaim_removes_only_abandoned_review_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE runs (id TEXT, role TEXT, status TEXT, pid INTEGER);")
+            .unwrap();
+        for (id, status, pid) in [
+            ("live-review", "running", Some(std::process::id())),
+            ("checking-review", "checking", Some(std::process::id())),
+            ("human-review", "reviewing", Some(std::process::id())),
+            ("finished-review", "completed", Some(std::process::id())),
+            ("interrupted-review", "interrupted", None),
+            ("dead-review", "running", None),
+        ] {
+            db.execute(
+                "INSERT INTO runs VALUES (?1,'supervisor',?2,?3)",
+                rusqlite::params![id, status, pid],
+            )
+            .unwrap();
+            fs::create_dir(root.path().join(id)).unwrap();
+            fs::write(root.path().join(id).join("source.rs"), "submitted source").unwrap();
+        }
+        fs::create_dir(root.path().join("orphan-review")).unwrap();
+        fs::create_dir(root.path().join("not a run")).unwrap();
+        fs::write(root.path().join("plain-file"), "leave alone").unwrap();
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked-review")).unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(reclaim(root.path(), &tx).unwrap(), 4);
+        for id in [
+            "live-review",
+            "checking-review",
+            "human-review",
+            "not a run",
+        ] {
+            assert!(root.path().join(id).is_dir(), "{id}");
+        }
+        assert!(root.path().join("plain-file").is_file());
+        #[cfg(unix)]
+        assert!(root.path().join("linked-review").is_symlink() && outside.path().is_dir());
+        assert_eq!(reclaim(root.path(), &tx).unwrap(), 0);
+    }
 
     fn object(root: &Path, args: &[&str], bytes: &[u8]) -> String {
         let mut child = git(root)
