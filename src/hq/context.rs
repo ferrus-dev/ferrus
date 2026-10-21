@@ -20,6 +20,7 @@ impl HqContext {
             state_rx,
             display,
             announced_completed_tasks: HashSet::new(),
+            announced_unavailable_nano_reviews: HashSet::new(),
             nano_view: None,
             nano_paused_tasks: HashSet::new(),
         }

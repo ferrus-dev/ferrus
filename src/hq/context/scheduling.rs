@@ -17,6 +17,11 @@ impl HqContext {
         tasks: &[TaskRecord],
         max_parallel: usize,
     ) -> Result<usize> {
+        self.announced_unavailable_nano_reviews.retain(|id| {
+            tasks.iter().any(|task| {
+                &task.id == id && task.status == crate::project::TaskStatus::Reviewing.as_str()
+            })
+        });
         let reviewing_count = tasks
             .iter()
             .filter(|task| task.status == crate::project::TaskStatus::Reviewing.as_str())
@@ -45,6 +50,30 @@ impl HqContext {
             if task_claim_blocks_spawn(task, &expected_agent_id, now, &live_run_task_ids) {
                 continue;
             }
+            if self
+                .supervisor
+                .as_ref()
+                .is_some_and(|agent| agent.name() == "nano")
+            {
+                let view = crate::project::task_repository_view(&task.id).await?;
+                if !view.is_some_and(|view| {
+                    view.lifecycle
+                        == crate::repository_graph::domain::TaskViewLifecycle::FrozenSubmitted
+                        && view.frozen_source_tree.is_some()
+                }) {
+                    if self
+                        .announced_unavailable_nano_reviews
+                        .insert(task.id.clone())
+                    {
+                        self.display.error(format!(
+                            "Nano cannot review task {} without a frozen submitted view. Automatic review is paused; select another Supervisor to review this submission.",
+                            task.id
+                        ));
+                    }
+                    continue;
+                }
+            }
+            self.announced_unavailable_nano_reviews.remove(&task.id);
             review_tasks.push(task.clone());
             if review_tasks.len() == slots {
                 break;

@@ -129,6 +129,131 @@ fn context(agent: FakeNative, debug: bool) -> HqContext {
     context
 }
 
+struct ReviewLaunchProbe {
+    name: &'static str,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl crate::agents::SupervisorAgent for ReviewLaunchProbe {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn model(&self) -> Option<&str> {
+        None
+    }
+    fn spawn_with_index(&self, _: AgentRunMode<'_>, _: u32) -> Result<StdCommand> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("Review launcher probe; no process started")
+    }
+}
+
+#[tokio::test]
+async fn unavailable_nano_review_does_not_redispatch_or_change_the_task() {
+    use crate::project::{RepositoryViewReference, RepositoryViewStatus, TaskStatus};
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    crate::project::record_task_status("t-001", ".ferrus/tasks/t-001.md", TaskStatus::Reviewing)
+        .await
+        .unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for status in [RepositoryViewStatus::NotBuilt, RepositoryViewStatus::Failed] {
+        crate::project::record_task_repository_view(
+            "t-001",
+            &RepositoryViewReference::new(None, None, status).unwrap(),
+        )
+        .await
+        .unwrap();
+        let tasks = crate::project::list_tasks().await.unwrap();
+        // Recreating HQ must still enforce eligibility from SQLite rather than
+        // depend on an in-memory record of a previously failed child.
+        for _ in 0..2 {
+            let (_, state) = watch::channel(None);
+            let (messages, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let mut ctx = HqContext::new(state, Display(messages), false);
+            ctx.supervisor = Some(Arc::new(ReviewLaunchProbe {
+                name: "nano",
+                attempts: attempts.clone(),
+            }));
+            ctx.executor = Some(crate::agents::parse_executor_agent("codex", None).unwrap());
+            for _ in 0..3 {
+                ctx.reconcile_runtime_schedule().await.unwrap();
+            }
+            let mut diagnostics = 0;
+            while let Ok(message) = received.try_recv() {
+                if matches!(message, tui::UiMessage::Error(text) if text.contains("frozen submitted view"))
+                {
+                    diagnostics += 1;
+                }
+            }
+            assert_eq!(diagnostics, 1);
+            assert!(ctx.headless.is_empty());
+            assert_eq!(crate::project::list_tasks().await.unwrap(), tasks);
+        }
+    }
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::project::list_runs(100).await.unwrap().is_empty());
+    assert!(!f.root.join(".ferrus/logs").exists());
+    assert!(!f.data.join("repo-graph.db").exists());
+
+    // The same submission remains available to a Supervisor that does not
+    // require Nano's frozen inspection view.
+    let (_, state) = watch::channel(None);
+    let (messages, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut ctx = HqContext::new(state, Display(messages), false);
+    ctx.supervisor = Some(Arc::new(ReviewLaunchProbe {
+        name: "codex",
+        attempts: attempts.clone(),
+    }));
+    ctx.executor = Some(crate::agents::parse_executor_agent("codex", None).unwrap());
+    ctx.review().await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unavailable_nano_review_does_not_occupy_a_ready_review_slot() {
+    use crate::{
+        project::{RepositoryViewReference, RepositoryViewStatus, TaskStatus},
+        repository_graph::domain::{Digest, SnapshotId},
+    };
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let _f = Fixture::new().await;
+    for id in ["t-001", "t-002"] {
+        crate::project::record_task_status(
+            id,
+            &format!(".ferrus/tasks/{id}.md"),
+            TaskStatus::Reviewing,
+        )
+        .await
+        .unwrap();
+    }
+    let snapshot = SnapshotId::new("submitted-snapshot").unwrap();
+    let view = RepositoryViewReference::materialized(
+        snapshot.clone(),
+        None,
+        snapshot,
+        RepositoryViewStatus::Available,
+    )
+    .unwrap()
+    .frozen(Digest::new("sha1", "a".repeat(40)).unwrap())
+    .unwrap();
+    crate::project::record_task_repository_view("t-002", &view)
+        .await
+        .unwrap();
+    let (_, state) = watch::channel(None);
+    let (messages, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut ctx = HqContext::new(state, Display(messages), false);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    ctx.supervisor = Some(Arc::new(ReviewLaunchProbe {
+        name: "nano",
+        attempts: attempts.clone(),
+    }));
+    ctx.executor = Some(crate::agents::parse_executor_agent("codex", None).unwrap());
+    ctx.review().await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(ctx.announced_unavailable_nano_reviews.contains("t-001"));
+    assert!(!ctx.announced_unavailable_nano_reviews.contains("t-002"));
+}
+
 #[tokio::test]
 async fn native_setup_failures_do_not_consume_dispatches() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();

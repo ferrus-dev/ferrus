@@ -29,6 +29,8 @@ Missing frozen submission evidence or an invalid binding fails
 before inference, with no canonical fallback. Arrange a successful graph freeze at submit;
 a graph-disabled or failed freeze does not provide this evidence. This requires a submitted Git tree;
 non-Git managed review has no equivalent immutable source and fails explicitly.
+HQ pauses automatic Nano review dispatch for such submissions and reports the missing view
+once. The task remains Reviewing so another Supervisor can review it.
 
 Only `approve` integrates code, using the existing canonical lock, checks, merge/rollback,
 source observation, and graph refresh. Rejection retains review-cycle limits, retry/dispatch
