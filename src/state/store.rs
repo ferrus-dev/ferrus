@@ -90,6 +90,16 @@ pub async fn write_review_for_run_dir(run_dir: &str, content: &str) -> Result<()
     write_path(&run_file(run_dir, "REVIEW.md"), content).await
 }
 
+// Native rejection publishes feedback inside its SQLite write transaction.
+pub(crate) fn write_review_for_run_dir_blocking(run_dir: &str, content: &str) -> Result<()> {
+    let path = resolve_project_path(run_file(run_dir, "REVIEW.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
 pub async fn read_submission_for_run_dir(run_dir: &str) -> Result<String> {
     read_path_or_empty(&run_file(run_dir, "SUBMISSION.md")).await
 }
@@ -216,7 +226,15 @@ pub async fn read_consult_response_for_run_dir(run_dir: &str) -> Result<String> 
 }
 
 pub async fn write_consult_response_for_run_dir(run_dir: &str, content: &str) -> Result<()> {
-    write_path(&run_file(run_dir, "CONSULT_RESPONSE.md"), content).await
+    let path = resolve_project_path(run_file(run_dir, "CONSULT_RESPONSE.md"));
+    let content = content.to_owned();
+    // Stage and publish in one blocking operation so cancellation cannot expose
+    // an incomplete answer.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        write_path_atomically(&path, |file| file.write_all(content.as_bytes()))
+    })
+    .await?
 }
 
 pub async fn clear_consult_response_for_run_dir(run_dir: &str) -> Result<()> {
@@ -276,6 +294,40 @@ async fn write_path(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
+fn write_path_atomically(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().context("Missing artifact directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let staged = parent.join(format!(
+        ".consult-response-{}-{nonce}-{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .with_context(|| format!("Failed to stage {}", path.display()))?;
+    let result = (|| -> std::io::Result<()> {
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&staged, path)
+    })();
+    // The closure owns the handle, including on failure, so Windows can remove
+    // an incomplete stage. A killed process can leave only an unpublished stage.
+    let _ = std::fs::remove_file(&staged);
+    result.with_context(|| format!("Failed to publish {}", path.display()))
+}
+
 async fn remove_path_if_exists(path: &Path) -> Result<()> {
     let path = resolve_project_path(path);
     match tokio::fs::remove_file(&path).await {
@@ -303,6 +355,58 @@ mod tests {
     //! Scoped artifact paths, isolated check logs, and template preservation.
 
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn consultation_response_staging_failure_never_publishes_a_prefix() {
+        for previous in [None, Some(""), Some("Previous complete response")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("CONSULT_RESPONSE.md");
+            if let Some(previous) = previous {
+                std::fs::write(&path, previous).unwrap();
+            }
+            let visible = || match std::fs::read_to_string(&path) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("Cannot read response: {error}"),
+            };
+            let error = write_path_atomically(&path, |file| {
+                file.write_all(b"Partial response")?;
+                assert_eq!(visible().as_deref(), previous);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "injected quota failure",
+                ))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("CONSULT_RESPONSE.md"));
+            assert_eq!(visible().as_deref(), previous);
+            assert_eq!(
+                std::fs::read_dir(directory.path()).unwrap().count(),
+                usize::from(previous.is_some())
+            );
+
+            write_path_atomically(&path, |file| {
+                file.write_all(b"Complete response")?;
+                assert_eq!(visible().as_deref(), previous);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(visible().as_deref(), Some("Complete response"));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn consultation_response_publication_failure_discards_the_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CONSULT_RESPONSE.md");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"original").unwrap();
+        assert!(write_path_atomically(&path, |file| file.write_all(b"Complete response")).is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, PathBuf) {

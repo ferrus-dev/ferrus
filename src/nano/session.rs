@@ -222,6 +222,8 @@ pub(crate) enum LimitKind {
 pub(crate) enum EndReason {
     ModelFinished,
     DefinitionCompleted,
+    ReviewCompleted,
+    ConsultationResponded,
     Submitted,
     TaskFailed,
     Paused,

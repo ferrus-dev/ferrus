@@ -688,6 +688,7 @@ pub(crate) struct HqContext {
     state_rx: watch::Receiver<Option<WatchedState>>,
     pub(crate) display: Display,
     announced_completed_tasks: HashSet<String>,
+    announced_unavailable_nano_reviews: HashSet<String>,
     nano_view: Option<crate::nano::conversation::View>,
     nano_paused_tasks: HashSet<String>,
 }

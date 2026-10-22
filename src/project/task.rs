@@ -184,29 +184,44 @@ pub async fn record_task_status_with_origin(
     let milestone_id = milestone_id.map(str::to_string);
     tokio::task::spawn_blocking(move || -> Result<()> {
         let connection = open_runtime_database(&database_path)?;
-        upsert_task(
+        record_task_status_on_connection(
             &connection,
             &task_id,
             &task_path,
             status,
             spec_path.as_deref(),
             milestone_id.as_deref(),
-        )?;
-        if status.clears_lease() {
-            clear_task_lease(&connection, &task_id)?;
-        }
-        insert_event(
-            &connection,
-            None,
-            "task_status_changed",
-            &serde_json::json!({
-                "task_id": task_id,
-                "status": status.as_str(),
-            }),
-        )?;
-        Ok(())
+        )
     })
     .await?
+}
+
+pub(crate) fn record_task_status_on_connection(
+    connection: &Connection,
+    task_id: &str,
+    task_path: &str,
+    status: TaskStatus,
+    spec_path: Option<&str>,
+    milestone_id: Option<&str>,
+) -> Result<()> {
+    upsert_task(
+        connection,
+        task_id,
+        task_path,
+        status,
+        spec_path,
+        milestone_id,
+    )?;
+    if status.clears_lease() {
+        clear_task_lease(connection, task_id)?;
+    }
+    insert_event(
+        connection,
+        None,
+        "task_status_changed",
+        &serde_json::json!({"task_id": task_id, "status": status.as_str()}),
+    )?;
+    Ok(())
 }
 
 /// Completes the normal submit transition and, when available, pins the exact
@@ -579,38 +594,50 @@ pub async fn record_task_review_rejected(
     tokio::task::spawn_blocking(move || -> Result<TaskReviewRejection> {
         let mut connection = open_runtime_database(&database_path)?;
         let transaction = connection.transaction()?;
-        let cycles = task_review_cycles(&transaction, &task_id)? + 1;
-        if cycles >= max_cycles {
-            transaction.execute(
-                r#"
+        let result =
+            record_task_review_rejected_in_transaction(&transaction, &task_id, max_cycles)?;
+        transaction.commit()?;
+        Ok(result)
+    })
+    .await?
+}
+
+pub(super) fn record_task_review_rejected_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    max_cycles: u32,
+) -> Result<TaskReviewRejection> {
+    let cycles = task_review_cycles(transaction, task_id)? + 1;
+    if cycles >= max_cycles {
+        transaction.execute(
+            r#"
                 UPDATE tasks
                 SET status = ?1, review_cycles = ?2,
                     failure_reason = ?3,
                     claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
                 WHERE id = ?4
                 "#,
-                params![
-                    TaskStatus::Failed.as_str(),
-                    cycles,
-                    format!("Task rejected {max_cycles} times without resolution."),
-                    task_id
-                ],
-            )?;
-            insert_event_in_transaction(
-                &transaction,
-                None,
-                "task_review_limit_exceeded",
-                &serde_json::json!({
-                    "task_id": task_id,
-                    "review_cycles": cycles,
-                    "max_review_cycles": max_cycles,
-                }),
-            )?;
-            transaction.commit()?;
-            Ok(TaskReviewRejection::LimitExceeded { cycles })
-        } else {
-            transaction.execute(
-                r#"
+            params![
+                TaskStatus::Failed.as_str(),
+                cycles,
+                format!("Task rejected {max_cycles} times without resolution."),
+                task_id
+            ],
+        )?;
+        insert_event_in_transaction(
+            transaction,
+            None,
+            "task_review_limit_exceeded",
+            &serde_json::json!({
+                "task_id": task_id,
+                "review_cycles": cycles,
+                "max_review_cycles": max_cycles,
+            }),
+        )?;
+        Ok(TaskReviewRejection::LimitExceeded { cycles })
+    } else {
+        transaction.execute(
+            r#"
                 UPDATE tasks
                 SET status = ?1, review_cycles = ?2, check_retries = 0,
                     executor_dispatches = 0,
@@ -621,23 +648,20 @@ pub async fn record_task_review_rejected(
                     claimed_by = NULL, lease_until = NULL, last_heartbeat = NULL
                 WHERE id = ?3
                 "#,
-                params![TaskStatus::Addressing.as_str(), cycles, task_id],
-            )?;
-            insert_event_in_transaction(
-                &transaction,
-                None,
-                "task_rejected",
-                &serde_json::json!({
-                    "task_id": task_id,
-                    "review_cycles": cycles,
-                    "max_review_cycles": max_cycles,
-                }),
-            )?;
-            transaction.commit()?;
-            Ok(TaskReviewRejection::Addressing { cycles })
-        }
-    })
-    .await?
+            params![TaskStatus::Addressing.as_str(), cycles, task_id],
+        )?;
+        insert_event_in_transaction(
+            transaction,
+            None,
+            "task_rejected",
+            &serde_json::json!({
+                "task_id": task_id,
+                "review_cycles": cycles,
+                "max_review_cycles": max_cycles,
+            }),
+        )?;
+        Ok(TaskReviewRejection::Addressing { cycles })
+    }
 }
 
 /// Accounts for one executor dispatch (HQ spawning an executor session) for a

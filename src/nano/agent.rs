@@ -339,12 +339,9 @@ mod tests {
             assert!(agent.validate_interactive_launch(role, 1).is_err());
         }
         assert!(agent.mcp_config_entry("supervisor", 1).is_err());
-        assert!(
-            agent
-                .spawn(AgentRunMode::Headless { prompt: "review" })
-                .unwrap_err()
-                .to_string()
-                .contains("Reviewer and Consultant")
+        assert_eq!(
+            agent.headless_prompt_transport(),
+            HeadlessPromptTransport::Jsonl
         );
     }
     #[test]
@@ -431,13 +428,31 @@ impl crate::agents::SupervisorAgent for Supervisor {
         true
     }
     fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command> {
-        let AgentRunMode::Interactive { prompt } = mode else {
-            bail!(
-                "Nano Supervisor supports taskless planning/spec/archive only; Reviewer and Consultant are not implemented"
-            )
-        };
-        self.spawn_profile(crate::agents::DefinitionMode::Plan, prompt, 0, index)
+        match mode {
+            AgentRunMode::Interactive { prompt } => {
+                self.spawn_profile(crate::agents::DefinitionMode::Plan, prompt, 0, index)
+            }
+            AgentRunMode::Headless { .. } => {
+                validate_config(None, self.model())?;
+                let mut command = Command::new(std::env::current_exe()?);
+                command
+                    .args(["nano", "run", "--supervise", "--config"])
+                    .arg(config_path(None)?);
+                command.env(
+                    crate::agent_id::ENV_PROJECT_ROOT,
+                    std::env::current_dir()?.canonicalize()?,
+                );
+                if let Some(model) = self.model() {
+                    command.arg("--model").arg(model);
+                }
+                Ok(command)
+            }
+        }
     }
+    fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
+        HeadlessPromptTransport::Jsonl
+    }
+
     fn spawn_definition(
         &self,
         profile: crate::agents::DefinitionMode,

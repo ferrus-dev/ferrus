@@ -50,11 +50,31 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
-    write_review(&context, &notes).await?;
+    run_for_context(context, notes, config, None).await
+}
 
-    let rejection =
+pub(crate) async fn run_for_context(
+    context: RuntimeTaskContext,
+    notes: String,
+    config: Config,
+    native_scope: Option<project::ExecutorSessionScope>,
+) -> Result<String> {
+    let rejection = if let Some(scope) = native_scope {
+        let published_notes = notes.clone();
+        project::reject_supervisor_session(
+            &scope,
+            context.repository_view.frozen_source_tree.clone(),
+            config.limits.max_review_cycles,
+            move |current| {
+                store::write_review_for_run_dir_blocking(&current.run_dir, &published_notes)
+            },
+        )
+        .await?
+    } else {
+        write_review(&context, &notes).await?;
         project::record_task_review_rejected(&context.task_id, config.limits.max_review_cycles)
-            .await?;
+            .await?
+    };
     crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(&context).await;
 
     match rejection {

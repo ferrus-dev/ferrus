@@ -149,7 +149,7 @@ fn digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn path(value: &str) -> Result<String> {
+pub(super) fn path(value: &str) -> Result<String> {
     if value.len() > 256 || value.contains('\\') {
         return Err(Failure::new(Code::InvalidPath, value));
     }

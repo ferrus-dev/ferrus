@@ -69,6 +69,17 @@ async fn run(agent_id: Option<&str>, response: String) -> Result<String> {
         );
     }
 
+    run_for_context(context, response).await
+}
+
+pub(crate) async fn run_for_context(
+    context: RuntimeTaskContext,
+    response: String,
+) -> Result<String> {
+    anyhow::ensure!(
+        context.status == "consultation" && !response.trim().is_empty(),
+        "Invalid consultation response"
+    );
     write_consult_response(&context, &response).await?;
     info!("Consultation response recorded");
     Ok(format!(

@@ -1,6 +1,73 @@
 //! Approval tests for canonical integration, rollback, workspace preservation, and lock ownership.
 
 use super::*;
+
+#[test]
+fn approval_git_commands_do_not_inherit_an_open_control_pipe() {
+    use std::{io::Write, time::Instant};
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    const CHILD: &str = "FERRUS_TEST_APPROVAL_GIT_STDIN";
+    if std::env::var_os(CHILD).is_some() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(directory.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Batch mode must see EOF even while the host control pipe stays open.
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                approval_git_command()
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(["cat-file", "--batch"])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("approval Git inherited the host control pipe")
+            .unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty());
+        });
+        return;
+    }
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "server::tools::approve::tests::approval_git_commands_do_not_inherit_an_open_control_pipe", "--nocapture"])
+        .env(CHILD, "1")
+        .stdin(Stdio::piped())
+        .stdout(log.reopen().unwrap())
+        .stderr(log.reopen().unwrap())
+        .spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "host control frame").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(log.path()).unwrap()
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("approval Git did not finish with the host pipe open");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(input);
+}
 use crate::state::store;
 use tempfile::TempDir;
 

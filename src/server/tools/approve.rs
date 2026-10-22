@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -29,6 +29,18 @@ use super::{
 
 pub const DESCRIPTION: &str = "Approve the current submission. Transitions state Reviewing -> Complete. \
      Must be called after /review_pending.";
+
+/// Approval changed external state and could not confirm that rollback restored it.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}\n\nApproval rollback failed; manual reconciliation is required: {rollback}")]
+pub(crate) struct ApprovalEffectUnknown {
+    error: anyhow::Error,
+    rollback: anyhow::Error,
+}
+
+fn rollback_failed(error: anyhow::Error, rollback: anyhow::Error) -> anyhow::Error {
+    ApprovalEffectUnknown { error, rollback }.into()
+}
 
 pub async fn handler(ctx: neva::di::Dc<crate::server::ServerContext>) -> Result<String, Error> {
     handler_for_agent(ctx.agent_id()).await
@@ -51,12 +63,28 @@ async fn run(agent_id: &str) -> Result<String> {
     }
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
+    run_for_context(context, project_root, None).await
+}
+
+pub(crate) async fn run_for_context(
+    context: RuntimeTaskContext,
+    project_root: PathBuf,
+    native_scope: Option<project::ExecutorSessionScope>,
+) -> Result<String> {
     // Observe both manifests while integration is serialized, then release the
     // approval lock before waiting for a potentially long graph refresh.
     let (integration_result, refresh_canonical_graph) = {
         let _approval_lock = acquire_canonical_approval_lock(&context).await?;
+        if let Some(scope) = native_scope.as_ref() {
+            let expected = context.repository_view.frozen_source_tree.clone();
+            project::with_supervisor_session(scope, false, move |tx, scope, current| {
+                project::require_supervisor_review(tx, scope, &current, expected.as_ref())
+            })
+            .await?;
+        }
         let observer = CanonicalIntegrationObserver::capture(&project_root).await;
-        let integration_result = integrate_approved_task(&context, &project_root).await;
+        let integration_result =
+            integrate_approved_task(&context, &project_root, native_scope.as_ref()).await;
         let refresh_canonical_graph = observer
             .finish(&context, &project_root, integration_result.is_ok())
             .await;
@@ -89,7 +117,19 @@ async fn run(agent_id: &str) -> Result<String> {
     Ok("Task approved. State: Complete. Well done!".to_string())
 }
 
-async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Path) -> Result<()> {
+// Tokio output() inherits stdin. Git must never receive an agent's open
+// command-protocol pipe; commands requiring input explicitly replace this with a pipe.
+fn approval_git_command() -> Command {
+    let mut command = Command::new("git");
+    command.stdin(Stdio::null());
+    command
+}
+
+async fn integrate_approved_task(
+    context: &RuntimeTaskContext,
+    project_root: &Path,
+    native_scope: Option<&project::ExecutorSessionScope>,
+) -> Result<()> {
     let canonical_snapshot = apply_approved_patch(context, project_root).await?;
     if let Some(canonical_snapshot) = canonical_snapshot.as_ref() {
         // The approved patch may have changed ferrus.toml, so run the integration
@@ -99,9 +139,7 @@ async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Pa
             Ok(config) => config,
             Err(err) => {
                 if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                    anyhow::bail!(
-                        "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                    );
+                    return Err(rollback_failed(err, rollback_err));
                 }
                 return Err(err);
             }
@@ -110,22 +148,83 @@ async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Pa
             run_post_apply_integration_checks(context, &post_apply_config, project_root).await;
         if let Err(err) = integration_checks {
             if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                anyhow::bail!(
-                    "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                );
+                return Err(rollback_failed(err, rollback_err));
             }
             return Err(err);
         }
         if let Err(err) = canonical_snapshot.restore_index().await {
             if let Err(rollback_err) = canonical_snapshot.restore(project_root).await {
-                anyhow::bail!(
-                    "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-                );
+                return Err(rollback_failed(err, rollback_err));
             }
             return Err(err).context("Failed to preserve the pre-integration canonical index");
         }
     }
     let transition = async {
+        if let Some(scope) = native_scope {
+            // Checks can outlive the lease. Fence completion and its milestone
+            // update together, then use the normal rollback path on lost authority.
+            let expected = context.repository_view.frozen_source_tree.clone();
+            let project_root = project_root.to_path_buf();
+            let milestone_backup = Arc::new(Mutex::new(None::<(PathBuf, Vec<u8>)>));
+            let backup_for_transaction = Arc::clone(&milestone_backup);
+            let result =
+                project::with_supervisor_session(scope, true, move |tx, scope, current| {
+                    project::require_supervisor_review(tx, scope, &current, expected.as_ref())?;
+                    project::record_task_status_on_connection(
+                        tx,
+                        &current.task_id,
+                        &current.task_path,
+                        project::TaskStatus::Complete,
+                        None,
+                        None,
+                    )?;
+                    if let (Some(spec_path), Some(milestone_id)) = (
+                        current.spec_path.as_deref(),
+                        current.milestone_id.as_deref(),
+                    ) {
+                        let spec_path = canonical_approval_path(&project_root, spec_path);
+                        match std::fs::read(&spec_path) {
+                            Ok(contents) => {
+                                // Keep this outside the transaction result: COMMIT can
+                                // fail after the closure has successfully written the spec.
+                                *backup_for_transaction
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) =
+                                    Some((spec_path.clone(), contents));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(error).context("Failed to back up approval milestone");
+                            }
+                        }
+                        specs::complete_milestone_blocking(
+                            &spec_path.to_string_lossy(),
+                            milestone_id,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = result {
+                let backup = milestone_backup
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some((path, contents)) = backup
+                    && let Err(rollback_error) = tokio::fs::write(&path, contents).await
+                {
+                    return Err(rollback_failed(
+                        error,
+                        anyhow::Error::new(rollback_error).context(format!(
+                            "Failed to restore approval milestone {}",
+                            path.display()
+                        )),
+                    ));
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
         if let (Some(spec_path), Some(milestone_id)) = (
             context.spec_path.as_deref(),
             context.milestone_id.as_deref(),
@@ -145,9 +244,7 @@ async fn integrate_approved_task(context: &RuntimeTaskContext, project_root: &Pa
         if let Some(canonical_snapshot) = canonical_snapshot.as_ref()
             && let Err(rollback_err) = canonical_snapshot.restore(project_root).await
         {
-            anyhow::bail!(
-                "{err}\n\nAdditionally failed to restore the pre-integration canonical workspace: {rollback_err}"
-            );
+            return Err(rollback_failed(err, rollback_err));
         }
         return Err(err);
     }
@@ -282,7 +379,7 @@ async fn capture_canonical_worktree_tree(project_root: &Path) -> Result<String> 
 }
 
 async fn ignored_untracked_paths(project_root: &Path) -> Result<Vec<Vec<u8>>> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -314,7 +411,7 @@ struct CanonicalIndexSnapshot {
 
 impl CanonicalIndexSnapshot {
     async fn capture(project_root: &Path) -> Result<Self> {
-        let output = Command::new("git")
+        let output = approval_git_command()
             .arg("-C")
             .arg(project_root)
             .args(["rev-parse", "--git-path", "index"])
@@ -419,18 +516,22 @@ async fn apply_approved_patch(
                 project_root.display(),
                 detail
             );
-            write_integration_error(context, &reason).await?;
+            if let Err(report_error) = write_integration_error(context, &reason).await {
+                return Err(error).context(format!(
+                    "{reason}\n\nFailed to save integration diagnostics: {report_error}"
+                ));
+            }
             project::record_task_integration_failed_best_effort(
                 &context.task_id,
                 context.run_id.as_deref(),
                 &reason,
             )
             .await;
-            anyhow::bail!(
+            return Err(error).context(format!(
                 "{reason}\n\nIntegration error was saved to {}/INTEGRATION_ERROR.md. \
              Reject this review with the conflict details so an Executor can address it.",
                 context.run_dir
-            );
+            ));
         }
     };
     Ok(Some(snapshot))
@@ -463,9 +564,7 @@ async fn integrate_patch_three_way(
     validate_tree_materialization(project_root, &snapshot.tree, &merged).await?;
     if let Err(error) = materialize_tree(project_root, &snapshot.tree, &merged).await {
         if let Err(restore_error) = snapshot.restore(project_root).await {
-            anyhow::bail!(
-                "{error}\n\nAdditionally failed to restore the pre-integration canonical workspace: {restore_error}"
-            );
+            return Err(rollback_failed(error, restore_error));
         }
         return Err(error);
     }
@@ -490,7 +589,7 @@ async fn task_baseline_tree(
 }
 
 async fn resolve_tree(project_root: &Path, revision: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["rev-parse", "--verify"])
@@ -502,7 +601,7 @@ async fn resolve_tree(project_root: &Path, revision: &str) -> Result<String> {
 
 async fn verify_tree(project_root: &Path, tree: &str) -> Result<()> {
     let object = format!("{tree}^{{tree}}");
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["cat-file", "-e"])
@@ -520,7 +619,7 @@ async fn submitted_tree_from_patch(
     let index = TemporaryIntegrationIndex::new();
     read_tree(project_root, index.path(), baseline, false).await?;
     let patch_path = store::resolve_project_path(Path::new(&context.run_dir).join("PATCH.diff"));
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -529,7 +628,7 @@ async fn submitted_tree_from_patch(
         .output()
         .await?;
     git_success(&output, "apply submitted patch to its baseline")?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -551,7 +650,7 @@ async fn merge_trees(
     let ours_commit = commit_tree(project_root, ours, Some(&baseline_commit), "canonical").await?;
     let theirs_commit =
         commit_tree(project_root, theirs, Some(&baseline_commit), "submitted").await?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["merge-tree", "--write-tree", "--messages"])
@@ -589,7 +688,7 @@ async fn tree_changes(
     current_tree: &str,
     target_tree: &str,
 ) -> Result<Vec<TreeChange>> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -645,7 +744,7 @@ async fn reject_ignored_path_collisions(project_root: &Path, changes: &[TreeChan
         return Ok(());
     }
 
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -702,7 +801,7 @@ async fn reject_sparse_checkout_exclusions(
         .map(|change| change.path.as_slice())
         .collect();
     let input = nul_terminated_paths(paths.iter().copied());
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -721,7 +820,7 @@ async fn reject_sparse_checkout_exclusions(
 }
 
 async fn sparse_checkout_enabled(project_root: &Path) -> Result<bool> {
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .args(["config", "--bool", "--get", "core.sparseCheckout"])
@@ -767,7 +866,7 @@ async fn commit_tree(
     parent: Option<&str>,
     role: &str,
 ) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -808,7 +907,7 @@ async fn tree_without_paths(
     let index = TemporaryIntegrationIndex::new();
     read_tree(project_root, index.path(), tree, false).await?;
     let input = nul_terminated_paths(excluded_paths.iter().map(Vec::as_slice));
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -819,7 +918,7 @@ async fn tree_without_paths(
         &output,
         "exclude pre-integration ignored paths from rollback",
     )?;
-    let output = Command::new("git")
+    let output = approval_git_command()
         .arg("-C")
         .arg(project_root)
         .env("GIT_INDEX_FILE", index.path())
@@ -870,7 +969,7 @@ async fn read_tree(
     tree: &str,
     update_worktree: bool,
 ) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = approval_git_command();
     command
         .arg("-C")
         .arg(project_root)
@@ -1323,7 +1422,7 @@ async fn cleanup_approved_workspace(
     }
 
     if tokio::fs::try_exists(&canonical_workspace).await? {
-        let output = Command::new("git")
+        let output = approval_git_command()
             .arg("-C")
             .arg(project_root)
             .args(["worktree", "remove", "--force"])

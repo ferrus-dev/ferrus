@@ -203,11 +203,21 @@ pub async fn first_incomplete_milestone_id(spec_path: &str) -> Result<Option<Str
 }
 
 pub async fn complete_milestone(spec_path: &str, milestone_id: &str) -> Result<()> {
+    let spec_path = spec_path.to_owned();
+    let milestone_id = milestone_id.to_owned();
+    tokio::task::spawn_blocking(move || complete_milestone_blocking(&spec_path, &milestone_id))
+        .await?
+}
+
+// Native approval uses this inside its short SQLite completion transaction.
+pub(crate) fn complete_milestone_blocking(spec_path: &str, milestone_id: &str) -> Result<()> {
     if !Path::new(&spec_path).exists() {
         return Ok(());
     }
 
-    let mut spec = load_spec(spec_path).await?;
+    let content = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("Failed to read spec {spec_path}"))?;
+    let mut spec = parse_spec(spec_path, &content);
     let Some(current_idx) = spec
         .milestones
         .iter()
@@ -219,7 +229,7 @@ pub async fn complete_milestone(spec_path: &str, milestone_id: &str) -> Result<(
     if !spec.milestones[current_idx].completed {
         mark_line_completed(&mut spec.lines[spec.milestones[current_idx].line_index]);
         spec.milestones[current_idx].completed = true;
-        write_spec_lines(spec_path, &spec.lines).await?;
+        write_spec_lines(spec_path, &spec.lines)?;
     }
 
     Ok(())
@@ -420,14 +430,12 @@ fn mark_line_completed(line: &mut String) {
 }
 
 #[allow(dead_code)]
-async fn write_spec_lines(path: &str, lines: &[String]) -> Result<()> {
+fn write_spec_lines(path: &str, lines: &[String]) -> Result<()> {
     let mut content = lines.join("\n");
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    tokio::fs::write(path, content)
-        .await
-        .with_context(|| format!("Failed to write spec {path}"))
+    std::fs::write(path, content).with_context(|| format!("Failed to write spec {path}"))
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub(crate) enum Binding {
     Managed(FerrusSession),
+    Supervisor(super::review::Session),
     Interactive {
         project_root: PathBuf,
         project_id: String,
@@ -71,43 +72,55 @@ impl Binding {
     pub(crate) fn managed(&self) -> Option<&FerrusSession> {
         match self {
             Self::Managed(session) => Some(session),
-            Self::Interactive { .. } => None,
+            Self::Interactive { .. } | Self::Supervisor(_) => None,
         }
     }
     pub(crate) fn project_root(&self) -> &Path {
         match self {
+            Self::Supervisor(session) => &session.root,
             Self::Managed(session) => session.project_root(),
             Self::Interactive { project_root, .. } => project_root,
         }
     }
     pub(crate) fn workspace(&self) -> &Path {
-        self.managed()
-            .map_or_else(|| self.project_root(), FerrusSession::workspace)
+        match self {
+            Self::Managed(session) => session.workspace(),
+            Self::Supervisor(session) => &session.source.path,
+            Self::Interactive { project_root, .. } => project_root,
+        }
     }
     pub(crate) fn project_id(&self) -> &str {
         match self {
+            Self::Supervisor(session) => &session.project_id,
             Self::Managed(session) => session.project_id(),
             Self::Interactive { project_id, .. } => project_id,
         }
     }
     pub(crate) fn data_dir(&self) -> &Path {
         match self {
+            Self::Supervisor(session) => &session.data,
             Self::Managed(session) => session.data_dir(),
             Self::Interactive { data_dir, .. } => data_dir,
         }
     }
     pub(crate) fn run_id(&self) -> &str {
         match self {
+            Self::Supervisor(session) => &session.scope.run_id,
             Self::Managed(session) => &session.scope.run_id,
             Self::Interactive { run_id, .. } => run_id,
         }
     }
     pub(crate) fn task_id(&self) -> Option<&str> {
-        self.managed().map(|session| session.scope.task_id.as_str())
+        match self {
+            Self::Managed(session) => Some(&session.scope.task_id),
+            Self::Supervisor(session) => Some(&session.scope.task_id),
+            _ => None,
+        }
     }
     pub(crate) async fn status(&self) -> Result<Option<crate::project::RuntimeTaskContext>> {
         match self {
             Self::Managed(session) => session.status().await.map(Some),
+            Self::Supervisor(session) => session.status().await.map(Some),
             Self::Interactive {
                 agent_id,
                 run_id,
@@ -208,6 +221,8 @@ impl super::instructions::InstructionScope for Binding {
                 }
             ) {
                 super::agent::SUPERVISOR_POLICY
+            } else if matches!(self, Self::Supervisor(_)) {
+                super::review::POLICY
             } else if runtime.is_some() {
                 ROLE_POLICY
             } else {
