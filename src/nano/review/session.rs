@@ -133,6 +133,10 @@ impl Session {
                         Ok(())
                     })
                     .await?;
+                    crate::repository_graph_runtime::release_submitted_tree_pin_best_effort(
+                        &context,
+                    )
+                    .await;
                     return Err(error);
                 }
                 Err(error) => return Err(error),

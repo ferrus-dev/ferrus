@@ -84,6 +84,19 @@ async fn native_reviewer_source_limit_durably_stops_dispatch() {
             rusqlite::params![tree, TASK],
         )
         .unwrap();
+    let tree = crate::repository_graph::source::parse_git_tree_digest(&tree).unwrap();
+    crate::repository_graph::source::pin_submitted_tree(&f.root, TASK, &tree).unwrap();
+    let task_pin = git(
+        &f,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/ferrus/reviews/",
+        ],
+    );
+    assert!(!task_pin.is_empty());
+    // Failure must release only this task's pin, not another reviewing task's.
+    crate::repository_graph::source::pin_submitted_tree(&f.root, "t-other", &tree).unwrap();
     for id in ["oversized-review", "retry-oversized-review"] {
         project::record_run_started_for_task_with_workspace(
             id,
@@ -125,6 +138,16 @@ async fn native_reviewer_source_limit_durably_stops_dispatch() {
         );
         assert!(task.claimed_by.is_none());
         assert!(!f.data.join("nano/review-sources").join(id).exists());
+        let pins = git(
+            &f,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/ferrus/reviews/",
+            ],
+        );
+        assert!(!pins.lines().any(|pin| pin == task_pin));
+        assert_eq!(pins.lines().count(), 1);
         project::record_run_finished(id, 1).await.unwrap();
     }
     assert_eq!(
