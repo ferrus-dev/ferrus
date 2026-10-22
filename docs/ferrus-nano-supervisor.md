@@ -25,6 +25,8 @@ These profiles use the existing task, specification, and archive operations dire
 without loopback MCP. Native file/search, scoped instructions, repository graph, and
 project-memory reads remain available under the existing source and freshness policies.
 `definition_context` provides the selected spec, linked task metadata, and authoring templates.
+Archive sessions read linked terminal task/run evidence with `read_archive_artifact`;
+ordinary file tools retain their runtime-path protections.
 Tools are selected by the host profile, independently of model requests or supporting documents.
 There is no task lease, Executor submission, review, or consultation authority.
 
@@ -40,7 +42,9 @@ these Supervisor profiles, so they cannot bypass confirmation.
 Confirmed operations are journaled before execution, share the canonical approval lock,
 and finish before shutdown returns. Task/spec/archive sessions return to HQ after saving
 their requested count; planning remains open until cancelled. SQLite run identity and role
-are checked independently of conversation content. Archive retains normal provenance and
+are checked independently of conversation content. Failed authoring sessions keep their
+stop reason visible until Esc returns to HQ, and save `diagnostics.log` beside their
+machine-local `nano/sessions/<run-id>/events.jsonl` journal. Archive retains normal provenance and
 best-effort memory refresh; a failed refresh does not undo a successful archive.
 
 HQ also launches [task-scoped Reviewer and Consultant profiles](ferrus-nano-review.md).

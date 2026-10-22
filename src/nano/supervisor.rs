@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
+mod artifacts;
+
 const AUTHORING_BYTES: usize = 24 * 1024;
 
 #[derive(Clone)]
@@ -314,13 +316,20 @@ impl Tools for SupervisorTools {
                 input_schema: serde_json::from_str(schema).expect("static tool schema"),
             });
         }
+        if self.scope.mode == DefinitionMode::Archive {
+            tools.push(artifacts::descriptor());
+        }
         tools
     }
     fn validate(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
         if !self.descriptors().iter().any(|tool| tool.name == name) {
             return Err(ToolError::UnknownTool);
         }
-        if authoring_name(name) {
+        if name == artifacts::NAME {
+            artifacts::parse(arguments)
+                .map(|_| ())
+                .map_err(|_| ToolError::InvalidArguments)
+        } else if authoring_name(name) {
             self.scope
                 .operation(&ValidatedCall {
                     call_id: String::new(),
@@ -358,6 +367,15 @@ impl Tools for SupervisorTools {
     async fn execute(&mut self, call: &ValidatedCall, stop: &Cancellation) -> ToolOutcome {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
+        }
+        if call.name == artifacts::NAME {
+            return match artifacts::read(&self.scope, &call.arguments).await {
+                Ok(value) => ToolOutcome::Success(value),
+                Err(error) => ToolOutcome::Failed(ToolError::Lifecycle(json!({
+                    "code":"archive_artifact_unavailable",
+                    "message":super::conversation::display_text(&error.to_string(),1024)
+                }))),
+            };
         }
         if authoring_name(&call.name) {
             let operation = match self.scope.operation(call) {
@@ -513,9 +531,62 @@ pub(crate) async fn launch(
         run_id: run.clone(),
         definition: Some(mode),
     };
-    let result = Box::pin(run_bound(binding, mode, prompt, task_count, config, model)).await;
+    let result = Box::pin(run_bound(
+        binding.clone(),
+        mode,
+        prompt,
+        task_count,
+        config,
+        model,
+    ))
+    .await;
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let path = failure_diagnostic(&binding, &error);
+            project::record_runtime_event_best_effort(
+                Some(run.clone()),
+                "nano_supervisor_failed",
+                json!({"reason":super::conversation::display_text(&error.to_string(),4096),
+                    "diagnostic_path":path}),
+            )
+            .await;
+            Err(error.context(format!(
+                "Nano Supervisor {run} failed; diagnostics: {}",
+                path.display()
+            )))
+        }
+    };
     project::record_run_finished(&run, if result.is_ok() { 0 } else { 1 }).await?;
     result
+}
+
+fn failure_diagnostic(binding: &Binding, error: &anyhow::Error) -> PathBuf {
+    use std::io::Write;
+    let directory = binding
+        .data_dir()
+        .join("nano/sessions")
+        .join(binding.run_id());
+    let path = directory.join("diagnostics.log");
+    let save = || -> Result<()> {
+        for parent in [
+            binding.data_dir().join("nano"),
+            binding.data_dir().join("nano/sessions"),
+            directory.clone(),
+        ] {
+            super::private::directory(&parent, false)?;
+        }
+        let mut file = super::private::file(&path, true)?;
+        file.write_all(
+            super::conversation::display_text(&format!("{error:#}\n"), 8192).as_bytes(),
+        )?;
+        file.sync_all()?;
+        Ok(())
+    };
+    if let Err(error) = save() {
+        tracing::warn!(error = ?error, "Could not save Nano Supervisor diagnostics");
+    }
+    path
 }
 async fn run_bound(
     binding: Binding,

@@ -380,6 +380,9 @@ impl Frontend {
             Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
             {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.quit(stop),
+                (KeyCode::Esc, _) if self.exit_on_end && self.view.snapshot.ended => {
+                    self.quit(stop)
+                }
                 (KeyCode::PageUp, _) => self.view.scroll_up(width),
                 (KeyCode::PageDown, _) => self.view.scroll = self.view.scroll.saturating_sub(10),
                 (KeyCode::Enter, modifiers) if input::multiline_enter(modifiers) => {
@@ -410,6 +413,15 @@ impl Frontend {
     fn quit(&mut self, stop: &Cancellation) {
         self.quitting = true;
         stop.cancel();
+    }
+
+    fn should_exit(&self, done: bool) -> bool {
+        done && (self.quitting
+            || self.exit_on_end
+                && matches!(
+                    self.view.snapshot.end_reason,
+                    Some(EndReason::DefinitionCompleted | EndReason::Cancelled)
+                ))
     }
 
     pub(crate) async fn run(
@@ -446,7 +458,7 @@ impl Frontend {
                     "Session stopped; inspect the journal and diagnostics".into();
                 dirty = true;
             }
-            if (self.quitting || self.exit_on_end) && *done.borrow() {
+            if self.should_exit(*done.borrow()) {
                 _terminal.finish()?;
                 return Ok(());
             }
@@ -502,7 +514,11 @@ impl Frontend {
             &self.view,
             width,
             top,
-            "PgUp/PgDn scroll; Ctrl-C or /quit exits",
+            if self.exit_on_end && self.view.snapshot.ended {
+                "PgUp/PgDn scroll; Esc returns to HQ"
+            } else {
+                "PgUp/PgDn scroll; Ctrl-C or /quit exits"
+            },
         );
         rows.resize(top, (String::new(), Color::Grey));
         for (index, text) in prompt
@@ -524,7 +540,9 @@ impl Frontend {
             .error
             .as_deref()
             .or_else(|| self.view.notices.last().map(String::as_str))
-            .unwrap_or(if self.pending.is_some() {
+            .unwrap_or(if self.exit_on_end && self.view.snapshot.ended {
+                "Session ended. Esc returns to HQ; diagnostics are saved on exit."
+            } else if self.pending.is_some() {
                 "Input queued; waiting for durable acceptance"
             } else {
                 "Enter sends; Alt/Shift-Enter adds a line; Up/Down recalls input"
@@ -714,6 +732,42 @@ mod tests {
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+    #[test]
+    fn authoring_failures_remain_visible_until_the_user_closes_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FileJournal::create(
+            &temp.path().canonicalize().unwrap(),
+            "failed-authoring",
+            super::super::journal::Quotas::default(),
+        )
+        .unwrap();
+        let (_, ui) = session(journal, "failed-authoring", true, None, None);
+        let (_sender, requests) = mpsc::channel(1);
+        let mut ui = ui.authoring(requests);
+        for reason in [
+            EndReason::Limit(LimitKind::NoProgress),
+            EndReason::ProviderProtocol,
+            EndReason::EffectUnknown,
+        ] {
+            ui.view.snapshot.end_reason = Some(reason);
+            assert!(!ui.should_exit(true));
+        }
+        ui.view.snapshot.end_reason = Some(EndReason::DefinitionCompleted);
+        assert!(!ui.should_exit(false));
+        assert!(ui.should_exit(true));
+        ui.view.snapshot.end_reason = None;
+        assert!(!ui.should_exit(true));
+        ui.view.snapshot.ended = true;
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+            &Cancellation::default(),
+            80,
+        );
+        assert!(ui.should_exit(true));
+    }
     #[tokio::test]
     async fn approval_requires_the_current_code_and_never_uses_queued_steering() {
         let temp = tempfile::tempdir().unwrap();

@@ -90,6 +90,7 @@ impl Conversation {
             {
                 self.snapshot.status = format!("Process ended: {reason:?}, durable={durable}");
                 self.snapshot.ended = true;
+                self.snapshot.end_reason = Some(reason.clone());
                 changed = true;
             }
             if state.notice_sequence > self.seen_notice {

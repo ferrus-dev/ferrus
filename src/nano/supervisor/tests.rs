@@ -150,6 +150,10 @@ async fn profile_tools_and_exact_run_role_are_independent_of_model_requests() {
         let fixture = Fixture::new(mode).await;
         let (tools, _journal) = fixture.tools(mode).await;
         let names: Vec<_> = tools.descriptors().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names.iter().any(|name| name == artifacts::NAME),
+            mode == DefinitionMode::Archive
+        );
         for name in ["enqueue_task", "create_spec", "archive_spec"] {
             assert_eq!(names.contains(&name.to_string()), operation == Some(name));
         }
@@ -440,7 +444,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
         mode: DefinitionMode::Archive,
         archive_path: Some(path.clone()),
     };
-    let mut archive = SupervisorTools {
+    let archive = SupervisorTools {
         native,
         scope,
         goal: 1,
@@ -456,8 +460,73 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             .validate(&mismatch.name, &mismatch.arguments)
             .is_err()
     );
-    let outcome = archive.execute(&call("archive_spec", json!({"input":{"spec_path":path,"outcome":"## Outcome\n\nImplemented and validated the approved feature."}})), &Cancellation::default()).await;
-    assert!(matches!(outcome, ToolOutcome::Success(_)), "{outcome:?}");
+    let run_dir = fixture
+        .root
+        .join(project::run_dir_for_task_display(&task.id));
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("SUBMISSION.md"), "Checks passed").unwrap();
+    std::fs::write(run_dir.join("REVIEW.md"), "Approved").unwrap();
+    let mut calls = ["task", "submission", "review"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, artifact)| ToolCall {
+            provider_call_id: format!("read-{i}"),
+            name: artifacts::NAME.into(),
+            arguments: json!({"task_id":task.id,"artifact":artifact}).to_string(),
+        })
+        .collect::<Vec<_>>();
+    calls.push(ToolCall {
+        provider_call_id: "save-archive".into(), name: "archive_spec".into(),
+        arguments: json!({"input":{"spec_path":path,"outcome":"## Outcome\n\nImplemented and validated the approved feature."}}).to_string(),
+    });
+    let provider = OneCall {
+        response: Some(ModelResponse {
+            finish: FinishReason::ToolCalls,
+            text: String::new(),
+            calls,
+            continuation: None,
+        }),
+    };
+    let (approvals, mut requests) = mpsc::channel(1);
+    let host = SupervisorHost {
+        scope: archive.scope.clone(),
+        approvals,
+    };
+    let identity = SessionIdentity {
+        session_id: "archive-tools".into(),
+        project_id: "test-project".into(),
+        task_id: None,
+        run_id: Some("definition".into()),
+    };
+    let mut engine = Engine::new(
+        identity,
+        Limits::default(),
+        provider,
+        archive,
+        host,
+        archive_journal,
+    )
+    .unwrap();
+    let stop = Cancellation::default();
+    let (end, _) = tokio::join!(
+        engine.run(
+            SessionCommand::Start {
+                input: "Inspect evidence and archive only after confirmation".into()
+            },
+            &stop
+        ),
+        async {
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request.tool, "archive_spec");
+            assert!(
+                !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("Implemented and validated")
+            );
+            request.reply.send(true).unwrap();
+        }
+    );
+    assert_eq!(end.unwrap().reason, EndReason::DefinitionCompleted);
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
@@ -470,7 +539,6 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             .is_some()
     );
     assert!(!fixture.root.join(task.path).exists());
-    assert_eq!(archive.end_reason(), Some(EndReason::DefinitionCompleted));
 }
 
 #[tokio::test]
@@ -499,4 +567,153 @@ async fn interrupted_authoring_keeps_and_joins_the_owned_operation() {
     ));
     assert!(tools.pending.is_none());
     assert_eq!(tools.saved, 1);
+}
+
+#[tokio::test]
+async fn archive_evidence_reads_only_terminal_tasks_of_the_pinned_spec() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new(DefinitionMode::Archive).await;
+    let spec = "docs/spec.md";
+    project::write_project_selection(&project::ProjectSelection {
+        selected_spec: Some(spec.into()),
+    })
+    .await
+    .unwrap();
+    let task = project::create_pending_task_artifact("Implemented feature", Some(spec), Some("m1"))
+        .await
+        .unwrap();
+    let other = project::create_pending_task_artifact("Other work", None, None)
+        .await
+        .unwrap();
+    let (mut tools, _journal) = fixture.tools(DefinitionMode::Archive).await;
+    let args = json!({"task_id":task.id,"artifact":"task"});
+    // An active task is not archival evidence, even if it belongs to this spec.
+    assert!(artifacts::read(&tools.scope, &args).await.is_err());
+    project::record_task_status(&task.id, &task.path, project::TaskStatus::Complete)
+        .await
+        .unwrap();
+    let run_dir = fixture
+        .root
+        .join(project::run_dir_for_task_display(&task.id));
+    std::fs::create_dir_all(&run_dir).unwrap();
+    for (artifact, file) in [
+        ("submission", "SUBMISSION.md"),
+        ("review", "REVIEW.md"),
+        ("patch", "PATCH.diff"),
+        ("integration_error", "INTEGRATION_ERROR.md"),
+    ] {
+        std::fs::write(run_dir.join(file), format!("{artifact} evidence\n")).unwrap();
+        let result = tools
+            .execute(
+                &call(
+                    artifacts::NAME,
+                    json!({"task_id":task.id,"artifact":artifact}),
+                ),
+                &Cancellation::default(),
+            )
+            .await;
+        let ToolOutcome::Success(value) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(value["text"], format!("{artifact} evidence\n"));
+    }
+    assert!(matches!(
+        tools
+            .execute(
+                &call(artifacts::NAME, args.clone()),
+                &Cancellation::default()
+            )
+            .await,
+        ToolOutcome::Success(_)
+    ));
+    // Normal workspace tools remain unable to read protected runtime files.
+    assert!(matches!(
+        tools
+            .native
+            .execute(
+                &call("read_file", json!({"path":task.path})),
+                &Cancellation::default()
+            )
+            .await,
+        ToolOutcome::Failed(_)
+    ));
+    assert!(
+        artifacts::read(&tools.scope, &json!({"task_id":other.id,"artifact":"task"}))
+            .await
+            .is_err()
+    );
+    for invalid in [
+        json!({"task_id":"../escape","artifact":"task"}),
+        json!({"task_id":task.id,"artifact":"ANSWER.md"}),
+        json!({"task_id":task.id,"artifact":"task","path":"secret"}),
+        json!({"task_id":task.id,"artifact":"task","max_bytes":4097}),
+    ] {
+        assert!(tools.validate(artifacts::NAME, &invalid).is_err());
+    }
+    std::fs::write(fixture.root.join(&task.path), "\u{e9}vidence").unwrap();
+    assert!(
+        artifacts::read(
+            &tools.scope,
+            &json!({"task_id":task.id,"artifact":"task","offset":1})
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        artifacts::read(
+            &tools.scope,
+            &json!({"task_id":task.id,"artifact":"task","max_bytes":1})
+        )
+        .await
+        .is_err()
+    );
+    let page = artifacts::read(
+        &tools.scope,
+        &json!({"task_id":task.id,"artifact":"task","max_bytes":2}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page["text"], "\u{e9}");
+    assert_eq!(page["next_offset"], 2);
+    assert_eq!(page["truncated"], true);
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(run_dir.join("REVIEW.md")).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("ferrus.toml"), run_dir.join("REVIEW.md"))
+            .unwrap();
+        assert!(
+            artifacts::read(
+                &tools.scope,
+                &json!({"task_id":task.id,"artifact":"review"})
+            )
+            .await
+            .is_err()
+        );
+    }
+    project::write_project_selection(&project::ProjectSelection {
+        selected_spec: Some("another.md".into()),
+    })
+    .await
+    .unwrap();
+    assert!(artifacts::read(&tools.scope, &args).await.is_err());
+}
+
+#[tokio::test]
+async fn supervisor_failure_keeps_private_diagnostics_beside_the_journal() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let fixture = Fixture::new(DefinitionMode::Archive).await;
+    let path = failure_diagnostic(
+        &fixture.binding,
+        &anyhow::anyhow!("Nano Supervisor ended: Limit(NoProgress), durable=true"),
+    );
+    assert_eq!(
+        path,
+        fixture
+            .data
+            .join("nano/sessions/definition/diagnostics.log")
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("Limit(NoProgress)"));
+    assert!(text.len() <= 8192);
+    super::super::private::read_only_file(&path).unwrap();
 }
