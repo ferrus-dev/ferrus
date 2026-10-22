@@ -23,7 +23,9 @@ Individual artifacts are limited to 1 MiB and pages to 4 KiB.
 The Reviewer reads a private inspection workspace built from submitted Git blobs without
 checkout filters. Subsequent canonical/worktree edits cannot alter those reads. Inspection
 is bounded to 20,000 entries, 8 MiB per blob, and 128 MiB total. Omitted symlinks/gitlinks and
-host-incompatible paths are reported separately in context metadata.
+host-incompatible or tool-inaccessible paths are reported separately in context metadata.
+A tree exceeding inspection limits fails the task with `nano_review_source_limit` instead
+of retrying the same immutable submission.
 Reviewer startup reclaims inspection directories without a live Supervisor run.
 Missing frozen submission evidence or an invalid binding fails
 before inference, with no canonical fallback. Arrange a successful graph freeze at submit;

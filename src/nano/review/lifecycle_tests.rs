@@ -57,6 +57,86 @@ fn tool(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
 }
 
 #[tokio::test]
+async fn native_reviewer_source_limit_durably_stops_dispatch() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let executor = git_session(&f, true).await;
+    lifecycle::submit(&executor, "Submission".into(), &Cancellation::default())
+        .await
+        .unwrap();
+    // Keep valid frozen-view metadata, but point at an immutable oversized tree.
+    std::fs::write(f.root.join("large.bin"), vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
+    let blob = git(&f, &["hash-object", "-w", "large.bin"]);
+    git(&f, &["read-tree", "--empty"]);
+    git(
+        &f,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},large.bin"),
+        ],
+    );
+    let tree = git(&f, &["write-tree"]);
+    f.connection()
+        .execute(
+            "UPDATE tasks SET repository_view_tree_digest=?1 WHERE id=?2",
+            rusqlite::params![tree, TASK],
+        )
+        .unwrap();
+    for id in ["oversized-review", "retry-oversized-review"] {
+        project::record_run_started_for_task_with_workspace(
+            id,
+            "supervisor",
+            "supervisor:nano:t-001",
+            std::process::id(),
+            Some(TASK),
+            f.root.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        let error = ReviewSession::bind(LaunchContext {
+            project_root: f.root.clone(),
+            workspace: f.root.clone(),
+            agent_id: "supervisor:nano:t-001".into(),
+            task_id: TASK.into(),
+            run_id: id.into(),
+            baseline_tree: None,
+        })
+        .await
+        .err()
+        .unwrap();
+        if id == "oversized-review" {
+            assert!(
+                error.to_string().contains("Reviewer source exceeds quota"),
+                "{error:#}"
+            );
+        }
+        let task = project::list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == TASK)
+            .unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(
+            task.failure_reason.as_deref(),
+            Some("nano_review_source_limit")
+        );
+        assert!(task.claimed_by.is_none());
+        assert!(!f.data.join("nano/review-sources").join(id).exists());
+        project::record_run_finished(id, 1).await.unwrap();
+    }
+    assert_eq!(
+        f.events()
+            .iter()
+            .filter(|(kind, _)| kind == "nano_supervisor_stopped")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn native_rejection_revalidates_the_lease_phase_and_submission_at_commit() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;

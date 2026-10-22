@@ -7,6 +7,17 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct LimitExceeded(&'static str);
+
+fn quota(fits: bool, message: &'static str) -> Result<()> {
+    if !fits {
+        return Err(LimitExceeded(message).into());
+    }
+    Ok(())
+}
+
 pub(crate) struct Source {
     pub path: PathBuf,
     pub owned: bool,
@@ -94,10 +105,10 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         .context("Missing tree listing")?
         .take(8 * 1024 * 1024 + 1)
         .read_to_end(&mut entries)?;
-    ensure!(
+    quota(
         entries.len() <= 8 * 1024 * 1024,
-        "Reviewer tree listing exceeds quota"
-    );
+        "Reviewer tree listing exceeds quota",
+    )?;
     ensure!(list.0.wait()?.success(), "Cannot inspect submitted tree");
     let mut batch = Child(
         git(root)
@@ -114,7 +125,7 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         .filter(|entry| !entry.is_empty())
         .enumerate()
     {
-        ensure!(index < 20000, "Reviewer tree file quota exceeded");
+        quota(index < 20000, "Reviewer tree file quota exceeded")?;
         let separator = entry
             .iter()
             .position(|byte| *byte == b'\t')
@@ -135,18 +146,19 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             "Unsupported tree entry"
         );
         let size: u64 = fields[3].parse()?;
-        total = total.checked_add(size).context("Tree quota overflow")?;
-        ensure!(
+        total = total
+            .checked_add(size)
+            .ok_or(LimitExceeded("Tree quota overflow"))?;
+        quota(
             size <= 8 * 1024 * 1024 && total <= 128 * 1024 * 1024,
-            "Reviewer source exceeds quota"
-        );
-        #[cfg(unix)]
-        let relative = {
-            use std::os::unix::ffi::OsStrExt;
-            Path::new(std::ffi::OsStr::from_bytes(path))
-        };
-        #[cfg(not(unix))]
+            "Reviewer source exceeds quota",
+        )?;
+        // Materialize only paths the model's file and search tools can address.
         let relative = match std::str::from_utf8(path) {
+            Ok(path) if super::super::workspace::path(path).is_err() => {
+                source.omitted_paths += 1;
+                continue;
+            }
             #[cfg(windows)]
             Ok(path) if !windows_path_supported(path) => {
                 source.omitted_paths += 1;
@@ -266,8 +278,6 @@ fn windows_path_supported(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
     #[test]
     fn reclaim_removes_only_abandoned_review_directories() {
@@ -443,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_non_utf8_paths_or_reports_host_restrictions() {
+    fn snapshot_reports_paths_that_review_tools_cannot_address() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         assert!(
@@ -458,34 +468,83 @@ mod tests {
             &["hash-object", "-w", "--stdin"],
             b"frozen contents\n",
         );
-        let mut entries = format!("100644 blob {blob}\tname-").into_bytes();
+        let names = [
+            "draft~",
+            "part:name",
+            "control\x01name",
+            "back\\slash",
+            ".ferrus",
+            "repo-graph.db",
+            "trailing.",
+            "CON",
+            "ordinary.txt",
+            "caf\u{e9}.txt",
+        ];
+        let mut entries = names
+            .iter()
+            .map(|name| format!("100644 blob {blob}\t{name}\0"))
+            .collect::<String>()
+            .into_bytes();
+        entries.extend_from_slice(format!("100644 blob {blob}\tname-").as_bytes());
         entries.extend_from_slice(b"\xff\tfile.txt\0");
-        entries.extend_from_slice(format!("100644 blob {blob}\tordinary.txt\0").as_bytes());
         let tree = object(root, &["mktree", "-z"], &entries);
         let source = snapshot(root, &root.join("inspection"), &tree).unwrap();
         assert_eq!(
             fs::read(source.path.join("ordinary.txt")).unwrap(),
             b"frozen contents\n"
         );
-        #[cfg(unix)]
-        {
-            let path = source.path.join(OsStr::from_bytes(b"name-\xff\tfile.txt"));
-            match fs::read(&path) {
-                Ok(contents) => {
-                    assert_eq!(contents, b"frozen contents\n");
-                    assert_eq!(source.omitted_paths, 0);
-                }
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        || error.raw_os_error() == Some(libc::EILSEQ) =>
-                {
-                    assert_eq!(source.omitted_paths, 1);
-                }
-                Err(error) => panic!("unexpected native-path error: {error}"),
-            }
+        assert_eq!(source.omitted_paths, names.len() - 1);
+        assert_eq!(fs::read_dir(&source.path).unwrap().count(), 2);
+        assert_eq!(
+            fs::read(source.path.join("caf\u{e9}.txt")).unwrap(),
+            b"frozen contents\n"
+        );
+        for name in ["ordinary.txt", "caf\u{e9}.txt"] {
+            assert!(super::super::super::workspace::path(name).is_ok());
         }
-        #[cfg(not(unix))]
-        assert_eq!(source.omitted_paths, 1);
         assert_eq!(source.omitted_links, 0);
+    }
+    #[test]
+    fn snapshot_limits_are_typed_and_remove_partial_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            git(root)
+                .args(["init", "--object-format=sha1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let small = object(root, &["hash-object", "-w", "--stdin"], b"ok");
+        let large = object(
+            root,
+            &["hash-object", "-w", "--stdin"],
+            &vec![b'x'; 8 * 1024 * 1024],
+        );
+        let oversized = object(
+            root,
+            &["hash-object", "-w", "--stdin"],
+            &vec![b'x'; 8 * 1024 * 1024 + 1],
+        );
+        for entries in [
+            format!("100644 blob {oversized}\tlarge.bin\0"),
+            (0..17)
+                .map(|i| format!("100644 blob {large}\tpart:{i}\0"))
+                .collect(),
+            (0..20001)
+                .map(|i| format!("100644 blob {small}\t.nano-tmp-{i}\0"))
+                .collect(),
+            format!("100644 blob {small}\t{}\0", "x".repeat(8 * 1024 * 1024)),
+        ] {
+            let tree = object(root, &["mktree", "-z"], entries.as_bytes());
+            let destination = root.join("inspection");
+            let error = snapshot(root, &destination, &tree).err().unwrap();
+            assert!(error.is::<LimitExceeded>(), "{error:#}");
+            assert!(!destination.exists());
+        }
+        let error = snapshot(root, &root.join("inspection"), "missing-tree")
+            .err()
+            .unwrap();
+        assert!(!error.is::<LimitExceeded>(), "{error:#}");
     }
 }

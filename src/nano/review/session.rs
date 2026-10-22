@@ -101,10 +101,42 @@ impl Session {
             })
             .await?;
             let owned_root = root.clone();
-            Arc::new(
+            let materialized =
                 tokio::task::spawn_blocking(move || source::snapshot(&owned_root, &target, &tree))
-                    .await??,
-            )
+                    .await?;
+            match materialized {
+                Ok(source) => Arc::new(source),
+                Err(error) if error.is::<source::LimitExceeded>() => {
+                    // A retry cannot make the immutable tree fit. Fail only this
+                    // still-authorized submission, not transient setup errors.
+                    project::start_supervisor_session(&scope, true, ttl).await?;
+                    let expected_tree = context.repository_view.frozen_source_tree.clone();
+                    project::with_supervisor_session(&scope, true, move |tx, scope, context| {
+                        project::require_supervisor_review(
+                            tx,
+                            scope,
+                            &context,
+                            expected_tree.as_ref(),
+                        )?;
+                        let reason = "nano_review_source_limit";
+                        tx.execute(
+                            "UPDATE tasks SET status='failed',failure_reason=?2,claimed_by=NULL,
+                             lease_until=NULL,last_heartbeat=NULL WHERE id=?1",
+                            rusqlite::params![scope.task_id, reason],
+                        )?;
+                        project::executor_event(
+                            tx,
+                            scope,
+                            "nano_supervisor_stopped",
+                            json!({"task_id":scope.task_id,"reason":reason}),
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             Arc::new(source::Source {
                 path: workspace,
