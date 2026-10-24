@@ -3,6 +3,28 @@ use crate::nano::{coding::CodingTools, provider::*, workspace};
 use std::path::Path;
 
 const SPEC: &str = "# Feature\n\n## Milestones\n\n- [ ] #1.0 Implement feature\n  - ID: m1.0\n  - Depends on: none\n";
+
+#[test]
+fn authoring_previews_present_the_proposed_document_instead_of_json() {
+    for (name, arguments, expected) in [
+        (
+            "archive_spec",
+            json!({"input":{"spec_path":"docs/spec.md","outcome":"## Outcome\n\nDelivered \"feature\""}}),
+            "Specification: docs/spec.md\n\n## Outcome\n\nDelivered \"feature\"",
+        ),
+        ("create_spec", json!({"markdown":SPEC}), SPEC),
+        (
+            "enqueue_task",
+            json!({"input":{"description":"Implement feature","spec_path":"docs/spec.md","milestone_id":"m1.0"}}),
+            "Specification: docs/spec.md\nMilestone: m1.0\n\nImplement feature",
+        ),
+    ] {
+        assert_eq!(
+            Operation::parse(name, &arguments).unwrap().preview(),
+            expected
+        );
+    }
+}
 struct Fixture {
     _temp: tempfile::TempDir,
     previous: PathBuf,
@@ -233,10 +255,7 @@ async fn task_authorization_requires_a_fresh_exact_human_confirmation() {
     );
     let (authorization, _) = tokio::join!(host.authorize(&call), async {
         let request = receiver.recv().await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&request.content).unwrap(),
-            call.arguments
-        );
+        assert_eq!(request.content, "Approved task");
         assert_eq!(request.tool, "enqueue_task");
         assert_eq!(fixture.count_tasks(), 0);
         request.reply.send(false).unwrap();

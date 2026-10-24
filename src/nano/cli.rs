@@ -331,7 +331,7 @@ async fn launch(
             journal,
             output: output.clone(),
             commands: Some(commands_rx),
-            streaming: (0, String::new()),
+            streaming: super::wire::Preview::default(),
             interactive,
             preview_enabled,
         };

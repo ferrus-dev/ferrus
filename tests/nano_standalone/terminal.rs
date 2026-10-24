@@ -107,10 +107,13 @@ impl Terminal {
         self.master.write_all(text).unwrap();
     }
     fn wait_for_display(&mut self, expected: &str) {
+        self.wait_for_display_since(expected, 0);
+    }
+    fn wait_for_display_since(&mut self, expected: &str, offset: usize) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             self.drain();
-            if String::from_utf8_lossy(&self.output).contains(expected) {
+            if String::from_utf8_lossy(&self.output[offset..]).contains(expected) {
                 return;
             }
             assert!(
@@ -261,6 +264,36 @@ fn terminal_conversation_steers_runs_tools_cancels_and_resumes_without_registrat
 }
 
 #[test]
+fn terminal_long_replies_can_be_read_from_beginning_to_end() {
+    let fixture = Fixture::new();
+    let text = format!(
+        "Beginning of the full reply\n{}\nEnd of the full reply",
+        (0..100)
+            .map(|i| format!("Paragraph {i}: {}\n", "readable text ".repeat(4)))
+            .collect::<String>()
+    );
+    let provider = Provider::new(vec![answer(&text)]);
+    fixture.configure(&provider.url, "");
+    let mut terminal = Terminal::start(fixture.command("long-reply").args([
+        "--interactive",
+        "--prompt",
+        "Explain the changes",
+    ]));
+    terminal.wait_for(&fixture, "long-reply", |records| waiting_after(records, 1));
+    terminal.wait_for_display("End of the full reply");
+    let before = terminal.output.len();
+    terminal.send(b"\x1b[1;5H");
+    terminal.wait_for_display_since("Beginning of the full reply", before);
+    let before = terminal.output.len();
+    terminal.send(b"\x1b[1;5F");
+    terminal.wait_for_display_since("End of the full reply", before);
+    terminal.send(b"/quit\r");
+    terminal.finish();
+    provider.finish();
+    fixture.assert_unregistered();
+}
+
+#[test]
 fn terminal_cancellation_joins_owned_writers_before_exit() {
     let fixture = Fixture::new();
     let provider = Provider::new(vec![
@@ -381,24 +414,8 @@ fn supervisor_run(fixture: &Fixture) -> String {
     }
 }
 impl Terminal {
-    fn approval_code(&mut self) -> String {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            self.drain();
-            let text = String::from_utf8_lossy(&self.output);
-            if let Some((_, tail)) = text.rsplit_once("Type approve ") {
-                let code: String = tail.chars().take(8).collect();
-                if code.len() == 8 && code.bytes().all(|c| c.is_ascii_hexdigit()) {
-                    return code;
-                }
-            }
-            assert!(
-                self.child.try_wait().unwrap().is_none(),
-                "Supervisor exited before requesting approval: {text}"
-            );
-            assert!(Instant::now() < deadline, "No approval prompt: {text}");
-            thread::sleep(Duration::from_millis(20));
-        }
+    fn wait_for_approval(&mut self) {
+        self.wait_for_display("Enter: approve");
     }
 }
 #[test]
@@ -420,7 +437,10 @@ fn native_supervisor_requires_human_approval_then_returns_to_hq_after_authoring(
         fixture.configure(&provider.url, "");
         let mut terminal = Terminal::start(&mut supervisor_command(&fixture, mode));
         let run = supervisor_run(&fixture);
-        let code = terminal.approval_code();
+        terminal.wait_for_approval();
+        let preview = String::from_utf8_lossy(&terminal.output);
+        assert!(!preview.contains("approval code"));
+        assert!(!preview.contains("\"markdown\":"));
         let records = fixture.records(&run);
         assert!(
             records
@@ -442,7 +462,7 @@ fn native_supervisor_requires_human_approval_then_returns_to_hq_after_authoring(
             .unwrap(),
             0
         );
-        terminal.send(format!("approve {code}\r").as_bytes());
+        terminal.send(if mode == "task" { b"approve\r" } else { b"\r" });
         terminal.finish();
         let requests = provider.finish();
         assert_eq!(requests.len(), 1);
@@ -503,7 +523,7 @@ fn declining_native_supervisor_approval_creates_no_task() {
     fixture.configure(&provider.url, "");
     let mut terminal = Terminal::start(&mut supervisor_command(&fixture, "task"));
     let run = supervisor_run(&fixture);
-    terminal.approval_code();
+    terminal.wait_for_approval();
     terminal.send(b"reject\r");
     terminal.wait_for(&fixture, &run, |records| waiting_after(records, 2));
     terminal.send(b"\x03");

@@ -6,9 +6,9 @@ use crate::nano::{
 };
 use std::collections::VecDeque;
 
-pub(super) const DISPLAY_BYTES: usize = 32 * 1024;
-const ENTRY_BYTES: usize = 2048;
-pub(super) const ENTRIES: usize = 128;
+pub(super) const DISPLAY_BYTES: usize = 8 * 1024 * 1024;
+const ENTRY_BYTES: usize = 512 * 1024;
+pub(super) const ENTRIES: usize = 2048;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
@@ -16,6 +16,7 @@ pub(crate) struct Snapshot {
     pub task_id: String,
     pub sequence: u64,
     pub entries: VecDeque<String>,
+    pub omitted_entries: usize,
     pub status: String,
     pub budget: Budget,
     pub ended: bool,
@@ -62,6 +63,7 @@ impl Snapshot {
             || self.entries.iter().map(String::len).sum::<usize>() > DISPLAY_BYTES
         {
             self.entries.pop_front();
+            self.omitted_entries = self.omitted_entries.saturating_add(1);
         }
     }
     pub(crate) fn apply(&mut self, record: &Record) {
@@ -120,7 +122,17 @@ impl Snapshot {
             SessionEvent::ModelFailed { error, .. } => self.push("Provider", &format!("{error:?}")),
             SessionEvent::ToolIntent { call, .. } => {
                 self.status = format!("Tool: {}", display_text(&call.name, 128));
-                self.push("Tool", &format!("{} {}", call.name, call.arguments));
+                match call.name.as_str() {
+                    "archive_spec" => self.push(
+                        "Action",
+                        "Archive specification; awaiting your confirmation",
+                    ),
+                    "create_spec" => {
+                        self.push("Action", "Save specification; awaiting your confirmation")
+                    }
+                    "enqueue_task" => self.push("Action", "Queue task; awaiting your confirmation"),
+                    _ => self.push("Tool", &format!("{} {}", call.name, call.arguments)),
+                }
             }
             SessionEvent::ToolResult { outcome, .. } => {
                 let mut text = match outcome {

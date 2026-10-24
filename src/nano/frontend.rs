@@ -14,7 +14,7 @@ use crate::shared::{
 use anyhow::{Result, ensure};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType, size},
@@ -42,7 +42,7 @@ pub(crate) struct DisplayJournal {
     events: watch::Sender<wire::ObservedEvents>,
     snapshot: Snapshot,
     commands: Option<mpsc::Receiver<SessionCommand>>,
-    streaming: (u64, String),
+    streaming: wire::Preview,
     interactive: bool,
 }
 impl Journal for DisplayJournal {
@@ -67,21 +67,9 @@ impl Journal for DisplayJournal {
         if !self.interactive {
             return;
         }
-        if self.streaming.0 != turn {
-            self.streaming = (turn, String::new());
+        if let Some(event) = self.streaming.update(turn, text) {
+            self.events.send_modify(|state| state.observe(event));
         }
-        self.streaming.1.push_str(text);
-        let mut cut = self.streaming.1.len().saturating_sub(512);
-        while !self.streaming.1.is_char_boundary(cut) {
-            cut += 1;
-        }
-        self.streaming.1.drain(..cut);
-        self.events.send_modify(|state| {
-            state.observe(wire::Event::Text {
-                turn,
-                text: self.streaming.1.clone(),
-            })
-        });
     }
 }
 
@@ -92,8 +80,10 @@ pub(crate) fn session(
     initial: Option<String>,
     history: Option<Snapshot>,
 ) -> (DisplayJournal, Frontend) {
+    let history = history.unwrap_or_default();
     let snapshot = Snapshot {
-        entries: history.map(|snapshot| snapshot.entries).unwrap_or_default(),
+        entries: history.entries,
+        omitted_entries: history.omitted_entries,
         ..Default::default()
     };
     let (snapshots, receiver) = watch::channel(None);
@@ -112,7 +102,7 @@ pub(crate) fn session(
             events,
             snapshot,
             commands: interactive.then_some(commands),
-            streaming: (0, String::new()),
+            streaming: wire::Preview::default(),
             interactive,
         },
         Frontend {
@@ -129,7 +119,7 @@ pub(crate) fn session(
             approvals: None,
             approval: None,
             approval_text: String::new(),
-            approval_scroll: 0,
+            approval_scroll: crate::shared::scroll::Scroll::default(),
             exit_on_end: false,
         },
     )
@@ -138,7 +128,6 @@ pub(crate) fn session(
 /// A one-shot host request bound to immutable tool arguments. Only the terminal
 /// frontend owns its reply; model text and steering are never approval commands.
 pub(crate) struct Approval {
-    pub id: String,
     pub tool: String,
     pub content: String,
     pub reply: tokio::sync::oneshot::Sender<bool>,
@@ -158,7 +147,7 @@ pub(crate) struct Frontend {
     approvals: Option<mpsc::Receiver<Approval>>,
     approval: Option<Approval>,
     approval_text: String,
-    approval_scroll: usize,
+    approval_scroll: crate::shared::scroll::Scroll,
     exit_on_end: bool,
 }
 impl Frontend {
@@ -174,7 +163,7 @@ impl Frontend {
         if let Some(approval) = self.approvals.as_mut().and_then(|rx| rx.try_recv().ok()) {
             self.approval = Some(approval);
             self.approval_text.clear();
-            self.approval_scroll = 0;
+            self.approval_scroll.home();
             self.error = None;
             return true;
         }
@@ -193,12 +182,10 @@ impl Frontend {
             Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
             {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.quit(stop),
-                (KeyCode::PageUp, _) => {
-                    self.approval_scroll = self.approval_scroll.saturating_sub(10)
-                }
-                (KeyCode::PageDown, _) => {
-                    self.approval_scroll = self.approval_scroll.saturating_add(10)
-                }
+                (KeyCode::PageUp, _) => self.approval_scroll.up(10),
+                (KeyCode::PageDown, _) => self.approval_scroll.down(10),
+                (KeyCode::Home, KeyModifiers::CONTROL) => self.approval_scroll.home(),
+                (KeyCode::End, KeyModifiers::CONTROL) => self.approval_scroll.end(),
                 (KeyCode::Backspace, _) => {
                     self.approval_text.pop();
                 }
@@ -208,17 +195,16 @@ impl Frontend {
                     }
                 }
                 (KeyCode::Enter, _) => {
-                    let approved = self.approval.as_ref().is_some_and(|request| {
-                        self.approval_text.trim() == format!("approve {}", request.id)
-                    });
-                    if approved || self.approval_text.trim() == "reject" {
+                    let answer = self.approval_text.trim().to_ascii_lowercase();
+                    let approved = matches!(answer.as_str(), "" | "y" | "yes" | "approve");
+                    if approved || matches!(answer.as_str(), "n" | "no" | "reject") {
                         if let Some(request) = self.approval.take() {
                             let _ = request.reply.send(approved);
                         }
                         self.approval_text.clear();
                         self.error = None;
                     } else {
-                        self.error = Some("Type the displayed approval code or reject.".into());
+                        self.error = Some("Type approve or reject, then press Enter.".into());
                     }
                 }
                 (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -228,34 +214,51 @@ impl Frontend {
                 }
                 _ => (),
             },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.approval_scroll.up(3),
+                MouseEventKind::ScrollDown => self.approval_scroll.down(3),
+                _ => (),
+            },
             _ => (),
         }
     }
     fn approval_rows(&self, width: usize, height: usize) -> (Vec<(String, Color)>, (u16, u16)) {
         let request = self.approval.as_ref().unwrap();
-        let mut rows = vec![(format!("Human approval: {}", request.tool), Color::Yellow)];
-        let content = conversation::wrap(&request.content, width);
-        let available = height.saturating_sub(3);
-        let start = self
-            .approval_scroll
-            .min(content.len().saturating_sub(available));
+        let title = match request.tool.as_str() {
+            "archive_spec" => "Archive specification",
+            "create_spec" => "Save specification",
+            "enqueue_task" => "Queue task",
+            _ => "Confirm operation",
+        };
+        let mut rows = vec![
+            (
+                format!("Ferrus / Nano - {title}"),
+                crate::shared::style::ACCENT,
+            ),
+            (crate::shared::style::separator(width), Color::DarkGrey),
+        ];
+        let content = conversation::wrap(&display_text(&request.content, 32 * 1024), width);
+        let available = height.saturating_sub(6);
+        let visible = self.approval_scroll.range(content.len(), available);
         rows.extend(
             content
                 .iter()
-                .skip(start)
-                .take(available)
+                .skip(visible.start)
+                .take(visible.len())
                 .cloned()
                 .map(|line| (line, Color::Grey)),
         );
-        rows.resize(height.saturating_sub(2), (String::new(), Color::Grey));
+        rows.resize(height.saturating_sub(4), (String::new(), Color::Grey));
+        rows.push((crate::shared::style::separator(width), Color::DarkGrey));
         rows.push((
-            self.error.clone().unwrap_or_else(|| {
-                format!(
-                    "Type approve {} or reject. PgUp/PgDn reviews; Esc declines.",
-                    request.id
-                )
-            }),
-            Color::Yellow,
+            "Enter: approve  Esc: decline  PgUp/PgDn: read".into(),
+            crate::shared::style::ACCENT,
+        ));
+        rows.push((
+            self.error
+                .clone()
+                .unwrap_or_else(|| "Approve this content? (approve/reject)".into()),
+            Color::Grey,
         ));
         rows.push((format!("> {}", self.approval_text), Color::White));
         rows.truncate(height);
@@ -299,6 +302,7 @@ impl Frontend {
             return;
         }
         self.pending = Some((id, self.text.clone()));
+        self.view.scroll.end();
         self.error = None;
     }
     fn poll(&mut self) -> bool {
@@ -366,12 +370,17 @@ impl Frontend {
             .map_or_else(|| self.saved.clone(), |index| self.history[index].clone());
         self.cursor = self.text.chars().count();
     }
-    fn event(&mut self, event: Event, stop: &Cancellation, width: usize) {
+    fn event(&mut self, event: Event, stop: &Cancellation, _width: usize) {
         // A receipt can arrive while EventStream is asleep. Settle it before
         // editing, so the next draft cannot be appended to already accepted text.
         self.poll();
-        self.receive_approval();
+        let new_approval = self.receive_approval();
         if self.approval.is_some() {
+            // An Enter already waiting in the input stream must not approve a
+            // proposal that the frontend has not had a chance to display yet.
+            if new_approval && matches!(&event, Event::Key(key) if key.code == KeyCode::Enter) {
+                return;
+            }
             self.approval_event(event, stop);
             return;
         }
@@ -383,8 +392,10 @@ impl Frontend {
                 (KeyCode::Esc, _) if self.exit_on_end && self.view.snapshot.ended => {
                     self.quit(stop)
                 }
-                (KeyCode::PageUp, _) => self.view.scroll_up(width),
-                (KeyCode::PageDown, _) => self.view.scroll = self.view.scroll.saturating_sub(10),
+                (KeyCode::PageUp, _) => self.view.scroll.up(10),
+                (KeyCode::PageDown, _) => self.view.scroll.down(10),
+                (KeyCode::Home, KeyModifiers::CONTROL) => self.view.scroll.home(),
+                (KeyCode::End, KeyModifiers::CONTROL) => self.view.scroll.end(),
                 (KeyCode::Enter, modifiers) if input::multiline_enter(modifiers) => {
                     self.insert("\n")
                 }
@@ -405,6 +416,11 @@ impl Frontend {
                 (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                     self.insert(&ch.to_string())
                 }
+                _ => (),
+            },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.view.scroll.up(3),
+                MouseEventKind::ScrollDown => self.view.scroll.down(3),
                 _ => (),
             },
             _ => (),
@@ -470,6 +486,7 @@ impl Frontend {
             tokio::select! {
                 event = events.next(), if input_open => {
                     match event {
+                        Some(Ok(Event::Mouse(mouse))) if !matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => continue,
                         Some(Ok(event)) => self.event(event, stop, size()?.0 as usize),
                         Some(Err(error)) => return Err(error.into()),
                         None => { input_open = false; self.quit(stop); },
@@ -509,18 +526,19 @@ impl Frontend {
         );
         let prompt_height = prompt.lines.len().min((height / 3).max(1));
         let prompt_start = (prompt.cursor_row as usize).saturating_sub(prompt_height - 1);
-        let top = height.saturating_sub(prompt_height + 1);
+        let top = height.saturating_sub(prompt_height + 3);
         let mut rows = conversation::lines(
             &self.view,
             width,
             top,
             if self.exit_on_end && self.view.snapshot.ended {
-                "PgUp/PgDn scroll; Esc returns to HQ"
+                "PgUp/PgDn or wheel: scroll; Esc: HQ"
             } else {
-                "PgUp/PgDn scroll; Ctrl-C or /quit exits"
+                "PgUp/PgDn or wheel: scroll; Ctrl-Home/End: first/latest"
             },
         );
         rows.resize(top, (String::new(), Color::Grey));
+        rows.push((crate::shared::style::separator(width), Color::DarkGrey));
         for (index, text) in prompt
             .lines
             .iter()
@@ -536,6 +554,7 @@ impl Frontend {
                 Color::White,
             ));
         }
+        rows.push((crate::shared::style::separator(width), Color::DarkGrey));
         let notice = self
             .error
             .as_deref()
@@ -562,7 +581,7 @@ impl Frontend {
         rows.resize(height, (String::new(), Color::Grey));
         rows.truncate(height);
         let cursor = (
-            (top + prompt.cursor_row as usize - prompt_start).min(height - 1) as u16,
+            (top + 1 + prompt.cursor_row as usize - prompt_start).min(height - 1) as u16,
             (prompt.cursor_col as usize).min(width - 1) as u16,
         );
         (rows, cursor)
@@ -690,7 +709,10 @@ mod tests {
         for width in [1, 2, 8, 40, 80] {
             for height in [1, 3, 8, 24] {
                 for scroll in [0, 10, usize::MAX] {
-                    ui.view.scroll = scroll;
+                    ui.view.scroll.end();
+                    if scroll > 0 {
+                        ui.view.scroll.up(scroll);
+                    }
                     let (rows, (row, col)) = ui.rows(width, height);
                     assert_eq!(rows.len(), height);
                     assert!(rows.iter().all(|(text, _)| text.chars().count() <= width));
@@ -726,6 +748,62 @@ mod tests {
                 .is_err()
         );
         assert!(journal.snapshots.borrow().is_none());
+    }
+
+    #[test]
+    fn long_streaming_response_keeps_its_beginning_and_the_readers_position() {
+        let (_temp, mut journal, mut ui) = frontend();
+        let text = (0..100)
+            .map(|i| format!("Paragraph {i}\n"))
+            .collect::<String>();
+        journal.snapshots.send_replace(Some(Snapshot {
+            turn: 1,
+            status: "Generating response (turn 1)".into(),
+            ..Default::default()
+        }));
+        journal.model_delta(1, &text);
+        ui.poll();
+        assert_eq!(ui.view.preview.as_ref().unwrap().1, text);
+        ui.view.scroll.home();
+        let before = ui.rows(80, 24).0;
+        assert!(
+            before
+                .iter()
+                .any(|(row, _)| row.contains("Nano: Paragraph 0"))
+        );
+        journal.events.send_modify(|state| {
+            state.observe(wire::Event::Text {
+                turn: 1,
+                text: format!("{text}New paragraph\n"),
+            })
+        });
+        ui.poll();
+        let during = ui.rows(80, 24).0;
+        assert_eq!(&before[3..10], &during[3..10]);
+        journal.snapshots.send_replace(Some(Snapshot {
+            turn: 1,
+            status: "Waiting for your input".into(),
+            entries: [format!("Nano: {text}New paragraph\n")].into(),
+            ..Default::default()
+        }));
+        ui.poll();
+        assert!(ui.view.preview.is_none());
+        assert_eq!(&before[3..10], &ui.rows(80, 24).0[3..10]);
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::CONTROL,
+            )),
+            &Cancellation::default(),
+            80,
+        );
+        assert!(ui.view.scroll.following());
+        assert!(
+            ui.rows(80, 24)
+                .0
+                .iter()
+                .any(|(row, _)| row.contains("New paragraph"))
+        );
     }
 }
 
@@ -769,7 +847,7 @@ mod approval_tests {
         assert!(ui.should_exit(true));
     }
     #[tokio::test]
-    async fn approval_requires_the_current_code_and_never_uses_queued_steering() {
+    async fn approval_accepts_plain_user_confirmation_and_never_uses_queued_steering() {
         let temp = tempfile::tempdir().unwrap();
         let journal = FileJournal::create(
             &temp.path().canonicalize().unwrap(),
@@ -782,7 +860,6 @@ mod approval_tests {
         let mut ui = ui.authoring(rx);
         let (reply, mut result) = tokio::sync::oneshot::channel();
         tx.send(Approval {
-            id: "0123abcd".into(),
             tool: "create_spec".into(),
             content: "Full final specification\nNo omitted content".into(),
             reply,
@@ -792,13 +869,21 @@ mod approval_tests {
         let stop = Cancellation::default();
         ui.sender
             .try_send(SessionCommand::Steer {
-                text: "approve 0123abcd".into(),
+                text: "approve".into(),
                 input_id: None,
             })
             .unwrap();
-        assert!(ui.receive_approval());
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            &stop,
+            80,
+        );
+        assert!(ui.approval.is_some());
         assert!(result.try_recv().is_err());
-        for text in ["y", "approve deadbeef"] {
+        for text in ["not an answer", "approve deadbeef"] {
             ui.approval_text = text.into();
             ui.event(
                 Event::Key(crossterm::event::KeyEvent::new(
@@ -810,6 +895,12 @@ mod approval_tests {
             );
             assert!(result.try_recv().is_err());
             assert!(ui.approval.is_some());
+            assert!(
+                ui.rows(80, 24)
+                    .0
+                    .iter()
+                    .any(|(row, _)| row.contains("Enter: approve"))
+            );
         }
         for width in [1, 2, 8, 80] {
             for height in [1, 3, 24] {
@@ -820,7 +911,7 @@ mod approval_tests {
             }
         }
         ui.approval_text.clear();
-        ui.event(Event::Paste("approve 0123abcd\n".into()), &stop, 80);
+        ui.event(Event::Paste("approve\n".into()), &stop, 80);
         assert!(result.try_recv().is_err());
         ui.event(
             Event::Key(crossterm::event::KeyEvent::new(
@@ -832,6 +923,35 @@ mod approval_tests {
         );
         assert!(result.await.unwrap());
         assert!(ui.approval.is_none());
+    }
+    #[tokio::test]
+    async fn enter_approves_the_displayed_content_without_a_challenge_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = FileJournal::create(
+            &temp.path().canonicalize().unwrap(),
+            "enter-approval",
+            super::super::journal::Quotas::default(),
+        )
+        .unwrap();
+        let (_, mut ui) = session(journal, "enter-approval", true, None, None);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        ui.approval = Some(Approval {
+            tool: "archive_spec".into(),
+            content: "## Outcome\n\nComplete".into(),
+            reply,
+        });
+        let rows = ui.rows(80, 24).0;
+        assert!(rows.iter().any(|(row, _)| row == "## Outcome"));
+        assert!(!rows.iter().any(|(row, _)| row.contains("code")));
+        ui.event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )),
+            &Cancellation::default(),
+            80,
+        );
+        assert!(result.await.unwrap());
     }
     #[tokio::test]
     async fn escape_declines_without_altering_the_normal_draft() {
@@ -848,7 +968,6 @@ mod approval_tests {
         ui = ui.authoring(rx);
         let (reply, result) = tokio::sync::oneshot::channel();
         tx.send(Approval {
-            id: "abcd0123".into(),
             tool: "archive_spec".into(),
             content: "Approved Outcome draft".into(),
             reply,

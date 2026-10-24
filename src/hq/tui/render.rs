@@ -362,7 +362,10 @@ pub(super) fn ferrus_logo_lines() -> &'static [&'static str] {
 }
 
 pub(super) fn separator_line(width: usize) -> StyledLine {
-    StyledLine::plain("─".repeat(width.max(1)), Color::DarkGrey)
+    StyledLine::plain(
+        crate::shared::style::separator(width.max(1)),
+        Color::DarkGrey,
+    )
 }
 
 pub(super) fn project_and_milestone_lines(app: &App, width: usize) -> Vec<DashboardLine> {

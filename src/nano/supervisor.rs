@@ -90,6 +90,22 @@ enum Operation {
     Archive(ArchiveInput),
 }
 impl Operation {
+    fn preview(&self) -> String {
+        match self {
+            Self::Enqueue(input) => {
+                let mut text = input.description.clone();
+                if let (Some(path), Some(milestone)) = (&input.spec_path, &input.milestone_id) {
+                    text = format!("Specification: {path}\nMilestone: {milestone}\n\n{text}");
+                }
+                text
+            }
+            Self::Spec(markdown) => markdown.clone(),
+            Self::Archive(input) => {
+                format!("Specification: {}\n\n{}", input.spec_path, input.outcome)
+            }
+        }
+    }
+
     fn parse(name: &str, arguments: &Value) -> Result<Self> {
         ensure!(
             serde_json::to_vec(arguments)?.len() <= AUTHORING_BYTES,
@@ -300,17 +316,17 @@ impl Tools for SupervisorTools {
             DefinitionMode::Plan => None,
             DefinitionMode::Task => Some((
                 "enqueue_task",
-                enqueue_task::DESCRIPTION,
+                "Propose a complete task for user review, then enqueue it if the user confirms in the host UI.",
                 enqueue_task::INPUT_SCHEMA,
             )),
             DefinitionMode::Spec => Some((
                 "create_spec",
-                create_spec::DESCRIPTION,
+                "Propose a complete feature specification for user review, then save it if the user confirms in the host UI.",
                 create_spec::INPUT_SCHEMA,
             )),
             DefinitionMode::Archive => Some((
                 "archive_spec",
-                archive_spec::DESCRIPTION,
+                "Propose an Outcome for the selected specification. The host displays it for user review and archives only after confirmation.",
                 archive_spec::INPUT_SCHEMA,
             )),
         };
@@ -318,8 +334,8 @@ impl Tools for SupervisorTools {
             tools.push(ToolDescriptor {
                 name: name.into(),
                 description: format!(
-                    "{description} The host displays these exact arguments and requires an \
-                    explicit human approval code before executing."
+                    "{description} Invoke this tool when the draft is ready; do not ask for a \
+                    separate conversational approval first."
                 ),
                 input_schema: serde_json::from_str(schema).expect("static tool schema"),
             });
@@ -446,9 +462,8 @@ impl Host for SupervisorHost {
     async fn authorize(&mut self, call: &ValidatedCall) -> Result<(), ToolError> {
         self.scope.check().await.map_err(|_| ToolError::Denied)?;
         if authoring_name(&call.name) {
-            self.scope
-                .operation(call)
-                .map_err(|_| ToolError::Denied)?
+            let operation = self.scope.operation(call).map_err(|_| ToolError::Denied)?;
+            operation
                 .preflight(self.scope.binding.project_root())
                 .await
                 .map_err(|error| {
@@ -456,18 +471,11 @@ impl Host for SupervisorHost {
                         json!({"code":"invalid_definition", "message":error.to_string()}),
                     )
                 })?;
-            use ring::rand::SecureRandom;
-            let mut bytes = [0; 4];
-            ring::rand::SystemRandom::new()
-                .fill(&mut bytes)
-                .map_err(|_| ToolError::Failed)?;
             let (reply, response) = oneshot::channel();
             self.approvals
                 .send(Approval {
-                    id: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
                     tool: call.name.clone(),
-                    content: serde_json::to_string_pretty(&call.arguments)
-                        .map_err(|_| ToolError::InvalidArguments)?,
+                    content: operation.preview(),
                     reply,
                 })
                 .await

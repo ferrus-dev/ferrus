@@ -269,8 +269,9 @@ mod tests {
         assert!(snapshot.entries.len() <= ENTRIES);
         assert!(snapshot.entries.iter().map(String::len).sum::<usize>() <= DISPLAY_BYTES);
         assert!(!snapshot.entries.iter().any(|text| text.contains('\x1b')));
+        assert!(snapshot.entries.back().unwrap().contains(&"x".repeat(3500)));
         assert!(
-            snapshot
+            !snapshot
                 .entries
                 .back()
                 .unwrap()

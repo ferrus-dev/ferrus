@@ -53,7 +53,7 @@ pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec
         &view.conversation,
         width,
         height,
-        "PgUp/PgDn scroll; /cancel; /detach",
+        "PgUp/PgDn or wheel: scroll; /detach",
     )
     .into_iter()
     .map(|(text, color)| DashboardLine::new(StyledLine::plain(text, color)))
@@ -98,7 +98,10 @@ mod tests {
         for width in [1, 2, 8, 40, 80] {
             for height in [1, 3, 8, 24] {
                 for scroll in [0, 10, usize::MAX] {
-                    app.nano.as_mut().unwrap().scroll = scroll;
+                    app.nano.as_mut().unwrap().scroll.end();
+                    if scroll > 0 {
+                        app.nano.as_mut().unwrap().scroll.up(scroll);
+                    }
                     let rows = dashboard_lines(&app, width, height);
                     assert!(rows.len() <= height);
                     for row in rows {

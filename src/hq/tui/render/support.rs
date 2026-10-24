@@ -91,11 +91,7 @@ pub(in crate::hq::tui) fn terminal_size_usize() -> (usize, usize) {
 }
 
 pub(in crate::hq::tui) fn orange() -> Color {
-    Color::Rgb {
-        r: 226,
-        g: 128,
-        b: 18,
-    }
+    crate::shared::style::ACCENT
 }
 
 pub(in crate::hq::tui) fn logo_gradient_color(idx: usize, len: usize) -> Color {
