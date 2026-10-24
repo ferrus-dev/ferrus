@@ -120,12 +120,7 @@ pub(crate) fn heading(view: &Conversation, width: usize) -> Vec<(String, Color)>
     .collect()
 }
 
-pub(crate) fn lines(
-    view: &Conversation,
-    width: usize,
-    height: usize,
-    controls: &str,
-) -> Vec<(String, Color)> {
+pub(crate) fn lines(view: &Conversation, width: usize, height: usize) -> Vec<(String, Color)> {
     let plain = |text: String, color| (text.chars().take(width).collect(), color);
     let budget = &view.snapshot.budget;
     // Pending request reservations are capacity, not consumed token usage.
@@ -212,7 +207,7 @@ pub(crate) fn lines(
                 }),
         );
     }
-    let available = height.saturating_sub(lines.len() + 2);
+    let available = height.saturating_sub(lines.len());
     let visible = view.scroll.range(body.len(), available);
     lines.extend(
         body[visible.clone()]
@@ -220,24 +215,19 @@ pub(crate) fn lines(
             .cloned()
             .map(|(text, color)| plain(text, color)),
     );
-    lines.resize(height.saturating_sub(2), (String::new(), Color::Grey));
-    lines.push(plain(style::separator(width), Color::DarkGrey));
-    lines.push(plain(
-        format!(
-            "{}-{} / {}  {}  {controls}",
-            visible.start.saturating_add(1).min(body.len()),
-            visible.end,
-            body.len(),
-            if view.scroll.following() {
-                "Live"
-            } else {
-                "History; Ctrl-End: latest"
-            }
-        ),
-        Color::DarkGrey,
-    ));
+    lines.resize(height, (String::new(), Color::Grey));
     lines.truncate(height);
     lines
+}
+
+pub(crate) const EDITING_HINT: &str = "Enter send · Alt/Shift-Enter newline · ↑/↓ history";
+
+pub(crate) fn navigation_hint(view: &Conversation) -> &'static str {
+    if view.scroll.following() {
+        "PgUp/PgDn/wheel scroll · Ctrl-Home/End jump"
+    } else {
+        "Reading history · Ctrl-End latest · PgUp/PgDn/wheel scroll"
+    }
 }
 
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {

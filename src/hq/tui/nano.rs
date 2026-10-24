@@ -49,33 +49,28 @@ impl NanoConversation {
     }
 }
 pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec<DashboardLine> {
-    crate::shared::conversation::lines(
-        &view.conversation,
-        width,
-        height,
-        "PgUp/PgDn or wheel: scroll; /detach",
-    )
-    .into_iter()
-    .enumerate()
-    .map(|(index, (text, color))| {
-        let line = if index == 0 {
-            StyledLine {
-                segments: crate::shared::conversation::heading(&view.conversation, width)
-                    .into_iter()
-                    .map(|(text, color)| StyledSegment {
-                        text,
-                        color,
-                        bold: false,
-                        link: None,
-                    })
-                    .collect(),
-            }
-        } else {
-            StyledLine::plain(text, color)
-        };
-        DashboardLine::new(line)
-    })
-    .collect()
+    crate::shared::conversation::lines(&view.conversation, width, height)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (text, color))| {
+            let line = if index == 0 {
+                StyledLine {
+                    segments: crate::shared::conversation::heading(&view.conversation, width)
+                        .into_iter()
+                        .map(|(text, color)| StyledSegment {
+                            text,
+                            color,
+                            bold: false,
+                            link: None,
+                        })
+                        .collect(),
+                }
+            } else {
+                StyledLine::plain(text, color)
+            };
+            DashboardLine::new(line)
+        })
+        .collect()
 }
 
 pub(super) fn trim_notices(notices: &mut Vec<TranscriptLine>) {

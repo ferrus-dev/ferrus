@@ -753,6 +753,18 @@ pub(super) fn prompt_accessory_lines(app: &App, width: usize) -> Vec<StyledLine>
         selection_dashboard_lines(app, width)
     } else if app.completion_popup_visible() {
         completion_dashboard_lines(app, width)
+    } else if let Some(view) = &app.nano {
+        vec![StyledLine::plain(
+            truncate_to_width(
+                &format!(
+                    "{} · {}",
+                    crate::shared::conversation::EDITING_HINT,
+                    crate::shared::conversation::navigation_hint(view)
+                ),
+                width,
+            ),
+            Color::DarkGrey,
+        )]
     } else {
         Vec::new()
     }
@@ -764,6 +776,16 @@ pub(super) fn footer_line(app: &App, width: usize) -> StyledLine {
             "Press Ctrl+C again within 2s to exit",
             Color::Yellow,
             true,
+            app.debug,
+            width,
+        );
+    }
+
+    if app.nano.is_some() {
+        return footer_with_debug(
+            "/cancel: stop session · /detach: return to HQ",
+            Color::DarkGrey,
+            false,
             app.debug,
             width,
         );

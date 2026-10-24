@@ -250,17 +250,17 @@ impl Frontend {
         );
         rows.resize(height.saturating_sub(4), (String::new(), Color::Grey));
         rows.push((crate::shared::style::separator(width), Color::DarkGrey));
-        rows.push((
-            "Enter: approve  Esc: decline  PgUp/PgDn: read".into(),
-            crate::shared::style::ACCENT,
-        ));
+        rows.push((format!("> {}", self.approval_text), Color::White));
         rows.push((
             self.error
                 .clone()
                 .unwrap_or_else(|| "Approve this content? (approve/reject)".into()),
             Color::Grey,
         ));
-        rows.push((format!("> {}", self.approval_text), Color::White));
+        rows.push((
+            "Enter: approve · Esc: decline · PgUp/PgDn or wheel: read".into(),
+            crate::shared::style::ACCENT,
+        ));
         rows.truncate(height);
         for (text, _) in &mut rows {
             *text = text.chars().take(width).collect();
@@ -268,7 +268,7 @@ impl Frontend {
         (
             rows,
             (
-                (height - 1) as u16,
+                height.saturating_sub(3) as u16,
                 (2 + self.approval_text.len()).min(width - 1) as u16,
             ),
         )
@@ -527,17 +527,54 @@ impl Frontend {
         );
         let prompt_height = prompt.lines.len().min((height / 3).max(1));
         let prompt_start = (prompt.cursor_row as usize).saturating_sub(prompt_height - 1);
-        let top = height.saturating_sub(prompt_height + 3);
-        let mut rows = conversation::lines(
-            &self.view,
-            width,
-            top,
-            if self.exit_on_end && self.view.snapshot.ended {
-                "PgUp/PgDn or wheel: scroll; Esc: HQ"
-            } else {
-                "PgUp/PgDn or wheel: scroll; Ctrl-Home/End: first/latest"
-            },
+        let mut footer = Vec::new();
+        let notice = self
+            .error
+            .as_deref()
+            .or_else(|| self.view.notices.last().map(String::as_str))
+            .or_else(|| {
+                if self.exit_on_end && self.view.snapshot.ended {
+                    Some("Session ended · Esc: return to HQ · Diagnostics are saved on exit")
+                } else if self.pending.is_some() {
+                    Some("Input queued · Waiting for durable acceptance")
+                } else {
+                    None
+                }
+            });
+        if let Some(notice) = notice {
+            footer.extend(
+                conversation::wrap(&display_text(notice, 1024), width)
+                    .into_iter()
+                    .map(|text| {
+                        (
+                            text,
+                            if self.error.is_some() {
+                                Color::Red
+                            } else {
+                                Color::DarkGrey
+                            },
+                        )
+                    }),
+            );
+        }
+        footer.push((
+            format!(
+                "{} · {} · Ctrl-C exit",
+                conversation::EDITING_HINT,
+                conversation::navigation_hint(&self.view)
+            )
+            .chars()
+            .take(width)
+            .collect(),
+            Color::DarkGrey,
+        ));
+        footer.truncate(
+            (height / 3)
+                .max(1)
+                .min(height.saturating_sub(prompt_height + 2)),
         );
+        let top = height.saturating_sub(prompt_height + 2 + footer.len());
+        let mut rows = conversation::lines(&self.view, width, top);
         rows.resize(top, (String::new(), Color::Grey));
         rows.push((crate::shared::style::separator(width), Color::DarkGrey));
         for (index, text) in prompt
@@ -556,29 +593,7 @@ impl Frontend {
             ));
         }
         rows.push((crate::shared::style::separator(width), Color::DarkGrey));
-        let notice = self
-            .error
-            .as_deref()
-            .or_else(|| self.view.notices.last().map(String::as_str))
-            .unwrap_or(if self.exit_on_end && self.view.snapshot.ended {
-                "Session ended. Esc returns to HQ; diagnostics are saved on exit."
-            } else if self.pending.is_some() {
-                "Input queued; waiting for durable acceptance"
-            } else {
-                "Enter sends; Alt/Shift-Enter adds a line; Up/Down recalls input"
-            });
-        rows.push((
-            display_text(notice, 1024)
-                .chars()
-                .filter(|ch| *ch != '\n')
-                .take(width)
-                .collect(),
-            if self.error.is_some() {
-                Color::Red
-            } else {
-                Color::DarkGrey
-            },
-        ));
+        rows.extend(footer);
         rows.resize(height, (String::new(), Color::Grey));
         rows.truncate(height);
         let cursor = (
