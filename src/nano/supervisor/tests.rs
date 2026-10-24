@@ -408,6 +408,21 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             .as_deref(),
         Some(path.as_str())
     );
+    // Mirror ferrus-test: obsolete failed attempts have no files, while a
+    // successor completed the same milestone and still has its evidence.
+    let mut missing_tasks = Vec::new();
+    for _ in 0..4 {
+        let old =
+            project::create_pending_task_artifact("Failed attempt", Some(&path), Some("m1.0"))
+                .await
+                .unwrap();
+        project::record_task_status(&old.id, &old.path, project::TaskStatus::Failed)
+            .await
+            .unwrap();
+        std::fs::remove_file(fixture.root.join(&old.path)).unwrap();
+        std::fs::remove_dir_all(fixture.root.join(&old.run_dir)).unwrap();
+        missing_tasks.push(old.id);
+    }
     let task =
         project::create_pending_task_artifact("Implemented feature", Some(&path), Some("m1.0"))
             .await
@@ -451,6 +466,11 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
         saved: 0,
         pending: None,
     };
+    let context = archive.definition_context().await.unwrap();
+    assert_eq!(context["skipped_failed_tasks"], 4);
+    let evidence_tasks = context["tasks"].as_array().unwrap();
+    assert_eq!(evidence_tasks.len(), 1);
+    assert_eq!(evidence_tasks[0]["id"], task.id);
     let mismatch = call(
         "archive_spec",
         json!({"input":{"spec_path":"another.md","outcome":"Completed"}}),
@@ -475,6 +495,17 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             arguments: json!({"task_id":task.id,"artifact":artifact}).to_string(),
         })
         .collect::<Vec<_>>();
+    let mut all_calls = missing_tasks
+        .iter()
+        .enumerate()
+        .map(|(i, id)| ToolCall {
+            provider_call_id: format!("missing-{i}"),
+            name: artifacts::NAME.into(),
+            arguments: json!({"task_id":id,"artifact":"task"}).to_string(),
+        })
+        .collect::<Vec<_>>();
+    all_calls.append(&mut calls);
+    calls = all_calls;
     calls.push(ToolCall {
         provider_call_id: "save-archive".into(), name: "archive_spec".into(),
         arguments: json!({"input":{"spec_path":path,"outcome":"## Outcome\n\nImplemented and validated the approved feature."}}).to_string(),
@@ -498,6 +529,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
         task_id: None,
         run_id: Some("definition".into()),
     };
+    let journal_path = archive_journal.directory().join("events.jsonl");
     let mut engine = Engine::new(
         identity,
         Limits::default(),
@@ -516,7 +548,10 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             &stop
         ),
         async {
-            let request = requests.recv().await.unwrap();
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                .await
+                .expect("archive never reached human confirmation")
+                .unwrap();
             assert_eq!(request.tool, "archive_spec");
             assert!(
                 !std::fs::read_to_string(&path)
@@ -526,18 +561,48 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
             request.reply.send(true).unwrap();
         }
     );
-    assert_eq!(end.unwrap().reason, EndReason::DefinitionCompleted);
+    let end = end.unwrap();
+    assert_eq!(end.reason, EndReason::DefinitionCompleted);
+    assert_eq!(end.budget.no_progress, 0);
+    let observations = read_records(&journal_path)
+        .into_iter()
+        .filter_map(|record| match record.event {
+            SessionEvent::ToolResult {
+                outcome: ToolOutcome::Success(value),
+                ..
+            } if value["available"] == false => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), missing_tasks.len());
+    assert!(
+        observations
+            .iter()
+            .all(|value| value["reason"] == "artifact_missing" && value["task_status"] == "failed")
+    );
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
             .contains("Implemented and validated")
     );
-    assert!(
-        project::read_last_spec_archive_path()
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let archive_path = project::read_last_spec_archive_path()
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(Path::new(&archive_path).join("manifest.toml")).unwrap(),
+    )
+    .unwrap();
+    let archived_tasks = manifest["tasks"].as_array().unwrap();
+    assert_eq!(archived_tasks.len(), missing_tasks.len() + 1);
+    for id in missing_tasks {
+        assert!(
+            archived_tasks
+                .iter()
+                .any(|entry| entry["id"].as_str() == Some(&id)
+                    && entry["status"].as_str() == Some("failed"))
+        );
+    }
     assert!(!fixture.root.join(task.path).exists());
 }
 
@@ -642,6 +707,12 @@ async fn archive_evidence_reads_only_terminal_tasks_of_the_pinned_spec() {
             .await
             .is_err()
     );
+    std::fs::remove_file(fixture.root.join(&task.path)).unwrap();
+    let missing = artifacts::read(&tools.scope, &args).await.unwrap();
+    assert_eq!(missing["available"], false);
+    assert_eq!(missing["reason"], "artifact_missing");
+    assert_eq!(missing["task_status"], "complete");
+    assert!(missing.get("text").is_none());
     for invalid in [
         json!({"task_id":"../escape","artifact":"task"}),
         json!({"task_id":task.id,"artifact":"ANSWER.md"}),

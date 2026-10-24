@@ -32,7 +32,7 @@ pub(super) fn parse(args: &Value) -> Result<Request> {
 pub(super) fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: NAME.into(),
-        description: "Read task intent, submission/check evidence, review, patch or integration error for a terminal task linked to the launch-selected archive spec. Use this tool for .ferrus artifacts; read_file deliberately cannot read runtime files. Pages are bounded to 4096 bytes; artifacts to 1 MiB. No arbitrary paths.".into(),
+        description: "Read task intent, submission/check evidence, review, patch or integration error for a terminal task linked to the launch-selected archive spec. Use this tool for .ferrus artifacts; read_file deliberately cannot read runtime files. Missing files return available=false: continue with other linked evidence without retrying or inventing missing contents. Pages are bounded to 4096 bytes; artifacts to 1 MiB. No arbitrary paths.".into(),
         input_schema: json!({"type":"object","properties":{
             "task_id":{"type":"string"},
             "artifact":{"type":"string","enum":["task","submission","review","patch","integration_error"]},
@@ -77,12 +77,21 @@ pub(super) async fn read(scope: &Scope, args: &Value) -> Result<Value> {
             )
         }
     };
-    let (text, digest) = super::super::workspace::instruction_file(
+    let Some((text, digest)) = super::super::workspace::instruction_file(
         scope.binding.project_root(),
         &path,
         1024 * 1024,
     )?
-    .context("Archive artifact is unavailable")?;
+    else {
+        // Historical terminal rows can outlive their checkout artifacts. This
+        // is a successful availability observation, not an execution failure.
+        return Ok(
+            json!({"task_id":request.task_id,"artifact":request.artifact,
+            "available":false,"reason":"artifact_missing","task_status":task.status,
+            "failure_reason":task.failure_reason,
+            "message":"The file is absent. Continue with other linked task evidence; do not retry or reconstruct missing contents."}),
+        );
+    };
     ensure!(
         request.offset <= text.len() && text.is_char_boundary(request.offset),
         "Invalid UTF-8 artifact offset"
@@ -99,7 +108,7 @@ pub(super) async fn read(scope: &Scope, args: &Value) -> Result<Value> {
         "Increase max_bytes to fit the next character"
     );
     Ok(
-        json!({"task_id":request.task_id,"artifact":request.artifact,"digest":digest,
+        json!({"task_id":request.task_id,"artifact":request.artifact,"available":true,"digest":digest,
         "text":&text[request.offset..end],"next_offset":end,"truncated":end<text.len()}),
     )
 }

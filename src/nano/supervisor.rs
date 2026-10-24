@@ -253,16 +253,24 @@ impl SupervisorTools {
             Ok(super::workspace::instruction_file(root, path, 12 * 1024)?.map(|(text, _)| text))
         };
         let selected = project::read_project_selection().await?.selected_spec;
-        let tasks = if let Some(path) = &selected {
+        let mut tasks = if let Some(path) = &selected {
             project::list_tasks_for_spec(path).await?
         } else {
             Vec::new()
         };
+        let mut skipped_failed_tasks = 0;
+        if self.scope.mode == DefinitionMode::Archive {
+            let count = tasks.len();
+            tasks.retain(|task| task.status != "failed");
+            skipped_failed_tasks = count - tasks.len();
+        }
         ensure!(
             tasks.len() <= 128,
             "Too many tasks for one definition context packet"
         );
-        let value = json!({"mode":self.scope.mode.as_str(), "selected_spec":selected, "tasks":tasks.iter().map(|task| json!({"id":task.id,"path":task.path,"status":task.status})).collect::<Vec<_>>(),
+        let value = json!({"mode":self.scope.mode.as_str(), "selected_spec":selected,
+            "skipped_failed_tasks":skipped_failed_tasks,
+            "tasks":tasks.iter().map(|task| json!({"id":task.id,"path":task.path,"status":task.status})).collect::<Vec<_>>(),
             "task_template":template(".ferrus/TASK.md")?.unwrap_or_else(|| crate::templates::TASK_TEMPLATE.into()),
             "spec_template":template(".ferrus/SPEC_TEMPLATE.md")?.unwrap_or_else(|| crate::templates::SPEC_TEMPLATE.into())});
         ensure!(

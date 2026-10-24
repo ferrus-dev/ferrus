@@ -19,6 +19,20 @@ fn task_record(id: &str, status: crate::project::TaskStatus) -> TaskRecord {
     }
 }
 
+#[test]
+fn archive_prompt_skips_failed_attempts_without_discarding_history_count() {
+    let tasks = [
+        task_record("t-001", crate::project::TaskStatus::Failed),
+        task_record("t-002", crate::project::TaskStatus::Complete),
+    ];
+    let prompt = archive_spec_prompt_context("docs/spec.md", &tasks);
+    assert!(prompt.contains("Task count: 2"));
+    assert!(prompt.contains("Failed attempts skipped for Outcome: 1"));
+    assert!(!prompt.contains("t-001"));
+    assert!(prompt.contains("Task ID: t-002"));
+    assert!(prompt.contains("Task path: .ferrus/tasks/t-002.md"));
+}
+
 #[cfg(unix)]
 fn failed_exit_status() -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
