@@ -97,6 +97,29 @@ impl Conversation {
     }
 }
 
+pub(crate) fn heading(view: &Conversation, width: usize) -> Vec<(String, Color)> {
+    let label = if view.name == view.run_id {
+        "Ferrus / Nano / ".to_string()
+    } else {
+        format!(
+            "Ferrus / Nano / {} / ",
+            display_text(&view.name, 256).replace('\n', " ")
+        )
+    };
+    let mut remaining = width;
+    [
+        (label, style::ACCENT),
+        (display_text(&view.run_id, 256), Color::DarkGrey),
+    ]
+    .into_iter()
+    .map(|(text, color)| {
+        let text: String = text.chars().take(remaining).collect();
+        remaining = remaining.saturating_sub(text.chars().count());
+        (text, color)
+    })
+    .collect()
+}
+
 pub(crate) fn lines(
     view: &Conversation,
     width: usize,
@@ -104,15 +127,30 @@ pub(crate) fn lines(
     controls: &str,
 ) -> Vec<(String, Color)> {
     let plain = |text: String, color| (text.chars().take(width).collect(), color);
+    let budget = &view.snapshot.budget;
+    // Pending request reservations are capacity, not consumed token usage.
+    let input = budget
+        .reported_input_tokens
+        .saturating_add(budget.estimated_input_tokens);
+    let output = budget
+        .reported_output_tokens
+        .saturating_add(budget.estimated_output_tokens);
     let mut lines = vec![
-        plain(format!("Ferrus / Nano - {}", view.name), style::ACCENT),
+        plain(
+            heading(view, width)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect(),
+            style::ACCENT,
+        ),
         plain(
             format!(
-                "{}  |  Tokens: {}  Turns: {}  Tools: {}",
+                "{} · ↑ {} · ↓ {} · Turns: {} · Tools: {}",
                 display_text(&view.snapshot.status, 256),
-                view.snapshot.budget.tokens(),
-                view.snapshot.budget.model_turns,
-                view.snapshot.budget.tool_calls,
+                input,
+                output,
+                budget.model_turns,
+                budget.tool_calls,
             ),
             Color::DarkGrey,
         ),
@@ -174,7 +212,7 @@ pub(crate) fn lines(
                 }),
         );
     }
-    let available = height.saturating_sub(lines.len() + 1);
+    let available = height.saturating_sub(lines.len() + 2);
     let visible = view.scroll.range(body.len(), available);
     lines.extend(
         body[visible.clone()]
@@ -182,7 +220,8 @@ pub(crate) fn lines(
             .cloned()
             .map(|(text, color)| plain(text, color)),
     );
-    lines.resize(height.saturating_sub(1), (String::new(), Color::Grey));
+    lines.resize(height.saturating_sub(2), (String::new(), Color::Grey));
+    lines.push(plain(style::separator(width), Color::DarkGrey));
     lines.push(plain(
         format!(
             "{}-{} / {}  {}  {controls}",

@@ -56,7 +56,25 @@ pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec
         "PgUp/PgDn or wheel: scroll; /detach",
     )
     .into_iter()
-    .map(|(text, color)| DashboardLine::new(StyledLine::plain(text, color)))
+    .enumerate()
+    .map(|(index, (text, color))| {
+        let line = if index == 0 {
+            StyledLine {
+                segments: crate::shared::conversation::heading(&view.conversation, width)
+                    .into_iter()
+                    .map(|(text, color)| StyledSegment {
+                        text,
+                        color,
+                        bold: false,
+                        link: None,
+                    })
+                    .collect(),
+            }
+        } else {
+            StyledLine::plain(text, color)
+        };
+        DashboardLine::new(line)
+    })
     .collect()
 }
 

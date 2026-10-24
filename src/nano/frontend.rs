@@ -502,13 +502,14 @@ impl Frontend {
         let (rows, cursor) = self.rows(width.max(1), height.max(1));
         queue!(out, Hide)?;
         for (row, (text, color)) in rows.into_iter().enumerate() {
-            queue!(
-                out,
-                MoveTo(0, row as u16),
-                Clear(ClearType::CurrentLine),
-                SetForegroundColor(color),
-                Print(text)
-            )?;
+            queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine))?;
+            if row == 0 && self.approval.is_none() {
+                for (text, color) in conversation::heading(&self.view, width) {
+                    queue!(out, SetForegroundColor(color), Print(text))?;
+                }
+            } else {
+                queue!(out, SetForegroundColor(color), Print(text))?;
+            }
         }
         queue!(out, ResetColor, MoveTo(cursor.1, cursor.0), Show)?;
         out.flush()?;
