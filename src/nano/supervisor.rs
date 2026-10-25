@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
+mod artifacts;
+
 const AUTHORING_BYTES: usize = 24 * 1024;
 
 #[derive(Clone)]
@@ -88,6 +90,22 @@ enum Operation {
     Archive(ArchiveInput),
 }
 impl Operation {
+    fn preview(&self) -> String {
+        match self {
+            Self::Enqueue(input) => {
+                let mut text = input.description.clone();
+                if let (Some(path), Some(milestone)) = (&input.spec_path, &input.milestone_id) {
+                    text = format!("Specification: {path}\nMilestone: {milestone}\n\n{text}");
+                }
+                text
+            }
+            Self::Spec(markdown) => markdown.clone(),
+            Self::Archive(input) => {
+                format!("Specification: {}\n\n{}", input.spec_path, input.outcome)
+            }
+        }
+    }
+
     fn parse(name: &str, arguments: &Value) -> Result<Self> {
         ensure!(
             serde_json::to_vec(arguments)?.len() <= AUTHORING_BYTES,
@@ -251,16 +269,24 @@ impl SupervisorTools {
             Ok(super::workspace::instruction_file(root, path, 12 * 1024)?.map(|(text, _)| text))
         };
         let selected = project::read_project_selection().await?.selected_spec;
-        let tasks = if let Some(path) = &selected {
+        let mut tasks = if let Some(path) = &selected {
             project::list_tasks_for_spec(path).await?
         } else {
             Vec::new()
         };
+        let mut skipped_failed_tasks = 0;
+        if self.scope.mode == DefinitionMode::Archive {
+            let count = tasks.len();
+            tasks.retain(|task| task.status != "failed");
+            skipped_failed_tasks = count - tasks.len();
+        }
         ensure!(
             tasks.len() <= 128,
             "Too many tasks for one definition context packet"
         );
-        let value = json!({"mode":self.scope.mode.as_str(), "selected_spec":selected, "tasks":tasks.iter().map(|task| json!({"id":task.id,"path":task.path,"status":task.status})).collect::<Vec<_>>(),
+        let value = json!({"mode":self.scope.mode.as_str(), "selected_spec":selected,
+            "skipped_failed_tasks":skipped_failed_tasks,
+            "tasks":tasks.iter().map(|task| json!({"id":task.id,"path":task.path,"status":task.status})).collect::<Vec<_>>(),
             "task_template":template(".ferrus/TASK.md")?.unwrap_or_else(|| crate::templates::TASK_TEMPLATE.into()),
             "spec_template":template(".ferrus/SPEC_TEMPLATE.md")?.unwrap_or_else(|| crate::templates::SPEC_TEMPLATE.into())});
         ensure!(
@@ -290,17 +316,17 @@ impl Tools for SupervisorTools {
             DefinitionMode::Plan => None,
             DefinitionMode::Task => Some((
                 "enqueue_task",
-                enqueue_task::DESCRIPTION,
+                "Propose a complete task for user review, then enqueue it if the user confirms in the host UI.",
                 enqueue_task::INPUT_SCHEMA,
             )),
             DefinitionMode::Spec => Some((
                 "create_spec",
-                create_spec::DESCRIPTION,
+                "Propose a complete feature specification for user review, then save it if the user confirms in the host UI.",
                 create_spec::INPUT_SCHEMA,
             )),
             DefinitionMode::Archive => Some((
                 "archive_spec",
-                archive_spec::DESCRIPTION,
+                "Propose an Outcome for the selected specification. The host displays it for user review and archives only after confirmation.",
                 archive_spec::INPUT_SCHEMA,
             )),
         };
@@ -308,11 +334,14 @@ impl Tools for SupervisorTools {
             tools.push(ToolDescriptor {
                 name: name.into(),
                 description: format!(
-                    "{description} The host displays these exact arguments and requires an \
-                    explicit human approval code before executing."
+                    "{description} Invoke this tool when the draft is ready; do not ask for a \
+                    separate conversational approval first."
                 ),
                 input_schema: serde_json::from_str(schema).expect("static tool schema"),
             });
+        }
+        if self.scope.mode == DefinitionMode::Archive {
+            tools.push(artifacts::descriptor());
         }
         tools
     }
@@ -320,7 +349,11 @@ impl Tools for SupervisorTools {
         if !self.descriptors().iter().any(|tool| tool.name == name) {
             return Err(ToolError::UnknownTool);
         }
-        if authoring_name(name) {
+        if name == artifacts::NAME {
+            artifacts::parse(arguments)
+                .map(|_| ())
+                .map_err(|_| ToolError::InvalidArguments)
+        } else if authoring_name(name) {
             self.scope
                 .operation(&ValidatedCall {
                     call_id: String::new(),
@@ -358,6 +391,15 @@ impl Tools for SupervisorTools {
     async fn execute(&mut self, call: &ValidatedCall, stop: &Cancellation) -> ToolOutcome {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
+        }
+        if call.name == artifacts::NAME {
+            return match artifacts::read(&self.scope, &call.arguments).await {
+                Ok(value) => ToolOutcome::Success(value),
+                Err(error) => ToolOutcome::Failed(ToolError::Lifecycle(json!({
+                    "code":"archive_artifact_unavailable",
+                    "message":super::conversation::display_text(&error.to_string(),1024)
+                }))),
+            };
         }
         if authoring_name(&call.name) {
             let operation = match self.scope.operation(call) {
@@ -420,9 +462,8 @@ impl Host for SupervisorHost {
     async fn authorize(&mut self, call: &ValidatedCall) -> Result<(), ToolError> {
         self.scope.check().await.map_err(|_| ToolError::Denied)?;
         if authoring_name(&call.name) {
-            self.scope
-                .operation(call)
-                .map_err(|_| ToolError::Denied)?
+            let operation = self.scope.operation(call).map_err(|_| ToolError::Denied)?;
+            operation
                 .preflight(self.scope.binding.project_root())
                 .await
                 .map_err(|error| {
@@ -430,18 +471,11 @@ impl Host for SupervisorHost {
                         json!({"code":"invalid_definition", "message":error.to_string()}),
                     )
                 })?;
-            use ring::rand::SecureRandom;
-            let mut bytes = [0; 4];
-            ring::rand::SystemRandom::new()
-                .fill(&mut bytes)
-                .map_err(|_| ToolError::Failed)?;
             let (reply, response) = oneshot::channel();
             self.approvals
                 .send(Approval {
-                    id: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
                     tool: call.name.clone(),
-                    content: serde_json::to_string_pretty(&call.arguments)
-                        .map_err(|_| ToolError::InvalidArguments)?,
+                    content: operation.preview(),
                     reply,
                 })
                 .await
@@ -513,9 +547,62 @@ pub(crate) async fn launch(
         run_id: run.clone(),
         definition: Some(mode),
     };
-    let result = Box::pin(run_bound(binding, mode, prompt, task_count, config, model)).await;
+    let result = Box::pin(run_bound(
+        binding.clone(),
+        mode,
+        prompt,
+        task_count,
+        config,
+        model,
+    ))
+    .await;
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let path = failure_diagnostic(&binding, &error);
+            project::record_runtime_event_best_effort(
+                Some(run.clone()),
+                "nano_supervisor_failed",
+                json!({"reason":super::conversation::display_text(&error.to_string(),4096),
+                    "diagnostic_path":path}),
+            )
+            .await;
+            Err(error.context(format!(
+                "Nano Supervisor {run} failed; diagnostics: {}",
+                path.display()
+            )))
+        }
+    };
     project::record_run_finished(&run, if result.is_ok() { 0 } else { 1 }).await?;
     result
+}
+
+fn failure_diagnostic(binding: &Binding, error: &anyhow::Error) -> PathBuf {
+    use std::io::Write;
+    let directory = binding
+        .data_dir()
+        .join("nano/sessions")
+        .join(binding.run_id());
+    let path = directory.join("diagnostics.log");
+    let save = || -> Result<()> {
+        for parent in [
+            binding.data_dir().join("nano"),
+            binding.data_dir().join("nano/sessions"),
+            directory.clone(),
+        ] {
+            super::private::directory(&parent, false)?;
+        }
+        let mut file = super::private::file(&path, true)?;
+        file.write_all(
+            super::conversation::display_text(&format!("{error:#}\n"), 8192).as_bytes(),
+        )?;
+        file.sync_all()?;
+        Ok(())
+    };
+    if let Err(error) = save() {
+        tracing::warn!(error = ?error, "Could not save Nano Supervisor diagnostics");
+    }
+    path
 }
 async fn run_bound(
     binding: Binding,

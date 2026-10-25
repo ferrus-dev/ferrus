@@ -1,5 +1,6 @@
 //! Conversation state and rows shared by HQ and the standalone frontend.
 
+use super::{scroll::Scroll, style};
 use crate::nano::{
     conversation::{Snapshot, display_text},
     wire::{Event as NativeEvent, ObservedEvents},
@@ -14,7 +15,7 @@ pub(crate) struct Conversation {
     events: Option<watch::Receiver<ObservedEvents>>,
     pub(crate) snapshot: Snapshot,
     pub(crate) preview: Option<(u64, String)>,
-    pub(crate) scroll: usize,
+    pub(crate) scroll: Scroll,
     pub(crate) notices: Vec<String>,
     seen_notice: u64,
     pub(crate) rejected_input: Option<String>,
@@ -37,27 +38,11 @@ impl Conversation {
             events,
             snapshot,
             preview: None,
-            scroll: 0,
+            scroll: Scroll::default(),
             notices: Vec::new(),
             seen_notice: 0,
             rejected_input: None,
         }
-    }
-    pub(crate) fn scroll_up(&mut self, width: usize) {
-        let maximum = self
-            .snapshot
-            .entries
-            .iter()
-            .map(|entry| wrap(entry, width).len() + 1)
-            .sum::<usize>()
-            + self
-                .preview
-                .as_ref()
-                .map_or(0, |(_, text)| wrap(text, width).len());
-        self.scroll = self
-            .scroll
-            .saturating_add(10)
-            .min(maximum.saturating_sub(1));
     }
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = false;
@@ -81,7 +66,7 @@ impl Conversation {
                 && *turn == self.snapshot.turn
                 && self.snapshot.status.starts_with("Generating")
             {
-                let preview = Some((*turn, display_text(text, 512)));
+                let preview = Some((*turn, display_text(text, crate::nano::wire::PREVIEW_BYTES)));
                 changed |= preview != self.preview;
                 self.preview = preview;
             }
@@ -90,6 +75,7 @@ impl Conversation {
             {
                 self.snapshot.status = format!("Process ended: {reason:?}, durable={durable}");
                 self.snapshot.ended = true;
+                self.snapshot.end_reason = Some(reason.clone());
                 changed = true;
             }
             if state.notice_sequence > self.seen_notice {
@@ -111,55 +97,137 @@ impl Conversation {
     }
 }
 
-pub(crate) fn lines(
-    view: &Conversation,
-    width: usize,
-    height: usize,
-    controls: &str,
-) -> Vec<(String, Color)> {
+pub(crate) fn heading(view: &Conversation, width: usize) -> Vec<(String, Color)> {
+    let label = if view.name == view.run_id {
+        "Ferrus / Nano / ".to_string()
+    } else {
+        format!(
+            "Ferrus / Nano / {} / ",
+            display_text(&view.name, 256).replace('\n', " ")
+        )
+    };
+    let mut remaining = width;
+    [
+        (label, style::ACCENT),
+        (display_text(&view.run_id, 256), Color::DarkGrey),
+    ]
+    .into_iter()
+    .map(|(text, color)| {
+        let text: String = text.chars().take(remaining).collect();
+        remaining = remaining.saturating_sub(text.chars().count());
+        (text, color)
+    })
+    .collect()
+}
+
+pub(crate) fn lines(view: &Conversation, width: usize, height: usize) -> Vec<(String, Color)> {
     let plain = |text: String, color| (text.chars().take(width).collect(), color);
+    let budget = &view.snapshot.budget;
+    // Pending request reservations are capacity, not consumed token usage.
+    let input = budget
+        .reported_input_tokens
+        .saturating_add(budget.estimated_input_tokens);
+    let output = budget
+        .reported_output_tokens
+        .saturating_add(budget.estimated_output_tokens);
     let mut lines = vec![
         plain(
-            format!("Nano conversation: {}", view.name),
-            Color::Rgb {
-                r: 226,
-                g: 128,
-                b: 18,
-            },
+            heading(view, width)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect(),
+            style::ACCENT,
         ),
-        plain(display_text(&view.snapshot.status, 256), Color::Grey),
         plain(
             format!(
-                "Tokens: {}  Turns: {}  Tools: {}  {}",
-                view.snapshot.budget.tokens(),
-                view.snapshot.budget.model_turns,
-                view.snapshot.budget.tool_calls,
-                controls
+                "{} · ↑ {} · ↓ {} · Turns: {} · Tools: {}",
+                display_text(&view.snapshot.status, 256),
+                input,
+                output,
+                budget.model_turns,
+                budget.tool_calls,
             ),
             Color::DarkGrey,
         ),
+        plain(style::separator(width), Color::DarkGrey),
     ];
     let mut body = Vec::new();
+    if view.snapshot.omitted_entries > 0 {
+        body.extend(
+            wrap(
+                &format!(
+                    "[{} earlier entries are available in the session journal]",
+                    view.snapshot.omitted_entries
+                ),
+                width,
+            )
+            .into_iter()
+            .map(|text| (text, Color::DarkGrey)),
+        );
+    }
     for entry in &view.snapshot.entries {
-        body.extend(wrap(entry, width));
-        body.push(String::new());
+        let color = if entry.starts_with("You:") {
+            Color::White
+        } else if entry.starts_with("Tool:") || entry.starts_with("Result:") {
+            Color::DarkGrey
+        } else {
+            Color::Grey
+        };
+        body.extend(
+            wrap(entry, width)
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let color = if index == 0
+                        && (entry.starts_with("You:") || entry.starts_with("Nano:"))
+                    {
+                        style::ACCENT
+                    } else {
+                        color
+                    };
+                    (text, color)
+                }),
+        );
+        body.push((String::new(), color));
     }
     if let Some((_, preview)) = &view.preview {
-        body.extend(wrap(&format!("Nano (streaming preview): {preview}"), width));
+        body.extend(
+            wrap(&format!("Nano: {preview}"), width)
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    (
+                        text,
+                        if index == 0 {
+                            style::ACCENT
+                        } else {
+                            Color::Grey
+                        },
+                    )
+                }),
+        );
     }
     let available = height.saturating_sub(lines.len());
-    let end = body
-        .len()
-        .saturating_sub(view.scroll.min(body.len().saturating_sub(available)));
-    let start = end.saturating_sub(available);
+    let visible = view.scroll.range(body.len(), available);
     lines.extend(
-        body[start..end]
+        body[visible.clone()]
             .iter()
             .cloned()
-            .map(|text| plain(text, Color::Grey)),
+            .map(|(text, color)| plain(text, color)),
     );
+    lines.resize(height, (String::new(), Color::Grey));
     lines.truncate(height);
     lines
+}
+
+pub(crate) const EDITING_HINT: &str = "Enter send · Alt/Shift-Enter newline · ↑/↓ history";
+
+pub(crate) fn navigation_hint(view: &Conversation) -> &'static str {
+    if view.scroll.following() {
+        "PgUp/PgDn/wheel scroll · Ctrl-Home/End jump"
+    } else {
+        "Reading history · Ctrl-End latest · PgUp/PgDn/wheel scroll"
+    }
 }
 
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {

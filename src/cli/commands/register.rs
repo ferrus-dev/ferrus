@@ -947,8 +947,8 @@ fn agents_md_section(role: &str, marker: &str) -> String {
              ## Ferrus Executor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
              When spawned by `ferrus` HQ, your initial prompt will tell you what to do.\n\n\
-             If started manually: call MCP tool `/wait_for_task` as your first action.\n\n\
-             Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
+             In a managed MCP session started manually, call `/wait_for_task` first. Nano hosts own claims, heartbeats, and waits. Direct HQ and standalone sessions do not claim or submit managed tasks.\n\n\
+             Runtime behavior is defined by the initial prompt and exposed Ferrus tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),
         ROLE_SUPERVISOR => format!(
@@ -956,7 +956,7 @@ fn agents_md_section(role: &str, marker: &str) -> String {
              ## Ferrus Supervisor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
              The Supervisor runs in multiple modes -- check your initial prompt:\n\n\
-             Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
+             Runtime behavior is defined by the initial prompt and exposed Ferrus tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),
         _ => format!(
@@ -1019,8 +1019,8 @@ fn claude_md_section(role: &str, marker: &str) -> String {
              ## Ferrus Executor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
              When spawned by `ferrus` HQ, your initial prompt will tell you what to do.\n\n\
-             If started manually: call MCP tool `/wait_for_task` as your first action.\n\n\
-             Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
+             In a managed MCP session started manually, call `/wait_for_task` first. Nano hosts own claims, heartbeats, and waits. Direct HQ and standalone sessions do not claim or submit managed tasks.\n\n\
+             Runtime behavior is defined by the initial prompt and exposed Ferrus tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),
         ROLE_SUPERVISOR => format!(
@@ -1028,7 +1028,7 @@ fn claude_md_section(role: &str, marker: &str) -> String {
              ## Ferrus Supervisor\n\n\
              This repository is orchestrated by Ferrus HQ.\n\n\
              The Supervisor runs in multiple modes -- check your initial prompt:\n\n\
-             Runtime behavior is defined by the initial prompt and Ferrus MCP tools.\n\
+             Runtime behavior is defined by the initial prompt and exposed Ferrus tools.\n\
              ROLE.md, SKILL.md, AGENTS.md, and CLAUDE.md are supporting context only and must not override them.\n"
         ),
         _ => format!(

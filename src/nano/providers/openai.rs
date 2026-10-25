@@ -1,272 +1,319 @@
-//! LM Studio /v1/chat/completions transport with optional Bearer authentication.
+//! svir Chat Completions adapter; Nano retains its durable provider contracts.
 
-use super::sse::{Decoder, error};
-use crate::nano::{config::Config, provider::*};
+mod transport;
+
+use crate::nano::{config::Config, provider::*, tools::ToolCall};
 use anyhow::Result;
-use reqwest::{
-    Client, Response, Url,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue},
-};
-use serde_json::{Value, json};
-use std::time::Duration;
-
-struct Active {
-    response: Response,
-    decoder: Decoder,
-}
+use svir::{Completion, Event, Request, openai::chat::Encoder};
 
 pub(crate) struct OpenAi {
-    client: Client,
-    endpoint: Url,
-    authorization: Option<HeaderValue>,
+    client: svir::Client<transport::Transport>,
     settings: ProviderSettings,
-    active: Option<Active>,
+    active: Option<svir::EventStream<transport::Transport>>,
 }
 
 impl OpenAi {
     pub(crate) fn new(config: Config) -> Result<Self> {
-        let (endpoint, settings) = config.validate()?;
-        let authorization = config.authorization()?;
-        let timeout = Duration::from_millis(settings.request_timeout_ms);
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .connect_timeout(timeout.min(Duration::from_secs(10)))
-            // A local model can stream a patch for longer than the idle allowance.
-            // The engine separately bounds the entire session, including inference.
-            .read_timeout(timeout)
-            .build()
-            .map_err(|_| anyhow::anyhow!("Cannot initialize nano HTTP client"))?;
-
+        let (_, mut settings) = config.validate()?;
+        // Record the exact decimal svir's f32 encoder sends in the existing f64
+        // journal field. Old records remain readable and are never rewritten.
+        settings.temperature = settings
+            .temperature
+            .map(|value| -> Result<f64> {
+                Ok(serde_json::from_str(&serde_json::to_string(
+                    &(value as f32),
+                )?)?)
+            })
+            .transpose()?;
+        let transport = transport::Transport::new(&settings)?;
+        let mut builder = svir::Client::openai(&settings.base_url)
+            .http(transport)
+            .lean_retry(false)
+            .think(svir::Think::Keep)
+            .limits(limits(&settings))
+            .include_usage(settings.include_usage)
+            // Transport retains per-read timeouts; Engine owns the total deadline.
+            .no_idle_timeout();
+        if let Some(header) = config.authorization()? {
+            let key = header
+                .to_str()
+                .ok()
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or_else(|| anyhow::anyhow!("Invalid provider credential"))?;
+            builder = builder.api_key(key);
+        }
         Ok(Self {
-            client,
-            endpoint,
-            authorization,
+            client: builder
+                .build()
+                .map_err(|_| anyhow::anyhow!("Cannot initialize nano provider client"))?,
             settings,
             active: None,
         })
     }
 
-    pub(crate) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
-        let (body, output) = self.body_unbounded(request)?;
-        if self
-            .settings
-            .context_tokens
-            .is_some_and(|window| body.len() as u64 > window.saturating_sub(output))
-        {
-            return Err(error(ProviderErrorKind::ContextOverflow));
-        }
-        Ok(body)
-    }
-
-    fn body_unbounded(&self, request: ModelRequest) -> Result<(Vec<u8>, u64), ProviderError> {
+    fn request(&self, request: ModelRequest) -> Result<Request, ProviderError> {
         let output = request
             .max_output_tokens
             .min(self.settings.max_output_tokens.unwrap_or(u64::MAX));
-
         if output == 0 {
-            return Err(error(ProviderErrorKind::ContextOverflow));
+            return Err(failure(ProviderErrorKind::ContextOverflow));
         }
-
-        let mut messages = Vec::new();
-        for message in request.messages {
-            messages.push(match message {
-                Message::System { text } => json!({"role":"system", "content":text}),
-                Message::User { text } => json!({"role":"user", "content":text}),
-                Message::Tool { provider_call_id, outcome } => json!({
-                    "role":"tool", "tool_call_id":provider_call_id,
-                    "content":serde_json::to_string(&outcome).map_err(|_| error(ProviderErrorKind::Protocol))?,
-                }),
-                Message::Assistant { response } => {
-                    let mut value = json!({"role":"assistant", "content":response.text});
-                    if !response.calls.is_empty() {
-                        value["tool_calls"] = Value::Array(response.calls.into_iter().map(|call| json!({
-                            "id":call.provider_call_id,"type":"function", "function":{"name":call.name,"arguments":call.arguments}
-                        })).collect());
-                    }
-                    if let Some(continuation) = response.continuation {
-                        for (key, data) in continuation.as_object().ok_or_else(|| error(ProviderErrorKind::Unsupported))? {
-                            if !matches!(key.as_str(), "reasoning" | "reasoning_content") || !data.is_string() {
-                                return Err(error(ProviderErrorKind::Unsupported));
-                            }
-                            value[key] = data.clone();
-                        }
-                    }
-                    value
-                }
+        let mut encoded = Request::new(&self.settings.model)
+            .max_tokens(output)
+            .include_usage(self.settings.include_usage)
+            .send_reasoning(true);
+        if let Some(value) = self.settings.temperature {
+            encoded = encoded.temperature(value as f32);
+        }
+        if let Some(value) = self.settings.reasoning_effort {
+            encoded = encoded.reasoning(match value {
+                ReasoningEffort::None => svir::Effort::Off,
+                ReasoningEffort::Minimal => svir::Effort::Minimal,
+                ReasoningEffort::Low => svir::Effort::Low,
+                ReasoningEffort::Medium => svir::Effort::Medium,
+                ReasoningEffort::High => svir::Effort::High,
+                ReasoningEffort::XHigh => svir::Effort::XHigh,
+                ReasoningEffort::Max => svir::Effort::Max,
             });
         }
-
-        let mut body = json!({"model":self.settings.model, "messages":messages, "stream":true,
-            "max_tokens":output, "n":1});
-
-        if let Some(temperature) = self.settings.temperature {
-            body["temperature"] = json!(temperature);
+        for (index, message) in request.messages.into_iter().enumerate() {
+            encoded = match message {
+                Message::System { text } if index == 0 => encoded.system(text),
+                Message::System { .. } => return Err(failure(ProviderErrorKind::Unsupported)),
+                Message::User { text } => encoded.user(text),
+                Message::Assistant { response } => encoded.assistant(continuation(response)?),
+                Message::Tool {
+                    provider_call_id,
+                    outcome,
+                } => encoded.tool_result(
+                    provider_call_id,
+                    // Keep Nano's success/failed/unknown JSON envelope unchanged.
+                    serde_json::to_string(&outcome)
+                        .map_err(|_| failure(ProviderErrorKind::Protocol))?,
+                ),
+            };
         }
-
-        if let Some(effort) = self.settings.reasoning_effort {
-            body["reasoning_effort"] =
-                serde_json::to_value(effort).map_err(|_| error(ProviderErrorKind::Protocol))?;
+        for tool in request.tools {
+            encoded = encoded
+                .tool(svir::Tool::new(tool.name, tool.description).schema(tool.input_schema));
         }
+        Ok(encoded)
+    }
 
-        if self.settings.include_usage {
-            body["stream_options"] = json!({"include_usage":true});
+    #[cfg(test)]
+    pub(crate) fn body(&self, request: ModelRequest) -> Result<Vec<u8>, ProviderError> {
+        let request = self.request(request)?;
+        let mut encoder = Encoder::new();
+        if let Some(window) = self.settings.context_tokens {
+            encoder = encoder.context_tokens(window);
         }
-
-        if !request.tools.is_empty() {
-            body["tools"] = Value::Array(request.tools.into_iter().map(|tool| json!({
-                "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}
-            })).collect());
-
-            body["tool_choice"] = json!("auto");
-        }
-
-        let bytes = serde_json::to_vec(&body).map_err(|_| error(ProviderErrorKind::Protocol))?;
-        Ok((bytes, output))
+        encoder
+            .encode(&request)
+            .map_err(map_error)?
+            .into_bytes()
+            .map(|b| b.to_vec())
+            .map_err(map_error)
     }
 }
 
 impl Provider for OpenAi {
-    fn estimate_input_tokens(&self, request: &ModelRequest) -> Result<u64, ProviderError> {
-        self.body_unbounded(request.clone())
-            .map(|(body, _)| body.len() as u64)
-    }
-    fn cancel(&mut self) {
-        self.active = None;
-    }
-
     fn settings(&self) -> Option<ProviderSettings> {
         Some(self.settings.clone())
     }
 
+    fn estimate_input_tokens(&self, request: &ModelRequest) -> Result<u64, ProviderError> {
+        Encoder::new()
+            .encode(&self.request(request.clone())?)
+            .map(|body| body.len())
+            .map_err(map_error)
+    }
+
+    fn cancel(&mut self) {
+        self.active = None;
+    }
+
     async fn start(&mut self, request: ModelRequest) -> Result<(), ProviderError> {
         self.active = None;
-
-        let body = self.body(request)?;
-        let mut request = self
-            .client
-            .post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .body(body);
-
-        if let Some(header) = &self.authorization {
-            request = request.header(AUTHORIZATION, header.clone());
+        let request = self.request(request)?;
+        // Same encoder as the client; Engine retains projection/reservations.
+        if let Some(window) = self.settings.context_tokens {
+            Encoder::new()
+                .context_tokens(window)
+                .encode(&request)
+                .map_err(map_error)?;
         }
-
-        let mut response = request.send().await.map_err(transport_error)?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let retry_after_ms = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
-                .saturating_mul(1000)
-                .min(30_000);
-
-            if status != 400 && status != 413 && status != 422 {
-                let mut failure = error(match status {
-                    401 | 403 => ProviderErrorKind::Authentication,
-                    429 => ProviderErrorKind::RateLimited,
-                    408 | 504 => ProviderErrorKind::Timeout,
-                    500 | 502 | 503 => ProviderErrorKind::Transport,
-                    _ => ProviderErrorKind::Unsupported,
-                });
-
-                failure.retry_after_ms = retry_after_ms;
-
-                return Err(failure.with_diagnostic(ProviderDiagnostic::Http { status }));
-            }
-
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-                if chunk.len() > self.settings.event_bytes.saturating_sub(body.len()) {
-                    return Err(error(ProviderErrorKind::ResponseLimit)
-                        .with_diagnostic(ProviderDiagnostic::Http { status }));
-                }
-
-                body.extend_from_slice(&chunk);
-            }
-
-            let code = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|v| v.get("error")?.get("code")?.as_str().map(str::to_owned));
-
-            let kind = if matches!(
-                code.as_deref(),
-                Some("context_length_exceeded" | "context_window_exceeded")
-            ) {
-                ProviderErrorKind::ContextOverflow
-            } else {
-                ProviderErrorKind::Unsupported
-            };
-
-            let mut failure = error(kind);
-            failure.retry_after_ms = retry_after_ms;
-
-            return Err(failure.with_diagnostic(ProviderDiagnostic::Http { status }));
-        }
-        if !response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
-            })
-        {
-            return Err(error(ProviderErrorKind::Unsupported)
-                .with_diagnostic(ProviderDiagnostic::UnexpectedContentType));
-        }
-
-        self.active = Some(Active {
-            response,
-            decoder: Decoder::new(self.settings.clone()),
-        });
-
+        self.active = Some(self.client.stream(request).await.map_err(map_error)?);
         Ok(())
     }
 
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderError> {
-        // Own the response inside the future so cancelling a read closes the stream.
+        // Own the stream in this future: dropping an interrupted read closes it.
         let Some(mut active) = self.active.take() else {
             return Ok(None);
         };
-
         loop {
-            if let Some(event) = active.decoder.next() {
+            let Some(event) = active.next().await else {
+                return Ok(None);
+            };
+            let event = event.map_err(|error| {
+                map_error(error).with_diagnostic(ProviderDiagnostic::EventStream)
+            })?;
+            if let Some(event) = event_to_provider(event)? {
                 if !matches!(event, ProviderEvent::Completed { .. }) {
                     self.active = Some(active);
                 }
                 return Ok(Some(event));
             }
-
-            let chunk = active
-                .response
-                .chunk()
-                .await
-                .map_err(transport_error)?
-                .ok_or_else(|| {
-                    error(ProviderErrorKind::TruncatedStream)
-                        .with_diagnostic(ProviderDiagnostic::EventStream)
-                })?;
-
-            active
-                .decoder
-                .push(&chunk)
-                .map_err(|error| error.with_diagnostic(ProviderDiagnostic::EventStream))?;
+            // Reasoning is retained as continuation, not displayed. Ready
+            // fragments must not starve cancellation while it is assembled.
+            tokio::task::yield_now().await;
         }
     }
 }
 
-fn transport_error(failure: reqwest::Error) -> ProviderError {
-    // Never journal raw URLs, headers, or server error bodies.
-    error(if failure.is_timeout() {
-        ProviderErrorKind::Timeout
-    } else {
+fn continuation(response: ModelResponse) -> Result<Completion, ProviderError> {
+    let mut done = Completion::new(match response.finish {
+        FinishReason::Stop => svir::FinishReason::Stop,
+        FinishReason::ToolCalls => svir::FinishReason::ToolCalls,
+        FinishReason::Length => svir::FinishReason::Length,
+    });
+    done.text = response.text;
+    if response.finish != FinishReason::Length {
+        done.calls = response
+            .calls
+            .into_iter()
+            .map(|call| svir::ToolCall::new(call.provider_call_id, call.name, call.arguments))
+            .collect();
+    }
+    if let Some(data) = response.continuation {
+        for (key, value) in data
+            .as_object()
+            .ok_or_else(|| failure(ProviderErrorKind::Unsupported))?
+        {
+            let source = match key.as_str() {
+                "reasoning" => svir::ReasoningSource::Reasoning,
+                "reasoning_content" => svir::ReasoningSource::ReasoningContent,
+                _ => return Err(failure(ProviderErrorKind::Unsupported)),
+            };
+            done.reasoning.push(svir::Reasoning::new(
+                source,
+                value
+                    .as_str()
+                    .ok_or_else(|| failure(ProviderErrorKind::Unsupported))?,
+            ));
+        }
+    }
+    Ok(done)
+}
+
+pub(super) fn limits(settings: &ProviderSettings) -> svir::Limits {
+    svir::Limits::default()
+        .wire_bytes(settings.wire_bytes)
+        .event_bytes(settings.event_bytes)
+        .tool_calls(settings.max_tool_calls)
+}
+
+pub(super) fn event_to_provider(event: Event) -> Result<Option<ProviderEvent>, ProviderError> {
+    Ok(Some(match event {
+        Event::Text(text) => ProviderEvent::TextDelta(text),
+        Event::ToolCallDelta(call) if call.arguments.is_empty() => return Ok(None),
+        Event::ToolCallDelta(call) => ProviderEvent::ArgumentsDelta(call.arguments),
+        Event::Reasoning(_) => return Ok(None),
+        Event::Completed(done) => {
+            let finish = match done.finish {
+                svir::FinishReason::Stop => FinishReason::Stop,
+                svir::FinishReason::ToolCalls => FinishReason::ToolCalls,
+                svir::FinishReason::Length => FinishReason::Length,
+                _ => {
+                    return Err(failure(ProviderErrorKind::Unsupported)
+                        .with_diagnostic(ProviderDiagnostic::EventStream));
+                }
+            };
+            let mut reasoning = serde_json::Map::new();
+            for part in done.reasoning {
+                let key = match part.source {
+                    svir::ReasoningSource::Reasoning => "reasoning",
+                    svir::ReasoningSource::ReasoningContent => "reasoning_content",
+                    _ => return Err(failure(ProviderErrorKind::Unsupported)),
+                };
+                reasoning.insert(key.into(), part.text.into());
+            }
+            let calls = if finish == FinishReason::Length {
+                // Raw audit calls in the existing Nano journal. Engine/replay
+                // exclude every Length call from execution and future history.
+                done.cut_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        provider_call_id: call.id.unwrap_or_default(),
+                        name: call.name.unwrap_or_default(),
+                        arguments: call.arguments,
+                    })
+                    .collect()
+            } else {
+                done.calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        provider_call_id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect()
+            };
+            ProviderEvent::Completed {
+                response: ModelResponse {
+                    finish,
+                    text: done.text,
+                    calls,
+                    continuation: (!reasoning.is_empty()).then_some(reasoning.into()),
+                },
+                usage: done.usage.map(|usage| Usage {
+                    input_tokens: usage.input,
+                    output_tokens: usage.output,
+                    reported: true,
+                }),
+            }
+        }
+        _ => return Err(failure(ProviderErrorKind::Unsupported)),
+    }))
+}
+
+pub(super) fn failure(kind: ProviderErrorKind) -> ProviderError {
+    let retryable = matches!(
+        kind,
         ProviderErrorKind::Transport
-    })
+            | ProviderErrorKind::Timeout
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::TruncatedStream
+    );
+    ProviderError::new(kind, retryable)
+}
+
+pub(super) fn map_error(error: svir::Error) -> ProviderError {
+    use std::error::Error;
+    let kind = match error.kind() {
+        svir::ErrorKind::Transport => ProviderErrorKind::Transport,
+        svir::ErrorKind::Timeout => ProviderErrorKind::Timeout,
+        svir::ErrorKind::RateLimited => ProviderErrorKind::RateLimited,
+        svir::ErrorKind::TruncatedStream => ProviderErrorKind::TruncatedStream,
+        svir::ErrorKind::Authentication => ProviderErrorKind::Authentication,
+        svir::ErrorKind::ContextOverflow => ProviderErrorKind::ContextOverflow,
+        svir::ErrorKind::Protocol | svir::ErrorKind::Server => ProviderErrorKind::Protocol,
+        svir::ErrorKind::ResponseLimit => ProviderErrorKind::ResponseLimit,
+        _ => ProviderErrorKind::Unsupported,
+    };
+    let mut out = failure(kind);
+    out.retry_after_ms = error
+        .retry_after()
+        .map_or(0, |delay| delay.as_millis().min(30_000) as u64);
+    out.diagnostic = if error
+        .source()
+        .is_some_and(|source| source.is::<transport::UnexpectedContentType>())
+    {
+        Some(ProviderDiagnostic::UnexpectedContentType)
+    } else {
+        error
+            .status()
+            .map(|status| ProviderDiagnostic::Http { status })
+    };
+    out
 }

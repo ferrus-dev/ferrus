@@ -577,13 +577,14 @@ impl McpTools {
             let mut found = BTreeSet::new();
             let mut cursor = None;
             let mut cursors = BTreeSet::new();
+            let tools = self.servers[index].client.as_ref().unwrap().tools();
             for _ in 0..8 {
                 let page = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => anyhow::bail!("MCP discovery interrupted"),
                     result = tokio::time::timeout(
                         timeout,
-                        self.servers[index].client.as_mut().unwrap().list_tools(cursor),
+                        tools.list(cursor),
                     ) => result??,
                 };
                 ensure!(page.tools.len() <= MAX_TOOLS, "MCP catalog exceeds limit");
@@ -741,7 +742,8 @@ impl McpTools {
                     .collect()
             };
             client
-                .call_tool(remote_name.clone(), args)
+                .tools()
+                .call(remote_name.clone(), args)
                 .await
                 .map_err(|_| {
                     ToolOutcome::Unknown(ToolError::Mcp(json!({"code":"call_unconfirmed"})))
@@ -823,7 +825,8 @@ async fn current_schema(
     let mut result = None;
     for _ in 0..8 {
         let page = client
-            .list_tools(cursor)
+            .tools()
+            .list(cursor)
             .await
             .map_err(|_| ToolError::Failed)?;
         if page.tools.len() > MAX_TOOLS {

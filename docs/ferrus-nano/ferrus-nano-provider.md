@@ -5,6 +5,10 @@ The first inference adapter targets **LM Studio's OpenAI-compatible
 Cargo feature. This implements #75; [CLI/HQ launch](ferrus-nano-launch.md) is implemented in #80.
 An OpenAI-compatible label alone does not establish endpoint or model compatibility.
 
+svir 0.1.7 encodes requests, classifies provider statuses, and decodes streaming
+answers. A reqwest transport retains Nano's HTTP policy, bounded error-body reads,
+and typed diagnostics. Engine retries and journal formats stay under Nano's control.
+
 ## Host configuration
 
 The native launcher explicitly loads `nano::config::Config` and constructs `OpenAi`.
@@ -56,8 +60,11 @@ unsupported endpoint errors do not trigger protocol fallback.
 
 Registration creates only `base_url`, `model`, and `reasoning_effort = "none"`.
 Existing settings files are preserved. `temperature` is optional and is absent from
-the HTTP request when omitted. `context_tokens` is also optional: without it Nano
-does not impose a model context window or derive the output allowance from one.
+the request when omitted. The svir 0.1.7 adapter uses `f32` sampling precision;
+when set, the journal and settings digest record the decimal value actually sent.
+Existing journal fields and records remain unchanged and readable.
+`context_tokens` is also optional: without it Nano does not impose a model context
+window or derive the output allowance from one.
 The server controls its loaded context; Nano does not discover or reconfigure it.
 An explicit `context_tokens` value bounds Nano's local admission and compaction;
 it is never sent as a model-loading parameter. Session and byte limits still apply.

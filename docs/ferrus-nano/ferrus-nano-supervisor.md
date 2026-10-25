@@ -25,13 +25,17 @@ These profiles use the existing task, specification, and archive operations dire
 without loopback MCP. Native file/search, scoped instructions, repository graph, and
 project-memory reads remain available under the existing source and freshness policies.
 `definition_context` provides the selected spec, linked task metadata, and authoring templates.
+Archive sessions read linked terminal task/run evidence with `read_archive_artifact`;
+ordinary file tools retain their runtime-path protections.
 Tools are selected by the host profile, independently of model requests or supporting documents.
 There is no task lease, Executor submission, review, or consultation authority.
 
-Before each write, the terminal displays the complete proposed arguments in a scrollable
-confirmation view. Type its fresh `approve <code>` phrase and press Enter to authorize
-that exact operation. `reject` or Esc declines it; Ctrl-C ends the session. Conversation
-text, queued steering, and model claims cannot approve a write. Task origins must identify
+Before each write, the terminal displays the proposed task, specification, or Outcome as
+readable text in a scrollable confirmation view. Press Enter, or type `approve` and Enter,
+to authorize the operation. This is the single approval step; Nano submits the draft to this
+view without first asking for approval in conversation. `reject` or Esc declines it;
+Ctrl-C ends the session. Conversation text, queued steering, and model claims cannot approve
+a write. Task origins must identify
 an incomplete milestone without a live task; specifications require unique stable milestone
 IDs. Outcome content is accepted only by the archive profile through the existing archive
 workflow. Shell commands, arbitrary file writes, and external MCP peers are not exposed in
@@ -40,7 +44,9 @@ these Supervisor profiles, so they cannot bypass confirmation.
 Confirmed operations are journaled before execution, share the canonical approval lock,
 and finish before shutdown returns. Task/spec/archive sessions return to HQ after saving
 their requested count; planning remains open until cancelled. SQLite run identity and role
-are checked independently of conversation content. Archive retains normal provenance and
+are checked independently of conversation content. Failed authoring sessions keep their
+stop reason visible until Esc returns to HQ, and save `diagnostics.log` beside their
+machine-local `nano/sessions/<run-id>/events.jsonl` journal. Archive retains normal provenance and
 best-effort memory refresh; a failed refresh does not undo a successful archive.
 
 HQ also launches [task-scoped Reviewer and Consultant profiles](ferrus-nano-review.md).

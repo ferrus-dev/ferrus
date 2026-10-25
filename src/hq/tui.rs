@@ -11,7 +11,9 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    },
     queue,
     style::{Attribute, Color, Print, PrintStyledContent, Stylize, style},
     terminal::{Clear, ClearType, size},
@@ -470,6 +472,14 @@ fn handle_event(
         Event::Resize(_, _) => {
             redraw_dashboard(stdout, app, ui)?;
         }
+        Event::Mouse(mouse) if app.nano.is_some() => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.nano.as_mut().unwrap().scroll.up(3),
+                MouseEventKind::ScrollDown => app.nano.as_mut().unwrap().scroll.down(3),
+                _ => return Ok(()),
+            }
+            redraw_dashboard(stdout, app, ui)?;
+        }
         Event::Paste(text) => {
             app.insert_text(&text);
             redraw_prompt_area(stdout, app, ui)?;
@@ -506,15 +516,19 @@ fn handle_event(
                         full_redraw = true;
                     }
                     (KeyCode::PageUp, _) if app.nano.is_some() => {
-                        app.nano
-                            .as_mut()
-                            .unwrap()
-                            .scroll_up(terminal_width() as usize);
+                        app.nano.as_mut().unwrap().scroll.up(10);
                         full_redraw = true;
                     }
                     (KeyCode::PageDown, _) if app.nano.is_some() => {
-                        app.nano.as_mut().unwrap().scroll =
-                            app.nano.as_ref().unwrap().scroll.saturating_sub(10);
+                        app.nano.as_mut().unwrap().scroll.down(10);
+                        full_redraw = true;
+                    }
+                    (KeyCode::Home, KeyModifiers::CONTROL) if app.nano.is_some() => {
+                        app.nano.as_mut().unwrap().scroll.home();
+                        full_redraw = true;
+                    }
+                    (KeyCode::End, KeyModifiers::CONTROL) if app.nano.is_some() => {
+                        app.nano.as_mut().unwrap().scroll.end();
                         full_redraw = true;
                     }
                     (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => {

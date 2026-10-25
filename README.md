@@ -1,6 +1,6 @@
 # ferrus
 
-[![Ferrus version](https://img.shields.io/badge/ferrus-0.5.1--alpha.1-orange)](https://crates.io/crates/ferrus)
+[![Ferrus version](https://img.shields.io/badge/ferrus-0.6.0--alpha.1-orange)](https://crates.io/crates/ferrus)
 [![Rust version](https://img.shields.io/badge/rustc-1.95+-964B00)](https://releases.rs/docs/1.95.0/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/ferrus-dev/ferrus/blob/main/LICENSE)
 [![Rust](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml/badge.svg)](https://github.com/ferrus-dev/ferrus/actions/workflows/rust.yml)
@@ -10,26 +10,27 @@
 
 Ferrus turns coding agents into controlled, repeatable workers.
 
-It runs a Supervisor -> Executor -> Reviewer loop over your repository -- not as a chat, but as a **state machine**.
-Tasks are planned, implemented, checked, and reviewed in a structured, restart-safe flow. Unlike chat-based agents, ferrus enforces structure and lifecycle.
+It runs a Supervisor -> Executor -> Reviewer loop over your repository as a **state machine**.
+Tasks are planned, implemented, checked, and reviewed in a structured, restart-safe flow.
+Native Nano also supports direct workspace conversations without a managed task.
 
 Everything is explicit:
 - Runtime state lives in SQLite; task context lives in scoped Markdown artifacts
 - Optional repository graph facts live in a separate machine-local SQLite sidecar
-- Agents are stateless between runs
+- Task and run state survives agent process restarts
 - Crashes are recoverable
 - No hidden context
 
 ## Supported agents
 
-Ferrus works with existing coding agents:
+Ferrus works with external coding agents and its built-in Nano runtime:
 
 - **Codex**
 - **Claude Code**
 - **Qwen Code** (experimental)
 - **goose** (experimental)
 - **opencode** (experimental; Supervisor and Reviewer only)
-- **Nano** (experimental; native Executor, [Supervisor authoring](docs/ferrus-nano-supervisor.md), and [review/consultation](docs/ferrus-nano-review.md), requires `nano-openai`; [setup](docs/ferrus-nano-launch.md))
+- **Nano** (native Executor, [Supervisor authoring](docs/ferrus-nano/ferrus-nano-supervisor.md), [review/consultation](docs/ferrus-nano/ferrus-nano-review.md), and [standalone coding](docs/ferrus-nano/ferrus-nano-standalone.md); requires `nano-openai`; [setup](docs/ferrus-nano/ferrus-nano-launch.md))
 
 Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limitations and configuration details.
@@ -47,13 +48,13 @@ See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limita
    |
    +-> ferrus HQ
          |
-         +-> Supervisor (Claude Code or Codex) -- plans tasks
+         +-> Supervisor (configured agent) -- plans tasks
          |         | exits after task created;
          |
-         +-> Executor (Claude Code or Codex)   -- implements, checks, submits
+         +-> Executor (configured agent)   -- implements, checks, submits
          |         | runs headlessly
          |
-         +-> Reviewer (Claude Code or Codex)   -- spawned automatically on submission
+         +-> Reviewer (configured agent)   -- spawned automatically on submission
                    | exits after approve/reject; runs headlessly
 ```
 
@@ -84,7 +85,7 @@ For a smaller Cargo installation, use the same size profile as release assets:
 cargo install ferrus --locked --profile dist
 ```
 
-Prebuilt release archives include experimental Nano with native context and external MCP tools.
+Prebuilt release archives include `ferrus` and `ferrus-nano`, with native context and external MCP support.
 The Apple Silicon archive targets macOS 11.0 or newer (`MACOSX_DEPLOYMENT_TARGET=11.0`).
 CI builds it on `macos-latest`, checks the packaged arm64 executable's deployment target and
 SHA-256 checksum, and runs `--version`, `init`, and `doctor` with an isolated home and project.
@@ -131,9 +132,12 @@ non-Git projects run in the project directory with one Executor. Checks run befo
 work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
 provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
 
-`ferrus-nano` runs headless requests or `--interactive` conversations in an unregistered Git or non-Git directory; see [standalone Nano](docs/ferrus-nano-standalone.md).
+`ferrus-nano` runs headless requests or `--interactive` conversations in an unregistered Git or non-Git directory; see [standalone Nano](docs/ferrus-nano/ferrus-nano-standalone.md).
 With Nano, `/executor` opens a direct workspace conversation without a queued task;
-`/attach NAME` opens a running or historical managed conversation. See [interactive Nano](docs/ferrus-nano-interactive.md).
+`/attach NAME` opens a running or historical managed conversation. See [interactive Nano](docs/ferrus-nano/ferrus-nano-interactive.md).
+
+For standalone use, configure the provider and run `ferrus-nano --workspace /path/to/project --interactive`.
+Standalone needs no Ferrus registration or task database; its final response is separate from managed submission.
 
 The full HQ command list, state transitions, CLI reference, configuration example, graph commands, and runtime file
 layout are in [docs/cli-and-runtime.md](docs/cli-and-runtime.md).

@@ -22,5 +22,7 @@ High-level description of the Supervisor role.
 ## Notes
 
 This file is descriptive only.
-Runtime behavior is defined by the initial prompt and Ferrus MCP tools.
+Runtime behavior is defined by the initial prompt and exposed Ferrus tools.
+Nano hosts own task claims, heartbeats, and waits. Direct workspace and standalone
+sessions do not acquire managed task authority from this role description.
 If this file conflicts with them, follow the prompt and tools.

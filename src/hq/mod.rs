@@ -815,10 +815,14 @@ fn archive_spec_prompt_context(spec_path: &str, tasks: &[TaskRecord]) -> String 
     let mut lines = vec![
         format!("Spec path: {spec_path}"),
         format!("Task count: {}", tasks.len()),
-        "Linked tasks:".to_string(),
+        format!(
+            "Failed attempts skipped for Outcome: {} (retained in archive history)",
+            tasks.iter().filter(|task| task.status == "failed").count()
+        ),
+        "Linked tasks to inspect for Outcome:".to_string(),
     ];
 
-    for task in tasks {
+    for task in tasks.iter().filter(|task| task.status != "failed") {
         lines.push(format!(
             "- Task ID: {}\n  Status: {}\n  Milestone ID: {}\n  Task path: {}\n  Run dir: {}",
             task.id,

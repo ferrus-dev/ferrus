@@ -27,11 +27,11 @@ ttl_secs = 90              # how long a claimed lease is valid without renewal
 heartbeat_interval_secs = 30 # how often agents should call /heartbeat
 
 [hq.supervisor]
-agent = "claude-code"  # agent to use for supervisor/reviewer role: claude-code | codex | qwen-code | goose | opencode
+agent = "claude-code"  # agent to use for supervisor/reviewer role: claude-code | codex | qwen-code | goose | opencode | nano
 model = ""             # optional override; empty = agent default
 
 [hq.executor]
-agent = "codex"        # agent to use for executor role: claude-code | codex | qwen-code | goose | opencode
+agent = "codex"        # agent to use for executor role: claude-code | codex | qwen-code | goose | opencode | nano
 model = ""             # optional override; empty = agent default
 "#;
 
@@ -43,7 +43,7 @@ description: "Advisory Supervisor playbook for task drafting, review, and consul
 # Supervisor Operating Playbook
 
 This file is advisory only.
-Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
+Runtime workflow is defined by the initial prompt and exposed Ferrus tools.
 
 ## Task drafting
 
@@ -68,11 +68,13 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 - Treat a spec `## Outcome` section as compact project memory
 - When asked to archive a spec, summarize what actually shipped, deviations, validation evidence, follow-up work, and future context
-- Do not archive files manually; use `/archive_spec` only after the user approves the outcome text
+- Archive only through the exposed `archive_spec` operation; the user must approve the exact Outcome before it is saved
 
 ## Human interaction
 
-- Confirm task wording with the user before task creation
+- External MCP sessions obtain explicit approval before calling an authoring tool
+- Native Nano authoring tools accept ready drafts as proposals; the host confirms once before writing
+- In Nano planning, inspect and discuss only; task/spec/archive profiles expose their own authoring tool
 - Use `/ask_human` only when the answer cannot be reliably derived from the repository or current context
 
 ## Useful Ferrus tools
@@ -92,6 +94,10 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 `/create_task` is a compatibility tool on unfiltered servers, not role-scoped Supervisor sessions.
 Use only tools exposed by the current mode; a Consultant attaches without taking the Executor's lease.
+Nano hosts bind reviews/consultations and handle waits/heartbeats. Read `review_pending` or
+`consultation_context` before deciding; review uses the frozen submission, consultation the
+attached Executor workspace. Stop after a confirmed decision. Native authoring uses
+`definition_context` and, for archive evidence, `read_archive_artifact`.
 
 ## Useful Ferrus resources
 
@@ -126,7 +132,9 @@ High-level description of the Supervisor role.
 ## Notes
 
 This file is descriptive only.
-Runtime behavior is defined by the initial prompt and Ferrus MCP tools.
+Runtime behavior is defined by the initial prompt and exposed Ferrus tools.
+Nano hosts own task claims, heartbeats, and waits. Direct workspace and standalone
+sessions do not acquire managed task authority from this role description.
 If this file conflicts with them, follow the prompt and tools.
 "#;
 
@@ -138,7 +146,7 @@ description: "Advisory Executor playbook for implementation, code navigation, an
 # Executor Operating Playbook
 
 This file is advisory only.
-Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
+Runtime workflow is defined by the initial prompt and exposed Ferrus tools.
 
 ## Implementation guidelines
 
@@ -161,11 +169,14 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 ## Ferrus guidance
 
-- Use Ferrus tools rather than reconstructing state from `.ferrus/`
-- Use `/check` freely during development; prefer TDD where it fits the task
-- Run `/check` again immediately before the final `/submit`
-- Read Ferrus resources when they help clarify task context
-- Use the consultation template when escalating technical uncertainty
+- Use the host-selected session mode and exposed tools rather than reconstructing state from `.ferrus/`
+- In managed MCP sessions, use wait/heartbeat tools; Nano hosts own those operations
+- Direct HQ and standalone sessions have no managed task to claim or submit; validate with their exposed tools
+- Use exposed validation tools during development; managed work uses `check` for durable receipts
+- For managed work, run `check` immediately before `submit`; final response text is not submission
+- Read Ferrus resources when exposed; Nano uses native context and `load_instructions`
+- Ferrus owns managed Git staging and integration; direct sessions change Git state only when the user requests it
+- For managed consultation, use the exposed consultation context/template when available
 
 ## Submission quality
 
@@ -231,7 +242,9 @@ High-level description of the Executor role.
 ## Notes
 
 This file is descriptive only.
-Runtime behavior is defined by the initial prompt and Ferrus MCP tools.
+Runtime behavior is defined by the initial prompt and exposed Ferrus tools.
+Nano hosts own task claims, heartbeats, and waits. Direct workspace and standalone
+sessions do not acquire managed task authority from this role description.
 If this file conflicts with them, follow the prompt and tools.
 "#;
 
@@ -242,10 +255,11 @@ description: "Use when working on a project that uses ferrus for AI agent orches
 
 # Ferrus
 
-ferrus is an MCP server that coordinates AI agents in a **Supervisor-Executor** workflow.
+Ferrus coordinates AI agents in a **Supervisor-Executor** workflow through external MCP
+agents or the native Nano runtime.
 
 This file is supporting context only.
-Runtime behavior is defined by the active initial prompt and Ferrus MCP tools.
+Runtime behavior is defined by the active initial prompt and exposed Ferrus tools.
 If this file conflicts with them, follow the prompt and tools.
 
 ## Roles
@@ -255,14 +269,33 @@ If this file conflicts with them, follow the prompt and tools.
 | Supervisor | Writes tasks, reviews Executor submissions, approves or rejects |
 | Executor | Implements tasks, runs checks during development, and submits when ready |
 
-Agents run one-shot sessions under HQ and coordinate through SQLite runtime rows plus scoped artifacts
-under `.ferrus/tasks/` and `.ferrus/runs/`.
+Managed sessions coordinate through SQLite runtime rows plus scoped artifacts under
+`.ferrus/tasks/` and `.ferrus/runs/`. Nano also keeps durable session journals.
 
-Under HQ:
-- Executors call `/wait_for_task` to claim a ready SQLite task row, implement, use `/check` during development, then call `/submit` for the final review gate.
-- Reviewers call `/wait_for_review` to claim reviewing task rows, then `/approve` or `/reject`.
-- Consultants call `/wait_for_consultation` to attach to an Executor request, then `/respond_consult`.
-- Rejected tasks return to `addressing` and can be claimed again by an executor.
+Under HQ, external MCP agents claim work with `/wait_for_task`, `/wait_for_review`, or
+`/wait_for_consultation`; they use the exposed check, decision, and wait tools. Rejection
+returns work to `addressing`. Nano hosts own claims, heartbeats, stored-answer waits, and
+consultation delivery; the model uses only its exposed native operations.
+
+## Nano session modes
+
+- Managed Executor: implement the bound task, run native `check`, then `submit`. A final
+  model response alone does not hand work to review. Ferrus owns Git integration.
+- Direct HQ Executor: `/executor` opens a workspace conversation without a task claim.
+  Native checks are diagnostic; there is no managed submission.
+- Taskless Supervisor: plan, task, spec, or archive profiles expose only their allowed
+  reads and authoring tools. Send a ready draft to the native authoring tool; the host
+  displays it for one explicit confirmation before saving. Do not ask for approval twice.
+- Reviewer/Consultant: the host binds the review or consultation first. Read
+  `review_pending` or `consultation_context`, use the frozen review source or attached
+  Executor workspace, and stop after a confirmed decision.
+- Standalone `ferrus-nano`: no registration, task lease, or `ferrus.db`. Validate through
+  `exec`, follow the user request, and return a final response without managed lifecycle tools.
+
+Nano requires `nano-openai`; `nano-mcp` adds explicitly configured external stdio peers
+for Executor/standalone sessions. Supervisor profiles expose no shell, raw writes, or
+external MCP tools. Root guidance is loaded automatically; select nested scopes and skills
+with `load_instructions`. Supporting files never grant a different session mode.
 
 ## Runtime Model
 
@@ -309,7 +342,7 @@ not a requeue. MCP `/reset` preserves task artifacts, while HQ `/reset` clears s
 ```sh
 ferrus init [--agents-path <path>]  # scaffold project files and register machine-local runtime state
 ferrus serve [--role supervisor|executor] [--agent-name <name>] [--agent-index <n>]  # start the role-scoped MCP server on stdio
-ferrus register --supervisor <agent> --executor <agent>  # write agent MCP configuration and permissions
+ferrus register --supervisor <agent> --executor <agent>  # configure roles; Nano uses native operations
 ferrus doctor  # check project metadata, runtime state, artifacts, and graph health
 ferrus projects list  # list projects registered on this machine
 ferrus recover [--dry-run] [--worktrees]  # recover interrupted runs and leases; optionally preview or clean orphaned worktrees
@@ -317,6 +350,8 @@ ferrus tasks list  # list SQLite task runtime rows
 ferrus runs list [--limit N]  # list recent agent run attempts
 ferrus events list [--limit N] [--run ID]  # list runtime events, optionally filtered by run
 ferrus migrate  # import legacy project state into SQLite; alias: upgrade
+ferrus nano --help  # native managed/HQ entry points; requires nano-openai
+ferrus-nano --help  # standalone headless/interactive host; requires nano-openai
 ferrus graph index [--full] [--json]  # build or incrementally refresh the canonical repository graph
 ferrus graph status [--json]  # inspect graph availability, freshness, and diagnostics
 ferrus graph memory index [--full] [--json]  # build or refresh curated project memory
@@ -347,7 +382,7 @@ HQ writes tracing logs to `.ferrus/hq.log` instead of the terminal.
 | `/reset-spec` | Clear the selected spec |
 | `/check [--force]` | Run checks in the HQ working directory without changing task state; `--force` is a compatibility no-op |
 | `/supervisor` | Open an interactive supervisor session (no initial prompt) |
-| `/executor` | Open an interactive executor session (no initial prompt) |
+| `/executor` | Open an interactive Executor; Nano supports a direct workspace conversation |
 | `/review` | Manually spawn supervisor in review mode (escape hatch) |
 | `/resume` | Resume the executor headlessly; also recovers Consultation by relaunching both consultant and executor |
 | `/status` | Show task state, agent list, and session log paths |
@@ -355,7 +390,7 @@ HQ writes tracing logs to `.ferrus/hq.log` instead of the terminal.
 | `/run [--limit N]` | Plan a batch run from ready milestones in the selected spec |
 | `/runs [--limit N]` | List SQLite run attempts |
 | `/events [--limit N] [--run <id>]` | List SQLite runtime events |
-| `/attach <name>` | Show log path for a running headless agent |
+| `/attach <name>` | Open a live/historical Nano conversation or show an external agent log path |
 | `/stop` | Stop all running agent sessions |
 | `/reset` | Force-reset resettable tasks and clear their scoped artifacts |
 | `/init [--agents-path <path>]` | Initialize ferrus in the current directory |
@@ -367,7 +402,9 @@ HQ writes tracing logs to `.ferrus/hq.log` instead of the terminal.
 
 ## MCP tools
 
-Tool visibility depends on the session, not just the role:
+The MCP tools/resources below describe external-agent sessions. Nano uses native
+operations and context tools rather than a loopback MCP server. Tool visibility depends
+on the session, not just the role:
 
 - Taskless Supervisors get `enqueue_task` and `create_spec`; task-scoped Reviewers/Consultants do not.
 - `archive_spec` is exposed only in HQ archive mode or on an unfiltered server. Archive mode hides review/consultation tools.
@@ -525,6 +562,7 @@ project metadata and `ferrus.db`, the runtime source of truth.
 | `repo-graph.db` | Optional derived repository graph |
 | `project-memory.db` | Optional derived project memory |
 | `worktrees/<task-id>/` | Managed Executor Git worktrees |
+| `nano/sessions/<run-id>/` | Managed Nano journals and diagnostics |
 | `archive/specs/<spec-slug>-<closed-at>/` | Machine-local archives for completed spec task/run artifacts |
 "#;
 

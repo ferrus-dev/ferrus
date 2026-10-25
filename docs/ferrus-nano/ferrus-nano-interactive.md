@@ -21,7 +21,9 @@ Configure Nano as the Executor as described in [Nano launch](ferrus-nano-launch.
   one unconfirmed steering request at a time. Queue failures preserve the request for retry.
 - A final textual response waits for input. Failure, cancellation, and configured session limits
   end the attempt; managed `submit` ends a task-bound attempt normally.
-- PageUp/PageDown scroll the bounded conversation history. Input editing, multiline paste,
+- PageUp/PageDown and the mouse wheel scroll conversation history; Ctrl-Home/Ctrl-End go
+  to its beginning/latest output. Reading history holds the viewport steady as output arrives.
+  Input editing, multiline paste,
   terminal resize, completion, and other HQ commands use the existing HQ implementation.
 - `/detach` returns to the dashboard without stopping the Executor or changing task state.
 - `/cancel` cancels the selected attempt, stops owned writers, and journals its terminal outcome.
@@ -69,18 +71,19 @@ reconstructs display state from those records. Dropping the view stops its reade
 A missing journal is shown as unavailable once the persisted run is terminal, rather than
 waiting indefinitely for records that will not arrive.
 
-The display retains at most 128 entries and 32 KiB of text, with 2 KiB per entry. Tool arguments,
+The display retains at most 2048 entries and 8 MiB of text, with 512 KiB per entry. Tool arguments,
 results, status, token usage, and completed assistant responses come from typed journal events.
 Long results are marked as display-truncated; full records and command spools remain subject to
 normal journal/output quotas. Terminal control characters are sanitized before rendering.
 
-Streaming text is a temporary 512-byte preview associated with its model turn. It is coalesced
+Streaming text accumulates from the start of each response, up to 256 KiB. It is coalesced
 and replaced by the completed durable response; it never becomes replay or recovery evidence.
 The frontend polls coalesced snapshots at most once per 100 ms. Its rendering speed cannot delay
 journal commits, provider/tool effects, or heartbeat renewal.
 
 The existing v1 JSONL protocol adds `interact` and `steer` commands and text-preview events.
-Frames remain limited to 4096 bytes, including JSON encoding and the terminating newline.
+Command frames remain limited to 4096 bytes; event frames allow up to 2 MiB for cumulative text,
+including JSON encoding and the terminating newline.
 Both the pipe writer and the engine input queue hold at most eight commands. Full or disconnected
 queues report an error; queued input is authoritative only once `UserInput` has been committed.
 HQ supplies an optional `input_id` in steering frames and the journal records that ID on acceptance.

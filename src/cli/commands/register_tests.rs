@@ -44,7 +44,7 @@ fn agents_md_executor_section_forbids_consulting_about_tool_availability() {
 #[test]
 fn agents_md_executor_section_uses_ask_human_when_truly_stuck() {
     let section = agents_md_section(ROLE_EXECUTOR, "<!-- marker -->");
-    assert!(section.contains("initial prompt and Ferrus MCP tools"));
+    assert!(section.contains("initial prompt and exposed Ferrus tools"));
     assert!(!section.contains("Full workflow"));
 }
 
@@ -58,7 +58,7 @@ fn claude_md_executor_section_forbids_consulting_about_tool_availability() {
 #[test]
 fn claude_md_executor_section_uses_ask_human_when_truly_stuck() {
     let section = claude_md_section(ROLE_EXECUTOR, "<!-- marker -->");
-    assert!(section.contains("initial prompt and Ferrus MCP tools"));
+    assert!(section.contains("initial prompt and exposed Ferrus tools"));
     assert!(!section.contains("Full workflow"));
 }
 

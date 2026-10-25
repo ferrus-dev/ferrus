@@ -49,15 +49,28 @@ impl NanoConversation {
     }
 }
 pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec<DashboardLine> {
-    crate::shared::conversation::lines(
-        &view.conversation,
-        width,
-        height,
-        "PgUp/PgDn scroll; /cancel; /detach",
-    )
-    .into_iter()
-    .map(|(text, color)| DashboardLine::new(StyledLine::plain(text, color)))
-    .collect()
+    crate::shared::conversation::lines(&view.conversation, width, height)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (text, color))| {
+            let line = if index == 0 {
+                StyledLine {
+                    segments: crate::shared::conversation::heading(&view.conversation, width)
+                        .into_iter()
+                        .map(|(text, color)| StyledSegment {
+                            text,
+                            color,
+                            bold: false,
+                            link: None,
+                        })
+                        .collect(),
+                }
+            } else {
+                StyledLine::plain(text, color)
+            };
+            DashboardLine::new(line)
+        })
+        .collect()
 }
 
 pub(super) fn trim_notices(notices: &mut Vec<TranscriptLine>) {
@@ -98,7 +111,10 @@ mod tests {
         for width in [1, 2, 8, 40, 80] {
             for height in [1, 3, 8, 24] {
                 for scroll in [0, 10, usize::MAX] {
-                    app.nano.as_mut().unwrap().scroll = scroll;
+                    app.nano.as_mut().unwrap().scroll.end();
+                    if scroll > 0 {
+                        app.nano.as_mut().unwrap().scroll.up(scroll);
+                    }
                     let rows = dashboard_lines(&app, width, height);
                     assert!(rows.len() <= height);
                     for row in rows {

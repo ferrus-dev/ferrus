@@ -12,6 +12,54 @@ use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) const VERSION: u32 = 1;
 pub(crate) const FRAME_BYTES: usize = 4096;
+pub(crate) const PREVIEW_BYTES: usize = 256 * 1024;
+// Cumulative text previews must fit even after worst-case JSON escaping.
+const EVENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Default)]
+pub(crate) struct Preview {
+    turn: u64,
+    text: String,
+    published: Option<std::time::Instant>,
+}
+impl Preview {
+    pub(crate) fn update(&mut self, turn: u64, text: &str) -> Option<Event> {
+        if self.turn != turn {
+            self.turn = turn;
+            self.text.clear();
+            self.published = None;
+        }
+        let mut end = text
+            .len()
+            .min(PREVIEW_BYTES.saturating_sub(self.text.len()));
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&text[..end]);
+        if end < text.len() {
+            const NOTICE: &str =
+                "\n[Streaming display limit reached; full response appears when complete]";
+            let mut keep = PREVIEW_BYTES - NOTICE.len();
+            while !self.text.is_char_boundary(keep) {
+                keep -= 1;
+            }
+            self.text.truncate(keep);
+            self.text.push_str(NOTICE);
+        }
+        // Keep provider callbacks cheap; the UI paints at most ten times a second.
+        if self
+            .published
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(100))
+        {
+            return None;
+        }
+        self.published = Some(std::time::Instant::now());
+        Some(Event::Text {
+            turn,
+            text: self.text.clone(),
+        })
+    }
+}
 
 /// Own a pipe handle without holding Rust's global stdout lock during blocked I/O.
 pub(crate) fn stdout_file() -> std::io::Result<std::fs::File> {
@@ -204,12 +252,15 @@ pub(crate) struct Frame {
 }
 
 pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+    read_bounded_line(reader, FRAME_BYTES)
+}
+fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    std::io::Read::take(reader, FRAME_BYTES as u64 + 1).read_until(b'\n', &mut line)?;
+    std::io::Read::take(reader, limit as u64 + 1).read_until(b'\n', &mut line)?;
     if line.is_empty() {
         return Ok(None);
     }
-    ensure!(line.len() <= FRAME_BYTES, "Nano frame exceeds byte limit");
+    ensure!(line.len() <= limit, "Nano frame exceeds byte limit");
     ensure!(line.last() == Some(&b'\n'), "Incomplete nano frame");
     Ok(Some(line))
 }
@@ -226,7 +277,7 @@ pub(crate) fn read_command(reader: &mut impl BufRead) -> Result<Option<CommandKi
     Ok(Some(frame.command))
 }
 pub(crate) fn read_event(reader: &mut impl BufRead) -> Result<Option<Event>> {
-    let Some(line) = read_line(reader)? else {
+    let Some(line) = read_bounded_line(reader, EVENT_FRAME_BYTES)? else {
         return Ok(None);
     };
     let frame: Frame =
@@ -329,7 +380,7 @@ impl Output {
                     version: VERSION,
                     event,
                 },
-                FRAME_BYTES - 1,
+                EVENT_FRAME_BYTES - 1,
             )?)?;
             writer.write_all(b"\n")?;
             writer.flush()?;
@@ -341,7 +392,7 @@ pub(crate) struct ObservedJournal<J> {
     pub journal: J,
     pub output: Output,
     pub commands: Option<tokio::sync::mpsc::Receiver<super::session::SessionCommand>>,
-    pub streaming: (u64, String),
+    pub streaming: Preview,
     pub interactive: bool,
     pub preview_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -368,22 +419,9 @@ impl<J: Journal> Journal for ObservedJournal<J> {
         if self
             .preview_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(event) = self.streaming.update(turn, text)
         {
-            let (current, preview) = &mut self.streaming;
-            if *current != turn {
-                *current = turn;
-                preview.clear();
-            }
-            preview.push_str(text);
-            let mut cut = preview.len().saturating_sub(512);
-            while !preview.is_char_boundary(cut) {
-                cut += 1;
-            }
-            preview.drain(..cut);
-            self.output.publish(Event::Text {
-                turn,
-                text: preview.clone(),
-            });
+            self.output.publish(event);
         }
     }
 }
@@ -426,6 +464,55 @@ fn progress(record: &Record) -> Option<Event> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn coalesced_streaming_retains_the_response_prefix_and_fits_the_event_budget() {
+        let mut preview = Preview::default();
+        let beginning = format!("Start\n{}", "a".repeat(2048));
+        preview.update(1, &beginning).unwrap();
+        // Whether a frame is published here depends on scheduling. Either way,
+        // the next cumulative frame must retain all earlier text.
+        let _ = preview.update(1, &"b".repeat(4096));
+        preview.published = None;
+        let event = preview.update(1, "\nEnd").unwrap();
+        let Event::Text { text, .. } = &event else {
+            panic!("text expected")
+        };
+        assert!(text.starts_with(&beginning));
+        assert!(text.ends_with("\nEnd"));
+        assert!(text.len() > FRAME_BYTES);
+        let mut bytes = super::super::journal::encode(
+            &Frame {
+                version: VERSION,
+                event: event.clone(),
+            },
+            EVENT_FRAME_BYTES - 1,
+        )
+        .unwrap();
+        bytes.push(b'\n');
+        assert_eq!(read_event(&mut Cursor::new(bytes)).unwrap(), Some(event));
+        preview.published = None;
+        let event = preview
+            .update(2, &"\u{0001}".repeat(PREVIEW_BYTES + 10))
+            .unwrap();
+        let Event::Text { text, .. } = &event else {
+            panic!("text expected")
+        };
+        assert_eq!(text.len(), PREVIEW_BYTES);
+        assert!(text.starts_with('\u{0001}'));
+        assert!(text.ends_with("full response appears when complete]"));
+        assert!(
+            super::super::journal::encode(
+                &Frame {
+                    version: VERSION,
+                    event
+                },
+                EVENT_FRAME_BYTES - 1
+            )
+            .is_ok()
+        );
+        assert!(read_event(&mut Cursor::new(vec![b' '; EVENT_FRAME_BYTES + 1])).is_err());
+    }
 
     #[test]
     fn command_frames_are_bounded_versioned_and_strict() {

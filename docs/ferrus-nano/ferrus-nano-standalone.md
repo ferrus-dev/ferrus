@@ -73,8 +73,10 @@ Interactive mode requires terminal stdin and stdout. An omitted prompt opens an 
 conversation without reading a headless request from stdin. `--prompt` sends the first
 request automatically. Enter sends text or steering for the next safe engine boundary;
 Alt/Shift-Enter and bracketed paste support multiline requests. Left/Right, Home/End,
-Backspace/Delete edit the draft; Up/Down recall accepted requests. PgUp/PgDn scroll the
-bounded transcript. Resize preserves the prompt and cursor inside terminal geometry.
+Backspace/Delete edit the draft; Up/Down recall accepted requests. PgUp/PgDn and the mouse
+wheel scroll history; Ctrl-Home/Ctrl-End go to the beginning/latest output. New output does
+not move the viewport while reading history. Resize preserves the prompt and cursor
+inside terminal geometry.
 
 The view shares HQ's conversation rendering, prompt geometry, and editing primitives.
 It displays tool calls/results, streaming previews, cumulative usage, and input requests.

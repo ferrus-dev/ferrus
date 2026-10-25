@@ -2,7 +2,7 @@
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     queue,
     style::ResetColor,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -40,6 +40,7 @@ pub(crate) fn enter() -> io::Result<()> {
     queue!(
         stdout,
         EnableBracketedPaste,
+        EnableMouseCapture,
         Clear(ClearType::All),
         MoveTo(0, 0),
         Hide
@@ -49,10 +50,13 @@ pub(crate) fn enter() -> io::Result<()> {
 pub(crate) fn leave() -> io::Result<()> {
     let mut stdout = io::stdout();
     crate::platform::leave_tui(&mut stdout);
+    // Mouse capture restores console input modes through WinAPI on Windows.
+    // Keep it outside the display writer, which may be an in-memory buffer.
+    let mouse = queue!(stdout, DisableMouseCapture);
     // Always restore cooked input, even if the output stream has failed.
     let output = restore_display(&mut stdout);
     let raw = terminal::disable_raw_mode();
-    output.and(raw)
+    mouse.and(output).and(raw)
 }
 fn restore_display(writer: &mut impl Write) -> io::Result<()> {
     queue!(
