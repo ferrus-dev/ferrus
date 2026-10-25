@@ -50,10 +50,13 @@ pub(crate) fn enter() -> io::Result<()> {
 pub(crate) fn leave() -> io::Result<()> {
     let mut stdout = io::stdout();
     crate::platform::leave_tui(&mut stdout);
+    // Mouse capture restores console input modes through WinAPI on Windows.
+    // Keep it outside the display writer, which may be an in-memory buffer.
+    let mouse = queue!(stdout, DisableMouseCapture);
     // Always restore cooked input, even if the output stream has failed.
     let output = restore_display(&mut stdout);
     let raw = terminal::disable_raw_mode();
-    output.and(raw)
+    mouse.and(output).and(raw)
 }
 fn restore_display(writer: &mut impl Write) -> io::Result<()> {
     queue!(
@@ -61,7 +64,6 @@ fn restore_display(writer: &mut impl Write) -> io::Result<()> {
         ResetColor,
         Show,
         DisableBracketedPaste,
-        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     writer.flush()
@@ -76,7 +78,7 @@ mod tests {
         restore_display(&mut bytes).unwrap();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l"
+            "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1049l"
         );
     }
 }
