@@ -6,7 +6,7 @@ description: "Advisory Executor playbook for implementation, code navigation, an
 # Executor Operating Playbook
 
 This file is advisory only.
-Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
+Runtime workflow is defined by the initial prompt and exposed Ferrus tools.
 
 ## Implementation guidelines
 
@@ -29,11 +29,14 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 ## Ferrus guidance
 
-- Use Ferrus tools rather than reconstructing state from `.ferrus/`
-- Use `/check` freely during development; prefer TDD where it fits the task
-- Run `/check` again immediately before the final `/submit`
-- Read Ferrus resources when they help clarify task context
-- Use the consultation template when escalating technical uncertainty
+- Use the host-selected session mode and exposed tools rather than reconstructing state from `.ferrus/`
+- In managed MCP sessions, use wait/heartbeat tools; Nano hosts own those operations
+- Direct HQ and standalone sessions have no managed task to claim or submit; validate with their exposed tools
+- Use exposed validation tools during development; managed work uses `check` for durable receipts
+- For managed work, run `check` immediately before `submit`; final response text is not submission
+- Read Ferrus resources when exposed; Nano uses native context and `load_instructions`
+- Ferrus owns managed Git staging and integration; direct sessions change Git state only when the user requests it
+- For managed consultation, use the exposed consultation context/template when available
 
 ## Submission quality
 

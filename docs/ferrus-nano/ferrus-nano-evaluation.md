@@ -6,10 +6,10 @@ measured Nano-versus-external performance claims yet.
 
 ## Fixed workload and preparation
 
-The seven source trees in [the fixture suite](../tests/fixtures/nano_eval/suite.json)
+The seven source trees in [the fixture suite](../../tests/fixtures/nano_eval/suite.json)
 cover a local bug, a cross-file Rust change, a refactor, config/docs, Python
 without Rust graph coverage, graph-disabled work, and stale-context recovery.
-[Task text and checks](../tests/fixtures/nano_eval/tasks.md) live outside the
+[Task text and checks](../../tests/fixtures/nano_eval/tasks.md) live outside the
 starting trees. A test recomputes every pinned Git tree ID on each platform.
 
 Create one fresh project per case, variant, and sample. This command refuses an

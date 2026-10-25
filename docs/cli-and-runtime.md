@@ -19,7 +19,7 @@ Running `ferrus` without arguments opens the interactive HQ shell.
 | `/check` | Run configured checks without changing task state. |
 | `/check --force` | Compatibility form of `/check`; both ignore task status. |
 | `/supervisor` | Open an interactive Supervisor session. |
-| `/executor` | Open an interactive Executor session. |
+| `/executor` | Open an interactive Executor; Nano supports a direct workspace conversation without a task. |
 | `/resume` | Resume the Executor or a paused consultation. |
 | `/review` | Manually start review if automatic spawning failed. |
 | `/status` | Show task state, agents, counters, and session logs. |
@@ -27,7 +27,7 @@ Running `ferrus` without arguments opens the interactive HQ shell.
 | `/run [--limit N]` | Plan and queue a batch from ready milestones in the selected spec. |
 | `/runs [--limit N]` | List recent run attempts. |
 | `/events [--limit N] [--run ID]` | List runtime events. |
-| `/attach NAME` | Show the log path for a running headless agent. |
+| `/attach NAME` | Open a live/historical Nano conversation, or show an external agent's log path. |
 | `/stop` | Stop running agent sessions after confirmation. |
 | `/reset` | Stop sessions, mark all resettable tasks Reset, and clear their scoped artifacts after confirmation. |
 | `/init [--agents-path PATH]` | Initialize Ferrus in the current directory. |
@@ -97,13 +97,18 @@ Agent support is normalized through `src/agents/`: shared Supervisor and Executo
 the concrete CLI, while the Claude Code, Codex, Qwen Code, opencode, and goose adapters own launch flags, model
 overrides, headless prompt transport, and local permission or configuration conventions.
 
-The native Nano adapter stays under `src/nano/` and supports headless and native interactive HQ Executors.
+The native Nano adapter stays under `src/nano/` and supports managed Executors, direct HQ
+conversations, taskless Supervisor authoring, and task-scoped review/consultation.
 Build with `nano-openai` and select it with
 `ferrus register --executor nano --executor-model YOUR_LOADED_MODEL_ID`. Registration creates
 private local LM Studio settings if none exist; set an absolute private `FERRUS_NANO_CONFIG`
 for a custom provider file. HQ retains worktree and process supervision while Nano
 exchanges bounded JSONL commands/events instead of connecting back through Ferrus MCP.
-See [Nano launch](ferrus-nano-launch.md) for configuration, protocol, and current limitations.
+See [Nano launch](ferrus-nano/ferrus-nano-launch.md),
+[Supervisor authoring](ferrus-nano/ferrus-nano-supervisor.md), and
+[review/consultation](ferrus-nano/ferrus-nano-review.md) for profile boundaries.
+The separate [ferrus-nano executable](ferrus-nano/ferrus-nano-standalone.md) needs no
+registration or `ferrus.db`; headless and interactive completion are not managed submission.
 
 Qwen Code and goose are experimental. Ferrus attaches its role-scoped MCP server to goose at launch with
 `--with-extension`, so no project config file is written. Configure its model provider separately with

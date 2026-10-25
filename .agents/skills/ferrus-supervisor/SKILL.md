@@ -6,7 +6,7 @@ description: "Advisory Supervisor playbook for task drafting, review, and consul
 # Supervisor Operating Playbook
 
 This file is advisory only.
-Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
+Runtime workflow is defined by the initial prompt and exposed Ferrus tools.
 
 ## Task drafting
 
@@ -31,11 +31,13 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 - Treat a spec `## Outcome` section as compact project memory
 - When asked to archive a spec, summarize what actually shipped, deviations, validation evidence, follow-up work, and future context
-- Do not archive files manually; use `/archive_spec` only after the user approves the outcome text
+- Archive only through the exposed `archive_spec` operation; the user must approve the exact Outcome before it is saved
 
 ## Human interaction
 
-- Confirm task wording with the user before task creation
+- External MCP sessions obtain explicit approval before calling an authoring tool
+- Native Nano authoring tools accept ready drafts as proposals; the host confirms once before writing
+- In Nano planning, inspect and discuss only; task/spec/archive profiles expose their own authoring tool
 - Use `/ask_human` only when the answer cannot be reliably derived from the repository or current context
 
 ## Useful Ferrus tools
@@ -55,6 +57,10 @@ Runtime workflow is defined by the initial prompt and Ferrus MCP tools.
 
 `/create_task` is a compatibility tool on unfiltered servers, not role-scoped Supervisor sessions.
 Use only tools exposed by the current mode; a Consultant attaches without taking the Executor's lease.
+Nano hosts bind reviews/consultations and handle waits/heartbeats. Read `review_pending` or
+`consultation_context` before deciding; review uses the frozen submission, consultation the
+attached Executor workspace. Stop after a confirmed decision. Native authoring uses
+`definition_context` and, for archive evidence, `read_archive_artifact`.
 
 ## Useful Ferrus resources
 

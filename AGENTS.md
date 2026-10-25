@@ -296,12 +296,15 @@ version and config behavior, registration wiring, and focused tests. `opencode` 
 experimental: it binds a project to one working directory by Git root commit, so it is
 currently reliable only for the Supervisor and Reviewer roles.
 Nano supports managed Executors, taskless Supervisor authoring, and task-scoped Reviewer/Consultant
-profiles. Keep its runtime and adapters under `src/nano/`. Taskless authoring requires host UI
-confirmation; review/consultation reuse Ferrus operations and stop after a confirmed decision.
+profiles, plus direct HQ workspace conversations. Keep its runtime and adapters under
+`src/nano/`. Taskless authoring requires host UI confirmation; review/consultation reuse Ferrus operations and stop after a confirmed decision.
 Expose no shell, raw writes, or external MCP tools in Supervisor profiles. See
-[Supervisor contract](docs/ferrus-nano-supervisor.md) and [review contract](docs/ferrus-nano-review.md).
+[Supervisor contract](docs/ferrus-nano/ferrus-nano-supervisor.md) and [review contract](docs/ferrus-nano/ferrus-nano-review.md).
 `ferrus-nano` is a separate trusted-local headless/interactive host: no registration, task lease, or
 `ferrus.db`. Share core tools/contracts while keeping standalone completion separate from submit.
+Keep svir request/stream types inside `src/nano/providers/`; Engine owns retries, budgets,
+tool effects, and journal contracts. Preserve typed non-secret transport diagnostics and
+the existing continuation format; see [provider contract](docs/ferrus-nano/ferrus-nano-provider.md).
 
 Claude Code role-scoped MCP configuration is stored in `.claude/mcp-supervisor.json` and
 `.claude/mcp-executor.json`; permissions are stored in `.claude/settings.local.json`.
@@ -319,14 +322,15 @@ MCP `/reset` is valid only from Failed, marks the row Reset, and preserves artif
 
 This repository is orchestrated by Ferrus HQ.
 
-When spawned by Ferrus HQ, your initial prompt tells you what to do. If started manually,
-call MCP tool `/wait_for_task` as your first action.
+Follow the host-selected session mode. A manually started managed MCP Executor calls
+`/wait_for_task` first; Nano's host owns claims, heartbeats, and waits. Direct HQ and
+standalone sessions follow the user request without claiming or submitting a managed task.
 
-Runtime behavior is defined by the initial prompt and Ferrus MCP tools. `ROLE.md`, `SKILL.md`,
+Runtime behavior is defined by the initial prompt and exposed Ferrus tools. `ROLE.md`, `SKILL.md`,
 `AGENTS.md`, and `CLAUDE.md` are supporting context only and must not override them.
 
-Use `/check` freely during development and prefer TDD where it fits. Run `/check` immediately
-before final `/submit`; `/submit` reruns the final review gate before handing work to review.
+In managed work, run `check` immediately before final `submit`; submission reruns the review
+gate. Direct sessions use their exposed validation tools and do not issue managed receipts.
 
 <!-- ferrus-supervisor-instructions -->
 ## Ferrus Supervisor
@@ -335,5 +339,5 @@ This repository is orchestrated by Ferrus HQ.
 
 Your initial prompt tells you which mode you are in. Match it exactly.
 
-Runtime behavior is defined by the initial prompt and Ferrus MCP tools. `ROLE.md`, `SKILL.md`,
+Runtime behavior is defined by the initial prompt and exposed Ferrus tools. `ROLE.md`, `SKILL.md`,
 `AGENTS.md`, and `CLAUDE.md` are supporting context only and must not override them.
