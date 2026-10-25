@@ -29,7 +29,7 @@ Ferrus works with existing coding agents:
 - **Qwen Code** (experimental)
 - **goose** (experimental)
 - **opencode** (experimental; Supervisor and Reviewer only)
-- **Nano** (experimental; native Executor, [Supervisor authoring](docs/ferrus-nano-supervisor.md), and [review/consultation](docs/ferrus-nano-review.md), requires `nano-openai`; [setup](docs/ferrus-nano-launch.md))
+- **Nano** (experimental; native Executor, [Supervisor authoring](docs/ferrus-nano/ferrus-nano-supervisor.md), and [review/consultation](docs/ferrus-nano/ferrus-nano-review.md), requires `nano-openai`; [setup](docs/ferrus-nano/ferrus-nano-launch.md))
 
 Agents are treated as interchangeable workers -- ferrus provides the runtime, coordination, and state.
 See the [agent adapter notes](docs/cli-and-runtime.md#agent-adapters) for limitations and configuration details.
@@ -131,7 +131,7 @@ non-Git projects run in the project directory with one Executor. Checks run befo
 work resumes with review feedback. `/status`, `/tasks`, `/runs`, and `/events`
 provide local inspection; `ferrus doctor` and `ferrus recover` handle consistency and interrupted work.
 
-`ferrus-nano` runs headless requests or `--interactive` conversations in an unregistered Git or non-Git directory; see [standalone Nano](docs/ferrus-nano-standalone.md).
+`ferrus-nano` runs headless requests or `--interactive` conversations in an unregistered Git or non-Git directory; see [standalone Nano](docs/ferrus-nano/ferrus-nano-standalone.md).
 With Nano, `/executor` opens a direct workspace conversation without a queued task;
 `/attach NAME` opens a running or historical managed conversation. See [interactive Nano](docs/ferrus-nano-interactive.md).
 
