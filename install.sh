@@ -3,6 +3,8 @@ set -eu
 
 REPO="${FERRUS_INSTALL_REPO:-ferrus-dev/ferrus}"
 VERSION="${FERRUS_INSTALL_VERSION:-latest}"
+COMPONENTS="${FERRUS_INSTALL_COMPONENTS:-all}"
+BINARIES=""
 TARGET=""
 ARCHIVE=""
 CHECKSUM_FILE=""
@@ -11,6 +13,58 @@ CHECKSUM_URL=""
 INSTALL_DIR=""
 TMP_DIR=""
 HAS_CHECKSUM=0
+
+usage() {
+    cat <<'EOF'
+Usage: install.sh [--components all|ferrus|nano] [--help]
+
+Components default to FERRUS_INSTALL_COMPONENTS, or all when unset.
+  all     Install ferrus and ferrus-nano when available (default).
+  ferrus  Install only ferrus; retain any existing ferrus-nano.
+  nano    Install only ferrus-nano; fail if unavailable; retain existing ferrus.
+
+All modes download the same release archive. Selecting ferrus does not
+disable the Nano support compiled into the ferrus binary.
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --components)
+                if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                    echo "error: --components requires all, ferrus, or nano" >&2
+                    exit 1
+                fi
+                COMPONENTS="$2"
+                shift 2
+                ;;
+            --components=*)
+                COMPONENTS="${1#--components=}"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "error: unknown argument: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$COMPONENTS" in
+        all) BINARIES="ferrus ferrus-nano" ;;
+        ferrus) BINARIES="ferrus" ;;
+        nano) BINARIES="ferrus-nano" ;;
+        *)
+            echo "error: invalid components: $COMPONENTS (expected all, ferrus, or nano)" >&2
+            exit 1
+            ;;
+    esac
+}
 
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -210,53 +264,49 @@ verify_checksum() {
 }
 
 verify_archive_layout() {
-    expected_entry="ferrus-${TARGET}/ferrus"
-    if ! tar -tzf "$TMP_DIR/$ARCHIVE" | grep -Fx "$expected_entry" >/dev/null 2>&1; then
-        echo "error: archive does not contain expected binary entry: $expected_entry" >&2
-        exit 1
-    fi
+    tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+    # Validate every selected binary before changing an existing installation.
+    for binary in $BINARIES; do
+        expected_entry="ferrus-${TARGET}/$binary"
+        if [ ! -f "$TMP_DIR/$expected_entry" ]; then
+            # Older releases contain only ferrus.
+            if [ "$COMPONENTS" = "all" ] && [ "$binary" = "ferrus-nano" ]; then
+                BINARIES="ferrus"
+                echo "warning: this release does not include ferrus-nano; installing only ferrus" >&2
+                if [ -e "$INSTALL_DIR/ferrus-nano" ]; then
+                    echo "warning: existing $INSTALL_DIR/ferrus-nano was retained and may be incompatible. Remove it or install a release that includes Nano." >&2
+                fi
+            else
+                echo "error: archive does not contain expected binary entry: $expected_entry" >&2
+                exit 1
+            fi
+        fi
+    done
 }
 
-warn_existing_install() {
-    if [ -e "$INSTALL_DIR/ferrus" ]; then
-        echo "warning: overwriting existing installation at $INSTALL_DIR/ferrus" >&2
-    fi
-}
-
-install_binary() {
+install_binaries() {
     mkdir -p "$INSTALL_DIR"
-    if [ -n "${HOME:-}" ]; then
+    if [ "$COMPONENTS" != "nano" ] && [ -n "${HOME:-}" ]; then
         mkdir -p "${HOME}/.ferrus/projects"
     fi
-    tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
-
-    BIN_PATH="$TMP_DIR/ferrus-${TARGET}/ferrus"
-
-    if [ ! -f "$BIN_PATH" ]; then
-        echo "error: ferrus binary not found in archive" >&2
-        exit 1
-    fi
-
-    warn_existing_install
-    install "$BIN_PATH" "$INSTALL_DIR/ferrus"
-    # Older releases contain only ferrus; install the companion when present.
-    nano_path="$TMP_DIR/ferrus-${TARGET}/ferrus-nano"
-    if [ -f "$nano_path" ]; then
-        install "$nano_path" "$INSTALL_DIR/ferrus-nano"
-    elif [ -e "$INSTALL_DIR/ferrus-nano" ]; then
-        echo "warning: this release does not include ferrus-nano; existing $INSTALL_DIR/ferrus-nano was retained and may be incompatible. Remove it or install a release that includes Nano." >&2
-    fi
+    for binary in $BINARIES; do
+        if [ -e "$INSTALL_DIR/$binary" ]; then
+            echo "warning: overwriting existing installation at $INSTALL_DIR/$binary" >&2
+        fi
+        install "$TMP_DIR/ferrus-${TARGET}/$binary" "$INSTALL_DIR/$binary"
+    done
 }
 
 print_success() {
-    installed_version="$("$INSTALL_DIR/ferrus" --version 2>/dev/null || true)"
-
-    echo "installed ferrus to ${INSTALL_DIR}/ferrus"
-    if [ -n "$installed_version" ]; then
-        echo "version: ${installed_version}"
-    else
-        echo "warning: failed to determine installed ferrus version" >&2
-    fi
+    for binary in $BINARIES; do
+        installed_version="$("$INSTALL_DIR/$binary" --version 2>/dev/null || true)"
+        echo "installed $binary to $INSTALL_DIR/$binary"
+        if [ -n "$installed_version" ]; then
+            echo "version: ${installed_version}"
+        else
+            echo "warning: failed to determine installed $binary version" >&2
+        fi
+    done
 
     case ":$PATH:" in
         *:"$INSTALL_DIR":*)
@@ -270,6 +320,7 @@ print_success() {
 }
 
 main() {
+    parse_args "$@"
     need_cmd uname
     need_cmd tar
     need_cmd mktemp
@@ -279,7 +330,7 @@ main() {
     resolve_url
     pick_install_dir
 
-    echo "installing ferrus (${VERSION}) for ${TARGET}"
+    echo "installing ferrus components: ${COMPONENTS} (${VERSION}) for ${TARGET}"
     echo "download: ${RELEASE_URL}"
 
     TMP_DIR="$(mktemp -d)"
@@ -289,7 +340,7 @@ main() {
     download_checksum
     verify_checksum
     verify_archive_layout
-    install_binary
+    install_binaries
     print_success
 }
 

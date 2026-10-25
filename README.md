@@ -86,6 +86,23 @@ cargo install ferrus --locked --profile dist
 ```
 
 Prebuilt release archives include `ferrus` and `ferrus-nano`, with native context and external MCP support.
+The installers copy both by default. To select one binary:
+
+```sh
+curl -fsSL https://ferrus.dev/cli/install.sh | sh -s -- --components ferrus
+curl -fsSL https://ferrus.dev/cli/install.sh | sh -s -- --components nano
+```
+
+```powershell
+& ([scriptblock]::Create((iwr https://ferrus.dev/cli/install.ps1 -useb).Content)) -Components ferrus
+& ([scriptblock]::Create((iwr https://ferrus.dev/cli/install.ps1 -useb).Content)) -Components nano
+```
+
+Use `all` for both, or set `FERRUS_INSTALL_COMPONENTS=all|ferrus|nano`; an explicit parameter
+takes precedence. Every mode downloads the same archive and retains unselected installed binaries.
+Selecting `ferrus` keeps its compiled-in Nano support. Older releases without `ferrus-nano`
+install only `ferrus` in `all` mode with a warning; `nano` mode fails if its binary is missing.
+
 The Apple Silicon archive targets macOS 11.0 or newer (`MACOSX_DEPLOYMENT_TARGET=11.0`).
 CI builds it on `macos-latest`, checks the packaged arm64 executable's deployment target and
 SHA-256 checksum, and runs `--version`, `init`, and `doctor` with an isolated home and project.
@@ -115,7 +132,7 @@ ferrus                                                     # enter HQ
 
 Then type `/task` -- a supervisor spawns, you describe what you want, and the full loop runs automatically.
 
-On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` downloads the matching release binary into `~/.local/bin` by default. On Windows, `install.ps1` installs `ferrus.exe` into `%LOCALAPPDATA%\ferrus\bin` by default. Release archives are verified with published SHA-256 checksums before installation. Set `FERRUS_INSTALL_DIR` to override the destination, or `FERRUS_INSTALL_VERSION=vX.Y.Z` to install a specific release tag.
+On Linux and macOS for `x86_64` and `aarch64`/`arm64`, `install.sh` installs selected binaries into `~/.local/bin` by default. On Windows, `install.ps1` uses `%LOCALAPPDATA%\ferrus\bin` by default. Release archives are verified with published SHA-256 checksums before installation. Set `FERRUS_INSTALL_DIR` to override the destination, or `FERRUS_INSTALL_VERSION=vX.Y.Z` to install a specific release tag.
 
 ---
 

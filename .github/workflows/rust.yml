@@ -79,7 +79,7 @@ jobs:
 
       - name: Test core on Windows
         if: matrix.os == 'windows-latest'
-        run: "cargo test --locked --features nano-openai,nano-mcp --lib --bin ferrus --test repository_graph_eval -- --skip nano::"
+        run: "cargo test --locked --features nano-openai,nano-mcp --lib --bin ferrus --test repository_graph_eval --test installers -- --skip nano::"
 
   nano-windows:
     runs-on: windows-latest
