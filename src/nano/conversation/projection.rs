@@ -46,8 +46,10 @@ pub(crate) fn display_text(text: &str, cap: usize) -> String {
         if result.len() + ch.len_utf8() > content_cap {
             break;
         }
+
         result.push(ch);
     }
+
     if truncated {
         result.push_str(&TRUNCATED[..TRUNCATED.len().min(cap.saturating_sub(result.len()))]);
     }
@@ -66,6 +68,7 @@ impl Snapshot {
             self.omitted_entries = self.omitted_entries.saturating_add(1);
         }
     }
+
     pub(crate) fn apply(&mut self, record: &Record) {
         self.sequence = record.sequence;
         self.budget = record.budget.clone();
@@ -83,6 +86,7 @@ impl Snapshot {
                     );
                     return;
                 }
+
                 let initial = serde_json::Deserializer::from_str(input)
                     .into_iter::<serde_json::Value>()
                     .next()
@@ -103,9 +107,11 @@ impl Snapshot {
                 if let Some(id) = input_id {
                     self.accepted_inputs.push_back(id.clone());
                 }
+
                 while self.accepted_inputs.len() > 32 {
                     self.accepted_inputs.pop_front();
                 }
+
                 self.push("You", text);
             }
             SessionEvent::InputRequested => self.status = "Waiting for your input".into(),
@@ -117,6 +123,7 @@ impl Snapshot {
                 if !response.text.is_empty() {
                     self.push("Nano", &response.text);
                 }
+
                 self.status = "Processing response".into();
             }
             SessionEvent::ModelFailed { error, .. } => self.push("Provider", &format!("{error:?}")),
@@ -146,6 +153,7 @@ impl Snapshot {
                 if matches!(outcome, ToolOutcome::Success(value) if value["truncated"] == true) {
                     text.push_str("\n[tool output truncated; read the next page for more]");
                 }
+
                 self.push("Result", &text);
             }
             SessionEvent::Ended { reason } => {
@@ -186,6 +194,7 @@ mod tests {
                 },
             });
         }
+
         assert!(snapshot.entries[0].contains("# Outcome\n\nCompleted work"));
         assert!(!snapshot.entries[0].contains("\\n"));
         assert!(!snapshot.entries[0].contains('\u{1b}'));

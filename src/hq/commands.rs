@@ -120,6 +120,7 @@ pub fn parse_command(input: &str) -> Result<ShellCommand> {
     if !input.starts_with('/') {
         bail!("Commands must start with '/' -- try /status, /task, /quit");
     }
+
     let tokens = shlex::split(&input[1..])
         .ok_or_else(|| anyhow::anyhow!("Failed to tokenize command (unterminated quote?)"))?;
     let cli = HqCli::try_parse_from(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -139,6 +140,7 @@ mod tests {
             ShellCommand::Quit
         ));
     }
+
     #[test]
     fn parse_status() {
         assert!(matches!(
@@ -146,6 +148,7 @@ mod tests {
             ShellCommand::Status
         ));
     }
+
     #[test]
     fn parse_tasks() {
         assert!(matches!(
@@ -153,6 +156,7 @@ mod tests {
             ShellCommand::Tasks
         ));
     }
+
     #[test]
     fn parse_run() {
         assert!(matches!(
@@ -160,6 +164,7 @@ mod tests {
             ShellCommand::Run { limit: None }
         ));
     }
+
     #[test]
     fn parse_run_limit() {
         assert!(matches!(
@@ -167,6 +172,7 @@ mod tests {
             ShellCommand::Run { limit: Some(3) }
         ));
     }
+
     #[test]
     fn parse_runs() {
         assert!(matches!(
@@ -174,6 +180,7 @@ mod tests {
             ShellCommand::Runs { limit: 5 }
         ));
     }
+
     #[test]
     fn parse_events() {
         match parse_command("/events --limit 7 --run r-123").unwrap() {
@@ -184,6 +191,7 @@ mod tests {
             _ => panic!("expected Events"),
         }
     }
+
     #[test]
     fn parse_check() {
         assert!(matches!(
@@ -191,6 +199,7 @@ mod tests {
             ShellCommand::Check { force: false }
         ));
     }
+
     #[test]
     fn parse_check_force() {
         assert!(matches!(
@@ -198,6 +207,7 @@ mod tests {
             ShellCommand::Check { force: true }
         ));
     }
+
     #[test]
     fn parse_reset() {
         assert!(matches!(
@@ -205,6 +215,7 @@ mod tests {
             ShellCommand::Reset
         ));
     }
+
     #[test]
     fn parse_stop() {
         assert!(matches!(
@@ -212,6 +223,7 @@ mod tests {
             ShellCommand::Stop
         ));
     }
+
     #[test]
     fn parse_plan() {
         assert!(matches!(
@@ -219,6 +231,7 @@ mod tests {
             ShellCommand::Plan
         ));
     }
+
     #[test]
     fn parse_review() {
         assert!(matches!(
@@ -226,6 +239,7 @@ mod tests {
             ShellCommand::Review
         ));
     }
+
     #[test]
     fn parse_archive_spec() {
         assert!(matches!(
@@ -233,6 +247,7 @@ mod tests {
             ShellCommand::ArchiveSpec
         ));
     }
+
     #[test]
     fn parse_task() {
         assert!(matches!(
@@ -240,6 +255,7 @@ mod tests {
             ShellCommand::Task { manual: false }
         ));
     }
+
     #[test]
     fn parse_task_manual() {
         assert!(matches!(
@@ -247,6 +263,7 @@ mod tests {
             ShellCommand::Task { manual: true }
         ));
     }
+
     #[test]
     fn parse_milestones() {
         assert!(matches!(
@@ -254,6 +271,7 @@ mod tests {
             ShellCommand::Milestones
         ));
     }
+
     #[test]
     fn parse_reset_spec() {
         assert!(matches!(
@@ -261,6 +279,7 @@ mod tests {
             ShellCommand::ResetSpec
         ));
     }
+
     #[test]
     fn parse_spec() {
         assert!(matches!(
@@ -268,6 +287,7 @@ mod tests {
             ShellCommand::Spec
         ));
     }
+
     #[test]
     fn parse_supervisor_cmd() {
         assert!(matches!(
@@ -275,6 +295,7 @@ mod tests {
             ShellCommand::Supervisor
         ));
     }
+
     #[test]
     fn parse_executor_cmd() {
         assert!(matches!(
@@ -282,6 +303,7 @@ mod tests {
             ShellCommand::Executor
         ));
     }
+
     #[test]
     fn parse_resume() {
         assert!(matches!(
@@ -289,6 +311,7 @@ mod tests {
             ShellCommand::Resume
         ));
     }
+
     #[test]
     fn parse_model() {
         match parse_command("/model supervisor claude-opus-4.6").unwrap() {
@@ -304,6 +327,7 @@ mod tests {
             _ => panic!("expected Model"),
         }
     }
+
     #[test]
     fn parse_model_clear() {
         match parse_command("/model executor --clear").unwrap() {
@@ -319,10 +343,12 @@ mod tests {
             _ => panic!("expected Model"),
         }
     }
+
     #[test]
     fn execute_command_removed() {
         assert!(parse_command("/execute").is_err());
     }
+
     #[test]
     fn parse_attach_with_name() {
         match parse_command("/attach executor").unwrap() {
@@ -330,6 +356,7 @@ mod tests {
             _ => panic!("expected Attach"),
         }
     }
+
     #[test]
     fn attach_parses_structured_name() {
         match parse_command("/attach executor:codex:1").unwrap() {
@@ -337,10 +364,12 @@ mod tests {
             _ => panic!("expected Attach"),
         }
     }
+
     #[test]
     fn unknown_command_errors() {
         assert!(parse_command("/foobar").is_err());
     }
+
     #[test]
     fn non_slash_errors() {
         assert!(parse_command("hello").is_err());

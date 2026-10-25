@@ -121,6 +121,7 @@ pub(crate) trait Tools {
     fn end_reason(&self) -> Option<super::session::EndReason> {
         None
     }
+
     fn descriptors(&self) -> Vec<ToolDescriptor>;
 
     /// The adapter owns schema validation; execution receives only the validated object.

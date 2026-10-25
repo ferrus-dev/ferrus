@@ -48,6 +48,7 @@ async fn run(agent_id: &str, notes: String) -> Result<String> {
             context.status
         );
     }
+
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     run_for_context(context, notes, config, None).await

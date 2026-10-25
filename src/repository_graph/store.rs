@@ -138,6 +138,7 @@ impl GraphStore for Sidecar {
                 operation: "start",
             });
         }
+
         self.connection_mut().execute(
             "INSERT INTO index_builds(\
                 id, repository_namespace, repository_id, source_revision_id, \
@@ -167,6 +168,7 @@ impl GraphStore for Sidecar {
                 operation: "fail",
             });
         }
+
         transaction.execute(
             "UPDATE index_builds SET state = 'failed', finished_at = ?2, \
              failure_code = ?3, failure_message = NULL WHERE id = ?1",
@@ -195,6 +197,7 @@ impl GraphStore for Sidecar {
                 operation: "complete",
             });
         }
+
         validate_snapshot_for_build(snapshot, &build)?;
 
         let completed = if let Some(existing) = load_snapshot(&transaction, &snapshot.id)? {
@@ -248,12 +251,14 @@ impl GraphStore for Sidecar {
         if build.repository != request.repository {
             return Err(StoreError::IdentityMismatch("repository"));
         }
+
         if !matches!(build.state, BuildState::Complete | BuildState::Published) {
             return Err(StoreError::InvalidTransition {
                 state: build.state,
                 operation: "publish",
             });
         }
+
         let snapshot =
             load_snapshot(&transaction, &build.prospective_snapshot_id)?.ok_or_else(|| {
                 StoreError::SnapshotNotFound(build.prospective_snapshot_id.as_str().to_string())
@@ -293,6 +298,7 @@ impl GraphStore for Sidecar {
                         build.id.as_str()
                     )));
                 }
+
                 transaction.commit()?;
                 return Ok(PublicationOutcome::Superseded {
                     current: view.clone(),
@@ -346,6 +352,7 @@ impl GraphStore for Sidecar {
                 ],
             )?;
         }
+
         transaction.execute(
             "UPDATE index_builds SET state = 'published' WHERE id = ?1",
             [build.id.as_str()],
@@ -373,6 +380,7 @@ impl GraphStore for Sidecar {
                 operation: "supersede",
             });
         }
+
         transaction.execute(
             "UPDATE index_builds SET state = 'superseded' WHERE id = ?1",
             [build_id.as_str()],
@@ -589,12 +597,15 @@ pub(super) fn validate_snapshot_for_build(
     if snapshot.id != build.prospective_snapshot_id {
         return Err(StoreError::IdentityMismatch("snapshot id"));
     }
+
     if snapshot.repository != build.repository {
         return Err(StoreError::IdentityMismatch("repository"));
     }
+
     if snapshot.source_revision_id != build.source_revision_id {
         return Err(StoreError::IdentityMismatch("source revision"));
     }
+
     Ok(())
 }
 
@@ -611,6 +622,7 @@ pub(super) fn validate_equivalent_snapshot(
     {
         return Err(StoreError::IdentityMismatch("existing snapshot contents"));
     }
+
     Ok(())
 }
 

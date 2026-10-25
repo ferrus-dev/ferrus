@@ -73,6 +73,7 @@ impl Default for MemoryPolicy {
             };
             categories.insert(category, policy);
         }
+
         Self {
             schema_version: MEMORY_POLICY_SCHEMA_VERSION,
             categories,
@@ -81,13 +82,9 @@ impl Default for MemoryPolicy {
 }
 
 impl MemoryPolicy {
-    pub fn digest(&self) -> Digest {
-        let encoded = serde_json::to_vec(self).expect("memory policy is serializable");
-        let value = Sha256::digest(encoded)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Digest::new("sha256", value).expect("sha256 output is lowercase hexadecimal")
+    pub fn digest(&self) -> Result<Digest, serde_json::Error> {
+        let encoded = serde_json::to_vec(self)?;
+        Ok(Digest::from_sha256(Sha256::digest(encoded).into()))
     }
 
     pub fn category(&self, category: MemorySourceCategory) -> Option<&MemorySourcePolicy> {
@@ -134,8 +131,8 @@ mod tests {
     #[test]
     fn policy_digest_is_deterministic() {
         assert_eq!(
-            MemoryPolicy::default().digest(),
-            MemoryPolicy::default().digest()
+            MemoryPolicy::default().digest().unwrap(),
+            MemoryPolicy::default().digest().unwrap()
         );
     }
 }

@@ -1,6 +1,6 @@
 //! Privacy-safe diagnostics and lifecycle events.
 
-use std::{collections::BTreeMap, convert::Infallible, fmt};
+use std::{borrow::Cow, collections::BTreeMap, convert::Infallible, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -21,9 +21,28 @@ pub struct InvalidMemoryDiagnosticCode;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct MemoryDiagnosticCode(String);
+pub struct MemoryDiagnosticCode(Cow<'static, str>);
 
 impl MemoryDiagnosticCode {
+    /// Constructs a built-in code. Use in a `const` block to validate at compile time.
+    pub const fn from_static(value: &'static str) -> Self {
+        assert!(
+            !value.is_empty() && value.len() <= MAX_DIAGNOSTIC_CODE_BYTES,
+            "invalid diagnostic code length"
+        );
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            assert!(
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.',
+                "invalid diagnostic code"
+            );
+            index += 1;
+        }
+        Self(Cow::Borrowed(value))
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidMemoryDiagnosticCode> {
         let value = value.into();
         let valid = !value.is_empty()
@@ -32,7 +51,7 @@ impl MemoryDiagnosticCode {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.');
         valid
-            .then_some(Self(value))
+            .then_some(Self(value.into()))
             .ok_or(InvalidMemoryDiagnosticCode)
     }
 

@@ -20,6 +20,7 @@ pub(crate) struct Conversation {
     seen_notice: u64,
     pub(crate) rejected_input: Option<String>,
 }
+
 impl Conversation {
     pub(crate) fn new(
         name: String,
@@ -44,6 +45,7 @@ impl Conversation {
             rejected_input: None,
         }
     }
+
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = false;
         if !matches!(self.snapshots.has_changed(), Ok(false))
@@ -54,8 +56,10 @@ impl Conversation {
             if !self.snapshot.status.starts_with("Generating") {
                 self.preview = None;
             }
+
             changed = true;
         }
+
         if let Some(events) = &mut self.events
             && !matches!(events.has_changed(), Ok(false))
         {
@@ -70,6 +74,7 @@ impl Conversation {
                 changed |= preview != self.preview;
                 self.preview = preview;
             }
+
             if let Some(NativeEvent::Ended { reason, durable }) = &event
                 && !self.snapshot.ended
             {
@@ -78,6 +83,7 @@ impl Conversation {
                 self.snapshot.end_reason = Some(reason.clone());
                 changed = true;
             }
+
             if state.notice_sequence > self.seen_notice {
                 self.seen_notice = state.notice_sequence;
                 if let Some(code) = state.notice {
@@ -86,13 +92,16 @@ impl Conversation {
                     if self.notices.len() > 64 {
                         self.notices.remove(0);
                     }
+
                     changed = true;
                 }
             }
+
             if events.has_changed().is_err() {
                 self.events = None;
             }
         }
+
         changed
     }
 }
@@ -165,6 +174,7 @@ pub(crate) fn lines(view: &Conversation, width: usize, height: usize) -> Vec<(St
             .map(|text| (text, Color::DarkGrey)),
         );
     }
+
     for entry in &view.snapshot.entries {
         let color = if entry.starts_with("You:") {
             Color::White
@@ -190,6 +200,7 @@ pub(crate) fn lines(view: &Conversation, width: usize, height: usize) -> Vec<(St
         );
         body.push((String::new(), color));
     }
+
     if let Some((_, preview)) = &view.preview {
         body.extend(
             wrap(&format!("Nano: {preview}"), width)
@@ -207,6 +218,7 @@ pub(crate) fn lines(view: &Conversation, width: usize, height: usize) -> Vec<(St
                 }),
         );
     }
+
     let available = height.saturating_sub(lines.len());
     let visible = view.scroll.range(body.len(), available);
     lines.extend(
@@ -242,10 +254,13 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
                 lines.push(std::mem::take(&mut current));
                 used = 0;
             }
+
             current.push(ch);
             used += next;
         }
+
         lines.push(current);
     }
+
     lines
 }

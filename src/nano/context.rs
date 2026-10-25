@@ -42,7 +42,10 @@ impl Context {
     }
 
     pub(super) fn invalidate(&self) {
-        self.cache.lock().unwrap().clear();
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     pub(super) async fn revisions(&self) -> Result<Value> {
@@ -97,6 +100,7 @@ impl Context {
         if name == "repository_graph_status" {
             return Ok(value);
         }
+
         let graph = self.graph().await?;
         request.with_graph_budget(value, &graph.config.query_limits)
     }
@@ -118,6 +122,7 @@ impl Context {
             if let Some(snapshot) = &status.snapshot_id {
                 scope.snapshot = query::SnapshotSelector::Snapshot(snapshot.clone());
             }
+
             let cacheable =
                 self.cache_enabled && !input.include_snippets && status.snapshot_id.is_some();
             let key = super::working_set::identity(&(
@@ -134,10 +139,17 @@ impl Context {
                 self.session.project_id(),
                 self.session.task_id(),
                 self.session.workspace(),
-            ));
-            if cacheable && let Some(value) = self.cache.lock().unwrap().get(&key) {
+            ))?;
+            if cacheable
+                && let Some(value) = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+            {
                 return Ok(serde_json::from_value(value)?);
             }
+
             let page = PageRequest {
                 cursor: input.cursor.map(PageCursor::new).transpose()?,
             };
@@ -185,7 +197,7 @@ impl Context {
                         .context_with_snippets(
                             &request,
                             NonZeroU64::new(input.max_snippet_bytes.unwrap_or(4096).min(8192))
-                                .unwrap(),
+                                .context("Snippet limit must be positive")?,
                         )
                         .await?
                 } else {
@@ -200,9 +212,10 @@ impl Context {
             {
                 self.cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(key, serde_json::to_value(&response)?);
             }
+
             return Ok(response);
         }
 

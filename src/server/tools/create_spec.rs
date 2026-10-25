@@ -149,6 +149,7 @@ fn ensure_trailing_newline(mut markdown: String) -> String {
     if !markdown.ends_with('\n') {
         markdown.push('\n');
     }
+
     markdown
 }
 

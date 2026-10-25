@@ -11,7 +11,7 @@ use super::{
     tools::*,
 };
 use crate::server::tools::approve::{CanonicalApprovalLock, acquire_canonical_approval_lock_at};
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
 use tokio::task::JoinHandle;
@@ -48,10 +48,12 @@ impl<B: ExecutionBackend> InteractiveTools<B> {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::InvalidArguments);
         }
+
         self.native.invalidate_unknown().await;
         if !self.native.coding.commands.quiesce().await {
             return ToolOutcome::Unknown(ToolError::Failed);
         }
+
         self.native.coding.workspace.invalidate_for_command();
         let (binding, stop) = (self.binding.clone(), self.stop.clone());
         self.pending = Some(tokio::spawn(async move {
@@ -62,12 +64,15 @@ impl<B: ExecutionBackend> InteractiveTools<B> {
                 binding.run_id(),
                 crate::project::allocate_run_id("check", "nano"),
             ));
-            tokio::fs::create_dir_all(log.parent().unwrap()).await?;
+            tokio::fs::create_dir_all(log.parent().context("Missing check log directory")?).await?;
             let (passed, report, _) =
                 super::checks::run(&config, binding.workspace(), &log, &stop).await?;
             Ok(json!({"passed":passed,"report":report,"log":log,"managed":false}))
         }));
-        let result = self.pending.as_mut().unwrap().await;
+        let Some(pending) = self.pending.as_mut() else {
+            return ToolOutcome::Unknown(ToolError::Interrupted);
+        };
+        let result = pending.await;
         self.pending = None;
         check_outcome(result)
     }
@@ -82,9 +87,11 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
         self.release_workspace_if_quiet();
         self.native.prepare_context(messages, stop).await
     }
+
     fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
         self.native.effect_plan(call)
     }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.native.descriptors();
         tools.push(ToolDescriptor {
@@ -94,6 +101,7 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
         });
         tools
     }
+
     fn validate(&self, name: &str, args: &Value) -> Result<(), ToolError> {
         if name == "check" {
             return if args.as_object().is_some_and(|args| args.is_empty()) {
@@ -102,8 +110,10 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
                 Err(ToolError::InvalidArguments)
             };
         }
+
         self.native.validate(name, args)
     }
+
     async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome {
         let may_write = matches!(call.name.as_str(), "exec" | "apply_patch" | "check")
             || call.name.starts_with("mcp_");
@@ -122,8 +132,13 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
                     Err(_) => return ToolOutcome::Failed(ToolError::Failed),
                 }
             }
-            self.workspace_owner = Arc::downgrade(self.workspace_lock.as_ref().unwrap());
+
+            let Some(lock) = self.workspace_lock.as_ref() else {
+                return ToolOutcome::Failed(ToolError::Failed);
+            };
+            self.workspace_owner = Arc::downgrade(lock);
         }
+
         if may_write {
             self.native.coding.commands.set_execution_guard(
                 self.workspace_lock
@@ -131,6 +146,7 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
                     .map(|lock| lock as Arc<dyn Send + Sync>),
             );
         }
+
         let outcome = if call.name == "check" {
             self.check(call).await
         } else {
@@ -141,13 +157,16 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
         self.release_workspace_if_quiet();
         outcome
     }
+
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         if let Some(task) = self.pending.take() {
             self.stop.cancel();
             return Some(check_outcome(task.await));
         }
+
         self.native.interrupted().await
     }
+
     async fn shutdown(&mut self) -> bool {
         self.stop.cancel();
         let joined = match self.pending.take() {
@@ -159,6 +178,7 @@ impl<B: ExecutionBackend> Tools for InteractiveTools<B> {
             self.native.coding.commands.set_execution_guard(None);
             self.workspace_lock = None;
         }
+
         stopped
     }
 }
@@ -178,6 +198,7 @@ fn check_outcome(result: Result<Result<Value>, tokio::task::JoinError>) -> ToolO
 }
 
 struct InteractiveHost(Binding);
+
 impl Host for InteractiveHost {
     async fn authorize(&mut self, _: &ValidatedCall) -> Result<(), ToolError> {
         self.0
@@ -186,6 +207,7 @@ impl Host for InteractiveHost {
             .map(|_| ())
             .map_err(|_| ToolError::Denied)
     }
+
     fn committed(&mut self, _: &Record) {}
 }
 
@@ -211,6 +233,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
                 .await?,
         );
     }
+
     let mut instructions = native.instructions.load(&[], &[]).await?;
     instructions
         .documents

@@ -12,19 +12,23 @@ use std::io::{self, Write};
 pub(crate) struct Guard {
     active: bool,
 }
+
 impl Guard {
     pub(crate) fn enter() -> io::Result<Self> {
         if let Err(error) = enter() {
             let _ = leave();
             return Err(error);
         }
+
         Ok(Self { active: true })
     }
+
     pub(crate) fn finish(mut self) -> io::Result<()> {
         self.active = false;
         leave()
     }
 }
+
 impl Drop for Guard {
     fn drop(&mut self) {
         if self.active {
@@ -32,6 +36,7 @@ impl Drop for Guard {
         }
     }
 }
+
 pub(crate) fn enter() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -47,6 +52,7 @@ pub(crate) fn enter() -> io::Result<()> {
     )?;
     stdout.flush()
 }
+
 pub(crate) fn leave() -> io::Result<()> {
     let mut stdout = io::stdout();
     crate::platform::leave_tui(&mut stdout);
@@ -58,6 +64,7 @@ pub(crate) fn leave() -> io::Result<()> {
     let raw = terminal::disable_raw_mode();
     mouse.and(output).and(raw)
 }
+
 fn restore_display(writer: &mut impl Write) -> io::Result<()> {
     queue!(
         writer,
@@ -72,6 +79,7 @@ fn restore_display(writer: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn cleanup_restores_cursor_paste_and_screen() {
         let mut bytes = Vec::new();

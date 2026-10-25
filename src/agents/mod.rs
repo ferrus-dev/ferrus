@@ -4,9 +4,13 @@
 //! interactively or headlessly, and derives the MCP configuration used by HQ.
 
 pub(crate) mod claude;
+
 pub(crate) mod codex;
+
 pub(crate) mod goose;
+
 pub(crate) mod opencode;
+
 pub(crate) mod qwen;
 
 use anyhow::{Context, Result, bail};
@@ -54,9 +58,11 @@ impl AgentDisplayConfig {
         if self.model.is_none() {
             self.model = fallback.model;
         }
+
         if self.effort.is_none() {
             self.effort = fallback.effort;
         }
+
         self
     }
 }
@@ -95,6 +101,7 @@ pub enum DefinitionMode {
     Spec,
     Archive,
 }
+
 impl DefinitionMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -114,6 +121,7 @@ pub trait SupervisorAgent: Send + Sync {
     fn native_definition(&self) -> bool {
         false
     }
+
     fn spawn_definition(
         &self,
         _profile: DefinitionMode,
@@ -208,6 +216,7 @@ pub trait ExecutorAgent: Send + Sync {
     fn validate_headless_launch(&self, role: &str, index: u32) -> Result<()> {
         self.validate_interactive_launch(role, index)
     }
+
     /// Returns the stable configuration name for this agent backend.
     fn name(&self) -> &'static str;
 
@@ -470,6 +479,7 @@ pub(crate) async fn allow_mcp_server_tools_in_json_settings(
     if added {
         println!("Allowed {permission} in {}", path.display());
     }
+
     Ok(())
 }
 
@@ -502,6 +512,7 @@ pub(crate) fn ensure_mcp_config_file_exists(path: &Path) -> Result<()> {
             absolute_display_path_string(path)
         )));
     }
+
     Ok(())
 }
 
@@ -527,6 +538,7 @@ pub(crate) fn validate_json_mcp_server(path: &Path, key: &str) -> Result<()> {
             display_path(path)
         )));
     }
+
     Ok(())
 }
 
@@ -549,6 +561,7 @@ pub(crate) fn validate_toml_mcp_server(path: &Path, key: &str) -> Result<()> {
             display_path(path)
         )));
     }
+
     Ok(())
 }
 
@@ -581,6 +594,7 @@ fn add_json_allow_permission(root: &mut Value, permission: &str, path: &Path) ->
     {
         return Ok(false);
     }
+
     if allow_array.iter().any(|value| !value.is_string()) {
         bail!(
             "{} permissions.allow must contain only strings",

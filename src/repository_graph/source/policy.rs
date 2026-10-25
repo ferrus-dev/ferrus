@@ -48,71 +48,161 @@ impl SourcePolicy {
         })
     }
 
-    pub(super) fn exclusion_for_file(&self, path: &RepoPath) -> Option<&'static str> {
+    pub(super) fn exclusion_for_file(
+        &self,
+        path: &RepoPath,
+    ) -> Option<crate::repository_graph::domain::DiagnosticCode> {
         if hard_excluded(path) {
-            return Some("runtime_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "runtime_path_excluded",
+                    )
+                },
+            );
         }
+
         if self
             .sensitive
             .iter()
             .any(|pattern| sensitive_glob_matches(pattern, path.as_str()))
         {
-            return Some("sensitive_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "sensitive_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self.include_vendor && is_vendor(path) {
-            return Some("vendor_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "vendor_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self.include_generated && is_generated(path) {
-            return Some("generated_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "generated_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self
             .include
             .iter()
             .any(|pattern| glob_matches(pattern, path.as_str()))
         {
-            return Some("path_not_included");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "path_not_included",
+                    )
+                },
+            );
         }
+
         let mut excluded = false;
         for (negated, pattern) in &self.rules {
             if glob_matches(pattern, path.as_str()) {
                 excluded = !negated;
             }
         }
-        excluded.then_some("source_rule_excluded")
+
+        excluded.then_some(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static("source_rule_excluded")
+            },
+        )
     }
 
-    pub(super) fn exclusion_for_directory(&self, path: &RepoPath) -> Option<&'static str> {
+    pub(super) fn exclusion_for_directory(
+        &self,
+        path: &RepoPath,
+    ) -> Option<crate::repository_graph::domain::DiagnosticCode> {
         if hard_excluded(path) {
-            return Some("runtime_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "runtime_path_excluded",
+                    )
+                },
+            );
         }
+
         if self
             .sensitive
             .iter()
             .any(|pattern| sensitive_glob_matches(pattern, path.as_str()))
         {
-            return Some("sensitive_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "sensitive_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self.include_vendor && is_vendor(path) {
-            return Some("vendor_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "vendor_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self.include_generated && is_generated(path) {
-            return Some("generated_path_excluded");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "generated_path_excluded",
+                    )
+                },
+            );
         }
+
         if !self
             .include
             .iter()
             .any(|pattern| glob_may_match_descendant(pattern, path.as_str()))
         {
-            return Some("path_not_included");
+            return Some(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "path_not_included",
+                    )
+                },
+            );
         }
+
         if self.has_negated_rules {
             return None;
         }
+
         self.rules
             .iter()
             .rev()
             .find(|(_, pattern)| glob_matches(pattern, path.as_str()))
-            .and_then(|(negated, _)| (!negated).then_some("source_rule_excluded"))
+            .and_then(|(negated, _)| {
+                (!negated).then_some(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "source_rule_excluded",
+                        )
+                    },
+                )
+            })
     }
 }
 
@@ -154,6 +244,7 @@ pub(super) fn glob_matches(pattern: &str, path: &str) -> bool {
             .iter()
             .any(|component| component_matches(pattern_components[0], component));
     }
+
     components_match(&pattern_components, &path_components)
 }
 
@@ -162,6 +253,7 @@ pub(super) fn glob_may_match_descendant(pattern: &str, directory: &str) -> bool 
     if pattern_components.len() == 1 {
         return true;
     }
+
     let directory_components = directory.split('/').collect::<Vec<_>>();
     let mut reachable = BTreeSet::from([(0_usize, 0_usize)]);
     let mut visited = BTreeSet::new();
@@ -169,11 +261,13 @@ pub(super) fn glob_may_match_descendant(pattern: &str, directory: &str) -> bool 
         if !visited.insert(state) {
             continue;
         }
+
         let (pattern_index, directory_index) = state;
         if directory_index == directory_components.len() && pattern_index < pattern_components.len()
         {
             return true;
         }
+
         let Some(component) = pattern_components.get(pattern_index) else {
             continue;
         };
@@ -188,6 +282,7 @@ pub(super) fn glob_may_match_descendant(pattern: &str, directory: &str) -> bool 
             reachable.insert((pattern_index + 1, directory_index + 1));
         }
     }
+
     false
 }
 
@@ -202,10 +297,12 @@ fn components_match(pattern: &[&str], path: &[&str]) -> bool {
         if !visited.insert(state) {
             continue;
         }
+
         let (pattern_index, path_index) = state;
         if pattern_index == pattern.len() && path_index == path.len() {
             return true;
         }
+
         let Some(component) = pattern.get(pattern_index) else {
             continue;
         };
@@ -220,6 +317,7 @@ fn components_match(pattern: &[&str], path: &[&str]) -> bool {
             reachable.insert((pattern_index + 1, path_index + 1));
         }
     }
+
     false
 }
 
@@ -232,10 +330,12 @@ fn component_matches(pattern: &str, value: &str) -> bool {
         if !visited.insert(state) {
             continue;
         }
+
         let (pattern_index, value_index) = state;
         if pattern_index == pattern.len() && value_index == value.len() {
             return true;
         }
+
         match pattern.get(pattern_index) {
             Some('*') => {
                 reachable.insert((pattern_index + 1, value_index));
@@ -256,5 +356,6 @@ fn component_matches(pattern: &str, value: &str) -> bool {
             _ => {}
         }
     }
+
     false
 }

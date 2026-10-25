@@ -16,6 +16,7 @@ pub(super) fn extract_dependency_groups(
         if !facts.active() {
             return;
         }
+
         if let Some(value) = manifest.get(key) {
             extract_dependency_table(value, scope, None, spans.header(key, 0), facts, package);
         }
@@ -28,8 +29,16 @@ pub(super) fn extract_dependency_groups(
         if !facts.active() {
             return;
         }
+
         let Some(target) = target.as_table() else {
-            facts.diagnostic("cargo.invalid_target_dependency_table", None);
+            facts.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.invalid_target_dependency_table",
+                    )
+                },
+                None,
+            );
             continue;
         };
         for (key, scope) in [
@@ -40,6 +49,7 @@ pub(super) fn extract_dependency_groups(
             if !facts.active() {
                 return;
             }
+
             if let Some(value) = target.get(key) {
                 extract_dependency_table(
                     value,
@@ -85,7 +95,14 @@ pub(super) fn extract_dependency_table(
     owner: &NodeId,
 ) {
     let Some(dependencies) = value.as_table() else {
-        facts.diagnostic("cargo.invalid_dependency_table", span);
+        facts.diagnostic(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static(
+                    "cargo.invalid_dependency_table",
+                )
+            },
+            span,
+        );
         return;
     };
     let mut dependencies = dependencies.iter().collect::<Vec<_>>();
@@ -95,13 +112,30 @@ pub(super) fn extract_dependency_table(
         if !facts.active() {
             break;
         }
+
         let parsed = parse_dependency(facts.manifest_path(), alias, declaration);
         if parsed.invalid {
-            facts.diagnostic("cargo.invalid_dependency_declaration", span.clone());
+            facts.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.invalid_dependency_declaration",
+                    )
+                },
+                span.clone(),
+            );
         }
+
         if parsed.path_outside_repository {
-            facts.diagnostic("cargo.dependency_path_outside_repository", span.clone());
+            facts.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.dependency_path_outside_repository",
+                    )
+                },
+                span.clone(),
+            );
         }
+
         let condition = target_condition.unwrap_or("");
         let key = semantic_key(
             "dependency",
@@ -125,27 +159,33 @@ pub(super) fn extract_dependency_table(
                 GraphValue::String(condition.to_string()),
             );
         }
+
         if let Some(version) = parsed.version {
             properties.insert("version".to_string(), GraphValue::String(version));
         }
+
         if let Some(registry) = parsed.registry {
             properties.insert("registry".to_string(), GraphValue::String(registry));
         }
+
         if let Some(optional) = parsed.optional {
             properties.insert("optional".to_string(), GraphValue::Boolean(optional));
         }
+
         if let Some(default_features) = parsed.default_features {
             properties.insert(
                 "default_features".to_string(),
                 GraphValue::Boolean(default_features),
             );
         }
+
         if !parsed.features.is_empty() {
             properties.insert(
                 "features".to_string(),
                 GraphValue::StringList(parsed.features),
             );
         }
+
         if parsed.git {
             // Deliberately do not persist a possibly credential-bearing Git URL.
             properties.insert("git".to_string(), GraphValue::Boolean(true));
@@ -302,6 +342,7 @@ pub(super) fn parse_dependency(
     if common.invalid {
         return common;
     }
+
     if let Some(path) = path {
         let Some(package_dir) = normalize_directory_from_manifest(manifest_path, path) else {
             common.path_outside_repository = true;
@@ -320,6 +361,7 @@ pub(super) fn parse_dependency(
         common.confidence = Confidence::High;
         return common;
     }
+
     if workspace == Some(true) {
         common.classification = "workspace_unresolved";
         common.target = EdgeTarget::Unresolved(format!(
@@ -329,6 +371,7 @@ pub(super) fn parse_dependency(
         common.confidence = Confidence::High;
         return common;
     }
+
     if git || common.version.is_some() || common.registry.is_some() {
         common.classification = "external";
         common.target =
@@ -337,6 +380,7 @@ pub(super) fn parse_dependency(
         common.confidence = Confidence::Exact;
         return common;
     }
+
     common
 }
 
@@ -398,6 +442,7 @@ pub(super) fn normalize_directory_from_manifest(
     {
         return None;
     }
+
     let mut components = manifest_path.split('/').collect::<Vec<_>>();
     components.pop();
     for component in relative.split('/') {
@@ -409,6 +454,7 @@ pub(super) fn normalize_directory_from_manifest(
             component => components.push(component),
         }
     }
+
     Some(components.join("/"))
 }
 
@@ -461,16 +507,16 @@ pub(super) fn escape_component(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || b"-._/".contains(&byte) {
             escaped.push(char::from(byte));
         } else {
-            use std::fmt::Write as _;
-            write!(escaped, "%{byte:02X}").expect("writing to a String cannot fail");
+            escaped.push_str(&format!("%{byte:02X}"));
         }
     }
+
     escaped
 }
 
 pub(super) fn extractor_identity() -> ExtractorIdentity {
     ExtractorIdentity {
-        id: ExtractorId::new(EXTRACTOR_ID).expect("built-in extractor ID is non-empty"),
+        id: const { ExtractorId::from_static(EXTRACTOR_ID) },
         version: EXTRACTOR_VERSION.to_string(),
         contract_version: EXTRACTOR_CONTRACT_VERSION,
     }

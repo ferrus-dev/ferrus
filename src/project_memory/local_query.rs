@@ -36,6 +36,7 @@ impl GraphQuery for OptionalGraphQuery<'_> {
             .ok_or_else(graph_unavailable)?
             .status(request)
     }
+
     fn search(
         &self,
         request: &crate::repository_graph::query::SearchRequest,
@@ -48,6 +49,7 @@ impl GraphQuery for OptionalGraphQuery<'_> {
             .ok_or_else(graph_unavailable)?
             .search(request)
     }
+
     fn show(
         &self,
         request: &crate::repository_graph::query::ShowRequest,
@@ -60,6 +62,7 @@ impl GraphQuery for OptionalGraphQuery<'_> {
             .ok_or_else(graph_unavailable)?
             .show(request)
     }
+
     fn neighborhood(
         &self,
         request: &crate::repository_graph::query::NeighborhoodRequest,
@@ -72,6 +75,7 @@ impl GraphQuery for OptionalGraphQuery<'_> {
             .ok_or_else(graph_unavailable)?
             .neighborhood(request)
     }
+
     fn context(
         &self,
         request: &crate::repository_graph::query::ContextRequest,
@@ -112,6 +116,7 @@ impl MemoryQuery for OptionalMemoryBackend<'_> {
             .ok_or(MemoryQueryError::Unavailable)?
             .status(request)
     }
+
     fn search(
         &self,
         request: crate::project_memory::query::MemorySearchRequest,
@@ -122,6 +127,7 @@ impl MemoryQuery for OptionalMemoryBackend<'_> {
             .ok_or(MemoryQueryError::Unavailable)?
             .search(request)
     }
+
     fn context(
         &self,
         request: crate::project_memory::query::MemoryContextRequest,
@@ -145,6 +151,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .repository_link_set(id)
     }
+
     fn repository_link_set_for_snapshot(
         &self,
         revision: &crate::project_memory::domain::MemoryRevisionId,
@@ -155,6 +162,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .repository_link_set_for_snapshot(revision, repository, snapshot)
     }
+
     fn latest_repository_link_set(
         &self,
         revision: &crate::project_memory::domain::MemoryRevisionId,
@@ -164,6 +172,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .latest_repository_link_set(revision, repository)
     }
+
     fn latest_compatible_repository_link_set(
         &self,
         revision: &crate::project_memory::domain::MemoryRevision,
@@ -173,6 +182,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .latest_compatible_repository_link_set(revision, repository)
     }
+
     fn repository_links(
         &self,
         id: &crate::project_memory::domain::MemoryRepositoryLinkSetId,
@@ -181,6 +191,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .repository_links(id)
     }
+
     fn repository_link_diagnostics(
         &self,
         id: &crate::project_memory::domain::MemoryRepositoryLinkSetId,
@@ -189,6 +200,7 @@ impl crate::project_memory::ports::MemoryLinkStore for OptionalMemoryBackend<'_>
             .ok_or(crate::project_memory::sqlite::MemoryStoreError::RequiresRebuild)?
             .repository_link_diagnostics(id)
     }
+
     fn bounded_repository_links(
         &self,
         id: &crate::project_memory::domain::MemoryRepositoryLinkSetId,

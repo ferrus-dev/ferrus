@@ -7,17 +7,21 @@ pub(super) struct NanoConversation {
     conversation: crate::shared::conversation::Conversation,
     pub(super) notices: Vec<TranscriptLine>,
 }
+
 impl std::ops::Deref for NanoConversation {
     type Target = crate::shared::conversation::Conversation;
+
     fn deref(&self) -> &Self::Target {
         &self.conversation
     }
 }
+
 impl std::ops::DerefMut for NanoConversation {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conversation
     }
 }
+
 impl NanoConversation {
     pub(super) fn new(
         name: String,
@@ -32,6 +36,7 @@ impl NanoConversation {
             notices: Vec::new(),
         }
     }
+
     pub(super) fn poll(&mut self) -> bool {
         let changed = self.conversation.poll();
         self.notices.extend(
@@ -48,6 +53,7 @@ impl NanoConversation {
         changed
     }
 }
+
 pub(super) fn lines(view: &NanoConversation, width: usize, height: usize) -> Vec<DashboardLine> {
     crate::shared::conversation::lines(&view.conversation, width, height)
         .into_iter()
@@ -115,6 +121,7 @@ mod tests {
                     if scroll > 0 {
                         app.nano.as_mut().unwrap().scroll.up(scroll);
                     }
+
                     let rows = dashboard_lines(&app, width, height);
                     assert!(rows.len() <= height);
                     for row in rows {
@@ -128,10 +135,12 @@ mod tests {
                     }
                 }
             }
+
             let prompt = render_prompt(&app, width);
             assert!(usize::from(prompt.cursor_row) < prompt.lines.len());
             assert!(usize::from(prompt.cursor_col) <= width.max(3));
         }
+
         let native_rows = dashboard_lines(&app, 80, 20);
         app.nano = None;
         assert_ne!(native_rows.len(), 0);
@@ -173,6 +182,7 @@ mod tests {
                 app.question_task_id = Some("t-002".into());
                 app.nano = Some(view("run-2"));
             }
+
             app.history_up();
             app.question_task_id = Some("t-003".into());
             app.nano = Some(view("run-3"));
@@ -424,6 +434,7 @@ mod tests {
         for _ in 0..1000 {
             app.append_transcript(split_transcript(&"x".repeat(4096), TranscriptKind::Info));
         }
+
         let notices = &app.nano.as_ref().unwrap().notices;
         assert!(notices.len() <= 64);
         assert!(notices.iter().all(|line| line.text.len() <= 2048));
@@ -451,6 +462,7 @@ mod tests {
                 })
             });
         }
+
         assert!(view.poll());
         assert_eq!(view.preview.as_ref().unwrap().1, "preview 9999");
         assert!(

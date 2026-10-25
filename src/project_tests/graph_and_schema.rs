@@ -6,7 +6,9 @@ use super::*;
 async fn dashboard_reads_work_while_another_connection_holds_the_writer_lock() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let (_dir, previous) = setup_project().await;
+
     struct RestoreDirectory(PathBuf);
+
     impl Drop for RestoreDirectory {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).unwrap();
@@ -244,6 +246,7 @@ fn runtime_schema_migrations_adopt_legacy_database_without_data_loss() {
             .unwrap();
         assert_eq!(lifecycle, "mutable");
     }
+
     assert_eq!(
         connection
             .query_row(

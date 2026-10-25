@@ -89,23 +89,30 @@ pub enum IndexError {
 
 impl IndexError {
     fn diagnostic_code(self) -> DiagnosticCode {
-        let code = match self {
-            Self::Config => "index.config_invalid",
-            Self::AnalyzerUnavailable => "index.analyzer_unavailable",
-            Self::ExtractorSetMismatch => "index.extractor_set_mismatch",
-            Self::StorageRead => "index.storage_read_failed",
-            Self::BuildStart => "index.build_start_failed",
-            Self::Cache => "index.cache_failed",
-            Self::SourceRead => "index.source_read_failed",
-            Self::Extraction => "index.extraction_failed",
-            Self::FragmentConflict => "index.fragment_conflict",
-            Self::Resolution => "index.resolution_failed",
-            Self::Revalidation => "index.revalidation_failed",
-            Self::SourceChanged => "index.source_changed",
-            Self::Commit => "index.commit_failed",
-            Self::Publication => "index.publication_failed",
-        };
-        DiagnosticCode::new(code).expect("static index diagnostic code is canonical")
+        match self {
+            Self::Config => const { DiagnosticCode::from_static("index.config_invalid") },
+            Self::AnalyzerUnavailable => {
+                const { DiagnosticCode::from_static("index.analyzer_unavailable") }
+            }
+            Self::ExtractorSetMismatch => {
+                const { DiagnosticCode::from_static("index.extractor_set_mismatch") }
+            }
+            Self::StorageRead => const { DiagnosticCode::from_static("index.storage_read_failed") },
+            Self::BuildStart => const { DiagnosticCode::from_static("index.build_start_failed") },
+            Self::Cache => const { DiagnosticCode::from_static("index.cache_failed") },
+            Self::SourceRead => const { DiagnosticCode::from_static("index.source_read_failed") },
+            Self::Extraction => const { DiagnosticCode::from_static("index.extraction_failed") },
+            Self::FragmentConflict => {
+                const { DiagnosticCode::from_static("index.fragment_conflict") }
+            }
+            Self::Resolution => const { DiagnosticCode::from_static("index.resolution_failed") },
+            Self::Revalidation => {
+                const { DiagnosticCode::from_static("index.revalidation_failed") }
+            }
+            Self::SourceChanged => const { DiagnosticCode::from_static("index.source_changed") },
+            Self::Commit => const { DiagnosticCode::from_static("index.commit_failed") },
+            Self::Publication => const { DiagnosticCode::from_static("index.publication_failed") },
+        }
     }
 }
 
@@ -149,16 +156,20 @@ where
         let started = Instant::now();
         let manifest = source.manifest();
         let active = ActiveExtractors::new(config)?;
-        if manifest.extractor_set_digest != extractor_set_digest(&active.identities) {
+        if manifest.extractor_set_digest
+            != extractor_set_digest(&active.identities).map_err(|_| IndexError::Config)?
+        {
             return Err(IndexError::ExtractorSetMismatch);
         }
+
         let analysis_config_digest = config
             .analysis_config_digest()
             .map_err(|_| IndexError::Config)?;
         if manifest.revision.analysis_config_digest != analysis_config_digest {
             return Err(IndexError::Config);
         }
-        let snapshot_id = snapshot_identity(manifest);
+
+        let snapshot_id = snapshot_identity(manifest).map_err(|_| IndexError::Config)?;
         let expected = self
             .store
             .published_view(&manifest.revision.repository, &request.view_name)
@@ -325,6 +336,7 @@ where
                     .supersede_build(&build.id)
                     .map_err(|_| IndexError::Publication)?;
             }
+
             self.emit(
                 LifecycleEventKind::BuildSuperseded,
                 &build,
@@ -339,6 +351,7 @@ where
                 &prepared.metrics,
             );
         }
+
         Ok(IndexOutcome {
             build_id: build.id,
             snapshot: completed,
@@ -393,6 +406,7 @@ where
                     metrics.skipped_files += 1;
                 }
             }
+
             metrics.nodes = existing.nodes;
             metrics.edges = existing.edges;
             metrics.diagnostics = existing.diagnostics;
@@ -405,6 +419,7 @@ where
                 metrics,
             });
         }
+
         let mut merger = FragmentMerger::new();
         merger
             .merge(source_graph)
@@ -414,6 +429,7 @@ where
                 .merge(GenericExtractor::new().repository_fragment(&context, manifest))
                 .map_err(|error| (error, metrics.clone()))?;
         }
+
         let mut cache_writes = Vec::new();
         let mut cache_hits = Vec::new();
 
@@ -428,6 +444,7 @@ where
                 metrics.skipped_files = metrics.skipped_files.saturating_add(1);
                 continue;
             }
+
             let mut fragments = Vec::new();
             let mut missing = Vec::new();
             for extractor in extractors {
@@ -485,6 +502,7 @@ where
                     fragments.push(fragment);
                 }
             }
+
             for fragment in fragments {
                 merger
                     .merge(fragment)
@@ -590,6 +608,7 @@ impl ActiveExtractors {
         {
             return Err(IndexError::AnalyzerUnavailable);
         }
+
         let identities = if config.analyzers.enabled.is_empty() {
             builtins
         } else {
@@ -665,13 +684,16 @@ fn rebase_fragment(mut fragment: GraphFragment, context: &ExtractionContext) -> 
     for node in &mut fragment.nodes {
         node.snapshot_id = context.snapshot_id.clone();
     }
+
     for edge in &mut fragment.edges {
         edge.snapshot_id = context.snapshot_id.clone();
     }
+
     for diagnostic in &mut fragment.diagnostics {
         diagnostic.build_id = context.build_id.clone();
         diagnostic.snapshot_id = Some(context.snapshot_id.clone());
     }
+
     fragment
 }
 
@@ -697,16 +719,20 @@ impl FragmentMerger {
             {
                 return Err(IndexError::FragmentConflict);
             }
+
             self.nodes.insert(node.id.clone(), node);
         }
+
         for edge in fragment.edges {
             if let Some(existing) = self.edges.get(&edge.id)
                 && existing != &edge
             {
                 return Err(IndexError::FragmentConflict);
             }
+
             self.edges.insert(edge.id.clone(), edge);
         }
+
         self.diagnostics.extend(fragment.diagnostics);
         Ok(())
     }
@@ -722,6 +748,7 @@ impl FragmentMerger {
             diagnostic.build_id = context.build_id.clone();
             diagnostic.snapshot_id = Some(context.snapshot_id.clone());
         }
+
         GraphFragment {
             nodes: self.nodes.into_values().collect(),
             edges: self.edges.into_values().collect(),
@@ -771,14 +798,14 @@ struct SnapshotIdentity<'a> {
     extractor_set_digest: &'a super::domain::Digest,
 }
 
-pub fn snapshot_identity(manifest: &SourceManifest) -> SnapshotId {
+pub fn snapshot_identity(manifest: &SourceManifest) -> Result<SnapshotId, serde_json::Error> {
     snapshot_identity_from_revision(&manifest.revision, &manifest.extractor_set_digest)
 }
 
 pub fn snapshot_identity_from_revision(
     revision: &super::domain::SourceRevision,
     extractor_set_digest: &super::domain::Digest,
-) -> SnapshotId {
+) -> Result<SnapshotId, serde_json::Error> {
     let identity = SnapshotIdentity {
         version: 1,
         repository: &revision.repository,
@@ -787,16 +814,14 @@ pub fn snapshot_identity_from_revision(
         analysis_config_digest: &revision.analysis_config_digest,
         extractor_set_digest,
     };
-    let bytes = serde_json::to_vec(&identity)
-        .expect("canonical snapshot identity serialization cannot fail");
+    let bytes = serde_json::to_vec(&identity)?;
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        encoded.push_str(&format!("{byte:02x}"));
     }
-    SnapshotId::new(format!("snapshot:{encoded}"))
-        .expect("prefixed sha256 snapshot identity is non-empty")
+
+    Ok(SnapshotId::from_content_digest(&encoded))
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

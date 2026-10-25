@@ -15,6 +15,7 @@ fn fallback_schema_exposes_properties_and_preserves_operation_constraints() {
     ] {
         assert!(validator.is_valid(&arguments));
     }
+
     for arguments in [
         serde_json::json!({"operation":"read","reason":"stale","input":{"query":"symbol"}}),
         serde_json::json!({"operation":"search","reason":"missing","input":{"path":"src/main.rs"}}),
@@ -43,6 +44,7 @@ async fn instructions_are_scoped_lazy_reloaded_and_bounded() {
     ] {
         std::fs::write(f.root.join(path), text).unwrap();
     }
+
     let session = FerrusSession::bind(f.launch()).await.unwrap();
     let instructions = Instructions::new(session.clone(), Limits::default()).unwrap();
     let before = instructions
@@ -263,6 +265,7 @@ async fn fallback_is_labeled_current_workspace_evidence() {
         assert_eq!(result["evidence"]["source"]["kind"], "workspace");
         assert_eq!(result["evidence"]["text"], "pub struct LocalOnly;\n");
     }
+
     let result = context.fallback(serde_json::from_value(serde_json::json!({"operation":"search","reason":"unsupported","input":{"query":"LocalOnly","paths":["sample.rs"]}})).unwrap(), &Cancellation::default()).await.unwrap();
     assert_eq!(
         result["evidence"]["matches"][0]["source"]["kind"],

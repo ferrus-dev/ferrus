@@ -103,6 +103,7 @@ impl HqContext {
             self.display
                 .info(format!("{} model cleared", target.display_name()));
         }
+
         Ok(())
     }
 
@@ -135,6 +136,7 @@ impl HqContext {
             entry.pid = None;
             entry.status = AgentStatus::Suspended;
         }
+
         write_agents(&reg).await
     }
 
@@ -175,6 +177,7 @@ impl HqContext {
         if !status.success() {
             anyhow::bail!(interactive_exit_error(role, agent_type, status, &stderr));
         }
+
         Ok(())
     }
 
@@ -186,6 +189,7 @@ impl HqContext {
         if !message.is_empty() {
             self.display.muted(message);
         }
+
         if tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait())
             .await
             .is_ok()
@@ -196,6 +200,7 @@ impl HqContext {
         if let Some(pid) = child.id() {
             platform::signal_process(pid, platform::ShutdownSignal::Terminate);
         }
+
         if tokio::time::timeout(std::time::Duration::from_millis(800), child.wait())
             .await
             .is_ok()
@@ -219,9 +224,11 @@ impl HqContext {
             self.display.info(format!("{name} is already running."));
             return false;
         }
+
         if existing_is_alive == Some(false) {
             self.reap_headless(name).await;
         }
+
         true
     }
 
@@ -390,6 +397,7 @@ impl HqContext {
         if let Some(baseline_tree) = workspace.baseline_tree.as_deref() {
             env.push((ENV_BASELINE_TREE, baseline_tree.to_string()));
         }
+
         let workspace = Some(agent_manager::HeadlessWorkspace {
             workspace_dir: workspace.workspace_dir.clone(),
             project_root: workspace.project_root.clone(),
@@ -457,6 +465,7 @@ impl HqContext {
                     "No additional runtime task session started. Use /tasks to inspect work.",
                 );
             }
+
             return Ok(());
         }
 
@@ -479,6 +488,7 @@ impl HqContext {
                 self.display
                     .info("No reviewer session started. Reviewing task(s) may already be claimed.");
             }
+
             return Ok(());
         }
 
@@ -515,6 +525,7 @@ impl HqContext {
                 "HQ checks failed. Task state was not modified.\n\nFailed commands:\n{failed}"
             ));
         }
+
         Ok(())
     }
 
@@ -553,6 +564,7 @@ impl HqContext {
             entry.pid = None;
             entry.status = agents::AgentStatus::Suspended;
         }
+
         agents::write_agents(&reg).await?;
 
         for task in &resettable {
@@ -571,6 +583,7 @@ impl HqContext {
             )
             .await;
         }
+
         crate::project::record_runtime_event_best_effort(
             None,
             "hq_reset",
@@ -589,6 +602,7 @@ impl HqContext {
         } else {
             tracing::debug!(reset_task_count = resettable.len(), "runtime reset");
         }
+
         Ok(())
     }
 
@@ -607,6 +621,7 @@ impl HqContext {
             entry.pid = None;
             entry.status = agents::AgentStatus::Suspended;
         }
+
         agents::write_agents(&reg).await?;
 
         self.display.muted("All agent sessions stopped.");
@@ -749,9 +764,11 @@ impl HqContext {
                 &stderr
             ));
         }
+
         if created_task_ids.is_empty() {
             created_task_ids = new_task_ids_since(existing_task_ids).await?;
         }
+
         Ok(created_task_ids)
     }
 
@@ -864,6 +881,7 @@ impl HqContext {
             self.display
                 .info("No queued task started. Use /tasks to inspect pending work.");
         }
+
         Ok(())
     }
 

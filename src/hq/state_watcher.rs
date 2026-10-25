@@ -143,9 +143,11 @@ pub fn format_elapsed(duration: std::time::Duration) -> String {
     if hours > 0 {
         parts.push(format!("{hours}h"));
     }
+
     if minutes > 0 {
         parts.push(format!("{minutes}m"));
     }
+
     parts.push(format!("{seconds}s"));
     parts.join(" ")
 }

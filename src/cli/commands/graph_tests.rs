@@ -4,8 +4,8 @@ use super::*;
 
 #[test]
 fn build_ids_are_opaque_and_unique_per_process() {
-    let first = next_build_id();
-    let second = next_build_id();
+    let first = next_build_id().unwrap();
+    let second = next_build_id().unwrap();
     assert_ne!(first, second);
     assert!(first.as_str().starts_with("build:"));
 }

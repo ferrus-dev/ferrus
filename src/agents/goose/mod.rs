@@ -140,6 +140,7 @@ fn quote_command_component(component: &str) -> String {
     {
         return component.to_string();
     }
+
     format!("'{}'", component.replace('\'', "'\"'\"'"))
 }
 
@@ -170,6 +171,7 @@ fn quote_command_component(component: &str) -> String {
             }
         }
     }
+
     quoted.push_str(&"\\".repeat(backslashes * 2));
     quoted.push('"');
     quoted
@@ -181,6 +183,7 @@ fn goose_command(role: &str, mode: AgentRunMode<'_>, model: Option<&str>) -> Res
     if let Some(model) = model {
         cmd.env("GOOSE_MODEL", model);
     }
+
     match mode {
         AgentRunMode::Headless { prompt } => {
             // Auto-approve tool calls so an unattended run never blocks on confirmation.
@@ -191,6 +194,7 @@ fn goose_command(role: &str, mode: AgentRunMode<'_>, model: Option<&str>) -> Res
             if std::env::var_os("GOOSE_MAX_TURNS").is_none() {
                 cmd.arg("--max-turns").arg(DEFAULT_MAX_TURNS.to_string());
             }
+
             cmd.arg("--max-tool-repetitions")
                 .arg(DEFAULT_MAX_TOOL_REPETITIONS.to_string());
             cmd.arg("--with-extension")
@@ -213,6 +217,7 @@ fn goose_command(role: &str, mode: AgentRunMode<'_>, model: Option<&str>) -> Res
             }
         },
     }
+
     Ok(cmd)
 }
 
@@ -239,9 +244,11 @@ fn goose_config_paths() -> Vec<PathBuf> {
     if let Some(config_dir) = dirs::config_dir() {
         paths.push(config_dir.join("goose").join("config.yaml"));
     }
+
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".config").join("goose").join("config.yaml"));
     }
+
     paths
 }
 
@@ -270,11 +277,13 @@ fn goose_display_from_config_lines<'a>(
                 config.model = goose_config_value_from_line(line, "GOOSE_MODEL:")
                     .or_else(|| goose_config_value_from_line(line, "model:"));
             }
+
             if config.effort.is_none() {
                 config.effort = goose_config_value_from_line(line, "GOOSE_REASONING_EFFORT:")
                     .or_else(|| goose_config_value_from_line(line, "reasoning_effort:"))
                     .or_else(|| goose_config_value_from_line(line, "effort:"));
             }
+
             config
         })
 }
@@ -284,6 +293,7 @@ fn goose_config_value_from_line(line: &str, key: &str) -> Option<String> {
     if line.starts_with('#') {
         return None;
     }
+
     let value = line.strip_prefix(key)?;
     normalized_model(Some(
         value.trim().trim_matches(|ch| matches!(ch, '"' | '\'')),

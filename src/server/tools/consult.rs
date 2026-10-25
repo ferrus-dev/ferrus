@@ -54,6 +54,7 @@ async fn run(agent_id: &str, question: String) -> Result<String> {
             context.status
         );
     }
+
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     validate_consult_request(&question)?;

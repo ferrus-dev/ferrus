@@ -1,5 +1,7 @@
 //! Integration gates for graph retrieval quality, determinism, and navigation usefulness.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 #[path = "support/repository_graph_eval.rs"]
 mod evaluation;
 

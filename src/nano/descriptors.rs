@@ -25,28 +25,56 @@ pub(super) fn descriptor(name: &str) -> ToolDescriptor {
             {"type":"object","properties":{"operation":{"const":"search"},"reason":reason,"input":search},"required":["operation","reason","input"],"additionalProperties":false}
         ]})
     } else {
-        let mut schema = json!({"type":"object","properties":{
-            "domain":{"type":"string","enum":["repository","memory","all"]},
-            "query":{"type":"string","minLength":1,"maxLength":512},
-            "paths":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}},
-            "kinds":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}},
-            "seeds":{"type":"array","maxItems":32,"items":{"type":"object","properties":{"type":{"type":"string","enum":["node","symbol","path","memory_entity","milestone","task","run"]},"value":{"type":"string","minLength":1,"maxLength":512}},"required":["type","value"],"additionalProperties":false}},
-            "cursor":{"type":"string","minLength":1,"maxLength":16384},
-            "max_results":{"type":"integer","minimum":1},"max_bytes":{"type":"integer","minimum":1},
-            "max_depth":{"type":"integer","minimum":1},"max_duration_ms":{"type":"integer","minimum":1},
-            "max_diagnostics":{"type":"integer","minimum":1},"max_snippet_bytes":{"type":"integer","minimum":1},
-            "include_snippets":{"type":"boolean"},"include_unresolved":{"type":"boolean"},"include_stale":{"type":"boolean"},
-            "direction":{"type":"string","enum":["incoming","outgoing","both"]}
-        },"required":[],"additionalProperties":false});
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "domain".into(),
+            json!({"type":"string","enum":["repository","memory","all"]}),
+        );
+        properties.insert(
+            "query".into(),
+            json!({"type":"string","minLength":1,"maxLength":512}),
+        );
+        properties.insert(
+            "paths".into(),
+            json!({"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}),
+        );
+        properties.insert(
+            "kinds".into(),
+            json!({"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}),
+        );
+        properties.insert("seeds".into(), json!({"type":"array","maxItems":32,"items":{"type":"object","properties":{"type":{"type":"string","enum":["node","symbol","path","memory_entity","milestone","task","run"]},"value":{"type":"string","minLength":1,"maxLength":512}},"required":["type","value"],"additionalProperties":false}}));
+        properties.insert(
+            "cursor".into(),
+            json!({"type":"string","minLength":1,"maxLength":16384}),
+        );
+        properties.insert("max_results".into(), json!({"type":"integer","minimum":1}));
+        properties.insert("max_bytes".into(), json!({"type":"integer","minimum":1}));
+        properties.insert("max_depth".into(), json!({"type":"integer","minimum":1}));
+        properties.insert(
+            "max_duration_ms".into(),
+            json!({"type":"integer","minimum":1}),
+        );
+        properties.insert(
+            "max_diagnostics".into(),
+            json!({"type":"integer","minimum":1}),
+        );
+        properties.insert(
+            "max_snippet_bytes".into(),
+            json!({"type":"integer","minimum":1}),
+        );
+        properties.insert("include_snippets".into(), json!({"type":"boolean"}));
+        properties.insert("include_unresolved".into(), json!({"type":"boolean"}));
+        properties.insert("include_stale".into(), json!({"type":"boolean"}));
+        properties.insert(
+            "direction".into(),
+            json!({"type":"string","enum":["incoming","outgoing","both"]}),
+        );
 
         let mut required = vec![];
         if name.starts_with("project_context") {
             required.push("domain");
         } else {
-            schema["properties"]
-                .as_object_mut()
-                .unwrap()
-                .remove("domain");
+            properties.remove("domain");
         }
 
         if name.ends_with("search") {
@@ -57,12 +85,8 @@ pub(super) fn descriptor(name: &str) -> ToolDescriptor {
             required.push("seeds");
         }
 
-        schema["properties"]
-            .as_object_mut()
-            .unwrap()
-            .retain(|key, _| context::fields(name).contains(&key.as_str()));
-        schema["required"] = json!(required);
-        schema
+        properties.retain(|key, _| context::fields(name).contains(&key.as_str()));
+        json!({"type":"object", "properties":properties, "required":required, "additionalProperties":false})
     };
 
     ToolDescriptor { name: name.into(), input_schema: schema, description: match name {

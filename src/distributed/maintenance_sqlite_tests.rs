@@ -483,230 +483,6 @@ fn table_count(path: &Path, table: &str, project: &RemoteProjectRef) -> u64 {
     u64::try_from(count).unwrap()
 }
 
-#[test]
-fn project_deletion_is_idempotent_audited_and_tenant_isolated() {
-    let mut fixture = fixture();
-    let request = full_request(&fixture.project_a, "delete-a", "delete-a-first");
-    let result = fixture
-        .maintenance
-        .delete(&administrator(&fixture.project_a), &request, Utc::now())
-        .unwrap();
-    assert_eq!(result.state, DeletionState::Complete);
-    for (counter, expected) in [
-        (AuditCounter::Objects, 1),
-        (AuditCounter::FactBatches, 1),
-        (AuditCounter::Snapshots, 1),
-        (AuditCounter::Revisions, 1),
-        (AuditCounter::Jobs, 2),
-    ] {
-        assert_eq!(result.counters.get(&counter), Some(&expected));
-    }
-    assert!(result.audit_event_id.is_some());
-
-    for table in [
-        "distributed_index_jobs",
-        "remote_immutable_revisions",
-        "remote_published_targets",
-        "remote_graph_views",
-        "remote_memory_views",
-    ] {
-        assert_eq!(
-            table_count(&fixture.control_path, table, &fixture.project_a),
-            0
-        );
-        assert!(table_count(&fixture.control_path, table, &fixture.project_b) > 0);
-    }
-    assert_eq!(
-        table_count(
-            &fixture.fact_path,
-            "unpublished_fact_batches",
-            &fixture.project_a
-        ),
-        0
-    );
-    assert_eq!(
-        table_count(
-            &fixture.fact_path,
-            "unpublished_fact_batches",
-            &fixture.project_b
-        ),
-        1
-    );
-    let objects =
-        EncryptedFilesystemObjectStore::open(&fixture.object_root, KEY, object_quota(), true)
-            .unwrap();
-    assert!(matches!(
-        objects.read_verified(&fixture.object_a),
-        Err(ObjectStoreError::ObjectUnavailable)
-    ));
-    assert_eq!(objects.read_verified(&fixture.object_b).unwrap(), SOURCE);
-    drop(objects);
-
-    let object_database = fixture.object_root.join("object-store.db");
-    for path in [
-        fixture.control_path.as_path(),
-        fixture.fact_path.as_path(),
-        object_database.as_path(),
-    ] {
-        assert_eq!(
-            table_count(path, "project_deletion_tombstones", &fixture.project_a),
-            1
-        );
-        assert_eq!(
-            table_count(path, "project_deletion_tombstones", &fixture.project_b),
-            0
-        );
-    }
-
-    let mut objects =
-        EncryptedFilesystemObjectStore::open(&fixture.object_root, KEY, object_quota(), true)
-            .unwrap();
-    assert!(matches!(
-        objects.put_verified(
-            &fixture.project_a,
-            &digest_bytes(b"new source after deletion"),
-            b"new source after deletion",
-        ),
-        Err(ObjectStoreError::ProjectDeleted)
-    ));
-    let mut facts = SqliteFactBatchStore::open_uncoordinated_for_test(
-        &fixture.fact_path,
-        KEY,
-        fact_quota(),
-        true,
-    )
-    .unwrap();
-    assert!(matches!(
-        facts.put(
-            &batch(&fixture.graph_job_a, "after-deletion"),
-            &fact_authority(),
-            fact_write_deadline(),
-        ),
-        Err(FactStoreError::ProjectDeleted)
-    ));
-
-    let repeated = full_request(&fixture.project_a, "delete-a-retry", "delete-a-retry");
-    let repeated = fixture
-        .maintenance
-        .delete(&administrator(&fixture.project_a), &repeated, Utc::now())
-        .unwrap();
-    assert_eq!(repeated.deletion_id, result.deletion_id);
-    assert_eq!(repeated.counters, result.counters);
-    assert_eq!(repeated.audit_event_id, result.audit_event_id);
-
-    let repository_scoped_admin = AuthorizationContext::for_class(
-        PrincipalId::new("repository-administrator").unwrap(),
-        CredentialId::new("repository-admin-credential").unwrap(),
-        CredentialClass::TenantAdministrator,
-        AuthorizationScope::Repository(fixture.repository_a.clone()),
-    );
-    assert!(
-        fixture
-            .maintenance
-            .inspect_deletion(
-                &repository_scoped_admin,
-                &InspectRemoteDeletionRequest {
-                    protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
-                    request_id: RequestId::new("inspect-wrong-target").unwrap(),
-                    deletion_id: result.deletion_id.clone(),
-                    target: DeletionTarget::Repository(fixture.repository_a.clone()),
-                },
-            )
-            .unwrap()
-            .is_none()
-    );
-
-    let audit: Vec<u8> = Connection::open(&fixture.control_path)
-        .unwrap()
-        .query_row(
-            "SELECT record_json FROM remote_audit_records
-             WHERE tenant_id = ?1 AND project_id = ?2",
-            params![
-                fixture.project_a.tenant_id.as_str(),
-                fixture.project_a.project_id.as_str()
-            ],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let audit = String::from_utf8(audit).unwrap();
-    assert!(!audit.contains("same private source"));
-    assert!(!audit.contains("/Users/"));
-    assert!(!audit.contains("access_token"));
-}
-
-#[test]
-fn authorization_precedes_validation_and_foreign_lookup() {
-    let mut fixture = fixture();
-    let query_agent = AuthorizationContext::for_class(
-        PrincipalId::new("query-agent").unwrap(),
-        CredentialId::new("query-credential").unwrap(),
-        CredentialClass::QueryAgent,
-        AuthorizationScope::Project(fixture.project_a.clone()),
-    );
-    let mut request = full_request(&fixture.project_b, "delete-b", "foreign-delete");
-    request.protocol_version += 1;
-    let error = fixture
-        .maintenance
-        .delete(&query_agent, &request, Utc::now())
-        .unwrap_err();
-    assert_eq!(error.code, RemoteErrorCode::Unauthorized);
-    assert!(!error.retryable);
-    assert_eq!(
-        table_count(
-            &fixture.control_path,
-            "distributed_index_jobs",
-            &fixture.project_b
-        ),
-        2
-    );
-}
-
-#[test]
-fn failed_cross_store_deletion_resumes_without_losing_progress() {
-    let mut fixture = fixture();
-    let saved_facts = fixture.directory.path().join("facts.saved");
-    fs::rename(&fixture.fact_path, &saved_facts).unwrap();
-    let request = full_request(&fixture.project_a, "delete-resume", "delete-resume-first");
-    let error = fixture
-        .maintenance
-        .delete(&administrator(&fixture.project_a), &request, Utc::now())
-        .unwrap_err();
-    assert_eq!(error.code, RemoteErrorCode::TemporarilyUnavailable);
-    assert!(error.retryable);
-    let inspected = fixture
-        .maintenance
-        .inspect_deletion(
-            &administrator(&fixture.project_a),
-            &InspectRemoteDeletionRequest {
-                protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
-                request_id: RequestId::new("inspect-failed").unwrap(),
-                deletion_id: request.deletion.deletion_id.clone(),
-                target: request.deletion.target.clone(),
-            },
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(inspected.state, DeletionState::Failed);
-    assert_eq!(inspected.counters.get(&AuditCounter::Objects), Some(&1));
-
-    fs::rename(&saved_facts, &fixture.fact_path).unwrap();
-    let completed = fixture
-        .maintenance
-        .delete(&administrator(&fixture.project_a), &request, Utc::now())
-        .unwrap();
-    assert_eq!(completed.state, DeletionState::Complete);
-    assert_eq!(completed.counters.get(&AuditCounter::Objects), Some(&1));
-    assert_eq!(completed.counters.get(&AuditCounter::FactBatches), Some(&1));
-    assert_eq!(
-        table_count(
-            &fixture.control_path,
-            "distributed_index_jobs",
-            &fixture.project_b
-        ),
-        2
-    );
-}
-
 fn job_count_for_kind(path: &Path, project: &RemoteProjectRef, kind: &str) -> u64 {
     let count = Connection::open(path)
         .unwrap()
@@ -758,28 +534,6 @@ fn partial_repository_request(
         )
         .unwrap(),
     }
-}
-
-#[test]
-fn partial_project_deletion_quiesces_writers_until_completion() {
-    let fixture = fixture();
-    let request = partial_project_request(
-        &fixture.project_a,
-        "quiesce-partial-project",
-        RetentionClass::PublishedGraphSnapshot,
-    );
-    assert_deletion_quiesces_writers(fixture, request, "partial-project");
-}
-
-#[test]
-fn repository_deletion_quiesces_writers_until_completion() {
-    let fixture = fixture();
-    let request = partial_repository_request(
-        &fixture.repository_a,
-        "quiesce-repository",
-        RetentionClass::PublishedGraphSnapshot,
-    );
-    assert_deletion_quiesces_writers(fixture, request, "repository");
 }
 
 fn assert_deletion_quiesces_writers(
@@ -838,69 +592,97 @@ fn assert_deletion_quiesces_writers(
     coordinator.submit(&submit, Utc::now()).unwrap();
 }
 
+#[path = "maintenance_sqlite_tests/authorization.rs"]
+mod authorization_tests;
+
+#[path = "maintenance_sqlite_tests/memory.rs"]
+mod memory_tests;
+
 #[test]
-fn graph_only_project_deletion_preserves_memory_job_linkage() {
-    let mut fixture = fixture();
+fn partial_project_deletion_quiesces_writers_until_completion() {
+    let fixture = fixture();
     let request = partial_project_request(
         &fixture.project_a,
-        "delete-only-graph",
+        "quiesce-partial-project",
         RetentionClass::PublishedGraphSnapshot,
     );
-    let result = fixture
+    assert_deletion_quiesces_writers(fixture, request, "partial-project");
+}
+
+#[test]
+fn repository_deletion_quiesces_writers_until_completion() {
+    let fixture = fixture();
+    let request = partial_repository_request(
+        &fixture.repository_a,
+        "quiesce-repository",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    assert_deletion_quiesces_writers(fixture, request, "repository");
+}
+
+#[test]
+fn failed_cross_store_deletion_resumes_without_losing_progress() {
+    let mut fixture = fixture();
+    let saved_facts = fixture.directory.path().join("facts.saved");
+    fs::rename(&fixture.fact_path, &saved_facts).unwrap();
+    let request = full_request(&fixture.project_a, "delete-resume", "delete-resume-first");
+    let error = fixture
+        .maintenance
+        .delete(&administrator(&fixture.project_a), &request, Utc::now())
+        .unwrap_err();
+    assert_eq!(error.code, RemoteErrorCode::TemporarilyUnavailable);
+    assert!(error.retryable);
+    let inspected = fixture
+        .maintenance
+        .inspect_deletion(
+            &administrator(&fixture.project_a),
+            &InspectRemoteDeletionRequest {
+                protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
+                request_id: RequestId::new("inspect-failed").unwrap(),
+                deletion_id: request.deletion.deletion_id.clone(),
+                target: request.deletion.target.clone(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspected.state, DeletionState::Failed);
+    assert_eq!(inspected.counters.get(&AuditCounter::Objects), Some(&1));
+
+    fs::rename(&saved_facts, &fixture.fact_path).unwrap();
+    let completed = fixture
         .maintenance
         .delete(&administrator(&fixture.project_a), &request, Utc::now())
         .unwrap();
-
-    assert_eq!(result.counters.get(&AuditCounter::Snapshots), Some(&1));
-    assert_eq!(result.counters.get(&AuditCounter::Jobs), Some(&1));
-    assert_eq!(
-        job_count_for_kind(
-            &fixture.control_path,
-            &fixture.project_a,
-            "repository_graph"
-        ),
-        0
-    );
-    assert_eq!(
-        job_count_for_kind(&fixture.control_path, &fixture.project_a, "project_memory"),
-        1
-    );
-    assert!(
-        SqliteIndexJobCoordinator::open(&fixture.control_path, coordinator_limits())
-            .unwrap()
-            .inspect(&super::protocol::InspectIndexJobRequest {
-                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                request_id: RequestId::new("inspect-retained-memory-job").unwrap(),
-                job: fixture.memory_job_a.clone(),
-            })
-            .unwrap()
-            .is_some()
-    );
+    assert_eq!(completed.state, DeletionState::Complete);
+    assert_eq!(completed.counters.get(&AuditCounter::Objects), Some(&1));
+    assert_eq!(completed.counters.get(&AuditCounter::FactBatches), Some(&1));
     assert_eq!(
         table_count(
             &fixture.control_path,
-            "remote_immutable_revisions",
-            &fixture.project_a
+            "distributed_index_jobs",
+            &fixture.project_b
         ),
-        1
+        2
     );
 }
 
 #[test]
-fn memory_only_project_deletion_preserves_graph_job_linkage() {
+fn repository_job_mapping_survives_until_snapshot_coverage_completes() {
     let mut fixture = fixture();
-    let request = partial_project_request(
-        &fixture.project_a,
-        "delete-only-memory",
-        RetentionClass::PublishedMemoryRevision,
+    let fact_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-facts-first",
+        RetentionClass::UnpublishedFact,
     );
-    let result = fixture
+    fixture
         .maintenance
-        .delete(&administrator(&fixture.project_a), &request, Utc::now())
+        .delete(
+            &administrator(&fixture.project_a),
+            &fact_request,
+            Utc::now(),
+        )
         .unwrap();
 
-    assert_eq!(result.counters.get(&AuditCounter::Revisions), Some(&1));
-    assert_eq!(result.counters.get(&AuditCounter::Jobs), Some(&1));
     assert_eq!(
         job_count_for_kind(
             &fixture.control_path,
@@ -910,27 +692,40 @@ fn memory_only_project_deletion_preserves_graph_job_linkage() {
         1
     );
     assert_eq!(
-        job_count_for_kind(&fixture.control_path, &fixture.project_a, "project_memory"),
-        0
-    );
-    assert!(
-        SqliteIndexJobCoordinator::open(&fixture.control_path, coordinator_limits())
-            .unwrap()
-            .inspect(&super::protocol::InspectIndexJobRequest {
-                protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                request_id: RequestId::new("inspect-retained-graph-job").unwrap(),
-                job: fixture.graph_job_a.clone(),
-            })
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
         table_count(
-            &fixture.control_path,
-            "remote_immutable_revisions",
+            &fixture.fact_path,
+            "unpublished_fact_batches",
             &fixture.project_a
         ),
-        1
+        0
+    );
+
+    let snapshot_request = partial_repository_request(
+        &fixture.repository_a,
+        "delete-repository-snapshot-second",
+        RetentionClass::PublishedGraphSnapshot,
+    );
+    let snapshot_result = fixture
+        .maintenance
+        .delete(
+            &administrator(&fixture.project_a),
+            &snapshot_request,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        snapshot_result.counters.get(&AuditCounter::Snapshots),
+        Some(&1)
+    );
+    assert_eq!(snapshot_result.counters.get(&AuditCounter::Jobs), Some(&1));
+    assert_eq!(
+        job_count_for_kind(
+            &fixture.control_path,
+            &fixture.project_a,
+            "repository_graph"
+        ),
+        0
     );
 }
 
@@ -1007,140 +802,5 @@ fn repository_job_mapping_survives_until_separate_fact_coverage_completes() {
             &fixture.project_a
         ),
         0
-    );
-}
-
-#[test]
-fn repository_job_mapping_survives_until_snapshot_coverage_completes() {
-    let mut fixture = fixture();
-    let fact_request = partial_repository_request(
-        &fixture.repository_a,
-        "delete-repository-facts-first",
-        RetentionClass::UnpublishedFact,
-    );
-    fixture
-        .maintenance
-        .delete(
-            &administrator(&fixture.project_a),
-            &fact_request,
-            Utc::now(),
-        )
-        .unwrap();
-
-    assert_eq!(
-        job_count_for_kind(
-            &fixture.control_path,
-            &fixture.project_a,
-            "repository_graph"
-        ),
-        1
-    );
-    assert_eq!(
-        table_count(
-            &fixture.fact_path,
-            "unpublished_fact_batches",
-            &fixture.project_a
-        ),
-        0
-    );
-
-    let snapshot_request = partial_repository_request(
-        &fixture.repository_a,
-        "delete-repository-snapshot-second",
-        RetentionClass::PublishedGraphSnapshot,
-    );
-    let snapshot_result = fixture
-        .maintenance
-        .delete(
-            &administrator(&fixture.project_a),
-            &snapshot_request,
-            Utc::now(),
-        )
-        .unwrap();
-
-    assert_eq!(
-        snapshot_result.counters.get(&AuditCounter::Snapshots),
-        Some(&1)
-    );
-    assert_eq!(snapshot_result.counters.get(&AuditCounter::Jobs), Some(&1));
-    assert_eq!(
-        job_count_for_kind(
-            &fixture.control_path,
-            &fixture.project_a,
-            "repository_graph"
-        ),
-        0
-    );
-}
-
-#[test]
-fn repository_deletion_preserves_memory_and_shared_source_objects() {
-    let mut fixture = fixture();
-    let request = RemoteDeleteRequest {
-        protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
-        request_id: RequestId::new("delete-repository").unwrap(),
-        deletion: DeleteDataRequest::new(
-            DeletionId::new("delete-repository").unwrap(),
-            DeletionTarget::Repository(fixture.repository_a.clone()),
-            BTreeSet::from([
-                RetentionClass::UnpublishedFact,
-                RetentionClass::PublishedGraphSnapshot,
-                RetentionClass::QueryCache,
-                RetentionClass::AuditRecord,
-            ]),
-            Utc::now(),
-        )
-        .unwrap(),
-    };
-    fixture
-        .maintenance
-        .delete(&administrator(&fixture.project_a), &request, Utc::now())
-        .unwrap();
-    let connection = Connection::open(&fixture.control_path).unwrap();
-    let domain_count = |domain: &str| -> u64 {
-        let count = connection
-            .query_row(
-                "SELECT COUNT(*) FROM remote_immutable_revisions
-                 WHERE tenant_id = ?1 AND project_id = ?2 AND domain = ?3",
-                params![
-                    fixture.project_a.tenant_id.as_str(),
-                    fixture.project_a.project_id.as_str(),
-                    domain
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap();
-        u64::try_from(count).unwrap()
-    };
-    assert_eq!(domain_count("repository_graph"), 0);
-    assert_eq!(domain_count("project_memory"), 1);
-    let objects =
-        EncryptedFilesystemObjectStore::open(&fixture.object_root, KEY, object_quota(), true)
-            .unwrap();
-    assert_eq!(objects.read_verified(&fixture.object_a).unwrap(), SOURCE);
-    drop(objects);
-
-    let unsafe_request = RemoteDeleteRequest {
-        protocol_version: DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION,
-        request_id: RequestId::new("delete-repository-source").unwrap(),
-        deletion: DeleteDataRequest::new(
-            DeletionId::new("delete-repository-source").unwrap(),
-            DeletionTarget::Repository(fixture.repository_a.clone()),
-            RetentionClass::ALL.into_iter().collect(),
-            Utc::now(),
-        )
-        .unwrap(),
-    };
-    assert_eq!(
-        fixture
-            .maintenance
-            .delete(
-                &administrator(&fixture.project_a),
-                &unsafe_request,
-                Utc::now()
-            )
-            .unwrap_err()
-            .code,
-        RemoteErrorCode::InvalidRequest
     );
 }

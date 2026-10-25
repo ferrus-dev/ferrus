@@ -187,6 +187,7 @@ impl SqliteRemoteQueryApi {
                         .relationships
                         .dedup_by(|left, right| left.id == right.id);
                 }
+
                 LoadedTarget {
                     graph: Some(graph),
                     memory: Some(memory),
@@ -290,6 +291,7 @@ impl SqliteRemoteQueryApi {
                 if depth_limited && page.truncation.is_none() {
                     page.truncation = Some(RemoteTruncationReason::Depth);
                 }
+
                 let mut data = RemoteNeighborhoodData {
                     nodes: Vec::new(),
                     edges: Vec::new(),
@@ -300,6 +302,7 @@ impl SqliteRemoteQueryApi {
                         GraphUnit::Edge(edge) => data.edges.push(edge),
                     }
                 }
+
                 (RemoteQueryData::Neighborhood(data), page)
             }
             RemoteQueryOperation::Context {
@@ -336,6 +339,7 @@ impl SqliteRemoteQueryApi {
                 if depth_limited && page.truncation.is_none() {
                     page.truncation = Some(RemoteTruncationReason::Depth);
                 }
+
                 let mut data = RemoteContextData {
                     graph_nodes: Vec::new(),
                     graph_edges: Vec::new(),
@@ -353,6 +357,7 @@ impl SqliteRemoteQueryApi {
                         }
                     }
                 }
+
                 if *include_snippets {
                     data.snippets = self.snippets(
                         &request.request_id,
@@ -363,6 +368,7 @@ impl SqliteRemoteQueryApi {
                         duration,
                     )?;
                 }
+
                 (RemoteQueryData::Context(Box::new(data)), page)
             }
         };
@@ -384,6 +390,7 @@ impl SqliteRemoteQueryApi {
         if started.elapsed() >= duration {
             return Err(query_budget(&request.request_id));
         }
+
         Ok(result)
     }
 
@@ -409,6 +416,7 @@ impl SqliteRemoteQueryApi {
                 if started.elapsed() >= duration || remaining == 0 {
                     break;
                 }
+
                 let Some(evidence) = node.provenance.evidence.as_ref() else {
                     continue;
                 };
@@ -417,6 +425,7 @@ impl SqliteRemoteQueryApi {
                 if !seen.insert(key) {
                     continue;
                 }
+
                 let Some(descriptor) = manifest.body.files.iter().find(|file| {
                     file.path == evidence.path && file.content_identity == evidence.content_identity
                 }) else {
@@ -443,6 +452,7 @@ impl SqliteRemoteQueryApi {
                 });
             }
         }
+
         if let Some(revision) = &loaded.memory {
             ensure_query_deadline(request_id, deadline)?;
             let manifest = self.memory_manifest(request_id, revision, deadline)?;
@@ -450,6 +460,7 @@ impl SqliteRemoteQueryApi {
                 if started.elapsed() >= duration || remaining == 0 {
                     break;
                 }
+
                 let Some(descriptor) = manifest.body.sources.iter().find(|source| {
                     source.category == entity.provenance.source_category
                         && source.locator == entity.provenance.source_locator
@@ -486,6 +497,7 @@ impl SqliteRemoteQueryApi {
                 });
             }
         }
+
         Ok(snippets)
     }
 
@@ -553,8 +565,7 @@ impl SqliteRemoteQueryApi {
             .inspect_bounded(
                 &InspectIndexJobRequest {
                     protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
-                    request_id: RequestId::new("query-manifest")
-                        .expect("static request id is valid"),
+                    request_id: const { RequestId::from_static("query-manifest") },
                     job: job.clone(),
                 },
                 deadline,
@@ -590,6 +601,7 @@ impl RemoteSnapshotQueryApi for SqliteRemoteQueryApi {
         if !request.body.validate() {
             return Err(query_invalid(&request.request_id));
         }
+
         let started = Instant::now();
         let budget = self.limits.clamp(request.body.budget);
         let duration = Duration::from_millis(budget.max_duration_ms.get());

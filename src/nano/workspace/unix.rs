@@ -28,7 +28,7 @@ pub(super) fn patch_name_key(name: &str) -> String {
 }
 
 pub(super) fn root(path: &Path) -> io::Result<File> {
-    let root = CString::new("/").unwrap();
+    let root = c"/";
     // SAFETY: root is NUL-terminated; returned descriptor is owned below.
     let fd = unsafe {
         libc::open(
@@ -98,6 +98,7 @@ pub(super) fn regular(file: &File) -> io::Result<()> {
     if !metadata.is_file() || metadata.nlink() != 1 {
         return Err(unsafe_file());
     }
+
     Ok(())
 }
 
@@ -151,6 +152,7 @@ pub(super) fn delete(parent: &File, value: &str) -> io::Result<()> {
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+
     Ok(())
 }
 

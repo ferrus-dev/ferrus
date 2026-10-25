@@ -79,6 +79,7 @@ fn nested_runtime_metadata_and_case_variants_are_excluded() {
     for relative in ["nested/.git", "nested/.FERRUS"] {
         fs::create_dir_all(directory.path().join(relative)).unwrap();
     }
+
     fs::write(directory.path().join("nested/.git/config"), b"metadata\n").unwrap();
     fs::write(directory.path().join("nested/.FERRUS/state"), b"runtime\n").unwrap();
     fs::write(directory.path().join(".ENV"), b"TOKEN=secret\n").unwrap();
@@ -221,6 +222,7 @@ fn include_filters_prune_unmatchable_trees_before_hard_limits() {
         )
         .unwrap();
     }
+
     let mut config = RepositoryGraphConfig::default();
     config.source.include = BTreeSet::from(["src/**".to_string()]);
     config.index_limits.max_files = 1;

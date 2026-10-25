@@ -29,5 +29,6 @@ async fn list(limit: usize, run_id: Option<String>) -> Result<()> {
     for line in runtime_table::event_lines(&events, run_id.as_deref()) {
         println!("{line}");
     }
+
     Ok(())
 }

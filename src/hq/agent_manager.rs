@@ -295,6 +295,7 @@ pub async fn kill_role(role: &str) -> Result<()> {
         e.pid = None;
         e.status = AgentStatus::Suspended;
     }
+
     write_agents(&reg).await?;
     Ok(())
 }
@@ -302,27 +303,35 @@ pub async fn kill_role(role: &str) -> Result<()> {
 pub fn executor_prompt() -> &'static str {
     EXECUTOR_PROMPT
 }
+
 pub fn consultant_prompt() -> &'static str {
     CONSULTANT_PROMPT
 }
+
 pub fn reviewer_prompt() -> &'static str {
     REVIEWER_PROMPT
 }
+
 pub fn executor_wait_for_answer_prompt() -> &'static str {
     EXECUTOR_WAIT_FOR_ANSWER_PROMPT
 }
+
 pub fn executor_wait_for_consult_prompt() -> &'static str {
     EXECUTOR_WAIT_FOR_CONSULT_PROMPT
 }
+
 pub fn supervisor_wait_for_answer_prompt() -> &'static str {
     SUPERVISOR_WAIT_FOR_ANSWER_PROMPT
 }
+
 pub fn supervisor_plan_prompt() -> &'static str {
     SUPERVISOR_PLAN_PROMPT
 }
+
 pub fn supervisor_task_prompt() -> &'static str {
     SUPERVISOR_TASK_PROMPT
 }
+
 pub fn supervisor_task_prompt_for_milestone(context: &str) -> String {
     format!(
         "{SUPERVISOR_TASK_PROMPT}\nSpec milestone context:\n\n{context}\n\n\
@@ -332,15 +341,18 @@ pub fn supervisor_task_prompt_for_milestone(context: &str) -> String {
          Pass the exact spec_path and milestone_id from this context to /enqueue_task."
     )
 }
+
 pub fn supervisor_batch_task_prompt(context: &str, task_count: usize) -> String {
     format!(
         "{SUPERVISOR_BATCH_TASK_PROMPT}\nHQ selected exactly {task_count} milestone(s) for this batch.\n\n{context}\n\n\
          Prepare exactly {task_count} approved queued task(s). Use /enqueue_task, not /create_task."
     )
 }
+
 pub fn supervisor_spec_prompt() -> &'static str {
     SUPERVISOR_SPEC_PROMPT
 }
+
 pub fn supervisor_archive_spec_prompt(context: &str) -> String {
     format!("{SUPERVISOR_ARCHIVE_SPEC_PROMPT}\nSpec archive context:\n\n{context}")
 }
@@ -383,14 +395,17 @@ impl HeadlessHandle {
         if terminate && let Some(control) = &self.native_control {
             control.cancel();
         }
+
         if terminate && self.native_control.is_some() && self.is_alive() {
             for _ in 0..20 {
                 if !self.is_alive() {
                     break;
                 }
+
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+
         if terminate && self.is_alive() {
             self.send_signal(ShutdownSignal::Terminate);
             std::thread::sleep(Duration::from_millis(250));
@@ -404,6 +419,7 @@ impl HeadlessHandle {
         if let Some(wait_thread) = self.wait_thread.take() {
             let _ = wait_thread.join();
         }
+
         for output_thread in self.output_threads.drain(..) {
             let _ = output_thread.join();
         }
@@ -474,6 +490,7 @@ pub(super) async fn spawn_native_interactive_executor_with_env(
             .env_remove(ENV_TASK_ID)
             .env_remove(ENV_BASELINE_TREE);
     }
+
     spawn_headless(HeadlessSpawn {
         agent_type: agent.name(),
         command,
@@ -572,6 +589,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                 .to_string(),
         ));
     }
+
     let workspace_path = match request
         .workspace
         .as_ref()
@@ -645,12 +663,15 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     if request.debug {
         append_debug_agent_flags(request.agent_type, &mut request.command);
     }
+
     for (key, value) in request.env {
         request.command.env(key, value);
     }
+
     if let Some(workspace) = request.workspace.as_ref() {
         request.command.current_dir(&workspace.workspace_dir);
     }
+
     let command_summary = format_command(&request.command);
 
     let logger = if request.debug && !native {
@@ -695,11 +716,14 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     })?;
     let mut child = SetupChild(Some(child));
     if request.prompt_transport == HeadlessPromptTransport::Stdin {
-        stream_prompt_to_stdin(&mut child, request.prompt)
-            .context("Failed to stream initial prompt")?;
+        stream_prompt_to_stdin(
+            child.0.as_mut().context("Missing owned child")?,
+            request.prompt,
+        )
+        .context("Failed to stream initial prompt")?;
     }
 
-    let pid = child.id();
+    let pid = child.0.as_ref().context("Missing owned child")?.id();
     let db_run_id = crate::project::record_run_started_for_task_with_id_best_effort(
         &run_id,
         request.role,
@@ -720,6 +744,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     if (native || executor_reservation.is_some()) && db_run_id.is_none() {
         anyhow::bail!("Native agent requires a persisted run before start");
     }
+
     let mut output_threads = Vec::new();
     let setup = async {
         let platform_guard = match platform::attach_headless_process(pid) {
@@ -740,7 +765,9 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         let mut native_ready = None;
 
         if let Some(logger) = logger.as_ref() {
-            let mut logger = logger.lock().expect("logger poisoned");
+            let mut logger = logger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             logger.log_event(
                 "Started",
                 format!(
@@ -753,7 +780,13 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         }
 
         if let Some(logger) = logger.as_ref() {
-            if let Some(stdout) = child.stdout.take() {
+            if let Some(stdout) = child
+                .0
+                .as_mut()
+                .context("Missing owned child")?
+                .stdout
+                .take()
+            {
                 if native {
                     let (thread, ready, events) =
                         spawn_native_log_reader(stdout, Arc::clone(logger), pid);
@@ -764,7 +797,14 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                     output_threads.push(spawn_slim_log_reader(stdout, Arc::clone(logger)));
                 }
             }
-            if let Some(stderr) = child.stderr.take() {
+
+            if let Some(stderr) = child
+                .0
+                .as_mut()
+                .context("Missing owned child")?
+                .stderr
+                .take()
+            {
                 if native {
                     let logger = Arc::clone(logger);
                     output_threads.push(std::thread::spawn(move || {
@@ -774,12 +814,16 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                             if line.len() > remaining {
                                 break;
                             }
+
                             remaining -= line.len();
                             let text: String = String::from_utf8_lossy(&line)
                                 .chars()
                                 .filter(|ch| !ch.is_control())
                                 .collect();
-                            let _ = logger.lock().unwrap().log_event("Nano diagnostic", text);
+                            let _ = logger
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .log_event("Nano diagnostic", text);
                         }
                     }));
                 } else {
@@ -796,7 +840,14 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                     log_path.display()
                 );
             }
-            let stdin = child.stdin.take().context("Missing nano command pipe")?;
+
+            let stdin = child
+                .0
+                .as_mut()
+                .context("Missing owned child")?
+                .stdin
+                .take()
+                .context("Missing nano command pipe")?;
             native_stdin = Some(stdin);
         }
 
@@ -814,6 +865,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
         if let Some(stdin) = &mut native_stdin {
             crate::nano::wire::write_command(stdin, crate::nano::wire::CommandKind::Start)?;
         }
+
         Ok::<_, anyhow::Error>((platform_guard, native_stdin, native_events))
     }
     .await;
@@ -824,6 +876,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
             for thread in output_threads {
                 let _ = thread.join();
             }
+
             // Registration may have succeeded before the start command failed.
             if let Ok(mut reg) = read_agents().await
                 && let Some(entry) = reg.by_name_mut(request.name)
@@ -833,9 +886,11 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                 entry.status = AgentStatus::Suspended;
                 let _ = write_agents(&reg).await;
             }
+
             if let Some(run) = &db_run_id {
                 crate::project::record_run_finished_best_effort(run, -1).await;
             }
+
             return Err(error);
         }
     };
@@ -844,15 +899,19 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
     if let Some(reservation) = &mut executor_reservation {
         reservation.started();
     }
-    let mut child = child.0.take().expect("owned child");
+
+    let mut child = child.0.take().context("Missing owned child")?;
     let wait_logger = logger.clone();
     let wait_thread = std::thread::spawn(move || {
         let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
         if let Some(logger) = wait_logger {
-            let mut logger = logger.lock().expect("logger poisoned");
+            let mut logger = logger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             logger.flush_pending_error();
             let _ = logger.log_event("Finished", format!("exit code {code}"));
         }
+
         let _ = exit_tx.send(Some(code));
     });
     let name_owned = request.name.to_string();
@@ -870,6 +929,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
                 e.pid = None;
                 e.status = AgentStatus::Suspended;
             }
+
             let _ = write_agents(&reg).await;
         }
 
@@ -896,17 +956,7 @@ async fn spawn_headless(mut request: HeadlessSpawn<'_>) -> Result<HeadlessHandle
 
 // Errors during setup must not leave a child running without a handle.
 struct SetupChild(Option<std::process::Child>);
-impl std::ops::Deref for SetupChild {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
-    }
-}
-impl std::ops::DerefMut for SetupChild {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().unwrap()
-    }
-}
+
 impl Drop for SetupChild {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
@@ -917,462 +967,9 @@ impl Drop for SetupChild {
     }
 }
 
-fn spawn_native_log_reader(
-    stdout: std::process::ChildStdout,
-    logger: Arc<Mutex<SlimLogger>>,
-    pid: u32,
-) -> (
-    std::thread::JoinHandle<()>,
-    tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::watch::Receiver<crate::nano::wire::ObservedEvents>,
-) {
-    use crate::nano::wire::{self, Event};
-    let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    let (events_tx, events) = tokio::sync::watch::channel(wire::ObservedEvents::default());
-    let thread = std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut ready_tx = Some(ready_tx);
-        loop {
-            match wire::read_event(&mut reader) {
-                Ok(Some(Event::Ready)) if ready_tx.is_some() => {
-                    let _ = ready_tx.take().unwrap().send(());
-                }
-                Ok(Some(event)) if ready_tx.is_none() && !matches!(event, Event::Ready) => {
-                    if !matches!(event, Event::Text { .. }) {
-                        let _ = logger.lock().unwrap().log_event("Nano", event.summary());
-                    }
-                    // Fast tool results and the following model turn must not overwrite
-                    // the useful activity before HQ's slower scheduler tick consumes it.
-                    if event.show_in_hq() || matches!(event, Event::Text { .. }) {
-                        events_tx.send_modify(|state| state.observe(event));
-                    }
-                }
-                Ok(None) => break,
-                _ => {
-                    let _ = logger
-                        .lock()
-                        .unwrap()
-                        .log_event("Nano error", "invalid event stream");
-                    platform::signal_process_group(pid, ShutdownSignal::Kill);
-                    break;
-                }
-            }
-        }
-    });
-    (thread, ready, events)
-}
-
-fn headless_log_path(
-    log_dir: &std::path::Path,
-    role: &str,
-    task_id: Option<&str>,
-    run_id: &str,
-    timestamp: &str,
-) -> PathBuf {
-    let scope = task_id.unwrap_or("session");
-    log_dir.join(format!(
-        "{}_{}_{}_{}.log",
-        sanitize_log_component(role),
-        sanitize_log_component(scope),
-        sanitize_log_component(timestamp),
-        sanitize_log_component(run_id),
-    ))
-}
-
-fn sanitize_log_component(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn stream_prompt_to_stdin(child: &mut std::process::Child, prompt: &str) -> Result<()> {
-    use std::io::Write as _;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdin pipe is unavailable"))?;
-    stdin
-        .write_all(prompt.as_bytes())
-        .context("failed writing prompt to stdin")?;
-    drop(stdin);
-    Ok(())
-}
-
-fn append_debug_agent_flags(agent_type: &str, command: &mut StdCommand) {
-    match agent_type {
-        "claude-code" => {
-            command.arg("--verbose");
-        }
-        // `codex --help` and `codex exec --help` expose no verbose/debug flag.
-        "codex" => {}
-        _ => {}
-    }
-}
-
-fn format_command(command: &StdCommand) -> String {
-    let program = command.get_program().to_string_lossy();
-    let args = command
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    format!("command={program} args={args:?}")
-}
-
-fn spawn_slim_log_reader<R>(
-    reader: R,
-    logger: Arc<Mutex<SlimLogger>>,
-) -> std::thread::JoinHandle<()>
-where
-    R: std::io::Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut logger = logger.lock().expect("logger poisoned");
-            let _ = logger.handle_agent_output(&line);
-        }
-    })
-}
-
-struct SlimLogger {
-    file: File,
-    pending_failed_tool: Option<String>,
-}
-
-impl SlimLogger {
-    fn new(file: File) -> Self {
-        Self {
-            file,
-            pending_failed_tool: None,
-        }
-    }
-
-    fn handle_agent_output(&mut self, line: &str) -> std::io::Result<()> {
-        if let Some((tool, status)) = parse_mcp_tool_status(line) {
-            self.flush_pending_error();
-            match status {
-                ToolCallStatus::Started => {}
-                ToolCallStatus::Completed => {
-                    self.log_event("MCP tool call", format!("{tool} - ok"))?;
-                }
-                ToolCallStatus::Failed => {
-                    self.pending_failed_tool = Some(tool);
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(tool) = self.pending_failed_tool.take() {
-            return self.log_event("MCP tool call", format!("{tool} - error: {line}"));
-        }
-
-        Ok(())
-    }
-
-    fn log_initial_prompt(&mut self, prompt: &str) -> std::io::Result<()> {
-        if prompt.trim().is_empty() {
-            return self.log_event("Initial prompt", "(empty)");
-        }
-
-        for line in prompt.lines() {
-            self.log_event("Initial prompt", line)?;
-        }
-        Ok(())
-    }
-
-    fn flush_pending_error(&mut self) {
-        if let Some(tool) = self.pending_failed_tool.take() {
-            let _ = self.log_event("MCP tool call", format!("{tool} - error"));
-        }
-    }
-
-    fn log_event(&mut self, label: &str, value: impl AsRef<str>) -> std::io::Result<()> {
-        writeln!(
-            self.file,
-            "{} {label}: {}",
-            chrono::Utc::now().to_rfc3339(),
-            value.as_ref()
-        )?;
-        self.file.flush()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolCallStatus {
-    Started,
-    Completed,
-    Failed,
-}
-
-fn parse_mcp_tool_status(line: &str) -> Option<(String, ToolCallStatus)> {
-    let rest = line.strip_prefix("mcp: ")?;
-    let (tool_path, status_text) = if let Some(tool_path) = rest.strip_suffix(" started") {
-        (tool_path, ToolCallStatus::Started)
-    } else if let Some(tool_path) = rest.strip_suffix(" (completed)") {
-        (tool_path, ToolCallStatus::Completed)
-    } else {
-        let tool_path = rest.strip_suffix(" (failed)")?;
-        (tool_path, ToolCallStatus::Failed)
-    };
-
-    let tool = tool_path.rsplit('/').next()?.to_string();
-    Some((tool, status_text))
-}
+mod logging;
+use logging::*;
 
 #[cfg(test)]
-mod tests {
-    //! Session log isolation and mode-specific agent prompts.
-
-    use super::*;
-
-    #[test]
-    fn headless_log_path_includes_role_task_timestamp_and_run() {
-        let path = headless_log_path(
-            std::path::Path::new(".ferrus/logs"),
-            "executor",
-            Some("t-042"),
-            "r-1234-abcd",
-            "20260814T120000",
-        );
-
-        assert_eq!(
-            path,
-            std::path::Path::new(".ferrus/logs/executor_t-042_20260814T120000_r-1234-abcd.log")
-        );
-    }
-
-    #[test]
-    fn headless_log_paths_do_not_collide_for_parallel_tasks() {
-        let log_dir = std::path::Path::new(".ferrus/logs");
-        let first = headless_log_path(
-            log_dir,
-            "executor",
-            Some("t-001"),
-            "r-1234-first",
-            "20260814T120000",
-        );
-        let second = headless_log_path(
-            log_dir,
-            "executor",
-            Some("t-002"),
-            "r-1234-second",
-            "20260814T120000",
-        );
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn headless_log_paths_do_not_collide_for_repeated_task_dispatches() {
-        let log_dir = std::path::Path::new(".ferrus/logs");
-        let first = headless_log_path(
-            log_dir,
-            "executor",
-            Some("t-001"),
-            "r-1234-first",
-            "20260814T120000",
-        );
-        let second = headless_log_path(
-            log_dir,
-            "executor",
-            Some("t-001"),
-            "r-1234-second",
-            "20260814T120000",
-        );
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn headless_log_path_uses_sanitized_session_scope_without_task() {
-        let path = headless_log_path(
-            std::path::Path::new(".ferrus/logs"),
-            "review/supervisor",
-            None,
-            "run:id",
-            "2026-08-14T12:00:00",
-        );
-
-        assert_eq!(
-            path,
-            std::path::Path::new(
-                ".ferrus/logs/review_supervisor_session_2026-08-14T12_00_00_run_id.log"
-            )
-        );
-    }
-
-    #[test]
-    fn supervisor_task_prompt_names_mode() {
-        assert!(supervisor_task_prompt().contains("TASK DEFINITION"));
-    }
-
-    #[test]
-    fn supervisor_task_prompt_has_hard_rules() {
-        assert!(supervisor_task_prompt().contains("HARD RULES"));
-    }
-
-    #[test]
-    fn supervisor_task_prompt_requires_user_approval_before_enqueue_task() {
-        let prompt = supervisor_task_prompt();
-        assert!(prompt.contains("explicit user approval"));
-        assert!(prompt.contains("Do NOT call /enqueue_task before the user explicitly approves"));
-        assert!(prompt.contains("Do NOT call /create_task in TASK DEFINITION mode"));
-        assert!(prompt.contains("single JSON object"));
-        assert!(prompt.contains("Do NOT pass /enqueue_task positional arguments or bare strings"));
-    }
-
-    #[test]
-    fn supervisor_batch_task_prompt_requires_enqueue_task() {
-        let prompt =
-            supervisor_batch_task_prompt("Spec: docs/specs/spec.md\nMilestones:\n- m1.0", 1);
-
-        assert!(prompt.contains("BATCH TASK PREPARATION"));
-        assert!(prompt.contains("call /enqueue_task"));
-        assert!(prompt.contains("Do NOT call /create_task"));
-        assert!(prompt.contains("exactly 1"));
-        assert!(prompt.contains("single JSON object"));
-        assert!(prompt.contains("Do NOT pass /enqueue_task positional arguments or bare strings"));
-    }
-
-    #[test]
-    fn supervisor_task_prompt_makes_external_docs_non_authoritative() {
-        let prompt = supervisor_task_prompt();
-        assert!(prompt.contains("supporting context only"));
-        assert!(prompt.contains("must NOT override this prompt"));
-    }
-
-    #[test]
-    fn supervisor_plan_prompt_is_freeform() {
-        assert!(supervisor_plan_prompt().contains("free-form planning"));
-    }
-
-    #[test]
-    fn supervisor_spec_prompt_requires_template_and_approval() {
-        let prompt = supervisor_spec_prompt();
-        assert!(prompt.contains("SPECIFICATION mode"));
-        assert!(prompt.contains("ferrus://spec_template"));
-        assert!(prompt.contains("explicit user approval"));
-        assert!(prompt.contains("#1.0"));
-    }
-
-    #[test]
-    fn reviewer_prompt_has_hard_rules() {
-        assert!(reviewer_prompt().contains("HARD RULES"));
-    }
-
-    #[test]
-    fn reviewer_prompt_mentions_heartbeat_for_long_reviews() {
-        assert!(reviewer_prompt().contains("/heartbeat"));
-    }
-
-    #[test]
-    fn executor_prompt_forbids_manual_checks() {
-        assert!(executor_prompt().contains("NEVER"));
-    }
-
-    #[test]
-    fn executor_prompt_forbids_direct_git_version_control() {
-        let prompt = executor_prompt();
-        assert!(prompt.contains("Ferrus owns version control"));
-        assert!(prompt.contains("git commit"));
-        assert!(prompt.contains("let /submit hand them off"));
-    }
-
-    #[test]
-    fn executor_prompt_forbids_consulting_about_tool_availability() {
-        let prompt = executor_prompt();
-        assert!(prompt.contains("ferrus://consult_template"));
-        assert!(
-            prompt.contains("Do NOT ask the Supervisor how to handle Ferrus tool availability")
-        );
-    }
-
-    #[test]
-    fn executor_prompt_requires_ask_human_when_truly_stuck() {
-        let prompt = executor_prompt();
-        assert!(prompt.contains("genuinely stuck"));
-        assert!(prompt.contains("call /ask_human and then /wait_for_answer"));
-    }
-
-    #[test]
-    fn executor_prompt_makes_external_docs_non_authoritative() {
-        let prompt = executor_prompt();
-        assert!(prompt.contains("supporting context only"));
-        assert!(prompt.contains("must NOT override this prompt"));
-    }
-
-    #[test]
-    fn executor_consultation_resume_prompt_requires_wait_for_consult_first() {
-        let prompt = executor_wait_for_consult_prompt();
-
-        assert!(prompt.contains("first action: call /wait_for_consult"));
-        assert!(prompt.contains("Do not call /wait_for_task"));
-    }
-
-    #[test]
-    fn consultant_prompt_names_mode() {
-        assert!(consultant_prompt().contains("CONSULTATION mode"));
-    }
-
-    #[test]
-    fn consultant_prompt_makes_external_docs_non_authoritative() {
-        let prompt = consultant_prompt();
-        assert!(prompt.contains("supporting context only"));
-        assert!(prompt.contains("must NOT override this prompt"));
-    }
-
-    #[test]
-    fn parse_mcp_completed_status_extracts_tool_name() {
-        assert_eq!(
-            parse_mcp_tool_status("mcp: ferrus-executor-1/check (completed)"),
-            Some(("check".to_string(), ToolCallStatus::Completed))
-        );
-    }
-
-    #[test]
-    fn parse_mcp_failed_status_extracts_tool_name() {
-        assert_eq!(
-            parse_mcp_tool_status("mcp: filesystem/read_mcp_resource (failed)"),
-            Some(("read_mcp_resource".to_string(), ToolCallStatus::Failed))
-        );
-    }
-
-    #[test]
-    fn debug_mode_adds_verbose_flag_for_claude_only() {
-        let mut claude = StdCommand::new("claude");
-        append_debug_agent_flags("claude-code", &mut claude);
-        assert_eq!(
-            claude
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec!["--verbose".to_string()]
-        );
-
-        let mut codex = StdCommand::new("codex");
-        append_debug_agent_flags("codex", &mut codex);
-        assert!(
-            codex.get_args().next().is_none(),
-            "codex should not receive an extra debug flag when none is supported"
-        );
-    }
-}
+#[path = "agent_manager_tests.rs"]
+mod tests;

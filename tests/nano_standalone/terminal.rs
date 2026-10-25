@@ -15,6 +15,7 @@ struct Terminal {
     slave: File,
     output: Vec<u8>,
 }
+
 impl Terminal {
     fn start(command: &mut Command) -> Self {
         let (mut master, mut slave) = (-1, -1);
@@ -56,9 +57,11 @@ impl Terminal {
                 launch.env_remove(key);
             }
         }
+
         if let Some(directory) = command.get_current_dir() {
             launch.current_dir(directory);
         }
+
         launch
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
@@ -69,6 +72,7 @@ impl Terminal {
                 if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+
                 Ok(())
             });
         }
@@ -79,17 +83,20 @@ impl Terminal {
             output: Vec::new(),
         }
     }
+
     fn drain(&mut self) {
         let mut bytes = [0; 8192];
         while let Ok(count) = self.master.read(&mut bytes) {
             if count == 0 {
                 break;
             }
+
             if self.output.len() < 256 * 1024 {
                 self.output.extend_from_slice(&bytes[..count]);
             }
         }
     }
+
     fn resize(&self, width: u16, height: u16) {
         let window = libc::winsize {
             ws_row: height,
@@ -103,12 +110,15 @@ impl Terminal {
             0
         );
     }
+
     fn send(&mut self, text: &[u8]) {
         self.master.write_all(text).unwrap();
     }
+
     fn wait_for_display(&mut self, expected: &str) {
         self.wait_for_display_since(expected, 0);
     }
+
     fn wait_for_display_since(&mut self, expected: &str, offset: usize) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -116,6 +126,7 @@ impl Terminal {
             if String::from_utf8_lossy(&self.output[offset..]).contains(expected) {
                 return;
             }
+
             assert!(
                 self.child.try_wait().unwrap().is_none(),
                 "Nano exited before rendering {expected:?}"
@@ -127,6 +138,7 @@ impl Terminal {
             thread::sleep(Duration::from_millis(20));
         }
     }
+
     fn wait_for(&mut self, fixture: &Fixture, id: &str, predicate: impl Fn(&[Value]) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -145,6 +157,7 @@ impl Terminal {
             if predicate(&records) {
                 return;
             }
+
             assert!(
                 self.child.try_wait().unwrap().is_none(),
                 "Nano exited before expected records: {}",
@@ -157,9 +170,11 @@ impl Terminal {
             thread::sleep(Duration::from_millis(20));
         }
     }
+
     fn finish(self) {
         self.finish_status(true);
     }
+
     fn finish_status(mut self, success: bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -168,9 +183,11 @@ impl Terminal {
                 assert_eq!(status.success(), success, "{status:?}");
                 break;
             }
+
             assert!(Instant::now() < deadline, "Nano did not stop");
             thread::sleep(Duration::from_millis(20));
         }
+
         self.drain();
         let display = String::from_utf8_lossy(&self.output);
         assert!(display.contains("\x1b[?1049h"));
@@ -178,12 +195,14 @@ impl Terminal {
         assert!(display.contains("\x1b[?2004l"));
     }
 }
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
+
 fn waiting_after(records: &[Value], turns: usize) -> bool {
     records
         .iter()
@@ -373,6 +392,7 @@ fn supervisor_fixture() -> Fixture {
     fixture.store = PathBuf::from(local["data_dir"].as_str().unwrap());
     fixture
 }
+
 fn supervisor_command(fixture: &Fixture, mode: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferrus"));
     command
@@ -388,12 +408,14 @@ fn supervisor_command(fixture: &Fixture, mode: &str) -> Command {
     ] {
         command.env_remove(key);
     }
+
     command
         .args(["nano", "supervisor", "--mode", mode, "--config"])
         .arg(&fixture.config)
         .args(["--prompt", "Draft the requested approved change"]);
     command
 }
+
 fn supervisor_run(fixture: &Fixture) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -406,6 +428,7 @@ fn supervisor_run(fixture: &Fixture) -> String {
         {
             return id;
         }
+
         assert!(
             Instant::now() < deadline,
             "Supervisor did not persist its run"
@@ -413,11 +436,13 @@ fn supervisor_run(fixture: &Fixture) -> String {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
 impl Terminal {
     fn wait_for_approval(&mut self) {
         self.wait_for_display("Enter: approve");
     }
 }
+
 #[test]
 fn native_supervisor_requires_human_approval_then_returns_to_hq_after_authoring() {
     for (mode, name, arguments) in [

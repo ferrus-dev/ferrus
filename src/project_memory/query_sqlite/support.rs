@@ -115,36 +115,68 @@ pub(super) fn memory_search_hit(entity: MemoryEntity, query: &str) -> Option<Mem
     let id = entity.id.as_str().to_lowercase();
     let title = entity_title(&entity).map(str::to_lowercase);
     let (match_kind, score, reason) = if id == query {
-        (MemorySearchMatchKind::ExactId, 1.0, "search.exactid")
+        (
+            MemorySearchMatchKind::ExactId,
+            1.0,
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.exactid",
+                )
+            },
+        )
     } else if title.as_deref() == Some(query) {
-        (MemorySearchMatchKind::ExactTitle, 0.95, "search.exacttitle")
+        (
+            MemorySearchMatchKind::ExactTitle,
+            0.95,
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.exacttitle",
+                )
+            },
+        )
     } else if title.as_ref().is_some_and(|title| title.starts_with(query)) {
         (
             MemorySearchMatchKind::TitlePrefix,
             0.85,
-            "search.titleprefix",
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.titleprefix",
+                )
+            },
         )
     } else if title.as_ref().is_some_and(|title| title.contains(query)) {
         (
             MemorySearchMatchKind::TitleContains,
             0.75,
-            "search.titlecontains",
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.titlecontains",
+                )
+            },
         )
     } else if entity_text(&entity).is_some_and(|text| text.to_lowercase().contains(query)) {
         (
             MemorySearchMatchKind::CuratedTextContains,
             0.65,
-            "search.textcontains",
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.textcontains",
+                )
+            },
         )
     } else if serde_json::to_string(&entity.provenance)
-        .expect("memory provenance is serializable")
+        .ok()?
         .to_lowercase()
         .contains(query)
     {
         (
             MemorySearchMatchKind::ProvenanceReference,
             0.55,
-            "search.provenance",
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "search.provenance",
+                )
+            },
         )
     } else {
         return None;
@@ -200,14 +232,35 @@ pub(super) fn freshness(
     };
     let mut reason_codes = Vec::new();
     if comparison.source_set_digest != revision.source_set_digest {
-        reason_codes.push(diagnostic_code("freshness.sourceschanged"));
+        reason_codes.push(diagnostic_code(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "freshness.sourceschanged",
+                )
+            },
+        ));
     }
+
     if comparison.policy_digest != revision.policy_digest {
-        reason_codes.push(diagnostic_code("freshness.policychanged"));
+        reason_codes.push(diagnostic_code(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "freshness.policychanged",
+                )
+            },
+        ));
     }
+
     if comparison.extractor_set_digest != revision.extractor_set_digest {
-        reason_codes.push(diagnostic_code("freshness.extractorschanged"));
+        reason_codes.push(diagnostic_code(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "freshness.extractorschanged",
+                )
+            },
+        ));
     }
+
     MemoryFreshnessEnvelope {
         freshness: if reason_codes.is_empty() {
             MemoryFreshness::Fresh
@@ -223,7 +276,13 @@ pub(super) fn unknown_freshness() -> MemoryFreshnessEnvelope {
     MemoryFreshnessEnvelope {
         freshness: MemoryFreshness::Unknown,
         compared_source_set_digest: None,
-        reason_codes: vec![diagnostic_code("freshness.notcompared")],
+        reason_codes: vec![diagnostic_code(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "freshness.notcompared",
+                )
+            },
+        )],
     }
 }
 
@@ -250,11 +309,17 @@ pub(super) fn validate_wire_version(version: u32) -> Result<(), MemoryQueryError
     if version == MEMORY_QUERY_WIRE_VERSION {
         Ok(())
     } else {
-        Err(invalid_request("query.wireversion"))
+        Err(invalid_request(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "query.wireversion",
+                )
+            },
+        ))
     }
 }
 
-pub(super) fn invalid_request(code: &str) -> MemoryQueryError {
+pub(super) fn invalid_request(code: MemoryDiagnosticCode) -> MemoryQueryError {
     MemoryQueryError::Backend(diagnostic_code(code))
 }
 
@@ -277,11 +342,23 @@ pub(super) fn finish_at_deadline<T>(
 pub(super) fn store_error(error: MemoryStoreError) -> MemoryQueryError {
     match error {
         MemoryStoreError::RevisionNotFound => MemoryQueryError::RevisionNotFound,
-        MemoryStoreError::RequiresRebuild => backend_error("storage.incompatible"),
+        MemoryStoreError::RequiresRebuild => backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "storage.incompatible",
+                )
+            },
+        ),
         MemoryStoreError::Database(ref error) if sqlite_budget_error(error) => {
             duration_budget_error()
         }
-        _ => backend_error("storage.unavailable"),
+        _ => backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "storage.unavailable",
+                )
+            },
+        ),
     }
 }
 
@@ -289,7 +366,13 @@ pub(super) fn sqlite_error(error: SqliteError) -> MemoryQueryError {
     if sqlite_budget_error(&error) {
         duration_budget_error()
     } else {
-        backend_error("storage.unavailable")
+        backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "storage.unavailable",
+                )
+            },
+        )
     }
 }
 
@@ -305,15 +388,23 @@ fn sqlite_budget_error(error: &SqliteError) -> bool {
 }
 
 pub(super) fn serialization_error(_: serde_json::Error) -> MemoryQueryError {
-    backend_error("storage.corrupt")
+    backend_error(
+        const {
+            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("storage.corrupt")
+        },
+    )
 }
 
-pub(super) fn backend_error(code: &str) -> MemoryQueryError {
+pub(super) fn backend_error(
+    code: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryQueryError {
     MemoryQueryError::Backend(diagnostic_code(code))
 }
 
-pub(super) fn diagnostic_code(value: &str) -> MemoryDiagnosticCode {
-    MemoryDiagnosticCode::new(value).expect("static memory diagnostic code is valid")
+pub(super) fn diagnostic_code(
+    value: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryDiagnosticCode {
+    value
 }
 
 pub(super) fn unsigned(value: i64) -> rusqlite::Result<u64> {
@@ -353,8 +444,15 @@ pub(super) fn encode_cursor(
         offset: u64::try_from(offset).unwrap_or(u64::MAX),
     };
     let bytes = serde_json::to_vec(&payload).map_err(serialization_error)?;
-    MemoryPageCursor::new(format!("cursor:{}", hex(&bytes)))
-        .map_err(|_| backend_error("query.cursor"))
+    MemoryPageCursor::new(format!("cursor:{}", hex(&bytes))).map_err(|_| {
+        backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "query.cursor",
+                )
+            },
+        )
+    })
 }
 
 pub(super) fn decode_cursor(
@@ -373,6 +471,7 @@ pub(super) fn decode_cursor(
     if encoded.len() > 4_096 || encoded.len() % 2 != 0 {
         return Err(MemoryQueryError::StaleCursor);
     }
+
     let bytes = unhex(encoded).ok_or(MemoryQueryError::StaleCursor)?;
     let payload: CursorPayload =
         serde_json::from_slice(&bytes).map_err(|_| MemoryQueryError::StaleCursor)?;
@@ -383,6 +482,7 @@ pub(super) fn decode_cursor(
     {
         return Err(MemoryQueryError::StaleCursor);
     }
+
     Ok(payload.offset)
 }
 

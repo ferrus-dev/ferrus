@@ -35,45 +35,6 @@ fn configure(f: &Fixture, commands: &[&str], retries: u32) {
     std::fs::write(f.root.join("ferrus.toml"), format!("[checks]\ncommands = {commands}\n[limits]\nmax_check_retries = {retries}\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n[lease]\nttl_secs = 30\nheartbeat_interval_secs = 1\n")).unwrap();
 }
 
-#[tokio::test]
-async fn evaluation_launch_captures_task_checks_and_prelaunch_graph_state() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let suite: serde_json::Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/nano_eval/suite.json")).unwrap();
-    let task = suite["workloads"]["local_bug_fix"]["task"]
-        .as_str()
-        .unwrap();
-    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), format!("{task}\n")).unwrap();
-    configure(&f, &["cargo test"], 3);
-
-    let disabled = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
-        .await
-        .unwrap();
-    assert_eq!(disabled["cache"], "disabled");
-    assert_eq!(
-        disabled["check_commands_sha256"],
-        crate::checks::commands_sha256(&["cargo test".into()]).unwrap()
-    );
-
-    let config = std::fs::read_to_string(f.root.join("ferrus.toml")).unwrap();
-    std::fs::write(
-        f.root.join("ferrus.toml"),
-        format!("{config}\n[repository_graph]\nenabled = true\n"),
-    )
-    .unwrap();
-    let cold = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
-        .await
-        .unwrap();
-    assert_eq!(cold["cache"], "cold");
-    assert_eq!(cold["task_sha256"], disabled["task_sha256"]);
-    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), "trivial task\n").unwrap();
-    let changed = crate::nano::capture_evaluation_launch("local_bug_fix", &f.root, TASK)
-        .await
-        .unwrap();
-    assert_ne!(changed["task_sha256"], cold["task_sha256"]);
-}
-
 fn native(
     f: &Fixture,
     session: FerrusSession,
@@ -246,6 +207,7 @@ impl Provider for Script {
         if self.stall {
             std::future::pending::<()>().await;
         }
+
         Ok(self.responses.pop_front())
     }
 }
@@ -274,1718 +236,16 @@ fn script(calls: Vec<ToolCall>) -> Script {
     }
 }
 
-#[cfg(feature = "nano-openai")]
-#[tokio::test]
-#[ignore = "requires an explicitly selected Nano journal, private config, and local loaded model"]
-async fn live_lm_studio_replays_a_stopped_request_without_executing_tools() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let config =
-        std::env::var_os("FERRUS_NANO_SMOKE_CONFIG").expect("Set FERRUS_NANO_SMOKE_CONFIG");
-    let journal =
-        std::env::var_os("FERRUS_NANO_SMOKE_JOURNAL").expect("Set FERRUS_NANO_SMOKE_JOURNAL");
-    let config = crate::nano::config::Config::load(std::path::Path::new(&config)).unwrap();
-    let (endpoint, settings) = config.validate().unwrap();
-    assert!(matches!(
-        endpoint.host_str(),
-        Some("localhost" | "127.0.0.1" | "[::1]")
-    ));
-    let bytes = std::fs::read(journal).unwrap();
-    assert!(bytes.len() <= 16 * 1024 * 1024);
-    let records: Vec<Record> = bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
-    let failed = records
-        .iter()
-        .position(|record| {
-            matches!(
-                &record.event,
-                SessionEvent::ModelFailed {
-                    error: Some(ProviderErrorKind::Timeout),
-                    ..
-                }
-            ) || matches!(&record.event, SessionEvent::ModelCompleted { response, .. } if response.finish == FinishReason::Length)
-        })
-        .expect("No timed-out or length-limited request");
-    let start = records[..failed]
-        .iter()
-        .rposition(|record| matches!(record.event, SessionEvent::ModelStarted { .. }))
-        .unwrap();
-    let replay = crate::nano::replay::Replay::from_records(&records[..start]).unwrap();
-    let recorded_effort = records[..start]
-        .iter()
-        .find_map(|record| match &record.event {
-            SessionEvent::Started {
-                provider: Some(settings),
-                ..
-            } => Some(settings.reasoning_effort),
-            _ => None,
-        })
-        .expect("Missing recorded provider settings");
-    let composition = records[..start]
-        .iter()
-        .rev()
-        .find_map(|record| match &record.event {
-            SessionEvent::ContextComposed { composition } => Some(composition),
-            _ => None,
-        })
-        .unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (native, _) = native(&f, session.clone(), RUN);
-    let tools = ManagedTools::new(session, native, Cancellation::default());
-    let mut provider = crate::nano::providers::openai::OpenAi::new(config).unwrap();
-    let mut request = ModelRequest {
-        messages: replay
-            .projection
-            .unwrap_or_default()
-            .apply(&replay.messages)
-            .unwrap(),
-        tools: tools.descriptors(),
-        max_output_tokens: std::env::var("FERRUS_NANO_SMOKE_OUTPUT_TOKENS")
-            .ok()
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(composition.output_tokens_reserved),
-    };
-    let effort_bytes = |effort: Option<crate::nano::provider::ReasoningEffort>| {
-        effort.map_or(0, |effort| {
-            serde_json::to_vec(&serde_json::json!({"reasoning_effort":effort}))
-                .unwrap()
-                .len() as i64
-                - 1
-        })
-    };
-    let expected_bytes = composition.input_tokens_estimated as i64
-        + request.max_output_tokens.to_string().len() as i64
-        - composition.output_tokens_reserved.to_string().len() as i64
-        + effort_bytes(settings.reasoning_effort)
-        - effort_bytes(recorded_effort);
-    assert_eq!(
-        provider.estimate_input_tokens(&request).unwrap(),
-        expected_bytes as u64,
-        "Recorded request and current catalog/settings differ; do not treat this as an exact replay"
-    );
-    if std::env::var_os("FERRUS_NANO_SMOKE_CONTINUE_TRUNCATED").is_some() {
-        let SessionEvent::ModelCompleted { response, .. } = &records[failed].event else {
-            panic!("Continuation requires a completed length-limited response");
-        };
-        assert_eq!(response.finish, FinishReason::Length);
-        request.messages.extend(response.messages());
-        request.max_output_tokens = settings
-            .max_output_tokens
-            .unwrap_or(u64::MAX)
-            .min(settings.context_tokens.unwrap_or(u64::MAX) / 4)
-            .min(Limits::default().response_bytes as u64);
-    }
-    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_REQUEST_OUTPUT") {
-        use std::io::Write;
-        let mut file = crate::nano::private::file(std::path::Path::new(&path), true).unwrap();
-        file.write_all(&provider.body(request).unwrap()).unwrap();
-        return;
-    }
-    let start = tokio::time::Instant::now();
-    let response = tokio::time::timeout(Duration::from_secs(600), async {
-        provider.start(request).await.unwrap();
-        loop {
-            match provider
-                .next_event()
-                .await
-                .unwrap()
-                .expect("No completed response")
-            {
-                ProviderEvent::Completed { response, usage } => break (response, usage),
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("Replay exceeded its elapsed allowance");
-    println!(
-        "model={} elapsed_ms={} finish={:?} calls={:?} usage={:?}",
-        settings.model,
-        start.elapsed().as_millis(),
-        response.0.finish,
-        response
-            .0
-            .calls
-            .iter()
-            .map(|call| &call.name)
-            .collect::<Vec<_>>(),
-        response.1
-    );
-    assert_eq!(response.0.finish, FinishReason::ToolCalls);
-    assert!(!response.0.calls.is_empty());
-    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_RESPONSE_OUTPUT") {
-        use std::io::Write;
-        crate::nano::private::file(std::path::Path::new(&path), true)
-            .unwrap()
-            .write_all(&serde_json::to_vec(&response.0).unwrap())
-            .unwrap();
-    }
-    for call in response.0.calls {
-        tools
-            .validate(&call.name, &serde_json::from_str(&call.arguments).unwrap())
-            .unwrap();
-    }
-}
-
-#[cfg(feature = "nano-openai")]
-#[tokio::test]
-#[ignore = "requires a private config and a local model; executes native tools in a temporary project"]
-async fn live_lm_studio_managed_graph_edit_check_and_submit() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let path = std::env::var_os("FERRUS_NANO_SMOKE_CONFIG").expect("Set FERRUS_NANO_SMOKE_CONFIG");
-    let config = crate::nano::config::Config::load(std::path::Path::new(&path)).unwrap();
-    let (endpoint, settings) = config.validate().unwrap();
-    assert!(matches!(
-        endpoint.host_str(),
-        Some("localhost" | "127.0.0.1" | "[::1]")
-    ));
-    #[cfg(feature = "nano-mcp")]
-    assert!(
-        config.mcp_config_file.is_none(),
-        "This smoke executes only native tools"
-    );
-    let f = Fixture::new().await;
-    configure(&f, &["git diff --check"], 3);
-    // Optional copied workload. Fixed paths stay in a disposable project; never
-    // launch the agent in the original project or copy its runtime database.
-    let case = std::env::var_os("FERRUS_NANO_SMOKE_CASE_DIR").map(std::path::PathBuf::from);
-    let original_html = if let Some(case) = &case {
-        assert!(case.is_absolute());
-        for path in ["static/index.html", "docs/spec.md", "AGENTS.md"] {
-            let source = case.join(path);
-            if source.exists() {
-                assert!(std::fs::metadata(&source).unwrap().len() <= 32 * 1024);
-                let target = f.root.join(path);
-                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-                std::fs::copy(source, target).unwrap();
-            }
-        }
-        Some(std::fs::read_to_string(f.root.join("static/index.html")).unwrap())
-    } else {
-        None
-    };
-    let session = git_session(&f, true).await;
-    let task = if let Some(case) = &case {
-        std::fs::read_to_string(case.join("TASK.md")).unwrap()
-    } else {
-        "First locate Baseline using repository_search. In src/lib.rs rename the Baseline struct to Ready, keeping the rest of the file unchanged. Use native apply_patch for the edit. Run the Ferrus check tool and submit the change using the submit tool. Do not commit or ask for consultation.\n".into()
-    };
-    assert!(task.len() <= 32 * 1024);
-    std::fs::write(f.root.join(".ferrus/tasks/t-001.md"), task).unwrap();
-    let (tools, journal) = native(&f, session.clone(), RUN);
-    let start = tokio::time::Instant::now();
-    let end = managed::run(
-        session.clone(),
-        identity(RUN),
-        Limits {
-            elapsed_ms: if case.is_some() { 600_000 } else { 180_000 },
-            model_turns: if case.is_some() { 32 } else { 12 },
-            tokens: config.session_tokens,
-            ..Limits::default()
-        },
-        crate::nano::providers::openai::OpenAi::new(config).unwrap(),
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    println!(
-        "model={} elapsed_ms={} end={:?} turns={} tool_calls={} input={} output={}",
-        settings.model,
-        start.elapsed().as_millis(),
-        end.reason,
-        end.budget.model_turns,
-        end.budget.tool_calls,
-        end.budget.reported_input_tokens,
-        end.budget.reported_output_tokens
-    );
-    let (_, records) =
-        FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
-    if let Some(path) = std::env::var_os("FERRUS_NANO_SMOKE_JOURNAL_OUTPUT") {
-        use std::io::Write;
-        let mut output = crate::nano::private::file(std::path::Path::new(&path), true).unwrap();
-        for record in &records {
-            writeln!(output, "{}", serde_json::to_string(record).unwrap()).unwrap();
-        }
-    }
-    let calls: Vec<_> = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::ToolIntent { call, .. } => Some(call.name.as_str()),
-            _ => None,
-        })
-        .collect();
-    println!("calls={calls:?}");
-    let failures: Vec<_> = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::ToolResult {
-                outcome: ToolOutcome::Failed(error),
-                ..
-            } => Some(error),
-            _ => None,
-        })
-        .collect();
-    println!("tool_failures={failures:?}");
-    assert_eq!(end.reason, EndReason::Submitted);
-    assert!(end.durable);
-    assert_eq!(session.status().await.unwrap().status, "reviewing");
-    if let Some(original) = original_html {
-        assert_ne!(
-            std::fs::read_to_string(f.root.join("static/index.html")).unwrap(),
-            original
-        );
-    } else {
-        assert_eq!(
-            std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
-            "pub struct Ready;\n"
-        );
-        assert!(calls.contains(&"repository_search"));
-    }
-    for required in ["apply_patch", "check", "submit"] {
-        assert!(calls.contains(&required), "Missing native call: {required}");
-    }
-}
-
 struct RejectedProvider(ProviderErrorKind, bool);
+
 impl Provider for RejectedProvider {
     async fn start(&mut self, _: ModelRequest) -> std::result::Result<(), ProviderError> {
         Err(ProviderError::new(self.0.clone(), self.1))
     }
+
     async fn next_event(&mut self) -> std::result::Result<Option<ProviderEvent>, ProviderError> {
         panic!("Rejected request cannot have events")
     }
-}
-
-#[tokio::test]
-async fn permanent_provider_failure_or_retry_exhaustion_stops_dispatch_without_check_retries() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for (kind, retryable, reason, code) in [
-        (
-            ProviderErrorKind::Unsupported,
-            false,
-            EndReason::ProviderProtocol,
-            "nano_provider_protocol",
-        ),
-        (
-            ProviderErrorKind::Authentication,
-            false,
-            EndReason::ProviderFailed,
-            "nano_provider_failed",
-        ),
-        (
-            ProviderErrorKind::Timeout,
-            true,
-            EndReason::Limit(LimitKind::Retries),
-            "nano_limit_retries",
-        ),
-    ] {
-        let f = Fixture::new().await;
-        let session = FerrusSession::bind(f.launch()).await.unwrap();
-        let (tools, journal) = native(&f, session.clone(), RUN);
-        let end = managed::run(
-            session.clone(),
-            identity(RUN),
-            Limits {
-                retries: 0,
-                ..Default::default()
-            },
-            RejectedProvider(kind, retryable),
-            tools,
-            journal,
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(end.reason, reason);
-        assert!(end.durable);
-        let context = session.status().await.unwrap();
-        assert_eq!(context.status, "failed");
-        assert_eq!(context.check_retries, 0);
-        let state: (String, Option<String>, Option<String>) = f
-            .connection()
-            .query_row(
-                "SELECT failure_reason,claimed_by,lease_until FROM tasks WHERE id=?1",
-                [TASK],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, (code.into(), None, None));
-        assert!(f.events().iter().any(|(kind, _)| kind == code));
-        assert!(matches!(
-            session.claim().await.unwrap(),
-            project::ReadyTaskClaim::NoAvailable
-        ));
-        let (_, records) =
-            FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default())
-                .unwrap();
-        assert!(
-            matches!(&records.last().unwrap().event, SessionEvent::Ended {reason: actual} if actual == &reason)
-        );
-    }
-}
-
-#[tokio::test]
-async fn exhausted_phase_budgets_stop_dispatch_and_preserve_the_durable_reason() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for (kind, code) in [
-        (LimitKind::Tokens, "nano_limit_tokens"),
-        (LimitKind::ModelTurns, "nano_limit_model_turns"),
-        (LimitKind::ToolCalls, "nano_limit_tool_calls"),
-        (LimitKind::NoProgress, "nano_limit_no_progress"),
-    ] {
-        let f = Fixture::new().await;
-        let session = FerrusSession::bind(f.launch()).await.unwrap();
-        let (tools, journal) = native(&f, session.clone(), RUN);
-        let mut limits = Limits::default();
-        match kind {
-            LimitKind::Tokens => limits.tokens = 1,
-            LimitKind::ModelTurns => limits.model_turns = 1,
-            LimitKind::ToolCalls => limits.tool_calls = 1,
-            LimitKind::NoProgress => limits.no_progress = 1,
-            _ => unreachable!(),
-        }
-        let provider = script(
-            (0..2)
-                .map(|i| ToolCall {
-                    provider_call_id: format!("read-{i}"),
-                    name: "read_file".into(),
-                    arguments: json!({"path":"missing.txt"}).to_string(),
-                })
-                .collect(),
-        );
-        let end = managed::run(
-            session.clone(),
-            identity(RUN),
-            limits,
-            provider,
-            tools,
-            journal,
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(end.reason, EndReason::Limit(kind));
-        assert!(end.durable);
-        let state: (String, String, Option<String>, u32) = f
-            .connection()
-            .query_row(
-                "SELECT status,failure_reason,claimed_by,check_retries FROM tasks WHERE id=?1",
-                [TASK],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(state, ("failed".into(), code.into(), None, 0));
-        assert!(matches!(
-            session.claim().await.unwrap(),
-            project::ReadyTaskClaim::NoAvailable
-        ));
-        let (_, records) =
-            FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default())
-                .unwrap();
-        assert!(
-            matches!(&records.last().unwrap().event, SessionEvent::Ended { reason } if reason == &end.reason)
-        );
-    }
-}
-
-#[tokio::test]
-async fn truncated_reasoning_response_continues_to_submit_with_usage_preserved() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), RUN);
-    let provider = Script {
-        responses: VecDeque::from([
-            ProviderEvent::Completed {
-                response: ModelResponse {
-                    finish: FinishReason::Length,
-                    text: String::new(),
-                    calls: Vec::new(),
-                    continuation: Some(json!({"reasoning_content":"unfinished reasoning"})),
-                },
-                usage: Some(Usage {
-                    input_tokens: 10,
-                    output_tokens: 4096,
-                    reported: true,
-                }),
-            },
-            ProviderEvent::Completed {
-                response: ModelResponse {
-                    finish: FinishReason::ToolCalls,
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        provider_call_id: "submit".into(),
-                        name: "submit".into(),
-                        arguments: json!({"content":"## Summary\nDone"}).to_string(),
-                    }],
-                    continuation: None,
-                },
-                usage: Some(Usage {
-                    input_tokens: 10,
-                    output_tokens: 20,
-                    reported: true,
-                }),
-            },
-        ]),
-        starts: Arc::new(AtomicUsize::new(0)),
-        stall: false,
-    };
-    let end = managed::run(
-        session.clone(),
-        identity(RUN),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(end.reason, EndReason::Submitted);
-    assert_eq!(end.budget.reported_output_tokens, 4116);
-    assert_eq!(end.budget.tool_calls, 1);
-    assert!(end.durable);
-    let state: (String, Option<String>, Option<String>) = f
-        .connection()
-        .query_row(
-            "SELECT status,failure_reason,claimed_by FROM tasks WHERE id=?1",
-            [TASK],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(state, ("reviewing".into(), None, None));
-    assert!(matches!(
-        session.claim().await.unwrap(),
-        project::ReadyTaskClaim::NoAvailable
-    ));
-}
-
-#[tokio::test]
-async fn terminal_provider_failure_requires_current_executor_ownership() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    for update in [
-        "UPDATE tasks SET claimed_by='executor:other:1'",
-        "UPDATE tasks SET claimed_by='executor:nano:1',status='reviewing'",
-        "UPDATE tasks SET status='awaiting_human'",
-    ] {
-        f.connection().execute(update, []).unwrap();
-        let tasks = project::list_tasks().await.unwrap();
-        let events = f.events();
-        assert!(
-            session
-                .fail_stopped(&EndReason::ProviderProtocol, false)
-                .await
-                .is_err()
-        );
-        f.assert_no_effect(tasks, events).await;
-    }
-}
-
-#[tokio::test]
-async fn recovery_reconciles_a_sealed_provider_stop_before_new_inference() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for (reason, retryable) in [
-        (EndReason::ProviderProtocol, false),
-        (EndReason::ProviderFailed, true),
-        (EndReason::Limit(LimitKind::Tokens), true),
-        (EndReason::Limit(LimitKind::Retries), true),
-    ] {
-        let f = Fixture::new().await;
-        let session = FerrusSession::bind(f.launch()).await.unwrap();
-        session.claim().await.unwrap();
-        let previous = "old-provider-stop";
-        previous_run(&f, previous);
-        let mut journal = FileJournal::create(&f.data, previous, Quotas::default()).unwrap();
-        let mut budget = Budget::default();
-        journal
-            .append(
-                SessionEvent::Started {
-                    identity: SessionIdentity {
-                        session_id: previous.into(),
-                        project_id: "test-project".into(),
-                        task_id: Some(TASK.into()),
-                        run_id: Some(previous.into()),
-                    },
-                    limits: Limits {
-                        tokens: 20,
-                        retries: 0,
-                        ..Default::default()
-                    },
-                    input: "task".into(),
-                    system_prompt: None,
-                    launch_evidence: None,
-                    inherited_budget: None,
-                    provider: None,
-                },
-                &budget,
-            )
-            .unwrap();
-        budget.model_turns = 1;
-        budget.reserved_input_tokens = 10;
-        budget.reserved_output_tokens = 10;
-        journal
-            .append(SessionEvent::ModelStarted { turn: 1 }, &budget)
-            .unwrap();
-        let usage = Usage {
-            input_tokens: 10,
-            output_tokens: 10,
-            reported: false,
-        };
-        budget.reserved_input_tokens = 0;
-        budget.reserved_output_tokens = 0;
-        budget.charge(&usage);
-        journal
-            .append(
-                SessionEvent::ModelFailed {
-                    retryable,
-                    usage,
-                    error: Some(if retryable {
-                        ProviderErrorKind::Transport
-                    } else {
-                        ProviderErrorKind::Unsupported
-                    }),
-                    diagnostic: Some(ProviderDiagnostic::Http {
-                        status: if retryable { 503 } else { 400 },
-                    }),
-                },
-                &budget,
-            )
-            .unwrap();
-        let terminal = reason.managed_failure_code(retryable).is_some();
-        journal
-            .append(SessionEvent::Ended { reason }, &budget)
-            .unwrap();
-        drop(journal);
-        let workspace =
-            workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-        let recovery = crate::nano::resume::recover_previous(&session, &workspace).await;
-        if !terminal {
-            assert!(recovery.unwrap().is_some());
-            assert_eq!(session.status().await.unwrap().status, "executing");
-        } else {
-            assert!(recovery.is_err());
-            assert_eq!(session.status().await.unwrap().status, "failed");
-        }
-        let (_, records) = FileJournal::recover(
-            &f.data.join("nano/sessions").join(previous),
-            Quotas::default(),
-        )
-        .unwrap();
-        assert_eq!(records.len(), 4);
-    }
-}
-
-#[tokio::test]
-async fn managed_checks_share_retry_counts_and_stop_at_exhaustion() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &["exit 1"], 2);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    assert!(
-        lifecycle::check(&session, &Cancellation::default())
-            .await
-            .is_err()
-    );
-    session.claim().await.unwrap();
-    let result = lifecycle::check(&session, &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(result["retries"], 1);
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    let result = lifecycle::check(&session, &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(result["task_state"], "failed");
-    assert!(
-        lifecycle::check(&session, &Cancellation::default())
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().check_retries, 2);
-    assert_eq!(
-        std::fs::read_dir(f.root.join(".ferrus/logs"))
-            .unwrap()
-            .count(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn managed_check_pass_clears_retries_and_uses_bound_workspace() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &["exit 1"], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    lifecycle::check(&session, &Cancellation::default())
-        .await
-        .unwrap();
-    configure(&f, &["echo checked > native-check.txt"], 3);
-    let elsewhere = tempfile::tempdir().unwrap();
-    std::env::set_current_dir(elsewhere.path()).unwrap();
-    let value = lifecycle::check(&session, &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(value["status"], "passed");
-    assert_eq!(session.status().await.unwrap().check_retries, 0);
-    assert!(f.root.join("native-check.txt").exists());
-    assert!(!elsewhere.path().join("native-check.txt").exists());
-}
-
-#[tokio::test]
-async fn managed_waits_restore_addressing_once_and_deliver_actual_answers() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    f.connection()
-        .execute("UPDATE tasks SET status = 'addressing'", [])
-        .unwrap();
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    for human in [false, true] {
-        lifecycle::ask(&session, human, QUESTION.into())
-            .await
-            .unwrap();
-        assert!(
-            lifecycle::poll_answer(&session, human)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let directory = f.root.join(".ferrus/runs/t-001");
-        std::fs::write(
-            directory.join(if human {
-                "ANSWER.md"
-            } else {
-                "CONSULT_RESPONSE.md"
-            }),
-            "Use the bounded implementation.",
-        )
-        .unwrap();
-        let result = lifecycle::poll_answer(&session, human)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result["answer"], "Use the bounded implementation.");
-        assert_eq!(result["resumed_state"], "addressing");
-        assert!(
-            directory
-                .join(if human {
-                    "ANSWER.md"
-                } else {
-                    "CONSULT_RESPONSE.md"
-                })
-                .exists()
-        );
-        assert!(lifecycle::poll_answer(&session, human).await.is_err());
-        assert_eq!(session.status().await.unwrap().status, "addressing");
-    }
-}
-
-#[tokio::test]
-async fn previous_patch_is_reconciled_from_the_bound_workspace_once() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-    let plan = workspace
-        .patch_effect_plan(workspace::patch::PatchRequest {
-            edits: vec![workspace::patch::Edit::Create {
-                path: "recovered.txt".into(),
-                content: "recovered\n".into(),
-            }],
-        })
-        .unwrap();
-    previous_run(&f, "old-patch");
-    previous_intent(&f, "old-patch", "apply_patch", Some(plan), true);
-    std::fs::write(f.root.join("recovered.txt"), "recovered\n").unwrap();
-
-    let first = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(first.note.contains("matches its full recorded after-state"));
-    assert_eq!(first.budget.model_turns, 1);
-    assert_eq!(first.budget.tool_calls, 1);
-    assert_eq!(first.budget.tokens(), 2);
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    let old_dir = f.data.join("nano/sessions/old-patch");
-    let old_size = std::fs::metadata(old_dir.join("events.jsonl"))
-        .unwrap()
-        .len();
-    let second = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(second.note.contains("old-patch"));
-    assert_eq!(
-        std::fs::metadata(old_dir.join("events.jsonl"))
-            .unwrap()
-            .len(),
-        old_size
-    );
-    assert_eq!(
-        std::fs::read_to_string(f.root.join("recovered.txt")).unwrap(),
-        "recovered\n"
-    );
-
-    let (tools, journal) = native(&f, session.clone(), RUN);
-    let end = managed::run(
-        session.clone(),
-        identity(RUN),
-        Limits::default(),
-        script(vec![]),
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(end.budget.model_turns, 2);
-    assert_eq!(end.budget.tool_calls, 1);
-    assert_eq!(end.budget.reported_input_tokens, 11);
-    let (_, records) =
-        FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
-    assert!(
-        matches!(&records[0].event, SessionEvent::Started { inherited_budget: Some(budget), .. } if budget.model_turns == 1 && budget.tool_calls == 1)
-    );
-}
-
-#[tokio::test]
-async fn unknown_previous_command_fails_the_exact_owned_task() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-command");
-    previous_intent(&f, "old-command", "exec", None, true);
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-    let reason: String = f
-        .connection()
-        .query_row(
-            "SELECT failure_reason FROM tasks WHERE id = ?1",
-            [TASK],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(reason, "nano_effect_unknown");
-}
-
-#[tokio::test]
-async fn empty_intermediate_run_cannot_hide_an_unknown_command() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-command");
-    previous_intent(&f, "old-command", "exec", None, true);
-    f.connection()
-        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-command'", [])
-        .unwrap();
-    f.connection()
-        .execute(
-            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
-             VALUES (0, 'empty-run', ?1, 'executor', ?2, 'failed', '2026-01-02', '2026-01-02', ?3)",
-            rusqlite::params![TASK, AGENT, f.root.to_string_lossy()],
-        )
-        .unwrap();
-    drop(FileJournal::create(&f.data, "empty-run", Quotas::default()).unwrap());
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn historical_runs_after_the_latest_started_journal_do_not_exhaust_the_scan() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-read");
-    previous_intent(&f, "old-read", "read_file", None, true);
-    let connection = f.connection();
-    for ordinal in 1..=64 {
-        connection.execute(
-            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
-             VALUES (?1, ?2, ?3, 'executor', ?4, 'failed', '2026-01-01', '2026-01-01', ?5)",
-            rusqlite::params![-ordinal, format!("older-{ordinal}"), TASK, AGENT, f.root.to_string_lossy()],
-        ).unwrap();
-    }
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    let recovered = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(recovered.note.contains("old-read"));
-}
-
-#[tokio::test]
-async fn completed_exec_intent_with_running_command_blocks_redispatch() {
-    use std::io::Write;
-
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-running");
-    previous_intent(&f, "old-running", "exec", None, true);
-    let directory = f.data.join("nano/sessions/old-running");
-    let (mut journal, _) = FileJournal::recover_open(&directory, Quotas::default()).unwrap();
-    journal
-        .append(
-            SessionEvent::ToolResult {
-                call_id: "call-1".into(),
-                outcome: ToolOutcome::Success(json!({"process_id":"old-running-p1"})),
-            },
-            &journal.state().budget.clone(),
-        )
-        .unwrap();
-    drop(journal);
-    let commands_dir = directory.join("commands");
-    crate::nano::private::directory(&commands_dir, true).unwrap();
-    let snapshot = commands::Snapshot {
-        process_id: "old-running-p1".into(),
-        backend: "trusted_local".into(),
-        completion: commands::Completion::Running,
-        stdout: commands::OutputRef {
-            handle: "old-running-p1-stdout".into(),
-            bytes: 0,
-        },
-        stderr: commands::OutputRef {
-            handle: "old-running-p1-stderr".into(),
-            bytes: 0,
-        },
-        output_complete: false,
-        mutation_scope: "unknown".into(),
-    };
-    let mut state =
-        crate::nano::private::file(&commands_dir.join("old-running-p1.json"), true).unwrap();
-    state
-        .write_all(&serde_json::to_vec(&snapshot).unwrap())
-        .unwrap();
-    state.sync_all().unwrap();
-    drop(state);
-    for stream in ["stdout", "stderr"] {
-        drop(
-            crate::nano::private::file(
-                &commands_dir.join(format!("old-running-p1-{stream}")),
-                true,
-            )
-            .unwrap(),
-        );
-    }
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn previously_sealed_pending_intent_cannot_be_ignored() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-sealed");
-    previous_intent(&f, "old-sealed", "exec", None, true);
-    let directory = f.data.join("nano/sessions/old-sealed");
-    FileJournal::recover(&directory, Quotas::default()).unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn crash_before_execution_boundary_never_runs_or_marks_an_effect_unknown() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-unstarted");
-    previous_intent(&f, "old-unstarted", "exec", None, false);
-    {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(f.data.join("nano/sessions/old-unstarted/events.jsonl"))
-            .unwrap()
-            .write_all(b"{\"interrupted\":")
-            .unwrap();
-    }
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    let note = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(note.note.contains("no effect was started"));
-    assert_eq!(session.status().await.unwrap().status, "executing");
-}
-
-#[tokio::test]
-async fn recovery_rejects_a_stolen_lease_before_touching_the_old_journal() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-stale");
-    previous_intent(&f, "old-stale", "exec", None, true);
-    let old = f.data.join("nano/sessions/old-stale/events.jsonl");
-    let bytes = std::fs::read(&old).unwrap();
-    f.connection()
-        .execute(
-            "UPDATE tasks SET claimed_by = 'executor:other:1' WHERE id = ?1",
-            [TASK],
-        )
-        .unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read(old).unwrap(), bytes);
-    assert_eq!(session.status().await.unwrap().status, "executing");
-}
-
-#[tokio::test]
-async fn recovery_does_not_skip_a_newer_run_from_another_workspace() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-matching");
-    previous_intent(&f, "old-matching", "exec", None, true);
-    f.connection()
-        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-matching'", [])
-        .unwrap();
-    f.connection().execute(
-        "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
-         VALUES (0, 'newer-elsewhere', ?1, 'executor', ?2, 'failed', '2026-01-02', '2026-01-02', '/elsewhere')",
-        rusqlite::params![TASK, AGENT],
-    ).unwrap();
-    let journal = f.data.join("nano/sessions/old-matching/events.jsonl");
-    let bytes = std::fs::read(&journal).unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(std::fs::read(journal).unwrap(), bytes);
-}
-
-#[tokio::test]
-async fn recovery_does_not_skip_a_newer_run_from_another_executor() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-matching");
-    previous_intent(&f, "old-matching", "exec", None, true);
-    f.connection()
-        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-matching'", [])
-        .unwrap();
-    f.connection()
-        .execute(
-            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
-             VALUES (0, 'newer-agent', ?1, 'executor', 'other-agent', 'failed', '2026-01-02', '2026-01-02', ?2)",
-            rusqlite::params![TASK, f.root.to_string_lossy()],
-        )
-        .unwrap();
-    let journal = f.data.join("nano/sessions/old-matching/events.jsonl");
-    let bytes = std::fs::read(&journal).unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(std::fs::read(journal).unwrap(), bytes);
-}
-
-#[tokio::test]
-async fn restored_answer_is_carried_into_the_new_run_without_reasking() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-human");
-    previous_intent(&f, "old-human", "ask_human", None, true);
-    let run_dir = f.root.join(".ferrus/runs/t-001");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("ANSWER.md"), "Use the bounded implementation.").unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    let note = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(note.note.contains("Use the bounded implementation."));
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    assert!(
-        !f.events()
-            .iter()
-            .any(|(kind, _)| kind == "task_human_question")
-    );
-}
-
-#[tokio::test]
-async fn stale_answer_without_a_matching_prior_question_is_not_reused() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-read");
-    previous_intent(&f, "old-read", "read_file", None, true);
-    let run_dir = f.root.join(".ferrus/runs/t-001");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("ANSWER.md"), "stale instruction").unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    let recovered = crate::nano::resume::recover_previous(&session, &workspace)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!recovered.note.contains("stale instruction"));
-    assert_eq!(session.status().await.unwrap().status, "executing");
-}
-
-#[tokio::test]
-async fn completed_submit_starts_a_new_phase_without_inheriting_usage() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-submitted");
-    previous_intent(&f, "old-submitted", "submit", None, true);
-    finish_previous_submit(&f, "old-submitted");
-    f.connection()
-        .execute(
-            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
-            [TASK],
-        )
-        .unwrap();
-    let journal = f.data.join("nano/sessions/old-submitted/events.jsonl");
-    let before = std::fs::read(&journal).unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    f.connection()
-        .execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) \
-             VALUES ('old-submitted', 'submitted', '{}', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(std::fs::read(journal).unwrap(), before);
-    assert_eq!(session.status().await.unwrap().status, "addressing");
-}
-
-#[tokio::test]
-async fn committed_submit_with_lost_response_is_confirmed_after_rejection() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-submit");
-    previous_intent(&f, "old-submit", "submit", None, true);
-    f.connection()
-        .execute(
-            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
-            [TASK],
-        )
-        .unwrap();
-    f.connection()
-        .execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) \
-         VALUES ('old-submit', 'submitted', '{}', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-    let run_dir = f.root.join(".ferrus/runs/t-001");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("SUBMISSION.md"), "Ready for review.").unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(session.status().await.unwrap().status, "addressing");
-    let (_, records) =
-        FileJournal::recover(&f.data.join("nano/sessions/old-submit"), Quotas::default()).unwrap();
-    assert!(matches!(
-        &records.last().unwrap().event,
-        SessionEvent::Ended {
-            reason: EndReason::Submitted
-        }
-    ));
-    assert_eq!(
-        f.events()
-            .iter()
-            .filter(|(kind, _)| kind == "submitted")
-            .count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn committed_submit_can_be_reconciled_after_legacy_journal_sealing() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-submit-sealed");
-    previous_intent(&f, "old-submit-sealed", "submit", None, true);
-    f.connection()
-        .execute(
-            "UPDATE tasks SET status = 'addressing' WHERE id = ?1",
-            [TASK],
-        )
-        .unwrap();
-    f.connection()
-        .execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) \
-         VALUES ('old-submit-sealed', 'submitted', '{}', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-    let run_dir = f.root.join(".ferrus/runs/t-001");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("SUBMISSION.md"), "Ready for review.").unwrap();
-    let directory = f.data.join("nano/sessions/old-submit-sealed");
-    FileJournal::recover(&directory, Quotas::default()).unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(session.status().await.unwrap().status, "addressing");
-}
-
-#[tokio::test]
-async fn inconsistent_submitted_artifact_is_not_certified() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-mismatch");
-    previous_intent(&f, "old-mismatch", "submit", None, true);
-    f.connection()
-        .execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) \
-         VALUES ('old-mismatch', 'submitted', '{}', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-    let run_dir = f.root.join(".ferrus/runs/t-001");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(run_dir.join("SUBMISSION.md"), "changed after commit").unwrap();
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn uncommitted_submit_cannot_hide_interrupted_check_commands() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    previous_run(&f, "old-submit");
-    previous_intent(&f, "old-submit", "submit", None, true);
-    let workspace =
-        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
-
-    assert!(
-        crate::nano::resume::recover_previous(&session, &workspace)
-            .await
-            .is_err()
-    );
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn managed_operations_reject_foreign_expired_and_wrong_role_bindings() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    for sql in [
-        "UPDATE tasks SET claimed_by = 'executor:other:1'",
-        "UPDATE tasks SET claimed_by = 'executor:nano:1', lease_until = '2000-01-01T00:00:00Z'",
-        "UPDATE runs SET role = 'supervisor'",
-    ] {
-        f.connection().execute(sql, []).unwrap();
-        let events = f.events();
-        assert!(
-            lifecycle::check(&session, &Cancellation::default())
-                .await
-                .is_err()
-        );
-        assert!(
-            lifecycle::submit(&session, "notes".into(), &Cancellation::default())
-                .await
-                .is_err()
-        );
-        assert!(
-            lifecycle::ask(&session, true, "question".into())
-                .await
-                .is_err()
-        );
-        assert_eq!(f.events(), events);
-    }
-}
-
-#[tokio::test]
-async fn managed_submit_runs_both_gates_and_never_repeats_a_handoff() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    // Runtime output is deliberately outside the source tree checked for changes.
-    configure(&f, &["echo gate >> .ferrus/gates.txt"], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let result = lifecycle::submit(
-        &session,
-        "## Summary\nImplemented".into(),
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result["status"], "submitted");
-    assert_eq!(
-        std::fs::read_to_string(f.root.join(".ferrus/gates.txt"))
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
-    assert_eq!(session.status().await.unwrap().status, "reviewing");
-    let events = f.events();
-    let committed = events
-        .iter()
-        .find(|(kind, _)| kind == "submission_committed")
-        .unwrap();
-    assert_eq!(
-        committed.1["check_commands_sha256"],
-        crate::checks::commands_sha256(&["echo gate >> .ferrus/gates.txt".into()]).unwrap()
-    );
-    assert!(
-        lifecycle::submit(&session, "replacement".into(), &Cancellation::default())
-            .await
-            .is_err()
-    );
-    assert_eq!(f.events(), events);
-    assert!(
-        std::fs::read_to_string(f.root.join(".ferrus/runs/t-001/SUBMISSION.md"))
-            .unwrap()
-            .contains("Implemented")
-    );
-}
-
-#[tokio::test]
-async fn managed_submit_failure_keeps_work_open_without_submission_artifacts() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &["exit 1"], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let result = lifecycle::submit(&session, "notes".into(), &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(result["status"], "failed");
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    assert_eq!(session.status().await.unwrap().check_retries, 1);
-    assert!(!f.root.join(".ferrus/runs/t-001/SUBMISSION.md").exists());
-}
-
-#[tokio::test]
-async fn managed_engine_stops_at_submit_before_later_calls_or_inference() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-submit");
-    let provider = script(vec![
-        ToolCall {
-            provider_call_id: "submit".into(),
-            name: "submit".into(),
-            arguments: json!({"content":"## Summary\nDone"}).to_string(),
-        },
-        ToolCall {
-            provider_call_id: "later".into(),
-            name: "ask_human".into(),
-            arguments: json!({"question":"Must never execute"}).to_string(),
-        },
-    ]);
-    let starts = provider.starts.clone();
-    let result = managed::run(
-        session.clone(),
-        identity("managed-submit"),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result.reason, EndReason::Submitted);
-    assert!(result.durable);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
-    assert_eq!(result.budget.tool_calls, 1);
-    assert_eq!(session.status().await.unwrap().status, "reviewing");
-    assert!(!f.root.join(".ferrus/runs/t-001/QUESTION.md").exists());
-}
-
-#[tokio::test]
-async fn managed_model_final_is_incomplete_and_never_completes_the_task() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-final");
-    let result = managed::run(
-        session.clone(),
-        identity("managed-final"),
-        Limits::default(),
-        script(vec![]),
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result.reason, EndReason::ModelFinished);
-    assert_eq!(session.status().await.unwrap().status, "executing");
-}
-
-#[tokio::test]
-async fn managed_relaunch_cannot_claim_foreign_or_nonworking_human_waits() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    lifecycle::ask(&session, true, "Which option?".into())
-        .await
-        .unwrap();
-    for (index, (owner, resume)) in [
-        (Some("supervisor:codex:1"), "executing"),
-        (Some("executor:nano:2"), "addressing"),
-        (None, "executing"),
-        (Some(AGENT), "consultation"),
-        (Some(AGENT), "reviewing"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        f.connection()
-            .execute(
-                "UPDATE tasks SET awaiting_human_by=?1, awaiting_human_status=?2,
-             lease_until='2000-01-01T00:00:00Z' WHERE id=?3",
-                rusqlite::params![owner, resume, TASK],
-            )
-            .unwrap();
-        let tasks = project::list_tasks().await.unwrap();
-        let events = f.events();
-        let id = format!("invalid-wait-{index}");
-        let (tools, journal) = native(&f, session.clone(), &id);
-        let provider = script(vec![]);
-        let starts = provider.starts.clone();
-        assert!(
-            managed::run(
-                session.clone(),
-                identity(&id),
-                Limits::default(),
-                provider,
-                tools,
-                journal,
-                &Cancellation::default()
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(starts.load(Ordering::SeqCst), 0);
-        f.assert_no_effect(tasks, events).await;
-    }
-}
-
-#[tokio::test]
-async fn managed_relaunch_preserves_answers_when_delivery_cannot_start() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for human in [true, false] {
-        let (state, file, event) = if human {
-            ("awaiting_human", "ANSWER.md", "task_human_answered")
-        } else {
-            (
-                "consultation",
-                "CONSULT_RESPONSE.md",
-                "task_consultation_resolved",
-            )
-        };
-        for reason in ["missing", "cancelled", "context"] {
-            let f = Fixture::new().await;
-            let session = FerrusSession::bind(f.launch()).await.unwrap();
-            session.claim().await.unwrap();
-            lifecycle::ask(&session, human, QUESTION.into())
-                .await
-                .unwrap();
-            let path = f.root.join(".ferrus/runs/t-001").join(file);
-            let answer = if reason == "missing" {
-                String::new()
-            } else {
-                "x".repeat(16 * 1024)
-            };
-            std::fs::write(&path, &answer).unwrap();
-            let (tools, journal) = native(&f, session.clone(), "answer-delivery");
-            let provider = script(vec![]);
-            let starts = provider.starts.clone();
-            let stop = Cancellation::default();
-            let mut limits = Limits::default();
-            if reason == "cancelled" {
-                stop.cancel();
-            }
-            if reason == "context" {
-                limits.context_bytes = 16 * 1024;
-            }
-            let error = managed::run(
-                session.clone(),
-                identity("answer-delivery"),
-                limits,
-                provider,
-                tools,
-                journal,
-                &stop,
-            )
-            .await
-            .unwrap_err();
-            if reason == "missing" {
-                assert!(error.to_string().contains("no stored"));
-            }
-            assert_eq!(starts.load(Ordering::SeqCst), 0);
-            assert_eq!(session.status().await.unwrap().status, state);
-            assert_eq!(std::fs::read_to_string(path).unwrap(), answer);
-            assert!(!f.events().iter().any(|(kind, _)| kind == event));
-        }
-    }
-}
-
-#[tokio::test]
-async fn managed_consultation_relaunch_rejects_invalid_resume_and_foreign_live_lease() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    lifecycle::ask(&session, false, QUESTION.into())
-        .await
-        .unwrap();
-    for (resume, owner, until) in [
-        (None, AGENT, "2000-01-01T00:00:00Z"),
-        (Some("reviewing"), AGENT, "2000-01-01T00:00:00Z"),
-        (Some("consultation"), AGENT, "2000-01-01T00:00:00Z"),
-        (
-            Some("addressing"),
-            "executor:nano:2",
-            "2999-01-01T00:00:00Z",
-        ),
-    ] {
-        f.connection()
-            .execute(
-                "UPDATE tasks SET paused_status=?1, claimed_by=?2, lease_until=?3 WHERE id=?4",
-                rusqlite::params![resume, owner, until, TASK],
-            )
-            .unwrap();
-        let tasks = project::list_tasks().await.unwrap();
-        let events = f.events();
-        assert!(matches!(
-            session.claim().await.unwrap(),
-            ReadyTaskClaim::NoAvailable
-        ));
-        f.assert_no_effect(tasks, events).await;
-    }
-}
-
-#[tokio::test]
-async fn managed_heartbeat_renews_during_stalled_inference_then_stops_on_loss() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &[], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-heartbeat");
-    let mut provider = script(vec![]);
-    provider.stall = true;
-    let cancellation = Cancellation::default();
-    let execution = managed::run(
-        session.clone(),
-        identity("managed-heartbeat"),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &cancellation,
-    );
-    let lose = async {
-        wait_for_renewal(&f).await;
-        assert!(
-            f.events()
-                .iter()
-                .any(|(kind, _)| kind == "task_lease_renewed")
-        );
-        f.connection()
-            .execute("UPDATE tasks SET claimed_by = 'executor:other:1'", [])
-            .unwrap();
-    };
-    let (result, _) = tokio::join!(execution, lose);
-    assert_eq!(result.unwrap().reason, EndReason::AuthorityLost);
-    assert!(session.authorize().await.is_err());
-}
-
-#[tokio::test]
-async fn managed_waits_keep_heartbeat_and_cancel_as_paused() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &[], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-wait");
-    let provider = script(vec![ToolCall {
-        provider_call_id: "ask".into(),
-        name: "ask_human".into(),
-        arguments: json!({"question":"Need a decision"}).to_string(),
-    }]);
-    let starts = provider.starts.clone();
-    let cancellation = Cancellation::default();
-    let execution = managed::run(
-        session.clone(),
-        identity("managed-wait"),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &cancellation,
-    );
-    let cancel = async {
-        wait_for_renewal(&f).await;
-        assert_eq!(session.status().await.unwrap().status, "awaiting_human");
-        assert!(
-            f.events()
-                .iter()
-                .any(|(kind, _)| kind == "task_lease_renewed")
-        );
-        cancellation.cancel();
-    };
-    let (result, _) = tokio::join!(execution, cancel);
-    assert_eq!(result.unwrap().reason, EndReason::Paused);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
-    assert!(f.root.join(".ferrus/runs/t-001/QUESTION.md").exists());
-}
-
-#[tokio::test]
-async fn managed_tool_surface_has_no_approval_or_identity_arguments() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let (native, _journal) = native(&f, session.clone(), "managed-tools");
-    let mut tools = ManagedTools::new(session, native, Cancellation::default());
-    assert!(
-        !tools
-            .descriptors()
-            .iter()
-            .any(|tool| tool.name == "approve")
-    );
-    assert!(
-        tools
-            .validate("submit", &json!({"content":"done", "task_id":"foreign"}))
-            .is_err()
-    );
-    assert!(
-        tools
-            .validate("check", &json!({"workspace":"elsewhere"}))
-            .is_err()
-    );
-    assert!(
-        tools
-            .validate("consult", &json!({"question":"Missing template"}))
-            .is_err()
-    );
-    assert!(matches!(
-        tools
-            .execute(&call("check", json!({})), &Cancellation::default())
-            .await,
-        ToolOutcome::Success(_)
-    ));
-    assert!(tools.shutdown().await);
 }
 
 fn git(f: &Fixture, args: &[&str]) -> String {
@@ -2079,533 +339,8 @@ async fn git_session(f: &Fixture, index: bool) -> FerrusSession {
         .await
         .unwrap();
     }
+
     session
-}
-
-#[tokio::test]
-async fn managed_journal_records_effective_launch_flags_and_baseline() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, false).await;
-    let (mut tools, journal) = native(&f, session.clone(), "launch-evidence");
-    tools.native_context_enabled = false;
-    tools.working_set_enabled = false;
-    let end = managed::run(
-        session.clone(),
-        identity("launch-evidence"),
-        Limits::default(),
-        script(vec![]),
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    let (_, records) = FileJournal::recover(
-        &f.data.join("nano/sessions/launch-evidence"),
-        Quotas::default(),
-    )
-    .unwrap();
-    assert!(matches!(
-        &records[0].event,
-        SessionEvent::Started { launch_evidence: Some(evidence), .. }
-            if evidence.baseline_tree == session.baseline_tree().unwrap()
-                && !evidence.native_context_enabled
-                && !evidence.working_set_enabled
-    ));
-    let SessionEvent::Started {
-        system_prompt,
-        input,
-        ..
-    } = &records[0].event
-    else {
-        panic!("Missing session start");
-    };
-    assert_eq!(
-        system_prompt.as_deref(),
-        Some(crate::nano::instructions::ROLE_POLICY)
-    );
-    let task: Value = serde_json::from_str(input).unwrap();
-    let documents = task["documents"].as_array().unwrap();
-    assert!(documents.iter().any(|doc| doc["kind"] == "task"));
-    assert!(documents.iter().all(|doc| doc["kind"] != "runtime_policy"));
-}
-
-#[tokio::test]
-async fn managed_checks_collect_superseded_graphs_from_the_bound_project() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let config = std::fs::read_to_string(f.root.join("ferrus.toml")).unwrap();
-    std::fs::write(
-        f.root.join("ferrus.toml"),
-        format!("{config}\n[repository_graph.retention]\nmax_snapshots = 0\n"),
-    )
-    .unwrap();
-    let baseline = session
-        .status()
-        .await
-        .unwrap()
-        .repository_view
-        .baseline_snapshot_id
-        .unwrap();
-    let unrelated = tempfile::tempdir().unwrap();
-    std::env::set_current_dir(unrelated.path()).unwrap();
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct FirstEdit;\n").unwrap();
-    assert_eq!(
-        lifecycle::check(&session, &Cancellation::default())
-            .await
-            .unwrap()["status"],
-        "passed"
-    );
-    let previous = session
-        .status()
-        .await
-        .unwrap()
-        .repository_view
-        .view_snapshot_id
-        .unwrap();
-    assert_ne!(previous, baseline);
-    let sidecar = Connection::open(f.data.join("repo-graph.db")).unwrap();
-    // Retain the baseline through the live task reference alone, not a publication.
-    sidecar
-        .execute(
-            "DELETE FROM published_views WHERE view_name = 'canonical'",
-            [],
-        )
-        .unwrap();
-    let previous_content: String = sidecar
-        .query_row(
-            "SELECT content_digest FROM files WHERE snapshot_id = ?1 AND path = 'src/lib.rs'",
-            [previous.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct SecondEdit;\n").unwrap();
-    assert_eq!(
-        lifecycle::check(&session, &Cancellation::default())
-            .await
-            .unwrap()["status"],
-        "passed"
-    );
-    let current = session
-        .status()
-        .await
-        .unwrap()
-        .repository_view
-        .view_snapshot_id
-        .unwrap();
-    for (id, retained) in [(&baseline, true), (&previous, false), (&current, true)] {
-        let exists: bool = sidecar
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM snapshots WHERE id = ?1)",
-                [id.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(exists, retained, "snapshot {id:?}");
-    }
-    let fragments: i64 = sidecar
-        .query_row(
-            "SELECT count(*) FROM fragment_cache WHERE path = 'src/lib.rs' AND content_digest = ?1",
-            [previous_content],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(fragments, 0);
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    assert!(!unrelated.path().join(".ferrus").exists());
-}
-
-#[tokio::test]
-async fn managed_graph_maintenance_failure_preserves_a_successful_refresh() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let previous = session.status().await.unwrap().repository_view;
-    // Invalid retention metadata must fail maintenance closed without undoing publication.
-    f.connection()
-        .execute(
-            "UPDATE project_runtime_state SET canonical_graph_snapshot_id = '' WHERE row_id = 1",
-            [],
-        )
-        .unwrap();
-    assert!(
-        project::repository_graph_retention_references_at(&f.data.join("ferrus.db"))
-            .await
-            .is_err()
-    );
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct CheckedEdit;\n").unwrap();
-    assert_eq!(
-        lifecycle::check(&session, &Cancellation::default())
-            .await
-            .unwrap()["status"],
-        "passed"
-    );
-    let context = session.status().await.unwrap();
-    assert_eq!(context.status, "executing");
-    assert_eq!(
-        context.repository_view.status,
-        project::RepositoryViewStatus::Available
-    );
-    assert_ne!(
-        context.repository_view.view_snapshot_id,
-        previous.view_snapshot_id
-    );
-}
-
-#[tokio::test]
-async fn managed_submit_freezes_and_pins_the_exact_graph_tree() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct Submitted;\n").unwrap();
-    let checked = crate::repository_graph::source::capture_worktree_tree(&f.root).unwrap();
-    let result = lifecycle::submit(
-        &session,
-        "## Summary\nChanges".into(),
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result["status"], "submitted");
-    let context = session.status().await.unwrap();
-    assert_eq!(
-        context.repository_view.lifecycle,
-        crate::repository_graph::domain::TaskViewLifecycle::FrozenSubmitted
-    );
-    assert_eq!(
-        context.repository_view.frozen_source_tree,
-        Some(checked.clone())
-    );
-    assert!(
-        f.events()
-            .iter()
-            .any(|(kind, _)| kind == "repository_view_frozen")
-    );
-    let refs = git(&f, &["for-each-ref", "--format=%(refname) %(objectname)"]);
-    assert!(refs.contains("refs/ferrus/reviews/"));
-    assert!(refs.contains(checked.value()));
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct Later;\n").unwrap();
-    assert_eq!(
-        session.status().await.unwrap().repository_view,
-        context.repository_view
-    );
-}
-
-#[tokio::test]
-async fn managed_graph_freeze_failure_is_diagnostic_only() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, false).await;
-    let result = lifecycle::submit(&session, "notes".into(), &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(result["status"], "submitted");
-    assert_eq!(session.status().await.unwrap().status, "reviewing");
-    assert!(
-        f.events()
-            .iter()
-            .any(|(kind, _)| kind == "repository_view_freeze_failed")
-    );
-    assert_eq!(session.status().await.unwrap().check_retries, 0);
-}
-
-#[tokio::test]
-async fn managed_submit_rejects_source_changes_during_gates() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    for with_git in [false, true] {
-        let f = Fixture::new().await;
-        configure(&f, &["echo changed >> source.txt"], 3);
-        let session = if with_git {
-            git_session(&f, false).await
-        } else {
-            let session = FerrusSession::bind(f.launch()).await.unwrap();
-            session.claim().await.unwrap();
-            session
-        };
-        std::fs::write(f.root.join("source.txt"), "before").unwrap();
-        let error = lifecycle::submit(&session, "notes".into(), &Cancellation::default())
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Workspace changed"), "{error:#}");
-        assert_eq!(session.status().await.unwrap().status, "executing");
-        assert!(!f.root.join(".ferrus/runs/t-001/SUBMISSION.md").exists());
-    }
-}
-
-#[tokio::test]
-async fn managed_check_quiesces_writers_and_allows_later_commands() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let (native, _journal) = native(&f, session.clone(), "managed-writers");
-    let mut tools = ManagedTools::new(session, native, Cancellation::default());
-    let command = if cfg!(windows) {
-        "ping -n 30 127.0.0.1 > nul"
-    } else {
-        "sleep 30"
-    };
-    let started = tools
-        .native
-        .coding
-        .commands
-        .exec(
-            commands::ExecRequest {
-                command: command.into(),
-                cwd: ".".into(),
-                timeout_ms: 30_000,
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        tools
-            .execute(&call("check", json!({})), &Cancellation::default())
-            .await,
-        ToolOutcome::Success(_)
-    ));
-    let stopped = tools
-        .native
-        .coding
-        .commands
-        .read_process(&started.process_id, 0)
-        .await
-        .unwrap();
-    assert!(!stopped.potentially_writing());
-    assert!(
-        tools
-            .native
-            .coding
-            .commands
-            .exec(
-                commands::ExecRequest {
-                    command: "echo still-open".into(),
-                    cwd: ".".into(),
-                    timeout_ms: 1000
-                },
-                &Cancellation::default()
-            )
-            .await
-            .is_ok()
-    );
-    assert!(tools.shutdown().await);
-}
-
-#[tokio::test]
-async fn managed_claim_failure_prevents_the_first_inference() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    f.connection()
-        .execute("UPDATE tasks SET claimed_by = 'executor:other:1'", [])
-        .unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-unavailable");
-    let provider = script(vec![]);
-    let starts = provider.starts.clone();
-    assert!(
-        managed::run(
-            session,
-            identity("managed-unavailable"),
-            Limits::default(),
-            provider,
-            tools,
-            journal,
-            &Cancellation::default()
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(starts.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn managed_interrupt_reconciles_committed_submit_before_delivery() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let (native, _journal) = native(&f, session.clone(), "managed-race");
-    let stop = Cancellation::default();
-    let mut tools = ManagedTools::new(session.clone(), native, stop.clone());
-    let committing = session.clone();
-    tools.pending = Some(tokio::spawn(async move {
-        let result = lifecycle::submit(&committing, "Original submission".into(), &stop).await?;
-        // Hold delivery after the real SQLite commit until the engine interrupts.
-        stop.cancelled().await;
-        Ok(result)
-    }));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while session.status().await.unwrap().status != "reviewing" {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let events = f.events();
-    assert!(
-        matches!(tools.interrupted().await, Some(ToolOutcome::Success(value)) if value["status"] == "submitted")
-    );
-    assert_eq!(tools.end_reason(), Some(EndReason::Submitted));
-    assert!(tools.shutdown().await);
-    assert_eq!(f.events(), events);
-    assert_eq!(
-        std::fs::read_to_string(f.root.join(".ferrus/runs/t-001/SUBMISSION.md")).unwrap(),
-        "Original submission"
-    );
-}
-
-#[tokio::test]
-async fn managed_wait_returns_the_real_response_without_inference_polling() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let (native, _journal) = native(&f, session.clone(), "managed-response");
-    let mut tools = ManagedTools::new(session.clone(), native, Cancellation::default());
-    let request = call("consult", json!({"question":QUESTION}));
-    let stop = Cancellation::default();
-    let execute = tools.execute(&request, &stop);
-    let response = async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while session.status().await.unwrap().status != "consultation" {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        std::fs::write(
-            f.root.join(".ferrus/runs/t-001/CONSULT_RESPONSE.md"),
-            "Preserve both check gates.",
-        )
-        .unwrap();
-    };
-    let (outcome, _) = tokio::join!(execute, response);
-    assert!(
-        matches!(outcome, ToolOutcome::Success(value) if value["answer"] == "Preserve both check gates.")
-    );
-    assert_eq!(session.status().await.unwrap().status, "executing");
-    assert!(tools.shutdown().await);
-}
-
-#[tokio::test]
-async fn managed_final_gate_failure_preserves_submit_retry_accounting() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let command = if cfg!(windows) {
-        "if exist .ferrus\\first-gate.txt (exit /b 1) else (echo passed > .ferrus\\first-gate.txt)"
-    } else {
-        "if test -f .ferrus/first-gate.txt; then exit 1; else echo passed > .ferrus/first-gate.txt; fi"
-    };
-    configure(&f, &[command], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    let result = lifecycle::submit(&session, "notes".into(), &Cancellation::default())
-        .await
-        .unwrap();
-    assert_eq!(result["status"], "failed");
-    assert_eq!(result["retries"], 1);
-    let context = session.status().await.unwrap();
-    assert_eq!(context.status, "executing");
-    assert_eq!(
-        context.failure_reason,
-        Some(format!("Commands failed: {command}"))
-    );
-    let events = f.events();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|(kind, _)| kind == "check_passed")
-            .count(),
-        1
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|(kind, _)| kind == "submit_check_failed")
-            .count(),
-        1
-    );
-    assert!(!f.root.join(".ferrus/runs/t-001/SUBMISSION.md").exists());
-}
-
-#[tokio::test]
-async fn managed_lease_loss_stops_a_long_check_without_recording_a_pass() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let command = if cfg!(windows) {
-        "ping -n 30 127.0.0.1 > nul"
-    } else {
-        "sleep 30"
-    };
-    configure(&f, &[command], 3);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-long-check");
-    let provider = script(vec![ToolCall {
-        provider_call_id: "check".into(),
-        name: "check".into(),
-        arguments: "{}".into(),
-    }]);
-    let cancellation = Cancellation::default();
-    let execute = managed::run(
-        session.clone(),
-        identity("managed-long-check"),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &cancellation,
-    );
-    let steal = async {
-        wait_for_renewal(&f).await;
-        assert!(
-            f.events()
-                .iter()
-                .any(|(kind, _)| kind == "task_lease_renewed")
-        );
-        f.connection()
-            .execute("UPDATE tasks SET claimed_by = 'executor:other:1'", [])
-            .unwrap();
-    };
-    let (result, _) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(execute, steal)
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.unwrap().reason, EndReason::AuthorityLost);
-    assert!(!f.events().iter().any(|(kind, _)| kind == "check_passed"));
-    assert_eq!(session.status().await.unwrap().check_retries, 0);
-}
-
-#[tokio::test]
-async fn managed_wait_rejects_wrong_owner_and_oversized_answers_without_consuming_them() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    session.claim().await.unwrap();
-    lifecycle::ask(&session, true, "Need input".into())
-        .await
-        .unwrap();
-    let answer = f.root.join(".ferrus/runs/t-001/ANSWER.md");
-    std::fs::write(&answer, "Real answer").unwrap();
-    f.connection()
-        .execute(
-            "UPDATE tasks SET awaiting_human_by = 'supervisor:other:1'",
-            [],
-        )
-        .unwrap();
-    assert!(lifecycle::poll_answer(&session, true).await.is_err());
-    f.connection()
-        .execute("UPDATE tasks SET awaiting_human_by = 'executor:nano:1'", [])
-        .unwrap();
-    std::fs::write(&answer, "x".repeat(16 * 1024 + 1)).unwrap();
-    assert!(lifecycle::poll_answer(&session, true).await.is_err());
-    assert_eq!(session.status().await.unwrap().status, "awaiting_human");
-    assert!(answer.exists());
 }
 
 async fn wait_for_renewal(f: &Fixture) {
@@ -2622,110 +357,64 @@ async fn wait_for_renewal(f: &Fixture) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn managed_engine_ends_failed_when_check_retries_are_exhausted() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    configure(&f, &["exit 1"], 1);
-    let session = FerrusSession::bind(f.launch()).await.unwrap();
-    let (tools, journal) = native(&f, session.clone(), "managed-exhausted");
-    let provider = script(vec![ToolCall {
-        provider_call_id: "check".into(),
-        name: "check".into(),
-        arguments: "{}".into(),
-    }]);
-    let result = managed::run(
-        session.clone(),
-        identity("managed-exhausted"),
-        Limits::default(),
-        provider,
-        tools,
-        journal,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result.reason, EndReason::TaskFailed);
-    assert_eq!(result.budget.model_turns, 1);
-    assert_eq!(session.status().await.unwrap().status, "failed");
-}
-
-#[tokio::test]
-async fn managed_isolated_submit_writes_canonical_artifacts_from_the_checked_worktree() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let original = git_session(&f, false).await;
-    git(&f, &["add", "ferrus.toml", "src/lib.rs"]);
-    git(
-        &f,
-        &[
-            "-c",
-            "user.name=Nano Test",
-            "-c",
-            "user.email=nano@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "baseline",
-        ],
-    );
-    let workspace = f.data.join("worktrees").join(TASK);
-    // Git for Windows rejects verbatim absolute paths when creating a worktree.
-    // The git helper runs in f.root; keep the runtime binding absolute below.
-    let relative_workspace = workspace.strip_prefix(&f.root).unwrap();
-    git(
-        &f,
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "--detach",
-            relative_workspace.to_str().unwrap(),
-            "HEAD",
-        ],
-    );
-    std::fs::create_dir_all(workspace.join(".ferrus")).unwrap();
-    std::fs::copy(
-        f.root.join(".ferrus/project.toml"),
-        workspace.join(".ferrus/project.toml"),
-    )
-    .unwrap();
-    f.connection()
-        .execute(
-            "UPDATE runs SET workspace_path = ?1 WHERE id = ?2",
-            [workspace.to_str().unwrap(), RUN],
+fn baseline_patch(tools: &NativeTools<TrustedLocal>, symbol: &str) -> ValidatedCall {
+    let digest = tools
+        .coding
+        .workspace
+        .read_file(
+            serde_json::from_value(json!({
+                "path":"src/lib.rs"
+            }))
+            .unwrap(),
         )
-        .unwrap();
-    let mut launch = f.launch();
-    launch.workspace = workspace.clone();
-    launch.baseline_tree = original.baseline_tree().map(str::to_owned);
-    let session = FerrusSession::bind(launch).await.unwrap();
-    std::fs::write(workspace.join("src/lib.rs"), "pub struct IsolatedChange;\n").unwrap();
-    let unrelated = tempfile::tempdir().unwrap();
-    std::env::set_current_dir(unrelated.path()).unwrap();
-    let result = lifecycle::submit(
-        &session,
-        "Isolated submission".into(),
-        &Cancellation::default(),
+        .unwrap()
+        .source
+        .digest;
+    call(
+        "apply_patch",
+        json!({"edits":[{
+            "operation":"update", "path":"src/lib.rs", "expected_digest":digest,
+            "hunks":[{"start_line":1, "old_text":"pub struct Baseline;\n",
+                "new_text":format!("pub struct {symbol};\n")}]
+        }]}),
     )
-    .await
-    .unwrap();
-    assert_eq!(result["status"], "submitted");
-    let patch = std::fs::read_to_string(f.root.join(".ferrus/runs/t-001/PATCH.diff")).unwrap();
-    assert!(patch.contains("+pub struct IsolatedChange;"));
-    assert!(!patch.contains("project.toml"));
-    assert!(!workspace.join(".ferrus/runs/t-001/SUBMISSION.md").exists());
-    assert!(
-        std::fs::read_to_string(f.root.join("src/lib.rs"))
-            .unwrap()
-            .contains("Baseline")
-    );
 }
 
+mod reviewer_profiles {
+    use super::*;
+
+    include!("review/lifecycle_tests.rs");
+}
+
+#[path = "lifecycle_tests/recovery.rs"]
+mod recovery_tests;
+
+#[path = "lifecycle_tests/submission.rs"]
+mod submission_tests;
+
+#[path = "lifecycle_tests/ownership.rs"]
+mod ownership_tests;
+
+#[path = "lifecycle_tests/behavior.rs"]
+mod behavior_tests;
+
+#[path = "lifecycle_tests/human_waits.rs"]
+mod human_waits_tests;
+
+#[path = "lifecycle_tests/review.rs"]
+mod review_tests;
+
+#[path = "lifecycle_tests/cancellation.rs"]
+mod cancellation_tests;
+
+#[path = "lifecycle_tests/checks.rs"]
+mod checks_tests;
+
+#[path = "lifecycle_tests/compaction.rs"]
+mod compaction_tests;
+
 #[tokio::test]
-async fn managed_consult_wait_preserves_a_nested_supervisor_human_question() {
+async fn managed_consultation_relaunch_rejects_invalid_resume_and_foreign_live_lease() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
     let session = FerrusSession::bind(f.launch()).await.unwrap();
@@ -2733,83 +422,30 @@ async fn managed_consult_wait_preserves_a_nested_supervisor_human_question() {
     lifecycle::ask(&session, false, QUESTION.into())
         .await
         .unwrap();
-    project::record_task_human_question_requested_with_resume(
-        TASK,
-        TaskStatus::Consultation,
-        Some(TaskStatus::Executing),
-        "supervisor:fixture:1",
-    )
-    .await
-    .unwrap();
-    let directory = f.root.join(".ferrus/runs/t-001");
-    std::fs::write(directory.join("ANSWER.md"), "For the Supervisor only").unwrap();
-    assert!(
-        lifecycle::poll_answer(&session, false)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(session.status().await.unwrap().status, "awaiting_human");
-    assert!(directory.join("ANSWER.md").exists());
-    project::restore_task_from_human_answer(TASK).await.unwrap();
-    std::fs::write(
-        directory.join("CONSULT_RESPONSE.md"),
-        "Supervisor recommendation",
-    )
-    .unwrap();
-    let result = lifecycle::poll_answer(&session, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(result["answer"], "Supervisor recommendation");
-    assert_eq!(result["resumed_state"], "executing");
-}
-
-#[tokio::test]
-async fn working_set_refresh_publishes_edits_without_lifecycle_checks() {
-    use crate::nano::{
-        context::{Context, Request, Response},
-        refresh::Refresh,
-    };
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let before = session.status().await.unwrap();
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct WorkingSetEdit;\n").unwrap();
-    let mut refresh = Refresh::default();
-    refresh.invalidate();
-    assert_eq!(
-        refresh.prepare(&session.clone().into(), false).await[0]["status"],
-        "scheduled"
-    );
-    assert_eq!(refresh.settle().await.unwrap()["status"], "published");
-    let after = session.status().await.unwrap();
-    assert_eq!(after.status, before.status);
-    assert_eq!(after.check_retries, before.check_retries);
-    assert_eq!(
-        after.repository_view.baseline_snapshot_id,
-        before.repository_view.baseline_snapshot_id
-    );
-    assert_ne!(
-        after.repository_view.view_snapshot_id,
-        before.repository_view.view_snapshot_id
-    );
-    let context = Context::new(session);
-    let Response::RepositorySearch(Ok(result)) = context
-        .retrieve(
-            "repository_search",
-            Request::parse("repository_search", json!({"query":"WorkingSetEdit"})).unwrap(),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("search")
-    };
-    assert!(!result.data.hits.is_empty());
-    assert_eq!(
-        Some(result.snapshot_id),
-        after.repository_view.view_snapshot_id
-    );
+    for (resume, owner, until) in [
+        (None, AGENT, "2000-01-01T00:00:00Z"),
+        (Some("reviewing"), AGENT, "2000-01-01T00:00:00Z"),
+        (Some("consultation"), AGENT, "2000-01-01T00:00:00Z"),
+        (
+            Some("addressing"),
+            "executor:nano:2",
+            "2999-01-01T00:00:00Z",
+        ),
+    ] {
+        f.connection()
+            .execute(
+                "UPDATE tasks SET paused_status=?1, claimed_by=?2, lease_until=?3 WHERE id=?4",
+                rusqlite::params![resume, owner, until, TASK],
+            )
+            .unwrap();
+        let tasks = project::list_tasks().await.unwrap();
+        let events = f.events();
+        assert!(matches!(
+            session.claim().await.unwrap(),
+            ReadyTaskClaim::NoAvailable
+        ));
+        f.assert_no_effect(tasks, events).await;
+    }
 }
 
 #[tokio::test]
@@ -2853,603 +489,318 @@ async fn quick_patch_schedules_refresh_before_the_next_graph_query() {
 }
 
 #[tokio::test]
-async fn working_set_settles_refresh_before_reusing_graph_evidence_without_prefetch() {
+async fn unknown_previous_command_fails_the_exact_owned_task() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let previous = session
-        .status()
-        .await
-        .unwrap()
-        .repository_view
-        .view_snapshot_id;
-    let (mut tools, _journal) = native(&f, session.clone(), "working-set-after-patch");
-    let query = call("repository_search", json!({"query":"Baseline"}));
-    let result = tools.execute(&query, &Cancellation::default()).await;
-    assert!(
-        matches!(&result, ToolOutcome::Success(value) if serde_json::to_string(value).unwrap().contains("Baseline"))
-    );
-    let messages = vec![
-        Message::Assistant {
-            response: ModelResponse {
-                finish: FinishReason::ToolCalls,
-                text: String::new(),
-                calls: vec![ToolCall {
-                    provider_call_id: query.provider_call_id.clone(),
-                    name: query.name.clone(),
-                    arguments: query.arguments.to_string(),
-                }],
-                continuation: None,
-            },
-        },
-        Message::Tool {
-            provider_call_id: query.provider_call_id,
-            outcome: result,
-        },
-    ];
-    let patch = baseline_patch(&tools, "CurrentSymbol");
-    assert!(
-        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
-    );
-    let prepared = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(prepared.replacements.iter().any(|replacement| {
-        replacement.message == 1 && replacement.value["kind"] == "evidence_unavailable"
-    }));
-    assert!(
-        !serde_json::to_string(&prepared.apply(&messages).unwrap())
-            .unwrap()
-            .contains("pub struct Baseline;")
-    );
-    assert_ne!(
-        session
-            .status()
-            .await
-            .unwrap()
-            .repository_view
-            .view_snapshot_id,
-        previous
-    );
-    assert!(tools.shutdown().await);
-}
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-command");
+    previous_intent(&f, "old-command", "exec", None, true);
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
 
-fn baseline_patch(tools: &NativeTools<TrustedLocal>, symbol: &str) -> ValidatedCall {
-    let digest = tools
-        .coding
-        .workspace
-        .read_file(
-            serde_json::from_value(json!({
-                "path":"src/lib.rs"
-            }))
-            .unwrap(),
+    assert!(
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().status, "failed");
+    let reason: String = f
+        .connection()
+        .query_row(
+            "SELECT failure_reason FROM tasks WHERE id = ?1",
+            [TASK],
+            |row| row.get(0),
         )
-        .unwrap()
-        .source
-        .digest;
-    call(
-        "apply_patch",
-        json!({"edits":[{
-            "operation":"update", "path":"src/lib.rs", "expected_digest":digest,
-            "hunks":[{"start_line":1, "old_text":"pub struct Baseline;\n",
-                "new_text":format!("pub struct {symbol};\n")}]
-        }]}),
-    )
+        .unwrap();
+    assert_eq!(reason, "nano_effect_unknown");
 }
 
 #[tokio::test]
-async fn disabled_working_set_keeps_workspace_tools_but_never_schedules_refresh() {
+async fn empty_intermediate_run_cannot_hide_an_unknown_command() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let previous = session.status().await.unwrap().repository_view;
-    let (mut tools, _journal) = native(&f, session.clone(), "disabled-working-set");
-    tools.working_set_enabled = false;
-    tools.context.cache_enabled = false;
-    let patch = baseline_patch(&tools, "DisabledModeEdit");
-    assert!(
-        matches!(tools.execute(&patch, &Cancellation::default()).await,
-        ToolOutcome::Success(value) if value["complete"] == true)
-    );
-    let messages = vec![Message::User {
-        text: "task".into(),
-    }];
-    assert!(
-        tools
-            .prepare_context(&messages, &Cancellation::default())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
-    let prepared = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-command");
+    previous_intent(&f, "old-command", "exec", None, true);
+    f.connection()
+        .execute("UPDATE runs SET rowid = -1 WHERE id = 'old-command'", [])
         .unwrap();
+    f.connection()
+        .execute(
+            "INSERT INTO runs (rowid, id, task_id, role, agent, status, started_at, updated_at, workspace_path) \
+             VALUES (0, 'empty-run', ?1, 'executor', ?2, 'failed', '2026-01-02', '2026-01-02', ?3)",
+            rusqlite::params![TASK, AGENT, f.root.to_string_lossy()],
+        )
+        .unwrap();
+    drop(FileJournal::create(&f.data, "empty-run", Quotas::default()).unwrap());
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
     assert!(
-        prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "prefetch_unavailable")
+        crate::nano::resume::recover_previous(&session, &workspace)
+            .await
+            .is_err()
     );
-    assert!(
-        !prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "overlay_refresh")
-    );
-    assert_eq!(session.status().await.unwrap().repository_view, previous);
-    assert!(tools.shutdown().await);
-    assert_eq!(session.status().await.unwrap().repository_view, previous);
+    assert_eq!(session.status().await.unwrap().status, "failed");
 }
 
 #[tokio::test]
-#[cfg(feature = "nano-openai")]
-async fn direct_mutations_and_running_commands_share_the_canonical_approval_lock() {
-    use crate::server::tools::approve::acquire_canonical_approval_lock_at;
+async fn managed_waits_restore_addressing_once_and_deliver_actual_answers() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let _managed = git_session(&f, false).await;
-    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
-        .await
+    f.connection()
+        .execute("UPDATE tasks SET status = 'addressing'", [])
         .unwrap();
-    project::record_run_started_for_task_with_workspace(
-        "direct-lock",
-        "executor",
-        "executor:nano:1",
-        std::process::id(),
-        Some("current"),
-        f.root.to_string_lossy().into_owned(),
-    )
-    .await
-    .unwrap();
-    let binding = crate::nano::binding::Binding::Interactive {
-        definition: None,
-        project_root: f.root.clone(),
-        project_id: "test-project".into(),
-        data_dir: f.data.clone(),
-        agent_id: "executor:nano:1".into(),
-        run_id: "direct-lock".into(),
-    };
-    let journal = FileJournal::create(&f.data, "direct-lock", Quotas::default()).unwrap();
-    let coding = CodingTools {
-        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
-        commands: commands::Commands::trusted_local(
-            &f.root,
-            "direct-lock",
-            journal.directory(),
-            commands::Limits::default(),
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    for human in [false, true] {
+        lifecycle::ask(&session, human, QUESTION.into())
+            .await
+            .unwrap();
+        assert!(
+            lifecycle::poll_answer(&session, human)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let directory = f.root.join(".ferrus/runs/t-001");
+        std::fs::write(
+            directory.join(if human {
+                "ANSWER.md"
+            } else {
+                "CONSULT_RESPONSE.md"
+            }),
+            "Use the bounded implementation.",
         )
-        .unwrap(),
-    };
-    let mut native =
-        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
-    native.working_set_enabled = false;
-    let patch = baseline_patch(&native, "DirectLockedEdit");
-    let mut tools =
-        crate::nano::interactive::InteractiveTools::new(native, binding, Cancellation::default());
-    let lock_path = f.data.join("canonical-approval.lock");
-    let approval = acquire_canonical_approval_lock_at(&lock_path, "t-review")
+        .unwrap();
+        let result = lifecycle::poll_answer(&session, human)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["answer"], "Use the bounded implementation.");
+        assert_eq!(result["resumed_state"], "addressing");
+        assert!(
+            directory
+                .join(if human {
+                    "ANSWER.md"
+                } else {
+                    "CONSULT_RESPONSE.md"
+                })
+                .exists()
+        );
+        assert!(lifecycle::poll_answer(&session, human).await.is_err());
+        assert_eq!(session.status().await.unwrap().status, "addressing");
+    }
+}
+
+#[tokio::test]
+async fn restored_answer_is_carried_into_the_new_run_without_reasking() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    previous_run(&f, "old-human");
+    previous_intent(&f, "old-human", "ask_human", None, true);
+    let run_dir = f.root.join(".ferrus/runs/t-001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("ANSWER.md"), "Use the bounded implementation.").unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+
+    let note = crate::nano::resume::recover_previous(&session, &workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(note.note.contains("Use the bounded implementation."));
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    assert!(
+        !f.events()
+            .iter()
+            .any(|(kind, _)| kind == "task_human_question")
+    );
+}
+
+#[tokio::test]
+async fn managed_checks_share_retry_counts_and_stop_at_exhaustion() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    configure(&f, &["exit 1"], 2);
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    assert!(
+        lifecycle::check(&session, &Cancellation::default())
+            .await
+            .is_err()
+    );
+    session.claim().await.unwrap();
+    let result = lifecycle::check(&session, &Cancellation::default())
         .await
         .unwrap();
-    let before = std::fs::read(f.root.join("src/lib.rs")).unwrap();
-    let cancelled = Cancellation::default();
-    let signal = cancelled.clone();
-    let cancel = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        signal.cancel();
-    });
+    assert_eq!(result["retries"], 1);
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    let result = lifecycle::check(&session, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(result["task_state"], "failed");
+    assert!(
+        lifecycle::check(&session, &Cancellation::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(session.status().await.unwrap().check_retries, 2);
     assert_eq!(
-        tools.execute(&patch, &cancelled).await,
-        ToolOutcome::Failed(ToolError::Interrupted)
+        std::fs::read_dir(f.root.join(".ferrus/logs"))
+            .unwrap()
+            .count(),
+        2
     );
-    cancel.await.unwrap();
-    assert_eq!(std::fs::read(f.root.join("src/lib.rs")).unwrap(), before);
-    drop(approval);
-    assert!(matches!(
-        tools.execute(&patch, &Cancellation::default()).await,
-        ToolOutcome::Success(_)
-    ));
-    assert!(!lock_path.exists());
-    let short = ValidatedCall {
-        call_id: "short".into(),
-        provider_call_id: "short".into(),
-        name: "exec".into(),
-        arguments: json!({"command":"echo done", "cwd":".", "timeout_ms":60000}),
-    };
-    assert!(matches!(
-        tools.execute(&short, &Cancellation::default()).await,
-        ToolOutcome::Success(_)
-    ));
-    // The process guard must release without another model turn or tool call.
-    let approval = tokio::time::timeout(
-        Duration::from_secs(5),
-        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    drop(approval);
-    #[cfg(unix)]
-    let command = "sleep 30";
-    #[cfg(windows)]
-    let command = "ping -n 30 127.0.0.1 >nul";
-    let exec = ValidatedCall {
-        call_id: "exec".into(),
-        provider_call_id: "exec".into(),
-        name: "exec".into(),
-        arguments: json!({"command":command, "cwd":".", "timeout_ms":60000}),
-    };
-    assert!(matches!(
-        tools.execute(&exec, &Cancellation::default()).await,
-        ToolOutcome::Success(_)
-    ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            acquire_canonical_approval_lock_at(&lock_path, "t-review")
-        )
-        .await
-        .is_err()
-    );
-    assert!(tools.shutdown().await);
-    let approval = tokio::time::timeout(
-        Duration::from_secs(5),
-        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    drop(approval);
-    assert!(!lock_path.exists());
 }
 
 #[tokio::test]
-async fn taskless_mutation_persists_invalidation_without_scheduled_maintenance() {
+async fn managed_model_final_is_incomplete_and_never_completes_the_task() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let _managed = git_session(&f, true).await;
-    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
-        .await
-        .unwrap();
-    project::record_run_started_for_task_with_workspace(
-        "direct-invalidation",
-        "executor",
-        "executor:nano:1",
-        std::process::id(),
-        Some("current"),
-        f.root.to_string_lossy().into_owned(),
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    let (tools, journal) = native(&f, session.clone(), "managed-final");
+    let result = managed::run(
+        session.clone(),
+        identity("managed-final"),
+        Limits::default(),
+        script(vec![]),
+        tools,
+        journal,
+        &Cancellation::default(),
     )
     .await
     .unwrap();
-    let binding = crate::nano::binding::Binding::Interactive {
-        definition: None,
-        project_root: f.root.clone(),
-        project_id: "test-project".into(),
-        data_dir: f.data.clone(),
-        agent_id: "executor:nano:1".into(),
-        run_id: "direct-invalidation".into(),
-    };
-    let prior = binding.graph().await.unwrap().status().await.unwrap();
-    let journal = FileJournal::create(&f.data, "direct-invalidation", Quotas::default()).unwrap();
-    let coding = CodingTools {
-        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
-        commands: commands::Commands::trusted_local(
-            &f.root,
-            "direct-invalidation",
-            journal.directory(),
-            commands::Limits::default(),
+    assert_eq!(result.reason, EndReason::ModelFinished);
+    assert_eq!(session.status().await.unwrap().status, "executing");
+}
+
+#[tokio::test]
+async fn managed_wait_returns_the_real_response_without_inference_polling() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    let (native, _journal) = native(&f, session.clone(), "managed-response");
+    let mut tools = ManagedTools::new(session.clone(), native, Cancellation::default());
+    let request = call("consult", json!({"question":QUESTION}));
+    let stop = Cancellation::default();
+    let execute = tools.execute(&request, &stop);
+    let response = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.status().await.unwrap().status != "consultation" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(
+            f.root.join(".ferrus/runs/t-001/CONSULT_RESPONSE.md"),
+            "Preserve both check gates.",
         )
-        .unwrap(),
+        .unwrap();
     };
-    let mut tools =
-        NativeTools::new(binding.clone(), coding, instructions::Limits::default()).unwrap();
-    tools.working_set_enabled = false;
-    let patch = baseline_patch(&tools, "CanonicalUnrefreshedEdit");
-    // Invalidation must use the bound database rather than the process working directory.
+    let (outcome, _) = tokio::join!(execute, response);
+    assert!(
+        matches!(outcome, ToolOutcome::Success(value) if value["answer"] == "Preserve both check gates.")
+    );
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    assert!(tools.shutdown().await);
+}
+
+#[tokio::test]
+async fn managed_check_pass_clears_retries_and_uses_bound_workspace() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let f = Fixture::new().await;
+    configure(&f, &["exit 1"], 3);
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    lifecycle::check(&session, &Cancellation::default())
+        .await
+        .unwrap();
+    configure(&f, &["echo checked > native-check.txt"], 3);
     let elsewhere = tempfile::tempdir().unwrap();
     std::env::set_current_dir(elsewhere.path()).unwrap();
-    assert!(
-        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
-    );
-    drop(tools);
-    std::env::set_current_dir(&f.root).unwrap();
-    let state = project::canonical_graph_reference().await.unwrap();
-    assert_eq!(state.status, project::CanonicalGraphStatus::Stale);
-    let invalidations: i64 = f.connection().query_row(
-        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-invalidation'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(invalidations, 1);
-    let after = binding.graph().await.unwrap().status().await.unwrap();
-    assert_eq!(after.snapshot_id, prior.snapshot_id);
-    assert_eq!(
-        after.freshness.freshness,
-        crate::repository_graph::domain::Freshness::Stale
-    );
+    let value = lifecycle::check(&session, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(value["status"], "passed");
+    assert_eq!(session.status().await.unwrap().check_retries, 0);
+    assert!(f.root.join("native-check.txt").exists());
+    assert!(!elsewhere.path().join("native-check.txt").exists());
 }
 
 #[tokio::test]
-async fn taskless_prefetch_recovers_after_canonical_publication_but_not_refresh_failure() {
+async fn previous_patch_is_reconciled_from_the_bound_workspace_once() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
     let f = Fixture::new().await;
-    let _managed = git_session(&f, true).await;
-    project::record_task_status("current", ".ferrus/TASK.md", TaskStatus::Unknown)
-        .await
-        .unwrap();
-    project::record_run_started_for_task_with_workspace(
-        "direct-prefetch",
-        "executor",
-        "executor:nano:1",
-        std::process::id(),
-        Some("current"),
-        f.root.to_string_lossy().into_owned(),
-    )
-    .await
-    .unwrap();
-    let binding = crate::nano::binding::Binding::Interactive {
-        definition: None,
-        project_root: f.root.clone(),
-        project_id: "test-project".into(),
-        data_dir: f.data.clone(),
-        agent_id: "executor:nano:1".into(),
-        run_id: "direct-prefetch".into(),
-    };
-    let journal = FileJournal::create(&f.data, "direct-prefetch", Quotas::default()).unwrap();
-    let coding = CodingTools {
-        workspace: workspace::Workspace::new(&f.root, workspace::Limits::default()).unwrap(),
-        commands: commands::Commands::trusted_local(
-            &f.root,
-            "direct-prefetch",
-            journal.directory(),
-            commands::Limits::default(),
-        )
-        .unwrap(),
-    };
-    let mut tools = NativeTools::new(binding, coding, instructions::Limits::default()).unwrap();
-    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
-    let patch = baseline_patch(&tools, "CanonicalPrefetchedEdit");
-    assert!(
-        matches!(tools.execute(&patch, &Cancellation::default()).await, ToolOutcome::Success(value) if value["complete"] == true)
-    );
-    let messages = [Message::User {
-        text: "Inspect the changed symbol".into(),
-    }];
-    let prepared = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "published"),
-        "{:?}",
-        prepared.observations
-    );
-    assert!(
-        prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "prefetch"),
-        "{:?}",
-        prepared.observations
-    );
-    assert_eq!(
-        project::canonical_graph_reference().await.unwrap().status,
-        project::CanonicalGraphStatus::Fresh
-    );
-
-    std::fs::write(
-        f.root.join("ferrus.toml"),
-        "[repository_graph]\nenabled = 'invalid'\n",
-    )
-    .unwrap();
-    tools.invalidate_unknown().await;
-    let prepared = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "canonical_refresh" && item["status"] == "failed")
-    );
-    assert!(
-        !prepared
-            .observations
-            .iter()
-            .any(|item| item["kind"] == "prefetch")
-    );
-    assert_eq!(
-        project::canonical_graph_reference().await.unwrap().status,
-        project::CanonicalGraphStatus::Stale
-    );
-    let invalidations: i64 = f.connection().query_row(
-        "SELECT COUNT(*) FROM events WHERE type = 'canonical_graph_invalidated' AND run_id = 'direct-prefetch'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(invalidations, 2);
-    assert!(tools.shutdown().await);
-}
-
-#[tokio::test]
-async fn prefetch_waits_for_the_new_overlay_after_a_quick_patch() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let previous = session
-        .status()
-        .await
-        .unwrap()
-        .repository_view
-        .view_snapshot_id;
-    let (mut tools, _journal) = native(&f, session.clone(), "prefetch-after-patch");
-    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
-    let patch = baseline_patch(&tools, "PrefetchedEdit");
-    assert!(
-        matches!(tools.execute(&patch, &Cancellation::default()).await,
-        ToolOutcome::Success(value) if value["complete"] == true)
-    );
-    let prepared = tools
-        .prepare_context(
-            &[Message::User {
-                text: "task".into(),
+    let session = FerrusSession::bind(f.launch()).await.unwrap();
+    session.claim().await.unwrap();
+    let workspace =
+        workspace::Workspace::new(session.workspace(), workspace::Limits::default()).unwrap();
+    let plan = workspace
+        .patch_effect_plan(workspace::patch::PatchRequest {
+            edits: vec![workspace::patch::Edit::Create {
+                path: "recovered.txt".into(),
+                content: "recovered\n".into(),
             }],
-            &Cancellation::default(),
-        )
+        })
+        .unwrap();
+    previous_run(&f, "old-patch");
+    previous_intent(&f, "old-patch", "apply_patch", Some(plan), true);
+    std::fs::write(f.root.join("recovered.txt"), "recovered\n").unwrap();
+
+    let first = crate::nano::resume::recover_previous(&session, &workspace)
         .await
         .unwrap()
         .unwrap();
-    let prefetched = prepared
-        .observations
-        .iter()
-        .find(|item| item["kind"] == "prefetch")
-        .expect("prefetch should use the new task view");
-    let view = session.status().await.unwrap().repository_view;
-    assert_ne!(view.view_snapshot_id, previous);
-    assert_eq!(
-        prefetched["evidence"]["provenance"]["snapshot_id"],
-        json!(view.view_snapshot_id)
-    );
-    assert!(
-        !serde_json::to_string(prefetched)
-            .unwrap()
-            .contains("pub struct Baseline;")
-    );
-    assert!(tools.shutdown().await);
-}
-
-#[tokio::test]
-async fn shutdown_refreshes_an_overlay_deferred_by_an_active_writer() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let previous = session
-        .status()
+    assert!(first.note.contains("matches its full recorded after-state"));
+    assert_eq!(first.budget.model_turns, 1);
+    assert_eq!(first.budget.tool_calls, 1);
+    assert_eq!(first.budget.tokens(), 2);
+    assert_eq!(session.status().await.unwrap().status, "executing");
+    let old_dir = f.data.join("nano/sessions/old-patch");
+    let old_size = std::fs::metadata(old_dir.join("events.jsonl"))
+        .unwrap()
+        .len();
+    let second = crate::nano::resume::recover_previous(&session, &workspace)
         .await
         .unwrap()
-        .repository_view
-        .view_snapshot_id;
-    let (mut tools, _journal) = native(&f, session.clone(), "writer-at-shutdown");
-    let command = if cfg!(windows) {
-        r"echo pub struct ShutdownEdit;> src\lib.rs & ping -n 30 127.0.0.1 > nul"
-    } else {
-        "printf 'pub struct ShutdownEdit;\\n' > src/lib.rs; sleep 30"
-    };
-    let started = tools
-        .execute(
-            &call(
-                "exec",
-                json!({"command":command, "cwd":".", "timeout_ms":30_000}),
-            ),
-            &Cancellation::default(),
-        )
-        .await;
-    assert!(matches!(started, ToolOutcome::Success(_)));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if std::fs::read_to_string(f.root.join("src/lib.rs"))
-                .is_ok_and(|source| source.contains("ShutdownEdit"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        .unwrap();
+    assert!(second.note.contains("old-patch"));
+    assert_eq!(
+        std::fs::metadata(old_dir.join("events.jsonl"))
+            .unwrap()
+            .len(),
+        old_size
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("recovered.txt")).unwrap(),
+        "recovered\n"
+    );
+
+    let (tools, journal) = native(&f, session.clone(), RUN);
+    let end = managed::run(
+        session.clone(),
+        identity(RUN),
+        Limits::default(),
+        script(vec![]),
+        tools,
+        journal,
+        &Cancellation::default(),
+    )
     .await
-    .expect("command must write before shutdown");
-    assert!(tools.coding.commands.potentially_active_writers() > 0);
-    assert_eq!(
-        session
-            .status()
-            .await
-            .unwrap()
-            .repository_view
-            .view_snapshot_id,
-        previous
-    );
-    assert!(tools.shutdown().await);
-    assert_ne!(
-        session
-            .status()
-            .await
-            .unwrap()
-            .repository_view
-            .view_snapshot_id,
-        previous
-    );
-}
-
-#[tokio::test]
-async fn explicit_prefetch_is_read_only_host_evidence_and_rechecks_source_bytes() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let f = Fixture::new().await;
-    let session = git_session(&f, true).await;
-    let (mut tools, _journal) = native(&f, session, "prefetch-test");
-    tools.working_set_enabled = false;
-    tools.context.cache_enabled = false;
-    let messages = vec![Message::User {
-        text: "bound task and constraints".into(),
-    }];
+    .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    assert_eq!(end.budget.model_turns, 2);
+    assert_eq!(end.budget.tool_calls, 1);
+    assert_eq!(end.budget.reported_input_tokens, 11);
+    let (_, records) =
+        FileJournal::recover(&f.data.join("nano/sessions").join(RUN), Quotas::default()).unwrap();
     assert!(
-        tools
-            .prepare_context(&messages, &Cancellation::default())
-            .await
-            .unwrap()
-            .is_none()
+        matches!(&records[0].event, SessionEvent::Started { inherited_budget: Some(budget), .. } if budget.model_turns == 1 && budget.tool_calls == 1)
     );
-    tools.prefetch = vec![json!({"type":"path", "value":"src/lib.rs"})];
-    let events = f.events();
-    let tasks = project::list_tasks().await.unwrap();
-    let prepared = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(prepared.replacements.is_empty());
-    assert_eq!(prepared.observations.len(), 1);
-    assert_eq!(prepared.observations[0]["kind"], "prefetch");
-    assert_eq!(
-        prepared.observations[0]["evidence"]["binding"]["task"],
-        TASK
-    );
-    assert!(
-        !prepared.observations[0]["evidence"]["sources"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let projected = prepared.apply(&messages).unwrap();
-    assert_eq!(projected.len(), 2);
-    assert_eq!(projected[0], messages[0]);
-    assert!(
-        matches!(&projected[1], Message::User {text} if text.contains("Ferrus host observation") && text.contains("pub struct Baseline;"))
-    );
-    std::fs::write(f.root.join("src/lib.rs"), "pub struct ExternalChange;\n").unwrap();
-    let next = tools
-        .prepare_context(&messages, &Cancellation::default())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(next.observations[0]["kind"], "prefetch_unavailable");
-    assert!(
-        !serde_json::to_string(&next.apply(&messages).unwrap())
-            .unwrap()
-            .contains("pub struct Baseline;")
-    );
-    assert_eq!(messages.len(), 1);
-    f.assert_no_effect(tasks, events).await;
-    assert!(tools.shutdown().await);
-}
-
-mod reviewer_profiles {
-    use super::*;
-    include!("review/lifecycle_tests.rs");
 }

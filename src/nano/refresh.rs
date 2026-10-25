@@ -50,6 +50,7 @@ impl Refresh {
         {
             observations.push(value);
         }
+
         let Some(dirty) = self.take_pending(writers) else {
             return observations;
         };
@@ -60,6 +61,7 @@ impl Refresh {
                 if session.status().await.is_err() {
                     return json!({"kind":"canonical_refresh", "status":"failed"});
                 }
+
                 let status = crate::repository_graph_runtime::refresh_canonical_graph_after_workspace_change(
                     session.project_root().to_path_buf(),
                     session.run_id().into(),
@@ -67,7 +69,10 @@ impl Refresh {
                 .await;
                 return json!({"kind":"canonical_refresh", "status":status});
             }
-            let session = session.managed().unwrap();
+
+            let Some(session) = session.managed() else {
+                return json!({"kind":"task_refresh", "status":"failed"});
+            };
             let result = async {
                 let runtime = session.authorize().await?;
                 let Some(baseline) = session.baseline_tree() else {
@@ -83,6 +88,7 @@ impl Refresh {
                 if !graph.config.enabled {
                     return Ok(None);
                 }
+
                 crate::repository_graph_runtime::refresh_task_overlay_explicit(
                     graph,
                     session.data_dir(),
@@ -112,6 +118,7 @@ impl Refresh {
         if writers || self.task.is_some() || self.attempts >= 4 {
             return None;
         }
+
         let dirty = self.dirty.take()?;
         self.attempts += 1;
         Some(dirty)
@@ -144,6 +151,7 @@ mod tests {
         for _ in 0..8 {
             refresh.invalidate();
         }
+
         assert_eq!(refresh.dirty, Some(first));
         assert!(refresh.take_pending(true).is_none());
         assert_eq!(refresh.take_pending(false), Some(first));
@@ -152,6 +160,7 @@ mod tests {
             refresh.invalidate();
             assert!(refresh.take_pending(false).is_some());
         }
+
         refresh.invalidate();
         assert!(refresh.take_pending(false).is_none());
         assert_eq!(refresh.pending_reason(), Some("overlay_refresh_limit"));

@@ -21,6 +21,7 @@ pub(super) fn resolve_cargo_dependencies(
         if expired(started, duration) {
             break;
         }
+
         match &edge.target {
             EdgeTarget::Node(package) => {
                 known_targets.insert(edge.source.clone(), edge.target.clone());
@@ -49,8 +50,22 @@ pub(super) fn resolve_cargo_dependencies(
                                 .insert(edge.source.clone(), package.clone());
                         }
                     }
-                    [] => diagnostics.push("resolution.dependency_missing", edge),
-                    _ => diagnostics.push("resolution.dependency_ambiguous", edge),
+                    [] => diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "resolution.dependency_missing",
+                            )
+                        },
+                        edge,
+                    ),
+                    _ => diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "resolution.dependency_ambiguous",
+                            )
+                        },
+                        edge,
+                    ),
                 }
             }
             _ => {}
@@ -61,19 +76,28 @@ pub(super) fn resolve_cargo_dependencies(
         if expired(started, duration) {
             break;
         }
+
         let EdgeTarget::Unresolved(candidate) = &edge.target else {
             continue;
         };
         if !candidate.starts_with("cargo-workspace-dependency:") {
             continue;
         }
+
         let alias = indexes
             .nodes
             .get(&edge.source)
             .and_then(|node| string_property(node, "alias"))
             .map(normalize_identifier);
         let Some(alias) = alias else {
-            diagnostics.push("resolution.dependency_missing", edge);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.dependency_missing",
+                    )
+                },
+                edge,
+            );
             continue;
         };
         let workspaces = indexes
@@ -88,15 +112,26 @@ pub(super) fn resolve_cargo_dependencies(
         if workspaces.len() != 1 {
             diagnostics.push(
                 if workspaces.is_empty() {
-                    "resolution.dependency_missing"
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "resolution.dependency_missing",
+                        )
+                    }
                 } else {
-                    "resolution.dependency_ambiguous"
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "resolution.dependency_ambiguous",
+                        )
+                    }
                 },
                 edge,
             );
             continue;
         }
-        let workspace = workspaces.iter().next().expect("one workspace exists");
+
+        let Some(workspace) = workspaces.iter().next() else {
+            continue;
+        };
         let mut inherited = indexes
             .dependency_owners
             .iter()
@@ -115,7 +150,9 @@ pub(super) fn resolve_cargo_dependencies(
         inherited.dedup();
         match inherited.len() {
             1 => {
-                let target = inherited.into_iter().next().expect("one target exists");
+                let Some(target) = inherited.into_iter().next() else {
+                    continue;
+                };
                 if plan.replace(edge, resolved_edge(edge, target.clone(), Confidence::Exact)) {
                     known_targets.insert(edge.source.clone(), target.clone());
                     if let EdgeTarget::Node(package) = target {
@@ -125,10 +162,25 @@ pub(super) fn resolve_cargo_dependencies(
                     }
                 }
             }
-            0 => diagnostics.push("resolution.dependency_missing", edge),
-            _ => diagnostics.push("resolution.dependency_ambiguous", edge),
+            0 => diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.dependency_missing",
+                    )
+                },
+                edge,
+            ),
+            _ => diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.dependency_ambiguous",
+                    )
+                },
+                edge,
+            ),
         }
     }
+
     resolved
 }
 
@@ -136,230 +188,6 @@ pub(super) fn resolve_cargo_dependencies(
 pub(super) struct ResolvedDependencies {
     internal: BTreeMap<NodeId, NodeId>,
     external: BTreeSet<NodeId>,
-}
-
-pub(super) fn resolve_module_declarations(
-    input: &CrossFileResolutionInput<'_>,
-    indexes: &Indexes<'_>,
-    plan: &mut ResolutionPlan,
-    diagnostics: &mut DiagnosticBuffer,
-    started: Instant,
-    duration: Duration,
-) -> BTreeMap<super::super::domain::EdgeId, NodeId> {
-    let manifest_paths = input
-        .manifest
-        .files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let containment_parents = containment_module_parents(&input.fragment, indexes);
-    let mut resolved = BTreeMap::new();
-
-    for edge in sorted_edges(&input.fragment, "declares_module") {
-        if expired(started, duration) {
-            break;
-        }
-        if let EdgeTarget::Node(target) = &edge.target {
-            resolved.insert(edge.id.clone(), target.clone());
-            continue;
-        }
-        let EdgeTarget::Unresolved(name) = &edge.target else {
-            continue;
-        };
-        if evidence_key(edge.provenance.evidence.as_ref())
-            .is_some_and(|key| indexes.path_override_evidence.contains(&key))
-        {
-            diagnostics.push("resolution.module_path_override", edge);
-            continue;
-        }
-        let Some(base) = module_base(&edge.source, indexes, &containment_parents) else {
-            diagnostics.push("resolution.module_scope_ambiguous", edge);
-            continue;
-        };
-        let name = normalize_identifier(name);
-        if name.is_empty() || name.contains('/') || name.contains("::") {
-            diagnostics.push("resolution.module_target_unsupported", edge);
-            continue;
-        }
-        let candidates = [
-            join_path(&base, &format!("{name}.rs")),
-            join_path(&base, &format!("{name}/mod.rs")),
-        ];
-        let matches = candidates
-            .iter()
-            .filter(|candidate| manifest_paths.contains(candidate.as_str()))
-            .filter_map(|candidate| indexes.rust_roots_by_path.get(candidate))
-            .flatten()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        match matches.len() {
-            1 => {
-                let target = matches.into_iter().next().expect("one match exists");
-                let replacement =
-                    resolved_edge(edge, EdgeTarget::Node(target.clone()), Confidence::High);
-                if plan.replace(edge, replacement) {
-                    resolved.insert(edge.id.clone(), target);
-                }
-            }
-            0 => diagnostics.push("resolution.module_missing", edge),
-            _ => diagnostics.push("resolution.module_ambiguous", edge),
-        }
-    }
-    resolved
-}
-
-fn containment_module_parents(
-    fragment: &GraphFragment,
-    indexes: &Indexes<'_>,
-) -> BTreeMap<NodeId, BTreeSet<NodeId>> {
-    let mut parents = BTreeMap::new();
-    for edge in &fragment.edges {
-        if edge.kind != "contains" {
-            continue;
-        }
-        let EdgeTarget::Node(target) = &edge.target else {
-            continue;
-        };
-        if indexes
-            .nodes
-            .get(target)
-            .is_some_and(|node| node.kind == "module")
-        {
-            insert_set(&mut parents, target, &edge.source);
-        }
-    }
-    parents
-}
-
-fn module_base(
-    source: &NodeId,
-    indexes: &Indexes<'_>,
-    parents: &BTreeMap<NodeId, BTreeSet<NodeId>>,
-) -> Option<String> {
-    let mut current = source.clone();
-    let mut inline: Vec<String> = Vec::new();
-    let mut seen = BTreeSet::new();
-    loop {
-        if !seen.insert(current.clone()) {
-            return None;
-        }
-        let node = indexes.nodes.get(&current)?;
-        if is_file_module(node) {
-            let path = evidence_path(node)?;
-            let mut base = file_module_directory(path);
-            for segment in inline.iter().rev() {
-                base = join_path(&base, segment);
-            }
-            return Some(base);
-        }
-        if node.kind != "module" || string_property(node, "module_origin") != Some("inline") {
-            return None;
-        }
-        inline.push(normalize_identifier(string_property(node, "name")?));
-        let parent = parents.get(&current)?;
-        if parent.len() != 1 {
-            return None;
-        }
-        current = parent.iter().next()?.clone();
-    }
-}
-
-pub(super) struct ModuleGraph {
-    children: BTreeMap<(NodeId, String), BTreeSet<NodeId>>,
-    parents: BTreeMap<NodeId, BTreeSet<NodeId>>,
-}
-
-impl ModuleGraph {
-    pub(super) fn new(
-        fragment: &GraphFragment,
-        indexes: &Indexes<'_>,
-        resolved_modules: &BTreeMap<super::super::domain::EdgeId, NodeId>,
-    ) -> Self {
-        let mut children = BTreeMap::new();
-        let mut parents = BTreeMap::new();
-        for edge in &fragment.edges {
-            let target = if edge.kind == "declares_module" {
-                resolved_modules.get(&edge.id).cloned().or_else(|| {
-                    if let EdgeTarget::Node(target) = &edge.target {
-                        Some(target.clone())
-                    } else {
-                        None
-                    }
-                })
-            } else if edge.kind == "contains" {
-                if let EdgeTarget::Node(target) = &edge.target {
-                    Some(target.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let Some(target) = target else {
-                continue;
-            };
-            let Some(node) = indexes.nodes.get(&target) else {
-                continue;
-            };
-            if matches!(node.kind.as_str(), "mod_declaration" | "impl") {
-                continue;
-            }
-            if let Some(name) = string_property(node, "name") {
-                children
-                    .entry((edge.source.clone(), normalize_identifier(name)))
-                    .or_insert_with(BTreeSet::new)
-                    .insert(target.clone());
-            }
-            if node.kind == "module" {
-                insert_set(&mut parents, &target, &edge.source);
-            }
-        }
-        Self { children, parents }
-    }
-
-    fn child(&self, parent: &NodeId, name: &str) -> ChildLookup {
-        match self
-            .children
-            .get(&(parent.clone(), normalize_identifier(name)))
-        {
-            Some(matches) if matches.len() == 1 => {
-                ChildLookup::Unique(matches.iter().next().expect("one child exists").clone())
-            }
-            Some(matches) if !matches.is_empty() => ChildLookup::Ambiguous,
-            _ => ChildLookup::Missing,
-        }
-    }
-
-    fn parent(&self, child: &NodeId) -> ChildLookup {
-        match self.parents.get(child) {
-            Some(matches) if matches.len() == 1 => {
-                ChildLookup::Unique(matches.iter().next().expect("one parent exists").clone())
-            }
-            Some(matches) if !matches.is_empty() => ChildLookup::Ambiguous,
-            _ => ChildLookup::Missing,
-        }
-    }
-
-    fn root(&self, node: &NodeId) -> ChildLookup {
-        let mut current = node.clone();
-        let mut seen = BTreeSet::new();
-        loop {
-            if !seen.insert(current.clone()) {
-                return ChildLookup::Ambiguous;
-            }
-            match self.parent(&current) {
-                ChildLookup::Unique(parent) => current = parent,
-                ChildLookup::Missing => return ChildLookup::Unique(current),
-                ChildLookup::Ambiguous => return ChildLookup::Ambiguous,
-            }
-        }
-    }
-}
-
-enum ChildLookup {
-    Unique(NodeId),
-    Missing,
-    Ambiguous,
 }
 
 #[derive(Default)]
@@ -396,6 +224,7 @@ pub(super) fn resolve_cargo_membership(
         if expired(started, duration) {
             break;
         }
+
         for entry in entries {
             let Some(path) = indexes.entry_paths.get(entry) else {
                 continue;
@@ -406,6 +235,7 @@ pub(super) fn resolve_cargo_membership(
             if roots.len() != 1 {
                 continue;
             }
+
             let root = roots[0].clone();
             entry_roots.insert(entry.clone(), root.clone());
             if let Some(node) = indexes.nodes.get(entry) {
@@ -423,6 +253,7 @@ pub(super) fn resolve_cargo_membership(
                     plan.resolve_node(target.clone());
                 }
             }
+
             if let Some(edge) = input.fragment.edges.iter().find(|edge| {
                 edge.kind == "has_entry_point"
                     && edge.source == *target
@@ -434,6 +265,7 @@ pub(super) fn resolve_cargo_membership(
                     resolved_edge(edge, edge.target.clone(), Confidence::High),
                 );
             }
+
             if let Some(packages) = indexes.target_packages.get(target) {
                 for package in packages {
                     insert_set(&mut result.module_packages, &root, package);
@@ -471,6 +303,7 @@ pub(super) fn resolve_cargo_membership(
         if expired(started, duration) {
             break;
         }
+
         let evidence = indexes
             .nodes
             .get(module)
@@ -488,6 +321,7 @@ pub(super) fn resolve_cargo_membership(
             plan.add(edge);
         }
     }
+
     result
 }
 
@@ -518,6 +352,7 @@ fn resolve_workspace_membership(
         if expired(started, duration) {
             return;
         }
+
         let Some(package_manifest) = string_property(package, "manifest_path") else {
             continue;
         };
@@ -532,6 +367,7 @@ fn resolve_workspace_membership(
                 matches.insert(workspace.id.clone());
                 continue;
             }
+
             let member_patterns = string_list_property(workspace, "member_patterns");
             let exclude_patterns = string_list_property(workspace, "exclude_patterns");
             let mut workspace_unsupported = false;
@@ -552,15 +388,23 @@ fn resolve_workspace_membership(
                 matches.insert(workspace.id.clone());
             }
         }
+
         if unsupported {
             diagnostics.push_evidence(
-                "resolution.workspace_pattern_unsupported",
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.workspace_pattern_unsupported",
+                    )
+                },
                 package.provenance.evidence.as_ref(),
             );
         }
+
         match matches.len() {
             1 => {
-                let workspace = matches.iter().next().expect("one workspace exists").clone();
+                let Some(workspace) = matches.iter().next().cloned() else {
+                    continue;
+                };
                 insert_set(&mut result.package_workspaces, &package.id, &workspace);
                 let edge = new_edge(
                     input,
@@ -575,7 +419,11 @@ fn resolve_workspace_membership(
             }
             0 => {}
             _ => diagnostics.push_evidence(
-                "resolution.workspace_membership_ambiguous",
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.workspace_membership_ambiguous",
+                    )
+                },
                 package.provenance.evidence.as_ref(),
             ),
         }
@@ -600,17 +448,32 @@ pub(super) fn resolve_imports(
             if expired(started, duration) {
                 return;
             }
+
             let EdgeTarget::Unresolved(raw) = &edge.target else {
                 continue;
             };
             let path = match UsePath::parse(raw) {
                 Ok(path) => path,
                 Err(UsePathError::Unsupported) => {
-                    diagnostics.push("resolution.import_unsupported", edge);
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "resolution.import_unsupported",
+                            )
+                        },
+                        edge,
+                    );
                     continue;
                 }
                 Err(UsePathError::Invalid) => {
-                    diagnostics.push("resolution.import_invalid", edge);
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "resolution.import_invalid",
+                            )
+                        },
+                        edge,
+                    );
                     continue;
                 }
             };
@@ -637,8 +500,22 @@ pub(super) fn resolve_imports(
                         ),
                     );
                 }
-                UseResolution::Missing => diagnostics.push("resolution.import_missing", edge),
-                UseResolution::Ambiguous => diagnostics.push("resolution.import_ambiguous", edge),
+                UseResolution::Missing => diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "resolution.import_missing",
+                        )
+                    },
+                    edge,
+                ),
+                UseResolution::Ambiguous => diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "resolution.import_ambiguous",
+                        )
+                    },
+                    edge,
+                ),
             }
         }
     }
@@ -681,6 +558,7 @@ fn dependency_aliases(
                 .push(target.clone());
         }
     }
+
     result
 }
 
@@ -707,6 +585,7 @@ fn resolve_use_path(
                     ChildLookup::Ambiguous => return UseResolution::Ambiguous,
                 };
             }
+
             (current, 0)
         }
         UseBase::Bare => {
@@ -736,6 +615,7 @@ fn resolve_use_path(
             ChildLookup::Ambiguous => return UseResolution::Ambiguous,
         };
     }
+
     UseResolution::Node(current)
 }
 
@@ -755,6 +635,7 @@ fn dependency_target(
     if matches!(alias, "std" | "core" | "alloc") {
         return DependencyLookup::External;
     }
+
     let Some(packages) = cargo.module_packages.get(module) else {
         return DependencyLookup::Missing;
     };
@@ -771,17 +652,17 @@ fn dependency_target(
             DependencyLookup::Ambiguous
         };
     }
+
     match matches[0] {
         DependencyTarget::External => DependencyLookup::External,
         DependencyTarget::Unresolved => DependencyLookup::Missing,
         DependencyTarget::Internal(package) => match cargo.package_lib_roots.get(package) {
-            Some(roots) if roots.len() == 1 => DependencyLookup::Internal(
-                roots
-                    .iter()
-                    .next()
-                    .expect("one library root exists")
-                    .clone(),
-            ),
+            Some(roots) if roots.len() == 1 => roots
+                .iter()
+                .next()
+                .cloned()
+                .map(DependencyLookup::Internal)
+                .unwrap_or(DependencyLookup::Missing),
             Some(roots) if !roots.is_empty() => DependencyLookup::Ambiguous,
             _ => DependencyLookup::Missing,
         },
@@ -812,6 +693,7 @@ impl UsePath {
         if raw.contains(['{', '}', '*']) {
             return Err(UsePathError::Unsupported);
         }
+
         let target = raw
             .rsplit_once(" as ")
             .map_or(raw, |(target, _alias)| target)
@@ -819,6 +701,7 @@ impl UsePath {
         if target.is_empty() || target.starts_with("::") {
             return Err(UsePathError::Invalid);
         }
+
         let mut parts = target
             .split("::")
             .map(normalize_identifier)
@@ -826,6 +709,7 @@ impl UsePath {
         if parts.iter().any(String::is_empty) {
             return Err(UsePathError::Invalid);
         }
+
         let base = match parts.first().map(String::as_str) {
             Some("crate") => {
                 parts.remove(0);
@@ -892,9 +776,11 @@ impl ResolutionPlan {
         if self.replacements.contains_key(&original.id) {
             return true;
         }
+
         if !self.reserve() {
             return false;
         }
+
         self.replacements.insert(original.id.clone(), replacement);
         true
     }
@@ -903,13 +789,16 @@ impl ResolutionPlan {
         if self.existing_edges.contains(&edge.id) || self.additions.contains_key(&edge.id) {
             return true;
         }
+
         if self.additions_used >= self.addition_limit {
             self.truncated = true;
             return false;
         }
+
         if !self.reserve() {
             return false;
         }
+
         self.additions_used += 1;
         self.additions.insert(edge.id.clone(), edge);
         true
@@ -929,3 +818,6 @@ impl ResolutionPlan {
         }
     }
 }
+
+mod modules;
+pub(super) use modules::*;

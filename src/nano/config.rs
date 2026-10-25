@@ -53,18 +53,23 @@ fn default_enabled() -> bool {
 fn default_session_tokens() -> u64 {
     super::session::Limits::default().tokens
 }
+
 fn default_timeout() -> u64 {
     120_000
 }
+
 fn default_wire() -> usize {
     4 * 1024 * 1024
 }
+
 fn default_event() -> usize {
     256 * 1024
 }
+
 fn default_calls() -> usize {
     64
 }
+
 fn default_usage() -> bool {
     true
 }

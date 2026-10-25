@@ -26,5 +26,6 @@ async fn list(limit: usize) -> Result<()> {
     for line in runtime_table::run_lines(&runs) {
         println!("{line}");
     }
+
     Ok(())
 }

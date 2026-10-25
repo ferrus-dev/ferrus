@@ -188,6 +188,7 @@ impl AuthorizationContext {
         {
             return Err(AuthorizationError::Denied);
         }
+
         Ok(())
     }
 }
@@ -309,6 +310,7 @@ impl RemoteRetentionPolicy {
         if self.policy_version != DISTRIBUTED_POLICY_VERSION {
             return Err(RetentionPolicyError::UnsupportedVersion);
         }
+
         let classes = self
             .rules
             .iter()
@@ -319,6 +321,7 @@ impl RemoteRetentionPolicy {
         {
             return Err(RetentionPolicyError::Incomplete);
         }
+
         Ok(())
     }
 }
@@ -394,12 +397,15 @@ impl DeleteDataRequest {
         if self.policy_version != DISTRIBUTED_POLICY_VERSION {
             return Err(DeletionPolicyError::UnsupportedVersion);
         }
+
         if self.coverage.is_empty() {
             return Err(DeletionPolicyError::EmptyCoverage);
         }
+
         if self.idempotency_key != deletion_key(&self.target, &self.coverage)? {
             return Err(DeletionPolicyError::IdempotencyMismatch);
         }
+
         Ok(())
     }
 }
@@ -498,9 +504,11 @@ impl WorkerSandboxPolicy {
         if self.policy_version != DISTRIBUTED_POLICY_VERSION {
             return Err(WorkerPolicyError::UnsupportedVersion);
         }
+
         if !self.read_only_source_objects || !self.ephemeral_workspace {
             return Err(WorkerPolicyError::UnsafeStorageBoundary);
         }
+
         Ok(())
     }
 }

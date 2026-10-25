@@ -42,6 +42,7 @@ async fn run_with_cwd(
     if config.checks.commands.is_empty() {
         return Ok(CheckGateResult::Passed);
     }
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -92,6 +93,7 @@ pub(crate) fn build_report(
     for cmd in &failed {
         out.push_str(&format!("- `{}`\n", cmd.command));
     }
+
     out.push('\n');
 
     for cmd in &failed {
@@ -100,11 +102,13 @@ pub(crate) fn build_report(
         if cmd.output.truncated {
             out.push_str(&format!("(bounded tail of {} lines; up to {max_lines} lines and 64 KiB of output retained)\n", cmd.output.total_lines));
         }
+
         out.push_str("```\n");
         out.push_str(tail);
         if !tail.ends_with('\n') {
             out.push('\n');
         }
+
         out.push_str("```\n\n");
     }
 

@@ -13,9 +13,11 @@ pub(super) struct Request {
     #[serde(default = "page_bytes")]
     max_bytes: usize,
 }
+
 fn page_bytes() -> usize {
     2048
 }
+
 pub(super) fn parse(args: &Value) -> Result<Request> {
     let request: Request = serde_json::from_value(args.clone())?;
     ensure!(
@@ -29,6 +31,7 @@ pub(super) fn parse(args: &Value) -> Result<Request> {
     );
     Ok(request)
 }
+
 pub(super) fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: NAME.into(),
@@ -41,6 +44,7 @@ pub(super) fn descriptor() -> ToolDescriptor {
         },"required":["task_id","artifact"],"additionalProperties":false}),
     }
 }
+
 pub(super) async fn read(scope: &Scope, args: &Value) -> Result<Value> {
     scope.check().await?;
     ensure!(
@@ -103,6 +107,7 @@ pub(super) async fn read(scope: &Scope, args: &Value) -> Result<Value> {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
+
     ensure!(
         end > request.offset || end == text.len(),
         "Increase max_bytes to fit the next character"

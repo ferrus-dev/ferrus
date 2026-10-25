@@ -17,6 +17,7 @@ impl App {
         {
             return false;
         }
+
         self.release_nano_input(false);
         self.last_error =
             Some("Nano input was rejected; the request is still in the editor.".into());
@@ -31,6 +32,7 @@ impl App {
         if view.run_id != pending.run_id {
             return changed;
         }
+
         let accepted = view
             .snapshot
             .accepted_inputs
@@ -46,8 +48,10 @@ impl App {
                     "Nano ended before input confirmation; the request is kept. Inspect the journal before retrying."
                 }.into());
             }
+
             return true;
         }
+
         changed
     }
 
@@ -64,6 +68,7 @@ impl App {
                     self.history.remove(0);
                 }
             }
+
             if self.input == pending.text {
                 self.input.clear();
                 self.cursor_pos = 0;
@@ -80,6 +85,7 @@ impl App {
                     self.history.remove(0);
                 }
             }
+
             self.input = pending.text;
             self.cursor_pos = self.input.chars().count();
             self.answering_nano_run_id = Some(pending.run_id);
@@ -104,6 +110,7 @@ impl App {
                 );
             nano::trim_notices(&mut view.notices);
         }
+
         self.messages.extend(lines);
         trim_transcript_history(&mut self.messages);
     }
@@ -161,10 +168,12 @@ impl App {
         {
             return;
         }
+
         if self.input.is_empty() && ch != '/' {
             self.answering_question_task_id = self.question_task_id.clone();
             self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
+
         crate::shared::input::insert(&mut self.input, &mut self.cursor_pos, ch);
         self.history_idx = None;
         self.update_command_context();
@@ -174,10 +183,12 @@ impl App {
         if self.nano.is_some() && self.input.len() >= crate::nano::wire::FRAME_BYTES {
             return;
         }
+
         if self.input.is_empty() {
             self.answering_question_task_id = self.question_task_id.clone();
             self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
         }
+
         crate::shared::input::insert(&mut self.input, &mut self.cursor_pos, '\n');
         self.history_idx = None;
         self.update_command_context();
@@ -191,6 +202,7 @@ impl App {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
+
                     self.insert_newline();
                 }
                 '\n' => self.insert_newline(),
@@ -203,11 +215,13 @@ impl App {
         if self.cursor_pos == 0 {
             return;
         }
+
         crate::shared::input::delete(&mut self.input, &mut self.cursor_pos, true);
         if self.input.is_empty() {
             self.answering_question_task_id = None;
             self.answering_nano_run_id = None;
         }
+
         self.history_idx = None;
         self.update_command_context();
     }
@@ -216,11 +230,13 @@ impl App {
         if self.cursor_pos >= self.input.chars().count() {
             return;
         }
+
         crate::shared::input::delete(&mut self.input, &mut self.cursor_pos, false);
         if self.input.is_empty() {
             self.answering_question_task_id = None;
             self.answering_nano_run_id = None;
         }
+
         self.history_idx = None;
         self.update_command_context();
     }
@@ -247,9 +263,11 @@ impl App {
             self.previous_completion();
             return;
         }
+
         if self.move_cursor_up() {
             return;
         }
+
         self.history_up();
     }
 
@@ -258,9 +276,11 @@ impl App {
             self.next_completion();
             return;
         }
+
         if self.move_cursor_down() {
             return;
         }
+
         self.history_down();
     }
 
@@ -268,22 +288,26 @@ impl App {
         if self.history.is_empty() {
             return;
         }
+
         match self.history_idx {
             None => {
                 if self.input.is_empty() {
                     self.answering_question_task_id = self.question_task_id.clone();
                     self.answering_nano_run_id = self.nano.as_ref().map(|view| view.run_id.clone());
                 }
+
                 self.history_saved = self.input.clone();
                 self.history_idx = Some(self.history.len() - 1);
             }
             Some(0) => {}
             Some(idx) => self.history_idx = Some(idx - 1),
         }
+
         if let Some(idx) = self.history_idx {
             self.input = self.history[idx].clone();
             self.cursor_pos = self.input.chars().count();
         }
+
         self.update_command_context();
     }
 
@@ -305,6 +329,7 @@ impl App {
                 }
             }
         }
+
         self.update_command_context();
     }
 
@@ -399,6 +424,7 @@ impl App {
             self.input = (*cmd).to_string();
             self.cursor_pos = self.input.chars().count();
         }
+
         self.clear_completion();
     }
 
@@ -413,6 +439,7 @@ impl App {
             self.completion_active = false;
             return;
         }
+
         self.completion_hidden = false;
 
         let prefix = self.completion_prefix().to_string();
@@ -426,6 +453,7 @@ impl App {
             } else {
                 self.completion_active = true;
             }
+
             return;
         }
 
@@ -433,11 +461,13 @@ impl App {
             self.accept_completion();
             return;
         }
+
         if !self.completion_active {
             self.completion_active = true;
             self.completion_selected = 0;
             return;
         }
+
         self.completion_selected =
             (self.completion_selected + 1) % self.completion_candidates.len();
     }
@@ -460,6 +490,7 @@ impl App {
         if line.is_empty() {
             return;
         }
+
         let steering = !line.starts_with('/')
             && self.answering_question_task_id.is_none()
             && (self.nano.is_some() || self.answering_nano_run_id.is_some());
@@ -470,6 +501,7 @@ impl App {
             );
             return;
         }
+
         let input_id = steering.then(|| crate::project::allocate_run_id("input", "nano"));
         if steering
             && crate::nano::wire::validate_identified_steer(&line, input_id.as_deref()).is_err()
@@ -479,10 +511,12 @@ impl App {
             );
             return;
         }
+
         self.last_error = None;
         if line == "/quit" {
             self.should_quit = true;
         }
+
         let human_question_task_id = if line.starts_with('/') {
             None
         } else {
@@ -508,15 +542,17 @@ impl App {
                 Some("HQ input channel is closed; the request is still in the editor.".into());
             return;
         }
-        if steering && let Some(run_id) = nano_run_id {
+
+        if steering && let (Some(run_id), Some(input_id)) = (nano_run_id, input_id) {
             self.nano_pending = Some(PendingNanoInput {
                 run_id,
                 text: self.input.clone(),
-                input_id: input_id.unwrap(),
+                input_id,
             });
             self.last_error = Some("Waiting for Nano to accept the input.".into());
             return;
         }
+
         if !line.contains('\n') && self.history.last() != Some(&line) {
             self.history.push(line);
             if self.history.len() > MAX_HISTORY {
@@ -524,6 +560,7 @@ impl App {
                 self.history.drain(0..extra);
             }
         }
+
         self.input.clear();
         self.answering_question_task_id = None;
         self.answering_nano_run_id = None;
@@ -540,6 +577,7 @@ fn trim_transcript_history(lines: &mut Vec<TranscriptLine>) {
     if lines.len() <= MAX_TRANSCRIPT_LINES {
         return;
     }
+
     let cutoff = lines.len() - MAX_TRANSCRIPT_LINES;
     if let Some(start) = (cutoff..lines.len()).find(|&index| !lines[index].continuation) {
         lines.drain(..start);
@@ -563,6 +601,7 @@ fn trim_transcript_history(lines: &mut Vec<TranscriptLine>) {
         lines.truncate(MAX_TRANSCRIPT_LINES - usize::from(bottom.is_some()));
         lines.extend(bottom);
     }
+
     if lines.capacity() > MAX_TRANSCRIPT_LINES * 2 {
         lines.shrink_to(MAX_TRANSCRIPT_LINES);
     }

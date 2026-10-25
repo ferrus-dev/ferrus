@@ -269,6 +269,7 @@ impl Request {
         if name == "project_context_search" {
             r.search_kind_filters()?;
         }
+
         Ok(r)
     }
 
@@ -289,6 +290,7 @@ impl Request {
                 _ => repository.push(MemoryStatusToken::new(kind)?),
             }
         }
+
         Ok((repository, memory))
     }
 
@@ -301,26 +303,27 @@ impl Request {
                     .unwrap_or(default.max_results.get())
                     .min(64),
             )
-            .unwrap(),
+            .context("Query limits must be positive")?,
             NonZeroU64::new(
                 self.max_bytes
                     .unwrap_or(default.max_bytes.get())
                     .min(24 * 1024),
             )
-            .unwrap(),
-            NonZeroU32::new(self.max_depth.unwrap_or(default.max_depth.get()).min(8)).unwrap(),
+            .context("Query limits must be positive")?,
+            NonZeroU32::new(self.max_depth.unwrap_or(default.max_depth.get()).min(8))
+                .context("Query limits must be positive")?,
             NonZeroU64::new(
                 self.max_duration_ms
                     .unwrap_or(default.max_duration_ms.get())
                     .min(1000),
             )
-            .unwrap(),
+            .context("Query limits must be positive")?,
             NonZeroU32::new(
                 self.max_diagnostics
                     .unwrap_or(default.max_diagnostics.get())
                     .min(16),
             )
-            .unwrap(),
+            .context("Query limits must be positive")?,
         ))
     }
 
@@ -353,6 +356,7 @@ impl Request {
                 );
             }
         }
+
         Ok(value)
     }
 }

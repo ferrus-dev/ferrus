@@ -17,6 +17,7 @@ fn recent_transcript_borrows_only_visible_lines_from_large_history() {
         assert_eq!(block.len(), 1);
         assert!(std::ptr::eq(block[0], original));
     }
+
     assert!(recent_transcript_blocks(&messages, 0).is_empty());
 }
 
@@ -29,6 +30,7 @@ fn transcript_retention_evicts_whole_blocks() {
             TranscriptKind::Info,
         ));
     }
+
     assert!(app.messages.len() <= MAX_TRANSCRIPT_LINES);
     assert_eq!(app.messages.len() % 3, 0);
     assert!(!app.messages[0].continuation);
@@ -78,6 +80,7 @@ fn transcript_retention_preserves_oversized_table_borders_and_viewport_width() {
             .collect();
         assert!(display_width(&text) <= 9);
     }
+
     app.append_transcript(split_transcript("new message", TranscriptKind::Info));
     assert_eq!(app.messages.len(), 1);
     assert_eq!(app.messages[0].text, "new message");
@@ -366,6 +369,7 @@ fn project_milestone_frame_rows_keep_terminal_width() {
     for text in &rendered {
         assert_eq!(display_width(text), width - 2);
     }
+
     assert_eq!(rendered[1].find("Project"), rendered[6].find("tasks:"));
     assert!(rendered[1].contains("│ Project"));
     assert!(rendered[1].contains("│ Milestones"));
@@ -739,8 +743,10 @@ fn char_before_last_border(text: &str) -> Option<char> {
         if ch == '│' {
             before_last_border = before;
         }
+
         before = Some(ch);
     }
+
     before_last_border
 }
 

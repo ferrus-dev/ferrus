@@ -29,9 +29,11 @@ pub fn resolve_project_path(path: impl AsRef<Path>) -> PathBuf {
     if path.is_absolute() || !starts_with_ferrus_dir(path) {
         return path.to_path_buf();
     }
+
     if path == Path::new(LOCAL_PROJECT_TOML) {
         return path.to_path_buf();
     }
+
     project_root_from_env()
         .map(|root| root.join(path))
         .or_else(|| canonical_project_root_from_local_project_ref().map(|root| root.join(path)))
@@ -97,6 +99,7 @@ pub(crate) fn write_review_for_run_dir_blocking(run_dir: &str, content: &str) ->
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+
     std::fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
@@ -289,6 +292,7 @@ async fn write_path(path: &Path, content: &str) -> Result<()> {
             .await
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+
     tokio::fs::write(&path, content)
         .await
         .with_context(|| format!("Failed to write {}", path.display()))
@@ -365,6 +369,7 @@ mod tests {
             if let Some(previous) = previous {
                 std::fs::write(&path, previous).unwrap();
             }
+
             let visible = || match std::fs::read_to_string(&path) {
                 Ok(contents) => Some(contents),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

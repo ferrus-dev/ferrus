@@ -288,8 +288,7 @@ impl RepositoryGraphConfig {
         let bytes = serde_json::to_vec(&effective)
             .map_err(|error| RepositoryGraphConfigError::Serialization(error.to_string()))?;
         let value = Sha256::digest(bytes);
-        Ok(Digest::new("sha256", hex_lower(&value))
-            .expect("sha256 and hex_lower always produce a canonical digest"))
+        Ok(Digest::from_sha256(value.into()))
     }
 
     /// Returns the canonical discovery policy included in source-manifest identity.
@@ -307,8 +306,7 @@ impl RepositoryGraphConfig {
         let bytes = serde_json::to_vec(&effective)
             .map_err(|error| RepositoryGraphConfigError::Serialization(error.to_string()))?;
         let value = Sha256::digest(bytes);
-        Ok(Digest::new("sha256", hex_lower(&value))
-            .expect("sha256 and hex_lower always produce a canonical digest"))
+        Ok(Digest::from_sha256(value.into()))
     }
 
     fn effective_semantic_config(
@@ -335,6 +333,7 @@ impl RepositoryGraphConfig {
                         pattern.clone(),
                     ));
                 }
+
                 Ok(normalized)
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
@@ -355,6 +354,7 @@ impl RepositoryGraphConfig {
                         pattern.clone(),
                     ));
                 }
+
                 Ok(normalized.to_ascii_lowercase())
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
@@ -393,6 +393,7 @@ impl RepositoryGraphConfig {
                 return Err(RepositoryGraphConfigError::ZeroIndexLimit(name));
             }
         }
+
         Ok(())
     }
 }
@@ -402,6 +403,7 @@ fn normalize_pattern(pattern: &str) -> Result<String, RepositoryGraphConfigError
     if pattern.is_empty() {
         return Err(RepositoryGraphConfigError::EmptyPattern);
     }
+
     let (negated, body) = pattern
         .strip_prefix('!')
         .map_or((false, pattern), |body| (true, body));
@@ -427,17 +429,8 @@ pub(super) fn canonical_pattern_body(pattern: &str) -> Result<String, Repository
             pattern.to_string(),
         ));
     }
-    Ok(body.to_string())
-}
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
+    Ok(body.to_string())
 }
 
 #[cfg(test)]

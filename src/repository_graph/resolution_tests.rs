@@ -72,10 +72,12 @@ impl Fixture {
             if cargo.supports(file) {
                 append(&mut fragment, cargo.extract(input).unwrap());
             }
+
             if rust.supports(file) {
                 append(&mut fragment, rust.extract(input).unwrap());
             }
         }
+
         Self {
             context,
             manifest,
@@ -175,6 +177,7 @@ use serde::Serialize;
                 && edge.target == EdgeTarget::Node((*target).clone())
         }));
     }
+
     assert!(fragment.edges.iter().any(|edge| {
             edge.kind == "imports"
                 && matches!(&edge.target, EdgeTarget::External(path) if path == "rust-path:serde::Serialize")
@@ -385,6 +388,7 @@ serde.workspace = true
                 && edge.target == EdgeTarget::Node(package.id.clone())
         }));
     }
+
     assert!(!fragment.edges.iter().any(|edge| {
         edge.kind == "workspace_contains_package"
             && edge.target == EdgeTarget::Node(excluded.id.clone())

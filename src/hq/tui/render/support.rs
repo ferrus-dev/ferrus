@@ -5,6 +5,7 @@ use super::*;
 pub(in crate::hq::tui) fn enter_tui() -> Result<()> {
     Ok(crate::shared::terminal::enter()?)
 }
+
 pub(in crate::hq::tui) fn leave_tui() -> Result<()> {
     Ok(crate::shared::terminal::leave()?)
 }
@@ -323,6 +324,7 @@ pub(in crate::hq::tui) fn percent_encode_uri_path(value: &str) -> String {
             byte => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
+
     encoded
 }
 

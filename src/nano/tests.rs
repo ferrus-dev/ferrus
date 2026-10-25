@@ -142,6 +142,7 @@ fn launch_capture_requires_host_identity() {
         );
         assert!(result.unwrap_err().to_string().contains(missing));
     }
+
     let context = LaunchContext::capture(
         |key| {
             env.iter()
@@ -201,6 +202,7 @@ async fn native_claim_status_and_heartbeat_match_mcp() {
     ] {
         assert!(mcp.contains(&line), "{line}");
     }
+
     assert_eq!(fixture.events(), events);
     assert!(
         matches!(session.heartbeat().await.unwrap(), LeaseRenewal::Renewed { task_id, .. } if task_id == TASK)
@@ -230,6 +232,7 @@ async fn native_claim_status_and_heartbeat_match_mcp() {
         assert_eq!(payload["task_id"], TASK);
         assert_eq!(payload["claimed_by"], AGENT);
     }
+
     crate::test_support::assert_no_state_json();
 }
 
@@ -259,8 +262,10 @@ async fn binding_rejects_missing_or_mismatched_context_without_effects() {
             "baseline" => launch.baseline_tree = Some("unrecorded-tree".into()),
             _ => unreachable!(),
         }
+
         assert!(FerrusSession::bind(launch).await.is_err(), "{field}");
     }
+
     fixture.assert_no_effect(tasks, events).await;
 }
 
@@ -302,6 +307,7 @@ async fn every_operation_revalidates_the_bound_run() {
         );
         fixture.connection().execute(&sql, [original, RUN]).unwrap();
     }
+
     fixture.assert_no_effect(tasks, events).await;
 }
 
@@ -378,6 +384,7 @@ async fn heartbeat_stops_at_handoff_and_claim_accepts_addressing_only_when_ready
         }
         other => panic!("unexpected claim: {other:?}"),
     }
+
     assert!(matches!(
         session.heartbeat().await.unwrap(),
         LeaseRenewal::Renewed { .. }

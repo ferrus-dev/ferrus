@@ -22,5 +22,6 @@ async fn list() -> Result<()> {
     for line in runtime_table::task_lines(&tasks) {
         println!("{line}");
     }
+
     Ok(())
 }

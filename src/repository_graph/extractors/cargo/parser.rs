@@ -95,6 +95,7 @@ pub(super) fn run_parser_in_process_with_deadline(
     if budget.saturating_sub(started.elapsed()).is_zero() {
         return ParserDeadline::TimedOut;
     }
+
     let output = parse_manifest(source);
     if started.elapsed() >= budget {
         ParserDeadline::TimedOut
@@ -168,6 +169,7 @@ pub(super) fn run_parser_process(
                     ParserDeadline::Unavailable
                 };
             }
+
             let Some(output) = output else {
                 return ParserDeadline::Unavailable;
             };
@@ -194,11 +196,13 @@ pub(super) fn wait_for_child(
                 return ChildDeadline::Unavailable;
             }
         }
+
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             terminate_and_reap(child);
             return ChildDeadline::TimedOut;
         }
+
         thread::sleep(remaining.min(PARSER_WAIT_POLL_INTERVAL));
     }
 }

@@ -87,6 +87,7 @@ struct NodeRows {
 
 struct ContextCandidate {
     node: GraphNode,
+    evidence: SourceEvidence,
     depth: u32,
     selection_reasons: Vec<ContextSelectionReason>,
 }
@@ -145,7 +146,6 @@ impl FreshnessComparison {
 }
 
 mod engine;
-
 mod service;
 
 struct ResolvedScope {
@@ -186,6 +186,7 @@ impl EffectiveBudget {
                 details: BTreeMap::new(),
             });
         }
+
         Ok(Self {
             max_results: requested.max_results.get().min(service.max_results),
             max_bytes: requested.max_bytes.get().min(service.max_bytes),
@@ -222,6 +223,7 @@ fn validate_filters(filters: &[String], path_count: usize) -> Result<(), QueryEr
             "query filters must contain at most 32 non-empty values of at most 128 bytes",
         ));
     }
+
     Ok(())
 }
 
@@ -231,6 +233,7 @@ fn validate_search_request(request: &SearchRequest) -> Result<(), QueryError> {
     if text.is_empty() || text.len() > MAX_QUERY_TEXT_BYTES {
         return Err(invalid_request("search text must contain 1..=512 bytes"));
     }
+
     Ok(())
 }
 
@@ -241,12 +244,15 @@ fn freshness(expected: &GraphSnapshot, actual: Option<&FreshnessComparison>) -> 
             if actual.source_manifest_digest != expected.source_manifest_digest {
                 reason_codes.push("source_manifest_changed".to_string());
             }
+
             if actual.analysis_config_digest != expected.analysis_config_digest {
                 reason_codes.push("analysis_config_changed".to_string());
             }
+
             if actual.extractor_set_digest != expected.extractor_set_digest {
                 reason_codes.push("extractor_set_changed".to_string());
             }
+
             FreshnessEnvelope {
                 freshness: if reason_codes.is_empty() {
                     Freshness::Fresh
@@ -343,6 +349,7 @@ fn search_hit(node: GraphNode, match_kind: SearchMatchKind, query: &str) -> Sear
     {
         matched_fields.push("name".to_string());
     }
+
     if node
         .semantic_key
         .as_ref()
@@ -350,6 +357,7 @@ fn search_hit(node: GraphNode, match_kind: SearchMatchKind, query: &str) -> Sear
     {
         matched_fields.push("semantic_key".to_string());
     }
+
     if node
         .provenance
         .evidence
@@ -358,6 +366,7 @@ fn search_hit(node: GraphNode, match_kind: SearchMatchKind, query: &str) -> Sear
     {
         matched_fields.push("path".to_string());
     }
+
     let path = node
         .provenance
         .evidence
@@ -414,6 +423,9 @@ fn insert_context_candidate(
     depth: u32,
     reason: ContextSelectionReason,
 ) -> bool {
+    let Some(evidence) = node.provenance.evidence.clone() else {
+        return false;
+    };
     match candidates.entry(node.id.clone()) {
         std::collections::btree_map::Entry::Occupied(mut entry) => {
             let candidate = entry.get_mut();
@@ -421,11 +433,13 @@ fn insert_context_candidate(
             if !candidate.selection_reasons.contains(&reason) {
                 candidate.selection_reasons.push(reason);
             }
+
             false
         }
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(ContextCandidate {
                 node,
+                evidence,
                 depth,
                 selection_reasons: vec![reason],
             });
@@ -464,9 +478,11 @@ fn context_selection_kind(
     {
         return ContextSelectionKind::ResolvedDependency;
     }
+
     if next.kind == "document" {
         return ContextSelectionKind::Documentation;
     }
+
     if matches!(
         next.kind.as_str(),
         "manifest"
@@ -479,14 +495,17 @@ fn context_selection_kind(
     ) {
         return ContextSelectionKind::Configuration;
     }
+
     if edge.kind == "declares_module"
         || edge.kind == "contains" && edge.source == *current && is_declaration_node(next)
     {
         return ContextSelectionKind::Declaration;
     }
+
     if edge.kind == "contains" {
         return ContextSelectionKind::Containment;
     }
+
     ContextSelectionKind::Relationship
 }
 
@@ -544,18 +563,8 @@ fn context_candidate_order(
     left: &ContextCandidate,
     right: &ContextCandidate,
 ) -> std::cmp::Ordering {
-    let left_evidence = left
-        .node
-        .provenance
-        .evidence
-        .as_ref()
-        .expect("context candidates without evidence are filtered before sorting");
-    let right_evidence = right
-        .node
-        .provenance
-        .evidence
-        .as_ref()
-        .expect("context candidates without evidence are filtered before sorting");
+    let left_evidence = &left.evidence;
+    let right_evidence = &right.evidence;
     let left_rank = left
         .selection_reasons
         .iter()
@@ -592,12 +601,7 @@ fn context_candidate_order(
 }
 
 fn context_item(candidate: ContextCandidate) -> ContextItem {
-    let evidence = candidate
-        .node
-        .provenance
-        .evidence
-        .clone()
-        .expect("context candidates without evidence are filtered before materialization");
+    let evidence = candidate.evidence;
     ContextItem {
         node_id: candidate.node.id,
         kind: candidate.node.kind,
@@ -771,6 +775,7 @@ pub fn snapshot_file_descriptors(
             file_mode,
         });
     }
+
     Ok(files)
 }
 
@@ -813,6 +818,7 @@ pub fn all_snapshot_file_descriptors(
             },
         });
     }
+
     Ok(files)
 }
 

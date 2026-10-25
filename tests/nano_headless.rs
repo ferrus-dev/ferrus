@@ -1,4 +1,5 @@
 //! Real process/HTTP/SQLite regression for the opt-in native Executor frontend.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![cfg(feature = "nano-openai")]
 
 // Reuse the native private-file implementation for host configuration fixtures.
@@ -23,6 +24,7 @@ fn ferrus(root: &Path) -> Command {
     command.current_dir(root);
     command
 }
+
 fn success(command: &mut Command) -> String {
     let output = command.output().unwrap();
     assert!(
@@ -34,9 +36,11 @@ fn success(command: &mut Command) -> String {
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
+
 fn git(root: &Path, args: &[&str]) -> String {
     success(Command::new("git").current_dir(root).args(args))
 }
+
 fn private_config(path: &Path, text: &str) {
     let mut file = private::file(path, true).unwrap();
     file.write_all(text.as_bytes()).unwrap();
@@ -49,6 +53,7 @@ fn private_config(path: &Path, text: &str) {
         .unwrap();
     assert_eq!(bytes, text);
 }
+
 fn log_tail(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let start = file.metadata()?.len().saturating_sub(8192);
@@ -59,6 +64,7 @@ fn log_tail(path: &Path) -> std::io::Result<String> {
 }
 
 struct Process(Child, tempfile::NamedTempFile);
+
 impl Process {
     fn spawn(command: &mut Command) -> Self {
         // A pipe read only after exit can fill and block the child on Windows.
@@ -81,48 +87,12 @@ impl Process {
         )
     }
 }
+
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-#[test]
-fn process_diagnostics_do_not_block_verbose_children() {
-    const CHILD: &str = "FERRUS_TEST_VERBOSE_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        std::io::stderr()
-            .write_all(&vec![b'x'; 256 * 1024])
-            .unwrap();
-        return;
-    }
-
-    let mut child = Process::spawn(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "process_diagnostics_do_not_block_verbose_children",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null()),
-    );
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "{}", child.stderr());
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "verbose child did not exit: {}",
-            child.failure_diagnostics()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(child.stderr(), "x".repeat(8192));
 }
 
 struct Fixture {
@@ -132,6 +102,7 @@ struct Fixture {
     workspace: PathBuf,
     baseline: String,
 }
+
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -208,6 +179,7 @@ impl Fixture {
             baseline,
         }
     }
+
     fn command(&self, config: &Path) -> Command {
         let mut command = ferrus(&self.workspace);
         command
@@ -263,10 +235,12 @@ fn serve(
                 if line == "\r\n" {
                     break;
                 }
+
                 if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
                     length = value.trim().parse::<usize>().unwrap();
                 }
             }
+
             assert!((1..=512 * 1024).contains(&length));
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
@@ -277,6 +251,7 @@ fn serve(
                 assert_eq!(schema["type"], "object", "{tool}");
                 assert!(schema["properties"].is_object(), "{tool}");
             }
+
             assert_eq!(
                 request["tools"]
                     .as_array()
@@ -297,6 +272,7 @@ fn serve(
                     .unwrap();
                 assert_eq!(&restored, state);
             }
+
             let calls = match turn {
                 0 => {
                     let mut calls = vec![
@@ -319,6 +295,7 @@ fn serve(
                         );
                         calls.insert(0, ("mcp_local_echo", json!({"text":"from-mcp"})));
                     }
+
                     if graph_peer {
                         for name in [
                             "mcp_graph_repository_graph_status",
@@ -333,6 +310,7 @@ fn serve(
                                     .any(|tool| tool["function"]["name"] == name)
                             );
                         }
+
                         calls.insert(
                             0,
                             (
@@ -346,6 +324,7 @@ fn serve(
                         );
                         calls.insert(0, ("mcp_graph_repository_graph_status", json!({})));
                     }
+
                     calls
                 }
                 1 => vec![("check", json!({}))],
@@ -362,96 +341,36 @@ fn serve(
     })
 }
 
-#[test]
-fn headless_process_edits_checks_and_submits_an_isolated_task() {
-    run_headless_task(None, false, false, true, true);
-}
-
-#[test]
-fn headless_http_rejection_fails_the_task_and_preserves_safe_diagnostics() {
-    run_rejected_provider(400, 1, "provider_protocol", "nano_provider_protocol");
-}
-
-#[test]
-fn headless_retry_exhaustion_fails_the_task_instead_of_allowing_hq_redispatch() {
-    run_rejected_provider(503, 4, "limit", "nano_limit_retries");
-}
-
-#[test]
-fn headless_configured_token_budget_is_journaled_and_reported_before_inference() {
-    let fixture = Fixture::new();
-    let config = fixture.root.join("nano.toml");
-    private_config(
-        &config,
-        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\nsession_tokens = 1\n",
-    );
-    let mut child = Process::spawn(&mut fixture.command(&config));
-    let mut stdin = child.0.stdin.take().unwrap();
-    let reader = BufReader::new(child.0.stdout.take().unwrap());
-    let (tx, rx) = mpsc::channel();
-    let output = std::thread::spawn(move || {
-        for line in reader.lines() {
-            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
+#[cfg(feature = "nano-mcp")]
+fn find_python() -> PathBuf {
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for executable in ["python3", "python", "python.exe"] {
+            let path = directory.join(executable);
+            if path.is_file() {
+                return path.canonicalize().unwrap();
+            }
         }
-    });
-    let ready = rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    assert_eq!(ready["event"]["type"], "ready");
-    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(!status.success());
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(10));
     }
-    output.join().unwrap();
-    let events: Vec<_> = rx.try_iter().collect();
-    assert!(events.iter().any(|event| event["event"]["type"] == "ended"
-        && event["event"]["reason"] == json!({"reason":"limit","detail":"tokens"})
-        && event["event"]["durable"] == true));
-    assert!(child.stderr().contains("0 consumed, 1 limit"));
-    let journal =
-        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
-    let records: Vec<Value> = journal
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(records[0]["event"]["limits"]["tokens"], 1);
-    assert!(
-        !records
-            .iter()
-            .any(|record| record["event"]["event"] == "model_started")
-    );
-    let state: (String, String) = Connection::open(fixture.data.join("ferrus.db"))
-        .unwrap()
-        .query_row(
-            "SELECT status,failure_reason FROM tasks WHERE id='t-001'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, ("failed".into(), "nano_limit_tokens".into()));
+
+    panic!("Python 3 is required for the Nano MCP peer integration fixture");
 }
 
-fn run_rejected_provider(status_code: u16, attempts: usize, reason: &str, failure_code: &str) {
+fn run_interactive_task(interactive: bool) {
     let fixture = Fixture::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
-        for _ in 0..attempts {
+        for turn in 0..2 {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "No provider request");
+                        assert!(Instant::now() < deadline, "Missing interactive request");
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(error) => panic!("mock API: {error}"),
+                    Err(error) => panic!("{error}"),
                 }
             };
             stream.set_nonblocking(false).unwrap();
@@ -466,15 +385,43 @@ fn run_rejected_provider(status_code: u16, attempts: usize, reason: &str, failur
                 if line == "\r\n" {
                     break;
                 }
+
                 if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     length = value.trim().parse::<usize>().unwrap();
                 }
             }
+
             assert!((1..=512 * 1024).contains(&length));
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            let body = r#"{"error":"secret-server-detail: invalid tool schema"}"#;
-            write!(stream, "HTTP/1.1 {status_code} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "override-model");
+            let names: Vec<_> = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            for forbidden in ["approve", "reject", "archive", "create_task"] {
+                assert!(!names.contains(&forbidden));
+            }
+
+            let data = if turn == 0 {
+                json!({"choices":[{"index":0,"delta":{"content":"Need direction."},"finish_reason":"stop"}]})
+            } else {
+                assert_eq!(
+                    request["messages"].as_array().unwrap().last().unwrap(),
+                    &json!({"role":"user", "content":"Create answer.txt with 42, check and submit."})
+                );
+                let calls: Vec<_> = [
+                    ("apply_patch", json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]})),
+                    ("check", json!({})),
+                    ("submit", json!({"content":"Created answer.txt and checked it."})),
+                ].into_iter().enumerate().map(|(index,(name,args))| json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect();
+                json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
+            };
+            let sse = format!("data: {data}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
         }
     });
     let config = fixture.root.join("nano.toml");
@@ -482,287 +429,124 @@ fn run_rejected_provider(status_code: u16, attempts: usize, reason: &str, failur
         &config,
         &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
     );
-    let mut child = Process::spawn(&mut fixture.command(&config));
+    let mut command = fixture.command(&config);
+    if interactive {
+        command.arg("--interactive");
+    }
+
+    let mut child = Process::spawn(&mut command);
     let mut stdin = child.0.stdin.take().unwrap();
-    let reader = BufReader::new(child.0.stdout.take().unwrap());
-    let (tx, rx) = mpsc::channel();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
     let output = std::thread::spawn(move || {
-        for line in reader.lines() {
-            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+        for line in BufReader::new(stdout).lines() {
+            sender
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
                 .unwrap();
         }
     });
-    let ready = rx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_else(|error| panic!("No ready event: {error}; {}", child.failure_diagnostics()));
-    assert_eq!(ready["event"]["type"], "ready");
-    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(30)).unwrap()["event"]["type"],
+        "ready"
+    );
+    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
+    if !interactive {
+        writeln!(stdin, "{}", json!({"version":1,"command":"interact"})).unwrap();
+    }
+
     let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
+    loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| panic!("{error}; {}", child.failure_diagnostics()));
+        assert_ne!(
+            event["event"]["type"], "ended",
+            "Ended before input: {event}"
+        );
+        if event["event"]["phase"] == "input_requested" {
+            break;
         }
+
+        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
+    }
+
+    assert!(child.0.try_wait().unwrap().is_none());
+    writeln!(stdin, "{}", json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42, check and submit."}}})).unwrap();
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{}", child.stderr());
+            break;
+        }
+
         assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
         std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(!status.success());
+    }
+
     output.join().unwrap();
     server.join().unwrap();
-    let events: Vec<_> = rx.try_iter().collect();
-    let ended = events
-        .iter()
-        .find(|event| event["event"]["type"] == "ended")
-        .unwrap();
-    assert_eq!(ended["event"]["reason"]["reason"], reason);
-    if reason == "limit" {
-        assert_eq!(ended["event"]["reason"]["detail"], "retries");
-    }
-    assert_eq!(ended["event"]["durable"], true);
-    assert!(!events.iter().any(|event| event["event"]["type"] == "error"));
-    let stderr = child.stderr();
     assert!(
-        stderr.contains(if status_code == 400 {
-            "Unsupported"
-        } else {
-            "Transport"
-        }),
-        "{stderr}"
+        receiver
+            .try_iter()
+            .any(|event| event["event"]["type"] == "ended"
+                && event["event"]["reason"]["reason"] == "submitted")
     );
-    assert!(stderr.contains(&status_code.to_string()), "{stderr}");
-    assert!(!stderr.contains("secret-server-detail"));
     let journal =
         fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
     let records: Vec<Value> = journal
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let failed = records
-        .iter()
-        .find(|record| record["event"]["event"] == "model_failed")
-        .unwrap();
-    assert_eq!(
-        failed["event"]["diagnostic"],
-        json!({"source":"http","status":status_code})
-    );
-    assert_eq!(failed["event"]["retryable"], attempts > 1);
-    assert_eq!(
+    assert!(
         records
             .iter()
-            .filter(|record| record["event"]["event"] == "model_started")
-            .count(),
-        attempts
+            .any(|record| record["event"]["event"] == "interaction_opened")
     );
-    assert!(!journal.contains("secret-server-detail"));
-    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
-    let state: (String, String, Option<String>, i64) = db
-        .query_row(
-            "SELECT status,failure_reason,claimed_by,check_retries FROM tasks WHERE id='t-001'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(state, ("failed".into(), failure_code.into(), None, 0));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"]["event"] == "user_input")
+    );
     assert_eq!(
-        fs::read_to_string(fixture.root.join(".ferrus/tasks/t-001.md")).unwrap(),
-        "Create answer.txt, check and submit."
+        fs::read_to_string(fixture.workspace.join("answer.txt")).unwrap(),
+        "42\n"
     );
+    let status: String = Connection::open(fixture.data.join("ferrus.db"))
+        .unwrap()
+        .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "reviewing");
+}
+
+#[path = "nano_headless/review.rs"]
+mod review_tests;
+
+#[path = "nano_headless/recovery.rs"]
+mod recovery_tests;
+
+#[path = "nano_headless/cancellation.rs"]
+mod cancellation_tests;
+
+#[path = "nano_headless/provider.rs"]
+mod provider_tests;
+
+#[path = "nano_headless/checks.rs"]
+mod checks_tests;
+
+#[path = "nano_headless/tasks.rs"]
+mod tasks;
+use tasks::*;
+
+#[test]
+fn headless_retry_exhaustion_fails_the_task_instead_of_allowing_hq_redispatch() {
+    run_rejected_provider(503, 4, "limit", "nano_limit_retries");
 }
 
 #[test]
 fn headless_native_context_and_working_set_can_be_disabled_separately() {
     run_headless_task(None, false, false, false, true);
     run_headless_task(None, false, false, true, false);
-}
-
-#[cfg(feature = "nano-mcp")]
-#[test]
-fn headless_process_calls_isolated_external_stdio_tool() {
-    run_headless_task(None, true, false, true, true);
-}
-
-#[cfg(feature = "nano-mcp")]
-#[test]
-fn headless_process_calls_bound_ferrus_graph_over_mcp() {
-    run_headless_task(None, false, true, false, false);
-}
-
-#[cfg(feature = "nano-mcp")]
-#[test]
-fn mcp_peer_rejects_oversized_stdout_before_transport() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let config = root.join("mcp.toml");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
-    private_config(
-        &config,
-        &format!(
-            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
-            toml::Value::String(find_python().display().to_string()),
-            serde_json::to_string(&[script.display().to_string(), "oversize-startup".into()])
-                .unwrap(),
-        ),
-    );
-
-    let output = ferrus(&root)
-        .args(["nano", "mcp-peer", "--config"])
-        .arg(&config)
-        .args(["--server", "local"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
-
-    let call_config = root.join("call-mcp.toml");
-    private_config(
-        &call_config,
-        &format!(
-            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
-            toml::Value::String(find_python().display().to_string()),
-            serde_json::to_string(&[script.display().to_string(), "oversize".into()]).unwrap(),
-        ),
-    );
-    let mut child = ferrus(&root)
-        .args(["nano", "mcp-peer", "--config"])
-        .arg(&call_config)
-        .args(["--server", "local"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}}\n",
-        )
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP stdio frame exceeds limit"));
-}
-
-#[cfg(feature = "nano-mcp")]
-#[test]
-fn mcp_discovery_keeps_the_claim_alive_and_observes_cancel() {
-    let fixture = Fixture::new();
-    let mut config = fs::OpenOptions::new()
-        .append(true)
-        .open(fixture.root.join("ferrus.toml"))
-        .unwrap();
-    write!(
-        config,
-        "\n[lease]\nttl_secs = 6\nheartbeat_interval_secs = 1\n"
-    )
-    .unwrap();
-    drop(config);
-
-    let marker = fixture.data.join("listing-started");
-    let peer = fixture.data.join("mcp.toml");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
-    private_config(
-        &peer,
-        &format!(
-            "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\ntimeout_ms = 120000\n",
-            toml::Value::String(find_python().display().to_string()),
-            serde_json::to_string(&[
-                script.display().to_string(),
-                "stall-list".into(),
-                marker.display().to_string(),
-            ])
-            .unwrap(),
-        ),
-    );
-    let settings = fixture.data.join("provider.toml");
-    private_config(
-        &settings,
-        &format!(
-            "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'configured-model'\nmcp_config_file = {}\n",
-            toml::Value::String(peer.display().to_string()),
-        ),
-    );
-
-    let mut child = Process::spawn(&mut fixture.command(&settings));
-    let mut stdin = child.0.stdin.take().unwrap();
-    let stdout = child.0.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
-        }
-    });
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(30)).unwrap(),
-        json!({"version":1,"event":{"type":"ready"}})
-    );
-    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
-
-    let database = fixture.data.join("ferrus.db");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let initial_heartbeat = loop {
-        let db = Connection::open(&database).unwrap();
-        let (claimed_by, heartbeat): (Option<String>, Option<String>) = db
-            .query_row(
-                "SELECT claimed_by, last_heartbeat FROM tasks WHERE id='t-001'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        if marker.exists() {
-            assert_eq!(claimed_by.as_deref(), Some("executor:nano:1"));
-            break heartbeat.unwrap();
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let db = Connection::open(&database).unwrap();
-        let heartbeat: String = db
-            .query_row(
-                "SELECT last_heartbeat FROM tasks WHERE id='t-001'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if heartbeat != initial_heartbeat {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    let cancelled_at = Instant::now();
-    writeln!(stdin, "{{\"version\":1,\"command\":\"cancel\"}}").unwrap();
-    let mut ended = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(event) = rx.recv_timeout(Duration::from_millis(20))
-            && event["event"]["type"] == "ended"
-        {
-            ended = Some(event);
-        }
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "{}", child.stderr());
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-    }
-    assert!(cancelled_at.elapsed() < Duration::from_secs(10));
-    reader.join().unwrap();
-    for event in rx.try_iter() {
-        if event["event"]["type"] == "ended" {
-            ended = Some(event);
-        }
-    }
-    let ended = ended.expect("cancelled discovery must record a terminal event");
-    assert_eq!(ended["event"]["reason"]["reason"], "cancelled");
-    assert_eq!(ended["event"]["durable"], true);
 }
 
 #[test]
@@ -779,320 +563,70 @@ fn relaunched_consultation_delivers_the_response_before_inference_and_submits() 
     }
 }
 
-fn run_headless_task(
-    resume: Option<(&'static str, bool)>,
-    external_mcp: bool,
-    graph_peer: bool,
-    native_context: bool,
-    working_set: bool,
-) {
-    let fixture = Fixture::new();
-    let (request_file, response_file, restored_event) = match resume {
-        Some((_, false)) => (
-            "CONSULT_REQUEST.md",
-            "CONSULT_RESPONSE.md",
-            "task_consultation_resolved",
-        ),
-        _ => ("QUESTION.md", "ANSWER.md", "task_human_answered"),
-    };
-    if let Some((state, human)) = resume {
-        let directory = fixture.root.join(".ferrus/runs/t-001");
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join(request_file), "Which answer?").unwrap();
-        fs::write(directory.join(response_file), "Use forty-two.").unwrap();
-        if state == "addressing" {
-            fs::write(directory.join("REVIEW.md"), "Address the stored guidance.").unwrap();
-        }
-        let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
-        db.execute(
-            "INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path)
-             SELECT 'previous-nano-run',task_id,role,agent,'exited',started_at,updated_at,workspace_path
-             FROM runs WHERE id='nano-e2e-run'",
-            [],
-        ).unwrap();
-        db.execute(
-            "UPDATE tasks SET status='awaiting_human', paused_status=?1,
-            awaiting_human_status=?1, awaiting_human_by='executor:nano:1',
-            claimed_by='executor:nano:1', lease_until='2000-01-01T00:00:00Z',
-            human_answer_recorded=1 WHERE id='t-001'",
-            [state],
-        )
-        .unwrap();
-        if !human {
-            db.execute(
-                "UPDATE tasks SET status='consultation', awaiting_human_status=NULL,
-                awaiting_human_by=NULL, human_answer_recorded=0 WHERE id='t-001'",
-                [],
-            )
+#[test]
+fn headless_process_edits_checks_and_submits_an_isolated_task() {
+    run_headless_task(None, false, false, true, true);
+}
+
+#[test]
+fn interactive_process_attaches_to_headless_turn_then_steers_and_submits() {
+    run_interactive_task(false);
+}
+
+#[test]
+fn interactive_process_launch_waits_for_input_then_steers_and_submits() {
+    run_interactive_task(true);
+}
+
+#[test]
+fn process_diagnostics_do_not_block_verbose_children() {
+    const CHILD: &str = "FERRUS_TEST_VERBOSE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        std::io::stderr()
+            .write_all(&vec![b'x'; 256 * 1024])
             .unwrap();
-        }
+        return;
     }
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let settings = fixture.data.join("provider.toml");
-    #[cfg(feature = "nano-mcp")]
-    let mcp_setting = if external_mcp {
-        let peer = fixture.data.join("mcp.toml");
-        let python = find_python();
-        let script =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nano_mcp_peer.py");
-        private_config(
-            &peer,
-            &format!(
-                "[[servers]]\nid = 'local'\ncommand = {}\nargs = {}\nallow = ['echo']\n",
-                toml::Value::String(python.display().to_string()),
-                serde_json::to_string(&[script.display().to_string()]).unwrap(),
-            ),
-        );
-        format!(
-            "mcp_config_file = {}\n",
-            toml::Value::String(peer.display().to_string())
-        )
-    } else if graph_peer {
-        let peer = fixture.data.join("graph-mcp.toml");
-        private_config(
-            &peer,
-            &format!(
-                "[[servers]]\nid = 'graph'\ncommand = {}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_graph_status', 'repository_search', 'repository_context']\ninherit_managed_binding = true\ntimeout_ms = 12000\n",
-                toml::Value::String(env!("CARGO_BIN_EXE_ferrus").to_string()),
-            ),
-        );
-        format!(
-            "mcp_config_file = {}\n",
-            toml::Value::String(peer.display().to_string())
-        )
-    } else {
-        String::new()
-    };
-    #[cfg(not(feature = "nano-mcp"))]
-    let mcp_setting = String::new();
-    private_config(
-        &settings,
-        &format!(
-            "base_url = 'http://{}/v1'\nmodel = 'configured-model'\ncontext_tokens = 65536\nnative_context_enabled = {native_context}\nworking_set_enabled = {working_set}\n{mcp_setting}",
-            listener.local_addr().unwrap(),
-        ),
+
+    let mut child = Process::spawn(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_diagnostics_do_not_block_verbose_children",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
     );
-    let server = serve(
-        listener,
-        resume.map(|(state, _)| (fixture.data.join("ferrus.db"), state)),
-        external_mcp,
-        graph_peer,
-        native_context,
-    );
-    let mut launch = fixture.command(&settings);
-    if external_mcp {
-        launch.env("FERRUS_NANO_SECRET", "must-not-reach-peer");
-    }
-    let mut child = Process::spawn(&mut launch);
-    let mut stdin = child.0.stdin.take().unwrap();
-    let stdout = child.0.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
-        }
-    });
-    let ready = rx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_else(|error| panic!("No ready event: {error}; {}", child.failure_diagnostics()));
-    assert_eq!(ready, json!({"version":1,"event":{"type":"ready"}}));
-    writeln!(stdin, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
-    let mut ended = None;
-    let mut last_event = ready;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
-            assert_eq!(event["version"], 1);
-            last_event = event.clone();
-            if event["event"]["type"] == "ended" {
-                ended = Some(event);
-            }
-        }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "{}", child.stderr());
             break;
         }
-    }
-    if child.0.try_wait().unwrap().is_none() {
-        let diagnostics = child.failure_diagnostics();
-        let journal = log_tail(&fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl"));
-        panic!(
-            "nano did not exit; last event={last_event}\n{diagnostics}\njournal tail={journal:?}"
-        );
-    }
-    reader.join().unwrap();
-    for event in rx.try_iter() {
-        if event["event"]["type"] == "ended" {
-            ended = Some(event);
-        }
-    }
-    let ended = ended.unwrap_or_else(|| {
-        panic!(
-            "No terminal protocol event; last event={last_event}\n{}",
-            child.stderr()
-        )
-    });
-    assert_eq!(
-        ended["event"]["reason"]["reason"],
-        "submitted",
-        "{ended}; journal tail={:?}",
-        log_tail(&fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl"))
-    );
-    assert_eq!(ended["event"]["durable"], true);
-    server.join().unwrap();
-    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
-    let status: String = db
-        .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(status, "reviewing");
-    let submits: i64 = db
-        .query_row(
-            "SELECT count(*) FROM events WHERE type='submitted'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(submits, 1);
-    assert_eq!(
-        fs::read_to_string(fixture.workspace.join("answer.txt")).unwrap(),
-        "42\n"
-    );
-    assert!(!fixture.root.join("answer.txt").exists());
-    assert!(
-        fs::read_to_string(fixture.root.join(".ferrus/runs/t-001/PATCH.diff"))
-            .unwrap()
-            .contains("+42")
-    );
-    let journal =
-        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
-    let started: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-    assert_eq!(
-        started["event"]["launch_evidence"]["baseline_tree"],
-        fixture.baseline
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["native_context_enabled"],
-        native_context
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["working_set_enabled"],
-        working_set
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["graph_peer_mode"],
-        if graph_peer { "complete" } else { "absent" }
-    );
-    let (peer_count, tool_count) = if graph_peer {
-        (1, 3)
-    } else if external_mcp {
-        (1, 1)
-    } else {
-        (0, 0)
-    };
-    assert_eq!(
-        started["event"]["launch_evidence"]["mcp_peer_count"],
-        peer_count
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["mcp_tool_count"],
-        tool_count
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["graph_peer_id"],
-        if graph_peer {
-            Value::String("graph".into())
-        } else {
-            Value::Null
-        }
-    );
-    assert_eq!(
-        started["event"]["launch_evidence"]["graph_peer_timeout_ms"],
-        if graph_peer {
-            Value::from(12_000)
-        } else {
-            Value::Null
-        }
-    );
-    assert_eq!(started["event"]["provider"]["model"], "override-model");
-    assert_eq!(journal.contains("context_prepared"), working_set);
-    assert!(journal.contains("not-a-json-event"));
-    let results: Vec<Value> = journal
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|record| record["event"]["event"] == "tool_result")
-        .collect();
-    assert_eq!(
-        results.len(),
-        if graph_peer {
-            7
-        } else if external_mcp {
-            5
-        } else {
-            4
-        }
-    );
-    if graph_peer {
+
         assert!(
-            results
-                .iter()
-                .any(|result| result["event"]["outcome"]["content"]["kind"] == "repository_status")
+            Instant::now() < deadline,
+            "verbose child did not exit: {}",
+            child.failure_diagnostics()
         );
-        assert!(
-            results
-                .iter()
-                .any(|result| result["event"]["outcome"]["content"]["kind"] == "repository_search")
-        );
-        assert!(results.iter().any(|result|
-            result["event"]["outcome"]["content"]["kind"] == "repository_context"));
+        std::thread::sleep(Duration::from_millis(20));
     }
-    for result in results {
-        assert_eq!(result["event"]["outcome"]["status"], "success", "{result}");
-    }
-    if external_mcp {
-        assert!(journal.contains("from-mcp"));
-        assert!(journal.contains("inherited_provider_secret"));
-        assert!(journal.contains("null"));
-        assert!(!journal.contains("must-not-reach-peer"));
-    }
-    if resume.is_some() {
-        assert!(journal.contains("Use forty-two."));
-        assert_eq!(
-            db.query_row::<i64, _, _>(
-                "SELECT count(*) FROM events WHERE type=?1",
-                [restored_event],
-                |row| row.get(0),
-            )
-            .unwrap(),
-            1
-        );
-        let run_dir = fixture.root.join(".ferrus/runs/t-001");
-        assert!(
-            fs::read_to_string(run_dir.join(request_file))
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert_eq!(
-            fs::read_to_string(run_dir.join(response_file)).unwrap(),
-            "Use forty-two."
-        );
-    }
-    drop(stdin);
+
+    assert_eq!(child.stderr(), "x".repeat(8192));
 }
 
 #[cfg(feature = "nano-mcp")]
-fn find_python() -> PathBuf {
-    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-        for executable in ["python3", "python", "python.exe"] {
-            let path = directory.join(executable);
-            if path.is_file() {
-                return path.canonicalize().unwrap();
-            }
-        }
-    }
-    panic!("Python 3 is required for the Nano MCP peer integration fixture");
+#[test]
+fn headless_process_calls_isolated_external_stdio_tool() {
+    run_headless_task(None, true, false, true, true);
+}
+
+#[cfg(feature = "nano-mcp")]
+#[test]
+fn headless_process_calls_bound_ferrus_graph_over_mcp() {
+    run_headless_task(None, false, true, false, false);
 }
 
 #[test]
@@ -1161,6 +695,7 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
     for path in [".codex", ".claude", ".qwen", ".goose", "opencode.json"] {
         assert!(!f.root.join(path).exists());
     }
+
     assert!(
         success(ferrus(&f.root).args(["nano", "--version"])).contains(env!("CARGO_PKG_VERSION"))
     );
@@ -1171,796 +706,5 @@ fn native_registration_validates_before_writes_and_creates_no_loopback_mcp() {
             .unwrap()
             .status
             .success()
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn native_registration_provisions_default_local_provider_once() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let f = Fixture::new();
-    let home = f.data.join("home");
-    fs::create_dir(&home).unwrap();
-    let settings = home.join(".ferrus/nano.toml");
-    let before = fs::read(f.root.join("ferrus.toml")).unwrap();
-
-    let missing_model = ferrus(&f.root)
-        .args(["register", "--executor", "nano"])
-        .env_remove("FERRUS_NANO_CONFIG")
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-    assert!(!missing_model.status.success());
-    assert!(String::from_utf8_lossy(&missing_model.stderr).contains("--executor-model"));
-    assert_eq!(fs::read(f.root.join("ferrus.toml")).unwrap(), before);
-    assert!(!settings.exists());
-
-    let registered = ferrus(&f.root)
-        .args([
-            "register",
-            "--executor",
-            "nano",
-            "--executor-model",
-            "local/model",
-        ])
-        .env_remove("FERRUS_NANO_CONFIG")
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-    assert!(
-        registered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&registered.stderr)
-    );
-    let original = fs::read(&settings).unwrap();
-    assert!(String::from_utf8_lossy(&original).contains("local/model"));
-    private::check(&settings, false).unwrap();
-    private::check(settings.parent().unwrap(), true).unwrap();
-    let config: toml::Value =
-        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
-    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
-
-    let changed_settings = "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'updated/model'\n";
-    fs::write(&settings, changed_settings).unwrap();
-    success(
-        ferrus(&f.root)
-            .args(["register", "--executor", "nano"])
-            .env_remove("FERRUS_NANO_CONFIG")
-            .env("HOME", &home),
-    );
-    let config: toml::Value =
-        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
-    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
-
-    // Existing Ferrus homes may predate Nano and need not have private directory mode.
-    fs::set_permissions(
-        settings.parent().unwrap(),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    success(
-        ferrus(&f.root)
-            .args([
-                "register",
-                "--executor",
-                "nano",
-                "--executor-model",
-                "another-model",
-            ])
-            .env_remove("FERRUS_NANO_CONFIG")
-            .env("HOME", &home),
-    );
-    let config: toml::Value =
-        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
-    assert_eq!(
-        config["hq"]["executor"]["model"].as_str(),
-        Some("another-model")
-    );
-    success(
-        ferrus(&f.root)
-            .args(["register", "--executor", "nano"])
-            .env_remove("FERRUS_NANO_CONFIG")
-            .env("HOME", &home),
-    );
-    let config: toml::Value =
-        toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
-    assert_eq!(config["hq"]["executor"]["model"].as_str(), Some(""));
-    assert_eq!(fs::read_to_string(&settings).unwrap(), changed_settings);
-}
-
-#[cfg(unix)]
-#[test]
-fn registering_both_native_roles_shares_the_bootstrap_model_but_preserves_overrides() {
-    for supervisor_model in [None, Some("supervisor-model")] {
-        let f = Fixture::new();
-        let home = f.data.join("home");
-        fs::create_dir(&home).unwrap();
-        let mut command = ferrus(&f.root);
-        command.args([
-            "register",
-            "--supervisor",
-            "nano",
-            "--executor",
-            "nano",
-            "--executor-model",
-            "executor-model",
-        ]);
-        if let Some(model) = supervisor_model {
-            command.args(["--supervisor-model", model]);
-        }
-        success(command.env_remove("FERRUS_NANO_CONFIG").env("HOME", &home));
-        let settings: toml::Value =
-            toml::from_str(&fs::read_to_string(home.join(".ferrus/nano.toml")).unwrap()).unwrap();
-        assert_eq!(
-            settings["model"].as_str(),
-            Some(supervisor_model.unwrap_or("executor-model"))
-        );
-        let config: toml::Value =
-            toml::from_str(&fs::read_to_string(f.root.join("ferrus.toml")).unwrap()).unwrap();
-        assert_eq!(config["hq"]["supervisor"]["agent"].as_str(), Some("nano"));
-        assert_eq!(config["hq"]["supervisor"]["model"].as_str(), Some(""));
-        assert_eq!(
-            config["hq"]["executor"]["model"].as_str(),
-            Some(if supervisor_model.is_some() {
-                "executor-model"
-            } else {
-                ""
-            })
-        );
-    }
-}
-
-#[test]
-fn invalid_start_frames_fail_without_claiming_or_creating_a_journal() {
-    let f = Fixture::new();
-    let settings = f.data.join("provider.toml");
-    private_config(
-        &settings,
-        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'local-model'\n",
-    );
-    for input in [
-        b"{\"version\":99,\"command\":\"start\"}\n".to_vec(),
-        b"garbage\n".to_vec(),
-        vec![b' '; 4097],
-    ] {
-        let mut child = Process::spawn(&mut f.command(&settings));
-        let mut reader = BufReader::new(child.0.stdout.take().unwrap());
-        let mut ready = String::new();
-        assert!(
-            reader.read_line(&mut ready).unwrap() > 0,
-            "No ready event: {}",
-            child.failure_diagnostics()
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(&ready).unwrap()["event"]["type"],
-            "ready"
-        );
-        child.0.stdin.as_mut().unwrap().write_all(&input).unwrap();
-        child.0.stdin.take();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(!status.success());
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "invalid input did not stop the process: {}",
-                child.failure_diagnostics()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let mut events = String::new();
-        reader.read_to_string(&mut events).unwrap();
-        assert!(
-            events
-                .lines()
-                .all(|line| serde_json::from_str::<Value>(line).is_ok())
-        );
-        assert!(!f.data.join("nano/sessions").exists());
-        let db = Connection::open(f.data.join("ferrus.db")).unwrap();
-        let state: String = db
-            .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(state, "pending");
-    }
-}
-
-#[test]
-fn interactive_process_attaches_to_headless_turn_then_steers_and_submits() {
-    run_interactive_task(false);
-}
-
-#[test]
-fn interactive_process_launch_waits_for_input_then_steers_and_submits() {
-    run_interactive_task(true);
-}
-
-fn run_interactive_task(interactive: bool) {
-    let fixture = Fixture::new();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || {
-        for turn in 0..2 {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "Missing interactive request");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("{error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse::<usize>().unwrap();
-                }
-            }
-            assert!((1..=512 * 1024).contains(&length));
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(request["model"], "override-model");
-            let names: Vec<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap())
-                .collect();
-            for forbidden in ["approve", "reject", "archive", "create_task"] {
-                assert!(!names.contains(&forbidden));
-            }
-            let data = if turn == 0 {
-                json!({"choices":[{"index":0,"delta":{"content":"Need direction."},"finish_reason":"stop"}]})
-            } else {
-                assert_eq!(
-                    request["messages"].as_array().unwrap().last().unwrap(),
-                    &json!({"role":"user", "content":"Create answer.txt with 42, check and submit."})
-                );
-                let calls: Vec<_> = [
-                    ("apply_patch", json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]})),
-                    ("check", json!({})),
-                    ("submit", json!({"content":"Created answer.txt and checked it."})),
-                ].into_iter().enumerate().map(|(index,(name,args))| json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect();
-                json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
-            };
-            let sse = format!("data: {data}\n\ndata: [DONE]\n\n");
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
-        }
-    });
-    let config = fixture.root.join("nano.toml");
-    private_config(
-        &config,
-        &format!("base_url = {url:?}\nmodel = 'fixture-model'\n"),
-    );
-    let mut command = fixture.command(&config);
-    if interactive {
-        command.arg("--interactive");
-    }
-    let mut child = Process::spawn(&mut command);
-    let mut stdin = child.0.stdin.take().unwrap();
-    let stdout = child.0.stdout.take().unwrap();
-    let (sender, receiver) = mpsc::channel();
-    let output = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            sender
-                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
-        }
-    });
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(30)).unwrap()["event"]["type"],
-        "ready"
-    );
-    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
-    if !interactive {
-        writeln!(stdin, "{}", json!({"version":1,"command":"interact"})).unwrap();
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let event = receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_else(|error| panic!("{error}; {}", child.failure_diagnostics()));
-        assert_ne!(
-            event["event"]["type"], "ended",
-            "Ended before input: {event}"
-        );
-        if event["event"]["phase"] == "input_requested" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-    }
-    assert!(child.0.try_wait().unwrap().is_none());
-    writeln!(stdin, "{}", json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42, check and submit."}}})).unwrap();
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "{}", child.stderr());
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    output.join().unwrap();
-    server.join().unwrap();
-    assert!(
-        receiver
-            .try_iter()
-            .any(|event| event["event"]["type"] == "ended"
-                && event["event"]["reason"]["reason"] == "submitted")
-    );
-    let journal =
-        fs::read_to_string(fixture.data.join("nano/sessions/nano-e2e-run/events.jsonl")).unwrap();
-    let records: Vec<Value> = journal
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert!(
-        records
-            .iter()
-            .any(|record| record["event"]["event"] == "interaction_opened")
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| record["event"]["event"] == "user_input")
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.workspace.join("answer.txt")).unwrap(),
-        "42\n"
-    );
-    let status: String = Connection::open(fixture.data.join("ferrus.db"))
-        .unwrap()
-        .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(status, "reviewing");
-}
-
-#[test]
-fn taskless_interactive_process_waits_edits_checks_and_preserves_pending_tasks() {
-    let fixture = Fixture::new();
-    let mut config_text = fs::read_to_string(fixture.root.join("ferrus.toml")).unwrap();
-    config_text.push_str("\n[repository_graph]\nenabled = true\n");
-    fs::write(fixture.root.join("ferrus.toml"), config_text).unwrap();
-    success(ferrus(&fixture.root).args(["graph", "index"]));
-    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
-    db.execute("INSERT OR IGNORE INTO tasks(id,path,status) VALUES ('current','.ferrus/TASK.md','unknown')", []).unwrap();
-    db.execute("INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path) VALUES ('nano-direct-run','current','executor','executor:nano:1','running','2026-10-05T00:00:00Z','2026-10-05T00:00:00Z',?1)", [fixture.root.to_str().unwrap()]).unwrap();
-    drop(db);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let (requests_tx, requests_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        for turn in 0..2 {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "Missing taskless request");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("{error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse::<usize>().unwrap();
-                }
-            }
-            assert!((1..=512 * 1024).contains(&length));
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            let names: Vec<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap())
-                .collect();
-            for forbidden in [
-                "submit",
-                "consult",
-                "ask_human",
-                "wait_for_task",
-                "approve",
-                "reject",
-                "enqueue_task",
-            ] {
-                assert!(!names.contains(&forbidden));
-            }
-            assert!(
-                request["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("There is no managed task")
-            );
-            let data = if turn == 0 {
-                assert_eq!(
-                    request["messages"].as_array().unwrap().last().unwrap(),
-                    &json!({"role":"user", "content":"Create answer.txt with 42 and check it."})
-                );
-                let calls: Vec<_> = [
-                    ("repository_graph_status", json!({})),
-                    ("apply_patch", json!({"edits":[{"operation":"create","path":"answer.txt","content":"42\n"}]})),
-                    ("check", json!({})),
-                ].into_iter().enumerate().map(|(index, (name,args))|
-                    json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect();
-                json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
-            } else {
-                let messages = request["messages"].as_array().unwrap();
-                let result = |id| {
-                    let message = messages
-                        .iter()
-                        .find(|message| message["tool_call_id"] == id)
-                        .unwrap();
-                    serde_json::from_str::<Value>(message["content"].as_str().unwrap()).unwrap()
-                };
-                let graph = result("call-0");
-                assert_eq!(graph["status"], "success", "{graph}");
-                assert!(
-                    graph["content"]["result"]["snapshot_id"].is_string(),
-                    "{graph}"
-                );
-                assert!(graph["content"]["result"]["task_view"].is_null(), "{graph}");
-                assert_eq!(result("call-1")["status"], "success");
-                assert_eq!(result("call-2")["content"]["passed"], true);
-                json!({"choices":[{"index":0,"delta":{"content":"Created and checked answer.txt."},"finish_reason":"stop"}]})
-            };
-            requests_tx.send(turn).unwrap();
-            if turn == 1 {
-                // A provider can produce no streaming events while thinking.
-                // Keep this gap above the old five-second per-event timeout.
-                std::thread::sleep(Duration::from_secs(6));
-            }
-            let sse = format!("data: {data}\n\ndata: [DONE]\n\n");
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
-        }
-    });
-    let config = fixture.root.join("nano.toml");
-    let mut provider_config = format!("base_url = {url:?}\nmodel = 'fixture-model'\n");
-    if cfg!(feature = "nano-mcp") {
-        let peers = fixture.root.join("mcp.toml");
-        let executable = toml::Value::String(env!("CARGO_BIN_EXE_ferrus").into());
-        private_config(
-            &peers,
-            &format!(
-                "[[servers]]\nid = 'graph'\ncommand = {executable}\nargs = ['serve', '--role', 'executor']\nallow = ['repository_search']\ninherit_managed_binding = true\n"
-            ),
-        );
-        provider_config.push_str(&format!(
-            "mcp_config_file = {}\n",
-            toml::Value::String(peers.to_string_lossy().into_owned())
-        ));
-    }
-    private_config(&config, &provider_config);
-    let mut command = fixture.command(&config);
-    command
-        .current_dir(&fixture.root)
-        .args(["--interactive", "--taskless"])
-        .env_remove("FERRUS_TASK_ID")
-        .env_remove("FERRUS_BASELINE_TREE")
-        .env("RUST_LOG", "ferrus=debug")
-        .env("FERRUS_RUN_ID", "nano-direct-run");
-    // Linux also exercises the direct launch with a Windows-sized main-thread
-    // stack instead of relying on the host's larger default stack.
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the closure only calls OS resource-limit functions and
-        // constructs an error from errno; it does not allocate or acquire locks.
-        unsafe {
-            command.pre_exec(|| {
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                limit.rlim_cur = 1024 * 1024;
-                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = Process::spawn(&mut command);
-    let mut stdin = child.0.stdin.take().unwrap();
-    let stdout = child.0.stdout.take().unwrap();
-    let (sender, receiver) = mpsc::channel();
-    let output = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            sender
-                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
-        }
-    });
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(30)).unwrap()["event"]["type"],
-        "ready"
-    );
-    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
-    let journal_path = fixture
-        .data
-        .join("nano/sessions/nano-direct-run/events.jsonl");
-    let wait_for_input = |child: &mut Process, stage: &str| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let event = receiver
-                // Graph refresh, checks, or a non-streaming model response may
-                // legitimately be silent for more than five seconds. Apply the
-                // overall deadline instead of an accidental per-event deadline.
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "{stage}: {error}; {}\njournal tail:\n{}",
-                        child.failure_diagnostics(),
-                        log_tail(&journal_path).unwrap_or_else(|error| error.to_string())
-                    )
-                });
-            assert_ne!(event["event"]["type"], "ended", "{event}");
-            if event["event"]["phase"] == "input_requested" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        }
-    };
-    wait_for_input(&mut child, "initial input request");
-    assert!(
-        requests_rx.try_recv().is_err(),
-        "Opening /executor must not call the provider"
-    );
-    writeln!(
-        stdin,
-        "{}",
-        json!({"version":1,"command":{"steer":{"text":"Create answer.txt with 42 and check it.","input_id":"direct-input-1"}}})
-    )
-    .unwrap();
-    wait_for_input(&mut child, "response after editing and checks");
-    assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
-    assert_eq!(requests_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("answer.txt")).unwrap(),
-        "42\n"
-    );
-    assert!(!fixture.workspace.join("answer.txt").exists());
-    writeln!(stdin, "{}", json!({"version":1,"command":"cancel"})).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "{}", child.stderr());
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    output.join().unwrap();
-    server.join().unwrap();
-    let journal = fs::read_to_string(
-        fixture
-            .data
-            .join("nano/sessions/nano-direct-run/events.jsonl"),
-    )
-    .unwrap();
-    let records: Vec<Value> = journal
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert!(records[0]["event"]["identity"]["task_id"].is_null());
-    assert!(
-        records
-            .iter()
-            .any(|record| record["event"]["event"] == "user_input"
-                && record["event"]["input_id"] == "direct-input-1")
-    );
-    let db = Connection::open(fixture.data.join("ferrus.db")).unwrap();
-    let task: (String, Option<String>, u32, u32) = db.query_row(
-        "SELECT status, claimed_by, check_retries, executor_dispatches FROM tasks WHERE id = 't-001'", [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    ).unwrap();
-    assert_eq!(task, ("pending".into(), None, 0, 0));
-}
-
-#[test]
-fn taskless_interactive_rejects_a_managed_run_binding_before_inference() {
-    let fixture = Fixture::new();
-    let config = fixture.root.join("nano.toml");
-    private_config(
-        &config,
-        "base_url = 'http://127.0.0.1:1234/v1'\nmodel = 'fixture-model'\n",
-    );
-    let mut command = fixture.command(&config);
-    command
-        .current_dir(&fixture.root)
-        .args(["--interactive", "--taskless"])
-        .env_remove("FERRUS_TASK_ID")
-        .env_remove("FERRUS_BASELINE_TREE");
-    let mut child = Process::spawn(&mut command);
-    let mut stdin = child.0.stdin.take().unwrap();
-    writeln!(stdin, "{}", json!({"version":1,"command":"start"})).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(!status.success());
-            assert!(
-                child.stderr().contains("Interactive run binding mismatch"),
-                "{}",
-                child.stderr()
-            );
-            break;
-        }
-        assert!(Instant::now() < deadline, "{}", child.failure_diagnostics());
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!fixture.data.join("nano/sessions").exists());
-    let state: String = Connection::open(fixture.data.join("ferrus.db"))
-        .unwrap()
-        .query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(state, "pending");
-}
-
-#[test]
-fn headless_native_reviewer_uses_the_managed_protocol_and_stops_after_approval() {
-    let f = Fixture::new();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-    let settings = f.data.join("review-provider.toml");
-    private_config(
-        &settings,
-        &format!("base_url='{endpoint}'\nmodel='review-model'\n"),
-    );
-    let db = Connection::open(f.data.join("ferrus.db")).unwrap();
-    db.execute("UPDATE tasks SET status='reviewing',baseline_snapshot_id='snapshot:fixture',repository_view_snapshot_id='snapshot:fixture',repository_view_status='unavailable',repository_view_lifecycle='frozen_submitted',repository_view_tree_algorithm='git-sha1',repository_view_tree_digest=?1 WHERE id='t-001'",[&f.baseline]).unwrap();
-    db.execute("INSERT INTO runs(id,task_id,role,agent,status,started_at,updated_at,workspace_path,baseline_snapshot_id,repository_view_snapshot_id,repository_view_status,repository_view_lifecycle,repository_view_tree_algorithm,repository_view_tree_digest) VALUES('native-review','t-001','supervisor','supervisor:nano:t-001','running','2026-10-17T00:00:00Z','2026-10-17T00:00:00Z',?1,'snapshot:fixture','snapshot:fixture','unavailable','frozen_submitted','git-sha1',?2)",rusqlite::params![f.root.to_str().unwrap(),f.baseline]).unwrap();
-    let server = std::thread::spawn(move || {
-        listener.set_nonblocking(true).unwrap();
-        for name in ["review_pending", "approve"] {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10))
-                    }
-                    Err(error) => panic!("review mock: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse::<usize>().unwrap();
-                }
-            }
-            assert!((1..512 * 1024).contains(&length));
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            let names: Vec<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap())
-                .collect();
-            for denied in [
-                "exec",
-                "apply_patch",
-                "submit",
-                "enqueue_task",
-                "create_spec",
-                "archive_spec",
-                "respond_consult",
-            ] {
-                assert!(!names.contains(&denied));
-            }
-            assert!(names.contains(&"approve"));
-            let data = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":name,"type":"function","function":{"name":name,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
-            let body = format!("data: {data}\n\ndata: [DONE]\n\n");
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
-        }
-    });
-    let mut command = ferrus(&f.root);
-    command
-        .args(["--debug", "nano", "run", "--supervise", "--config"])
-        .arg(&settings)
-        .env("FERRUS_PROJECT_ROOT", &f.root)
-        .env("FERRUS_AGENT_ID", "supervisor:nano:t-001")
-        .env("FERRUS_TASK_ID", "t-001")
-        .env("FERRUS_RUN_ID", "native-review")
-        .env("RUST_LOG", "ferrus=debug")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    let mut child = Process::spawn(&mut command);
-    let mut input = child.0.stdin.take().unwrap();
-    let mut reader = BufReader::new(child.0.stdout.take().unwrap());
-    let mut ready = String::new();
-    reader.read_line(&mut ready).unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&ready).unwrap()["event"]["type"],
-        "ready"
-    );
-    writeln!(input, "{{\"version\":1,\"command\":\"start\"}}").unwrap();
-    let (tx, rx) = mpsc::channel();
-    let output = std::thread::spawn(move || {
-        for line in reader.lines() {
-            tx.send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .unwrap();
-        }
-    });
-    let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        events.extend(rx.try_iter());
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "{}", child.stderr());
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{}\nevents: {events:?}\njournal: {:?}",
-            child.failure_diagnostics(),
-            log_tail(&f.data.join("nano/sessions/native-review/events.jsonl"))
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    output.join().unwrap();
-    events.extend(rx.try_iter());
-    server.join().unwrap();
-    assert!(events.iter().any(|frame| frame["event"]["type"] == "ended"
-        && frame["event"]["reason"]["reason"] == "review_completed"
-        && frame["event"]["durable"] == true));
-    assert_eq!(
-        db.query_row("SELECT status FROM tasks WHERE id='t-001'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .unwrap(),
-        "complete"
     );
 }

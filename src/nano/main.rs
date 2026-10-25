@@ -1,5 +1,7 @@
 //! Standalone frontend; no HQ or orchestration modules are linked here.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use clap::Parser;
 
 #[tokio::main]
@@ -7,6 +9,7 @@ async fn main() -> anyhow::Result<()> {
     if ferrus::repository_graph::extractors::cargo::run_parser_worker_if_requested()? {
         return Ok(());
     }
+
     let cli = ferrus::nano::standalone::Cli::parse();
     if !cli.is_interactive() {
         tracing_subscriber::fmt()
@@ -14,5 +17,6 @@ async fn main() -> anyhow::Result<()> {
             .with_writer(std::io::stderr)
             .init();
     }
+
     ferrus::nano::standalone::run(cli).await
 }

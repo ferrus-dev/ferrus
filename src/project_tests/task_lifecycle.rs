@@ -717,6 +717,7 @@ async fn executor_dispatch_budget_fails_task_after_limit() {
             ExecutorDispatchOutcome::Proceed => {}
             other => panic!("expected Proceed, got {other:?}"),
         }
+
         assert_eq!(record_executor_dispatch("t-001").await.unwrap(), expected);
     }
 
@@ -771,6 +772,7 @@ async fn executor_dispatch_budget_resets_on_new_review_cycle() {
             ExecutorDispatchOutcome::Proceed => {}
             other => panic!("expected Proceed, got {other:?}"),
         }
+
         assert_eq!(record_executor_dispatch("t-001").await.unwrap(), expected);
     }
 
@@ -789,6 +791,7 @@ async fn executor_dispatch_budget_resets_on_new_review_cycle() {
         ExecutorDispatchOutcome::Proceed => {}
         other => panic!("expected dispatch budget reset, got {other:?}"),
     }
+
     assert_eq!(record_executor_dispatch("t-001").await.unwrap(), 1);
 
     teardown(previous);
@@ -804,6 +807,7 @@ async fn executor_dispatch_budget_disabled_when_zero() {
             ExecutorDispatchOutcome::Proceed => {}
             other => panic!("expected Proceed with guard disabled, got {other:?}"),
         }
+
         assert_eq!(record_executor_dispatch("t-001").await.unwrap(), expected);
     }
 

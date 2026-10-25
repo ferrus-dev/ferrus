@@ -72,6 +72,7 @@ pub async fn read_agents() -> Result<AgentsRegistry> {
     if !p.exists() {
         return Ok(AgentsRegistry::default());
     }
+
     let s = tokio::fs::read_to_string(p)
         .await
         .context("Failed to read .ferrus/agents.json")?;

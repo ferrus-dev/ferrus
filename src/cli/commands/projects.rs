@@ -22,5 +22,6 @@ async fn list() -> Result<()> {
     for line in runtime_table::project_lines(&projects) {
         println!("{line}");
     }
+
     Ok(())
 }

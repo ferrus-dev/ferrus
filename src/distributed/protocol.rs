@@ -188,6 +188,7 @@ impl IndexJobSpec {
         if kind != input.kind() || input.validate().is_err() {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
+
         let idempotency_key = idempotency_key(kind, &input, &semantics)?;
         Ok(Self {
             protocol_version: DISTRIBUTED_CONTROL_PROTOCOL_VERSION,
@@ -204,9 +205,11 @@ impl IndexJobSpec {
         if self.kind != self.input.kind() {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
+
         if self.idempotency_key != idempotency_key(self.kind, &self.input, &self.semantics)? {
             return Err(DistributedProtocolError::IdempotencyMismatch);
         }
+
         Ok(())
     }
 
@@ -327,6 +330,7 @@ impl IndexJobRecord {
         {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
+
         Ok(())
     }
 }
@@ -347,6 +351,7 @@ impl SubmitIndexJobRequest {
         if self.project != *self.job.project() {
             return Err(DistributedProtocolError::JobInputMismatch);
         }
+
         Ok(())
     }
 }
@@ -549,12 +554,14 @@ impl FactBatch {
         if self.header.protocol_version != DISTRIBUTED_FACT_PROTOCOL_VERSION {
             return Err(DistributedProtocolError::UnsupportedVersion);
         }
+
         if self.header.job.kind != self.header.target.kind()
             || self.header.job.kind != self.payload.kind()
             || self.header.job.project != *self.header.target.project()
         {
             return Err(DistributedProtocolError::FactBatchMismatch);
         }
+
         validate_fact_targets(&self.header.target, &self.payload)?;
         let payload_digest = hash(b"ferrus.distributed.fact-payload.v1\0", &self.payload)?;
         let batch_id = fact_batch_id(
@@ -568,6 +575,7 @@ impl FactBatch {
         if payload_digest != self.header.payload_digest || batch_id != self.header.batch_id {
             return Err(DistributedProtocolError::FactBatchIdentityMismatch);
         }
+
         Ok(())
     }
 }
@@ -678,6 +686,7 @@ fn memory_relationship_matches_link_target(
         if repository != &target.link_set.repository {
             return false;
         }
+
         match snapshot_id {
             None => relationship.provenance.resolution == MemoryResolutionState::Unresolved,
             Some(snapshot) if snapshot == &target.graph.snapshot_id => {
@@ -745,6 +754,7 @@ impl PublishGraphRequest {
         {
             return Err(DistributedProtocolError::PublicationMismatch);
         }
+
         Ok(())
     }
 }
@@ -776,6 +786,7 @@ impl PublishMemoryRequest {
         if self.job.kind != IndexJobKind::ProjectMemory || self.job.project != self.project {
             return Err(DistributedProtocolError::PublicationMismatch);
         }
+
         Ok(())
     }
 }
@@ -837,13 +848,16 @@ impl<T> RemoteQueryRequest<T> {
         if self.protocol_version != DISTRIBUTED_QUERY_PROTOCOL_VERSION {
             return Err(DistributedProtocolError::UnsupportedVersion);
         }
+
         if let RemoteQueryTarget::Federated(view) = &self.target {
             view.validate()
                 .map_err(|_| DistributedProtocolError::QueryScopeMismatch)?;
         }
+
         if self.project != *self.target.project() {
             return Err(DistributedProtocolError::QueryScopeMismatch);
         }
+
         Ok(())
     }
 }

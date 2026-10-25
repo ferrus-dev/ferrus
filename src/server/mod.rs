@@ -12,6 +12,7 @@ use crate::platform;
 
 mod prompts;
 mod resources;
+
 pub(crate) mod tools;
 
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -112,6 +113,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
                 .with_description(tools::create_task::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_task::INPUT_SCHEMA));
         }
+
         if supervisor_definition_tools_visible(
             all_roles,
             task_scoped_supervisor,
@@ -129,6 +131,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
                 .with_description(tools::create_spec::DESCRIPTION)
                 .with_input_schema(|_| ToolSchema::from_json_str(tools::create_spec::INPUT_SCHEMA));
         }
+
         if supervisor_archive_tool_visible(all_roles, archive_scoped_supervisor) {
             app.map_tool("archive_spec", tools::archive_spec::handler)
                 .with_arg_names(["input"])
@@ -137,6 +140,7 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
                     ToolSchema::from_json_str(tools::archive_spec::INPUT_SCHEMA)
                 });
         }
+
         if supervisor_review_tools_visible(archive_scoped_supervisor) {
             app.map_tool("wait_for_review", tools::wait_for_review::handler)
                 .with_description(tools::wait_for_review::DESCRIPTION);
@@ -264,24 +268,29 @@ pub async fn start(role: Option<Role>, agent_name: String, agent_index: u32) -> 
             .with_description(tools::ask_human::DESCRIPTION)
             .with_input_schema(|_| ToolSchema::from_json_str(tools::ask_human::INPUT_SCHEMA));
     }
+
     if all_roles || supervisor_role || executor_role {
         app.map_tool("wait_for_answer", tools::wait_for_answer::handler)
             .with_description(tools::wait_for_answer::DESCRIPTION);
     }
+
     if all_roles {
         app.map_tool("answer", tools::answer::handler)
             .with_arg_names(["response"])
             .with_description(tools::answer::DESCRIPTION)
             .with_input_schema(|_| ToolSchema::from_json_str(tools::answer::INPUT_SCHEMA));
     }
+
     if all_roles || executor_role {
         app.map_tool("status", tools::status::handler)
             .with_description(tools::status::DESCRIPTION);
     }
+
     if all_roles || executor_role {
         app.map_tool("reset", tools::reset::handler)
             .with_description(tools::reset::DESCRIPTION);
     }
+
     if all_roles || executor_role || task_scoped_supervisor {
         app.map_tool("heartbeat", tools::heartbeat::handler)
             .with_description(tools::heartbeat::DESCRIPTION);
@@ -329,6 +338,7 @@ fn supervisor_task_scope_from_agent_id(agent_id: &str) -> Option<&str> {
     if parts.next().is_some() || role != ROLE_SUPERVISOR || scope.parse::<u32>().is_ok() {
         return None;
     }
+
     Some(scope)
 }
 

@@ -103,6 +103,7 @@ pub fn open_for_query_at(path: &Path) -> Result<OpenMemoryQuerySidecarResult, Me
     {
         return Ok(OpenMemoryQuerySidecarResult::Absent);
     }
+
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -113,11 +114,13 @@ pub fn open_for_query_at(path: &Path) -> Result<OpenMemoryQuerySidecarResult, Me
     if application_id != MEMORY_APPLICATION_ID || version > MEMORY_SIDECAR_SCHEMA_VERSION {
         return Ok(OpenMemoryQuerySidecarResult::RequiresRebuild);
     }
+
     if version < MEMORY_SIDECAR_SCHEMA_VERSION {
         return Ok(OpenMemoryQuerySidecarResult::NeedsMigration {
             found_schema_version: version,
         });
     }
+
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "query_only", true)?;
@@ -194,6 +197,7 @@ impl MemoryStore for MemorySidecar {
         if build.state != MemoryBuildState::Building {
             return Err(MemoryStoreError::InvalidTransition);
         }
+
         self.connection.execute(
             "INSERT INTO memory_builds( \
                 id, project_namespace, project_id, prospective_revision_id, state, started_at \
@@ -222,6 +226,7 @@ impl MemoryStore for MemorySidecar {
         if changed != 1 {
             return Err(MemoryStoreError::InvalidTransition);
         }
+
         Ok(())
     }
 
@@ -237,6 +242,7 @@ impl MemoryStore for MemorySidecar {
         {
             return Err(MemoryStoreError::IdentityMismatch);
         }
+
         if let Some(existing) = load_revision(&transaction, &commit.revision.id)? {
             if existing.project != commit.revision.project
                 || existing.source_set_digest != commit.revision.source_set_digest
@@ -254,6 +260,7 @@ impl MemoryStore for MemorySidecar {
                 {
                     return Err(MemoryStoreError::IdentityMismatch);
                 }
+
                 transaction.execute(
                     "INSERT INTO memory_entities(revision_id, id, kind, source_category, entity_json) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -266,12 +273,14 @@ impl MemoryStore for MemorySidecar {
                     ],
                 )?;
             }
+
             for relationship in &commit.relationships {
                 if relationship.project != commit.revision.project
                     || relationship.memory_revision_id != commit.revision.id
                 {
                     return Err(MemoryStoreError::IdentityMismatch);
                 }
+
                 transaction.execute(
                     "INSERT INTO memory_relationships( \
                         revision_id, id, kind, source_entity_id, relationship_json \
@@ -286,9 +295,11 @@ impl MemoryStore for MemorySidecar {
                 )?;
             }
         }
+
         for repository_links in &commit.repository_links {
             insert_repository_link_commit(&transaction, &commit.revision, repository_links)?;
         }
+
         transaction.execute(
             "DELETE FROM memory_diagnostics WHERE build_id = ?1",
             [commit.revision.completed_by.as_str()],
@@ -308,6 +319,7 @@ impl MemoryStore for MemorySidecar {
                 ],
             )?;
         }
+
         transaction.execute(
             "INSERT INTO memory_revision_diagnostic_sets(revision_id, build_id) VALUES (?1, ?2) \
              ON CONFLICT(revision_id) DO UPDATE SET build_id = excluded.build_id",
@@ -329,6 +341,7 @@ impl MemoryStore for MemorySidecar {
                 ],
             )?;
         }
+
         let completed = transaction.execute(
             "UPDATE memory_builds SET state = 'complete', finished_at = ?2, \
                 metrics_json = ?3 WHERE id = ?1 AND state = 'building'",
@@ -341,6 +354,7 @@ impl MemoryStore for MemorySidecar {
         if completed != 1 {
             return Err(MemoryStoreError::InvalidTransition);
         }
+
         transaction.commit()?;
         Ok(())
     }
@@ -357,6 +371,7 @@ impl MemoryStore for MemorySidecar {
         if build.project != request.project || build.state != MemoryBuildState::Complete {
             return Err(MemoryStoreError::InvalidTransition);
         }
+
         let revision = load_revision(&transaction, &build.prospective_revision_id)?
             .ok_or(MemoryStoreError::RevisionNotFound)?;
         let current = load_published_view(&transaction, &request.project, &request.view_name)?;
@@ -367,6 +382,7 @@ impl MemoryStore for MemorySidecar {
         if request.expected != actual {
             return Err(MemoryStoreError::PublicationConflict);
         }
+
         if let Some(current) = current.as_ref()
             && current.revision_id == revision.id
         {
@@ -379,6 +395,7 @@ impl MemoryStore for MemorySidecar {
                 view: current.clone(),
             });
         }
+
         let generation = actual.map_or(1, |version| version.generation + 1);
         transaction.execute(
             "INSERT INTO memory_published_views( \
@@ -405,6 +422,7 @@ impl MemoryStore for MemorySidecar {
                 [current.build_id.as_str()],
             )?;
         }
+
         transaction.execute(
             "UPDATE memory_builds SET state = 'published' WHERE id = ?1",
             [build.id.as_str()],
@@ -429,6 +447,7 @@ impl MemoryStore for MemorySidecar {
         if changed != 1 {
             return Err(MemoryStoreError::InvalidTransition);
         }
+
         Ok(())
     }
 
@@ -671,6 +690,7 @@ impl MemoryLinkStore for MemorySidecar {
                 diagnostics.push(serde_json::from_str(&encoded)?);
             }
         }
+
         drop(deadline);
         let diagnostic_truncated = diagnostics.len() > max_diagnostics as usize;
         diagnostics.truncate(max_diagnostics as usize);
@@ -704,6 +724,7 @@ fn insert_repository_link_commit(
     {
         return Err(MemoryStoreError::IdentityMismatch);
     }
+
     let existing = transaction
         .query_row(
             "SELECT link_set_json FROM memory_repository_link_sets WHERE id = ?1",
@@ -716,6 +737,7 @@ fn insert_repository_link_commit(
         if existing != commit.link_set {
             return Err(MemoryStoreError::IdentityMismatch);
         }
+
         let mut statement = transaction.prepare(
             "SELECT relationship_json FROM memory_repository_links \
              WHERE link_set_id = ?1 ORDER BY relationship_id",
@@ -725,18 +747,18 @@ fn insert_repository_link_commit(
         let existing_relationships = rows
             .map(|row| Ok(serde_json::from_str::<MemoryRelationship>(&row?)?))
             .collect::<Result<Vec<_>, MemoryStoreError>>()?;
-        if existing_relationships.len() != commit.relationships.len()
-            || existing_relationships
-                .iter()
-                .zip(&commit.relationships)
-                .any(|(left, right)| {
-                    repository_link_semantics(left) != repository_link_semantics(right)
-                })
-        {
+        if existing_relationships.len() != commit.relationships.len() {
             return Err(MemoryStoreError::IdentityMismatch);
         }
+        for (left, right) in existing_relationships.iter().zip(&commit.relationships) {
+            if repository_link_semantics(left)? != repository_link_semantics(right)? {
+                return Err(MemoryStoreError::IdentityMismatch);
+            }
+        }
+
         return Ok(());
     }
+
     transaction.execute(
         "INSERT INTO memory_repository_link_sets( \
             id, memory_revision_id, repository_namespace, repository_id, snapshot_id, \
@@ -769,6 +791,7 @@ fn insert_repository_link_commit(
             ],
         )?;
     }
+
     for (sequence, diagnostic) in commit.diagnostics.iter().enumerate() {
         transaction.execute(
             "INSERT INTO memory_repository_link_diagnostics( \
@@ -782,10 +805,13 @@ fn insert_repository_link_commit(
             ],
         )?;
     }
+
     Ok(())
 }
 
-fn repository_link_semantics(relationship: &MemoryRelationship) -> Vec<u8> {
+fn repository_link_semantics(
+    relationship: &MemoryRelationship,
+) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&(
         &relationship.project,
         &relationship.memory_revision_id,
@@ -801,7 +827,6 @@ fn repository_link_semantics(relationship: &MemoryRelationship) -> Vec<u8> {
         relationship.provenance.resolution,
         relationship.provenance.confidence,
     ))
-    .expect("repository link semantics are serializable")
 }
 
 mod schema;

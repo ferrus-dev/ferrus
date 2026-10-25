@@ -92,12 +92,14 @@ async fn dead(pid: u32) {
             if !crate::platform::pid_is_alive(pid) {
                 return;
             }
+
             // An orphaned Linux zombie has exited and cannot write; PID 1 in a
             // container may not reap it promptly. Never signal that stale PID.
             #[cfg(target_os = "linux")]
             if fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z")) {
                 return;
             }
+
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -125,6 +127,7 @@ fn child_fixture() {
                 std::io::stdout().write_all(b"out-line\n").unwrap();
                 std::io::stderr().write_all(b"err-line\n").unwrap();
             }
+
             println!("OUT_END");
             eprintln!("ERR_END");
         }
@@ -156,6 +159,7 @@ fn child_fixture() {
             while !Path::new("leaf.pid").exists() {
                 std::thread::sleep(Duration::from_millis(10));
             }
+
             fs::write("ready", "ready").unwrap();
             if mode == "descendant" {
                 loop {
@@ -177,6 +181,7 @@ fn child_fixture() {
                     "unexpected inherited {name}"
                 );
             }
+
             println!("CLEAN_ENVIRONMENT");
         }
         _ => panic!("unknown fixture"),
@@ -308,6 +313,7 @@ async fn streams_are_spooled_paginated_and_stdin_is_eof() {
                 break;
             }
         }
+
         assert_eq!(cursor, output.bytes);
         assert!(text.contains(expected));
         if expected == "OUT_END" {
@@ -315,6 +321,7 @@ async fn streams_are_spooled_paginated_and_stdin_is_eof() {
             assert!(text.contains("CWD="));
         }
     }
+
     let stored: Snapshot = serde_json::from_slice(
         &fs::read(
             f.session
@@ -461,6 +468,7 @@ async fn stop_drop_and_parent_exit_clean_up_descendants() {
         } else {
             drop(f.commands);
         }
+
         dead(pid).await;
     }
 }
@@ -507,6 +515,7 @@ async fn environment_and_output_handles_are_session_scoped() {
             ToolError::InvalidArguments
         );
     }
+
     assert_eq!(
         other
             .commands
@@ -613,6 +622,7 @@ async fn cancelling_busy_output_reconciles_retained_byte_cursors() {
             if snapshot.stdout.bytes + snapshot.stderr.bytes > 0 {
                 break;
             }
+
             tokio::task::yield_now().await;
         }
     })
@@ -635,6 +645,7 @@ async fn cancelling_busy_output_reconciles_retained_byte_cursors() {
             .unwrap();
         assert_eq!(page.next_offset, output.bytes);
     }
+
     assert!(f.commands.shutdown().await);
 }
 
@@ -721,6 +732,7 @@ async fn explicit_cwd_uses_workspace_directory_validation() {
                 .is_err()
         );
     }
+
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(f._root.path(), f.workspace.join("outside")).unwrap();
@@ -748,11 +760,14 @@ async fn engine_completion_stops_background_coding_tools() {
         provider::*,
         session::*,
     };
+
     struct FinalProvider;
+
     impl Provider for FinalProvider {
         async fn start(&mut self, _: ModelRequest) -> std::result::Result<(), ProviderError> {
             Ok(())
         }
+
         async fn next_event(
             &mut self,
         ) -> std::result::Result<Option<ProviderEvent>, ProviderError> {
@@ -767,11 +782,14 @@ async fn engine_completion_stops_background_coding_tools() {
             }))
         }
     }
+
     struct TestHost;
+
     impl Host for TestHost {
         async fn authorize(&mut self, _: &ValidatedCall) -> std::result::Result<(), ToolError> {
             Ok(())
         }
+
         fn committed(&mut self, _: &Record) {}
     }
     let root = TempDir::new().unwrap();

@@ -63,6 +63,7 @@ impl Display {
         if let Some(spec) = &watched.selected_spec_display {
             lines.push(format!("spec       : {spec}"));
         }
+
         if agents.agents.is_empty() {
             lines.push("agents     : none".to_string());
         } else {
@@ -79,6 +80,7 @@ impl Display {
                 lines.push(format!("  [{:<10}] {:<10}{}", agent.role, status, pid));
             }
         }
+
         self.info_block(lines);
     }
 
@@ -174,6 +176,7 @@ mod tests {
             UiMessage::Info(text) => assert_eq!(text, "first\nsecond"),
             _ => panic!("expected info message"),
         }
+
         assert!(rx.try_recv().is_err());
     }
 
@@ -191,6 +194,7 @@ mod tests {
             }
             _ => panic!("expected table message"),
         }
+
         assert!(rx.try_recv().is_err());
     }
 
@@ -206,6 +210,7 @@ mod tests {
             UiMessage::Info(text) => assert_eq!(text, "No tasks recorded in ferrus.db."),
             _ => panic!("expected info message"),
         }
+
         assert!(rx.try_recv().is_err());
     }
 
@@ -221,6 +226,7 @@ mod tests {
             UiMessage::Success(text) => assert_eq!(text, "Task t-001 completed."),
             _ => panic!("expected success message"),
         }
+
         assert!(rx.try_recv().is_err());
     }
 
@@ -258,6 +264,7 @@ mod tests {
             }
             _ => panic!("expected info message"),
         }
+
         assert!(rx.try_recv().is_err());
     }
 }

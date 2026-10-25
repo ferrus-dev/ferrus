@@ -9,11 +9,13 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Review,
     Consult,
 }
+
 #[derive(Clone)]
 pub(crate) struct Session {
     pub scope: ExecutorSessionScope,
@@ -24,6 +26,7 @@ pub(crate) struct Session {
     pub ttl: u64,
     pub source: Arc<source::Source>,
 }
+
 impl Session {
     pub async fn bind(launch: super::super::ferrus::LaunchContext) -> Result<Self> {
         ensure!(
@@ -162,6 +165,7 @@ impl Session {
         session.authorize().await?;
         Ok(session)
     }
+
     pub async fn status(&self) -> Result<RuntimeTaskContext> {
         let mode = self.mode;
         let path = self.source.path.to_string_lossy().into_owned();
@@ -171,10 +175,12 @@ impl Session {
                 ensure!(Path::new(&workspace.context("Missing Executor workspace")?).canonicalize()?==scope.workspace_path,"Executor workspace changed");
                 context.repository_view=tx.query_row("SELECT baseline_snapshot_id, overlay_revision_id, repository_view_snapshot_id, repository_view_tree_algorithm, repository_view_tree_digest, repository_view_lifecycle, repository_view_status FROM tasks WHERE id=?1",[&scope.task_id],|row|project::repository_view_reference_from_row(row,0))?;
             }
+
             context.repository_workspace_path=Some(path);
             Ok(context)
         }).await
     }
+
     pub async fn authorize(&self) -> Result<RuntimeTaskContext> {
         let mode = self.mode;
         project::with_supervisor_session(&self.scope, false, move |tx, scope, context| {
@@ -207,10 +213,12 @@ impl Session {
                     "Supervisor phase ended"
                 );
             }
+
             if mode==Mode::Consult {
                 let workspace:String=tx.query_row("SELECT workspace_path FROM runs WHERE role='executor' AND task_id=?1 ORDER BY updated_at DESC, started_at DESC, id DESC LIMIT 1",[&scope.task_id],|row|row.get(0))?;
                 ensure!(Path::new(&workspace).canonicalize()?==scope.workspace_path,"Consultation Executor workspace changed");
             }
+
             if mode == Mode::Review {
                 project::require_executor_owner(tx, scope)?;
                 let tree: Option<String> = tx.query_row(
@@ -228,6 +236,7 @@ impl Session {
                     "Review submission changed"
                 );
             }
+
             Ok(context)
         })
         .await
@@ -240,7 +249,9 @@ impl Session {
         let mode = self.mode;
         project::with_supervisor_session(&self.scope,true,move |tx,scope,context| {
             if context.status != if mode==Mode::Review {"reviewing"} else {"consultation"} {return Ok(());}
+
             if mode==Mode::Review {project::require_executor_owner(tx,scope)?;} else if super::super::workspace::instruction_file(&root,&format!("{}/CONSULT_RESPONSE.md",context.run_dir),16384)?.is_some_and(|(text,_)|!text.trim().is_empty()) {return Ok(());}
+
             tx.execute("UPDATE tasks SET status='failed',failure_reason=?2,claimed_by=NULL,lease_until=NULL,last_heartbeat=NULL WHERE id=?1",rusqlite::params![scope.task_id,code])?;
             project::executor_event(tx,scope,"nano_supervisor_stopped",json!({"task_id":scope.task_id,"reason":code}))?;
             Ok(())

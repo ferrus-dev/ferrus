@@ -32,12 +32,8 @@ impl DiagnosticCollector {
         }
     }
 
-    pub fn push(&mut self, code: &'static str, path: Option<RepoPath>) {
-        let diagnostic = SourceDiagnostic {
-            code: DiagnosticCode::new(code)
-                .expect("source diagnostic constants are valid bounded codes"),
-            path,
-        };
+    pub fn push(&mut self, code: DiagnosticCode, path: Option<RepoPath>) {
+        let diagnostic = SourceDiagnostic { code, path };
         let insertion = self
             .diagnostics
             .binary_search_by(|stored| {
@@ -91,6 +87,7 @@ pub(super) fn build_manifest(
     {
         return Err(SourceError::PathCollision);
     }
+
     #[cfg(windows)]
     {
         let mut keys = BTreeSet::new();
@@ -111,25 +108,53 @@ pub(super) fn build_manifest(
             metrics.skipped = metrics.skipped.saturating_add(1);
             continue;
         }
+
         if candidate.kind == CandidateKind::Special {
-            diagnostics.push("special_file_skipped", Some(path));
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "special_file_skipped",
+                    )
+                },
+                Some(path),
+            );
             metrics.skipped = metrics.skipped.saturating_add(1);
             continue;
         }
+
         let file = match root.open_file(&path) {
             Ok(file) => file,
             Err(ConfinedOpenError::Symlink) => {
-                diagnostics.push("symlink_skipped", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "symlink_skipped",
+                        )
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 continue;
             }
             Err(ConfinedOpenError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                diagnostics.push("file_missing", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static("file_missing")
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 continue;
             }
             Err(ConfinedOpenError::Io(_)) => {
-                diagnostics.push("file_unreadable", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "file_unreadable",
+                        )
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 continue;
             }
@@ -137,36 +162,49 @@ pub(super) fn build_manifest(
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
-                diagnostics.push("file_unreadable", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "file_unreadable",
+                        )
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 continue;
             }
         };
         if !metadata.file_type().is_file() {
             let code = if candidate.kind == CandidateKind::Gitlink {
-                "gitlink_skipped"
+                const { crate::repository_graph::domain::DiagnosticCode::from_static("gitlink_skipped") }
             } else {
-                "special_file_skipped"
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "special_file_skipped",
+                    )
+                }
             };
             diagnostics.push(code, Some(path));
             metrics.skipped = metrics.skipped.saturating_add(1);
             continue;
         }
+
         if metadata.len() > context.limits.max_file_bytes {
-            diagnostics.push("file_too_large", Some(path));
+            diagnostics.push(const { crate::repository_graph::domain::DiagnosticCode::from_static("file_too_large") }, Some(path));
             metrics.skipped = metrics.skipped.saturating_add(1);
             continue;
         }
+
         let remaining_bytes = context
             .limits
             .max_total_bytes
-            .checked_sub(metrics.total_bytes)
-            .expect("inspected bytes never exceed the configured limit");
+            .saturating_sub(metrics.total_bytes);
         if metadata.len() > remaining_bytes {
             return Err(SourceError::TotalBytesLimitExceeded {
                 limit: context.limits.max_total_bytes,
             });
         }
+
         let read_limit = context.limits.max_file_bytes.min(remaining_bytes);
         let bytes = match read_bounded(file, read_limit) {
             Ok(BoundedRead::Complete(bytes)) => {
@@ -180,10 +218,18 @@ pub(super) fn build_manifest(
             Ok(BoundedRead::LimitExceeded { inspected }) => {
                 account_inspected_bytes(&mut metrics, inspected, context.limits.max_total_bytes)?;
                 if read_limit != remaining_bytes {
-                    diagnostics.push("file_too_large", Some(path));
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "file_too_large",
+                            )
+                        },
+                        Some(path),
+                    );
                     metrics.skipped = metrics.skipped.saturating_add(1);
                     continue;
                 }
+
                 return Err(SourceError::TotalBytesLimitExceeded {
                     limit: context.limits.max_total_bytes,
                 });
@@ -194,17 +240,32 @@ pub(super) fn build_manifest(
                     error.inspected,
                     context.limits.max_total_bytes,
                 )?;
-                diagnostics.push("file_unreadable", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "file_unreadable",
+                        )
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 continue;
             }
         };
-        let byte_len = u64::try_from(bytes.len()).expect("usize always fits into u64");
+        let byte_len = bytes.len() as u64;
         if is_binary(&bytes) {
-            diagnostics.push("binary_file_skipped", Some(path));
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "binary_file_skipped",
+                    )
+                },
+                Some(path),
+            );
             metrics.skipped = metrics.skipped.saturating_add(1);
             continue;
         }
+
         let declared_mode = match candidate.kind {
             CandidateKind::File(mode) => mode,
             CandidateKind::Symlink | CandidateKind::Gitlink | CandidateKind::Special => None,
@@ -215,6 +276,7 @@ pub(super) fn build_manifest(
                 limit: context.limits.max_files,
             });
         }
+
         files.push(SourceFileDescriptor {
             path,
             content_identity: sha256_digest(&bytes),
@@ -226,7 +288,7 @@ pub(super) fn build_manifest(
     }
 
     metrics.suppressed_diagnostics = diagnostics.suppressed;
-    let manifest_digest = canonical_source_manifest_digest(&files, &context.source_policy_digest);
+    let manifest_digest = canonical_source_manifest_digest(&files, &context.source_policy_digest)?;
     let revision = SourceRevision {
         id: revision_id(
             &context.repository,
@@ -236,7 +298,7 @@ pub(super) fn build_manifest(
             &context.analysis_config_digest,
             dirty,
             includes_untracked,
-        ),
+        )?,
         repository: context.repository.clone(),
         source_kind,
         base_revision,
@@ -301,6 +363,7 @@ pub(super) fn read_descriptor_verified(
     if !metadata.file_type().is_file() {
         return Err(SourceError::ContentChanged);
     }
+
     let bytes = match read_bounded(file, stored.byte_len) {
         Ok(BoundedRead::Complete(bytes)) => bytes,
         Ok(BoundedRead::LimitExceeded { .. }) => return Err(SourceError::ContentChanged),
@@ -314,10 +377,12 @@ pub(super) fn read_descriptor_verified(
     if bytes.len() as u64 != stored.byte_len || sha256_digest(&bytes) != stored.content_identity {
         return Err(SourceError::ContentChanged);
     }
+
     #[cfg(unix)]
     if observed_file_mode(&metadata, None) != stored.file_mode {
         return Err(SourceError::ContentChanged);
     }
+
     Ok(SourceContent { bytes })
 }
 
@@ -331,11 +396,14 @@ pub(super) fn normalize_discovered_path(path: &Path) -> Result<RepoPath, ()> {
         if component.contains('\\') || component.contains('\0') {
             return Err(());
         }
+
         if !normalized.is_empty() {
             normalized.push('/');
         }
+
         normalized.push_str(component);
     }
+
     RepoPath::new(normalized).map_err(|_| ())
 }
 
@@ -349,11 +417,14 @@ pub(super) fn windows_path_key(path: &RepoPath) -> Option<String> {
         {
             return None;
         }
+
         if !key.is_empty() {
             key.push('/');
         }
+
         key.push_str(&component.to_ascii_lowercase());
     }
+
     Some(key)
 }
 
@@ -396,6 +467,7 @@ pub(super) fn read_bounded(
             inspected: bytes.len() as u64,
         });
     }
+
     if bytes.len() as u64 > max_bytes {
         Ok(BoundedRead::LimitExceeded {
             inspected: bytes.len() as u64,
@@ -417,6 +489,7 @@ pub(super) fn account_inspected_bytes(
     if total > limit {
         return Err(SourceError::TotalBytesLimitExceeded { limit });
     }
+
     metrics.total_bytes = total;
     Ok(())
 }
@@ -448,8 +521,7 @@ pub(super) fn observed_file_mode(
 }
 
 pub(super) fn sha256_digest(bytes: &[u8]) -> Digest {
-    Digest::new("sha256", hex_lower(&Sha256::digest(bytes)))
-        .expect("sha256 output is always a canonical digest")
+    Digest::from_sha256(Sha256::digest(bytes).into())
 }
 
 #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -459,7 +531,7 @@ struct CanonicalExtractorIdentity<'a> {
     contract_version: u32,
 }
 
-pub fn extractor_set_digest(extractors: &[ExtractorIdentity]) -> Digest {
+pub fn extractor_set_digest(extractors: &[ExtractorIdentity]) -> Result<Digest, serde_json::Error> {
     let canonical = extractors
         .iter()
         .map(|extractor| CanonicalExtractorIdentity {
@@ -468,9 +540,8 @@ pub fn extractor_set_digest(extractors: &[ExtractorIdentity]) -> Digest {
             contract_version: extractor.contract_version,
         })
         .collect::<BTreeSet<_>>();
-    let bytes = serde_json::to_vec(&(SOURCE_MANIFEST_VERSION, canonical))
-        .expect("canonical extractor-set serialization cannot fail");
-    sha256_digest(&bytes)
+    let bytes = serde_json::to_vec(&(SOURCE_MANIFEST_VERSION, canonical))?;
+    Ok(sha256_digest(&bytes))
 }
 
 #[derive(Serialize)]
@@ -494,7 +565,7 @@ pub(super) fn revision_id(
     analysis_config_digest: &Digest,
     dirty: bool,
     includes_untracked: bool,
-) -> SourceRevisionId {
+) -> Result<SourceRevisionId, serde_json::Error> {
     let canonical = CanonicalRevision {
         version: SOURCE_MANIFEST_VERSION,
         repository,
@@ -505,19 +576,7 @@ pub(super) fn revision_id(
         dirty,
         includes_untracked,
     };
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical source revision serialization cannot fail");
+    let bytes = serde_json::to_vec(&canonical)?;
     let digest = sha256_digest(&bytes);
-    SourceRevisionId::new(format!("sha256:{}", digest.value()))
-        .expect("derived source revision identity is never empty")
-}
-
-pub(super) fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
+    Ok(SourceRevisionId::from_content_digest(digest.value()))
 }

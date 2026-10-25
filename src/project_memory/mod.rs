@@ -6,21 +6,35 @@
 //! share a physical sidecar, but that choice must not leak into these APIs.
 
 pub mod diagnostics;
+
 pub(crate) mod documents;
+
 pub mod domain;
+
 pub mod extractors;
+
 pub mod federation;
+
 pub mod federation_service;
+
 pub mod index;
+
 pub mod links;
+
 // Shared by local binary adapters and the optional standalone host.
 #[doc(hidden)]
 pub mod local_query;
+
 pub mod policy;
+
 pub mod ports;
+
 pub mod query;
+
 pub mod query_sqlite;
+
 pub mod source;
+
 pub mod sqlite;
 
 #[cfg(test)]

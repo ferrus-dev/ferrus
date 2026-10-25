@@ -198,6 +198,7 @@ fn parse_input(input: serde_json::Value) -> Result<RepositoryContextInput> {
     if input.seeds.is_empty() || input.seeds.len() > MAX_SEEDS {
         anyhow::bail!("repository_context requires 1..={MAX_SEEDS} seeds");
     }
+
     if input
         .seeds
         .iter()
@@ -205,6 +206,7 @@ fn parse_input(input: serde_json::Value) -> Result<RepositoryContextInput> {
     {
         anyhow::bail!("repository_context seeds must not be empty");
     }
+
     if input
         .seeds
         .iter()
@@ -212,12 +214,15 @@ fn parse_input(input: serde_json::Value) -> Result<RepositoryContextInput> {
     {
         anyhow::bail!("repository_context seeds exceed {MAX_SEED_BYTES} bytes");
     }
+
     if input.edge_kinds.len() > MAX_EDGE_KINDS {
         anyhow::bail!("repository_context edge_kinds exceeds {MAX_EDGE_KINDS} entries");
     }
+
     if input.edge_kinds.iter().any(|kind| kind.trim().is_empty()) {
         anyhow::bail!("repository_context edge_kinds must not contain empty entries");
     }
+
     if input
         .edge_kinds
         .iter()
@@ -225,6 +230,7 @@ fn parse_input(input: serde_json::Value) -> Result<RepositoryContextInput> {
     {
         anyhow::bail!("repository_context edge_kinds exceed {MAX_EDGE_KIND_BYTES} bytes");
     }
+
     if input
         .cursor
         .as_ref()
@@ -232,9 +238,11 @@ fn parse_input(input: serde_json::Value) -> Result<RepositoryContextInput> {
     {
         anyhow::bail!("repository_context cursor exceeds {MAX_CURSOR_BYTES} bytes");
     }
+
     if input.max_snippet_bytes == Some(0) {
         anyhow::bail!("repository_context max_snippet_bytes must be greater than zero");
     }
+
     Ok(input)
 }
 

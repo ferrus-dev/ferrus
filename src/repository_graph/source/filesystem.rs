@@ -93,6 +93,7 @@ impl FilesystemRepositorySource {
         if current_root != self.root.path() {
             return Ok(false);
         }
+
         let current = Self::discover(current_root, self.context.clone())?;
         Ok(same_manifest_identity(&self.manifest, &current.manifest))
     }
@@ -126,6 +127,7 @@ fn canonical_root(root: &Path) -> Result<std::path::PathBuf, SourceError> {
     if !metadata.is_dir() {
         return Err(SourceError::InvalidRoot);
     }
+
     fs::canonicalize(root).map_err(|_| SourceError::InvalidRoot)
 }
 
@@ -144,46 +146,92 @@ fn collect_directory(
             limit: context.limits.max_directories,
         });
     }
+
     metrics.directories = metrics.directories.saturating_add(1);
     let result = visit_directory_entries(&directory, |name, kind| {
         let Ok(path) = child_path(relative_directory, &name) else {
-            diagnostics.push("path_encoding_unsupported", None);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "path_encoding_unsupported",
+                    )
+                },
+                None,
+            );
             metrics.skipped = metrics.skipped.saturating_add(1);
             return Ok(());
         };
 
         if kind == RawEntryKind::Unreadable {
-            diagnostics.push("file_type_unreadable", Some(path));
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "file_type_unreadable",
+                    )
+                },
+                Some(path),
+            );
             metrics.skipped = metrics.skipped.saturating_add(1);
             return Ok(());
         }
+
         if kind == RawEntryKind::Directory {
             if let Some(code) = context.policy.exclusion_for_directory(&path) {
                 diagnostics.push(code, Some(path));
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 return Ok(());
             }
+
             if path.as_str().split('/').count() >= MAX_DIRECTORY_DEPTH {
-                diagnostics.push("directory_depth_exceeded", Some(path));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "directory_depth_exceeded",
+                        )
+                    },
+                    Some(path),
+                );
                 metrics.skipped = metrics.skipped.saturating_add(1);
                 return Ok(());
             }
+
             let child = match root.open_directory(&path) {
                 Ok(directory) => directory,
                 Err(ConfinedOpenError::Symlink) => {
-                    diagnostics.push("symlink_skipped", Some(path));
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "symlink_skipped",
+                            )
+                        },
+                        Some(path),
+                    );
                     metrics.skipped = metrics.skipped.saturating_add(1);
                     return Ok(());
                 }
                 Err(ConfinedOpenError::Io(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    diagnostics.push("directory_missing", Some(path));
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "directory_missing",
+                            )
+                        },
+                        Some(path),
+                    );
                     metrics.skipped = metrics.skipped.saturating_add(1);
                     return Ok(());
                 }
                 Err(ConfinedOpenError::Io(_)) => {
-                    diagnostics.push("directory_unreadable", Some(path));
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "directory_unreadable",
+                            )
+                        },
+                        Some(path),
+                    );
                     metrics.skipped = metrics.skipped.saturating_add(1);
                     return Ok(());
                 }
@@ -205,6 +253,7 @@ fn collect_directory(
                 limit: context.limits.max_files,
             });
         }
+
         metrics.candidates = metrics.candidates.saturating_add(1);
         let candidate_kind = match kind {
             RawEntryKind::File => CandidateKind::File(None),
@@ -229,7 +278,14 @@ fn collect_directory(
             })
         }
         Err(DirectoryVisitError::Io(_)) => {
-            diagnostics.push("directory_unreadable", relative_directory.cloned());
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "directory_unreadable",
+                    )
+                },
+                relative_directory.cloned(),
+            );
             metrics.skipped = metrics.skipped.saturating_add(1);
             Ok(())
         }
@@ -262,6 +318,7 @@ fn child_path(parent: Option<&RepoPath>, name: &OsStr) -> Result<RepoPath, ()> {
     if let Some(parent) = parent {
         relative.push(parent.as_str());
     }
+
     relative.push(name);
     normalize_discovered_path(&relative)
 }
@@ -320,6 +377,7 @@ fn visit_directory_entries(
         drop(unsafe { File::from_raw_fd(descriptor) });
         return Err(DirectoryVisitError::Io(source));
     }
+
     let stream = DirectoryStream(stream);
     loop {
         errno::set_errno(errno::Errno(0));
@@ -330,15 +388,18 @@ fn visit_directory_entries(
             if error.0 == 0 {
                 break;
             }
+
             return Err(DirectoryVisitError::Io(std::io::Error::from_raw_os_error(
                 error.0,
             )));
         }
+
         // SAFETY: `readdir` returned a live dirent with a NUL-terminated name.
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
         if matches!(name.to_bytes(), b"." | b"..") {
             continue;
         }
+
         // SAFETY: zero is a valid initial representation for `stat`.
         let mut status: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: the directory stream and NUL-terminated child name are live;
@@ -363,6 +424,7 @@ fn visit_directory_entries(
         };
         visit(OsString::from_vec(name.to_bytes().to_vec()), kind)?;
     }
+
     Ok(())
 }
 
@@ -408,8 +470,10 @@ fn visit_directory_entries(
             if source.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 return Ok(());
             }
+
             return Err(DirectoryVisitError::Io(source));
         }
+
         restart = false;
 
         let bytes = buffer.as_ptr().cast::<u8>();
@@ -422,6 +486,7 @@ fn visit_directory_entries(
             {
                 return Err(invalid_directory_buffer());
             }
+
             // SAFETY: the fixed fields fit in the checked buffer region. Some
             // filesystem drivers return entries without their documented
             // alignment, so every field is read unaligned.
@@ -437,6 +502,7 @@ fn visit_directory_entries(
             if name_bytes == 0 || name_bytes % size_of::<u16>() != 0 {
                 return Err(invalid_directory_buffer());
             }
+
             let name_start = cursor
                 .checked_add(fixed_size)
                 .ok_or_else(invalid_directory_buffer)?;
@@ -467,6 +533,7 @@ fn visit_directory_entries(
             if next == 0 {
                 break;
             }
+
             cursor = cursor
                 .checked_add(next)
                 .filter(|next_cursor| {

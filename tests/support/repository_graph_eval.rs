@@ -257,17 +257,21 @@ fn validate_corpus(corpus: &EvalCorpus) -> Result<()> {
     if corpus.schema_version != 1 {
         bail!("unsupported repository graph evaluation corpus version");
     }
+
     if corpus.cases.len() < MIN_CASES {
         bail!("repository graph evaluation corpus requires at least {MIN_CASES} cases");
     }
+
     let mut ids = HashSet::new();
     for case in &corpus.cases {
         if case.id.trim().is_empty() || !ids.insert(case.id.as_str()) {
             bail!("repository graph evaluation case ids must be non-empty and unique");
         }
+
         if case.labels.is_empty() {
             bail!("repository graph evaluation cases require labels");
         }
+
         match case.operation {
             EvalOperation::Search | EvalOperation::SearchTruncation
                 if case.query.as_deref().is_none_or(str::is_empty) =>
@@ -280,6 +284,7 @@ fn validate_corpus(corpus: &EvalCorpus) -> Result<()> {
             _ => {}
         }
     }
+
     for required in [
         "exact_path",
         "exact_unique_symbol",
@@ -303,6 +308,7 @@ fn validate_corpus(corpus: &EvalCorpus) -> Result<()> {
             bail!("repository graph evaluation corpus is missing the {required} label");
         }
     }
+
     Ok(())
 }
 
@@ -363,7 +369,7 @@ impl EvalFixture {
                     self.budget(matches!(case.operation, EvalOperation::SearchTruncation))?;
                 let request = SearchRequest {
                     scope: self.scope(budget),
-                    text: case.query.clone().expect("validated search query"),
+                    text: case.query.clone().context("Missing search query")?,
                     node_kinds: vec![],
                     paths: vec![],
                     page: PageRequest { cursor: None },
@@ -389,7 +395,7 @@ impl EvalFixture {
                 let request = ContextRequest {
                     scope: self.scope(budget),
                     seeds: vec![context_seed(
-                        case.seed.as_ref().expect("validated context seed"),
+                        case.seed.as_ref().context("Missing context seed")?,
                     )?],
                     policy: ContextPolicy {
                         direction: EdgeDirection::Both,
@@ -474,6 +480,7 @@ impl EvalFixture {
                 total_duration_us: elapsed,
             });
         }
+
         let mut files_read = 0_u64;
         let mut context_bytes = 0_u64;
         let mut matches = BTreeSet::new();
@@ -486,10 +493,12 @@ impl EvalFixture {
             if is_match {
                 matches.insert(path.as_str().to_string());
             }
+
             if baseline_complete(case, &matches) {
                 break;
             }
         }
+
         let success = if case.expected_paths.is_empty() {
             true
         } else {
@@ -530,8 +539,9 @@ impl EvalFixture {
         if !truncated {
             return Ok(defaults);
         }
+
         Ok(QueryBudget::new(
-            NonZeroU32::new(1).expect("one is non-zero"),
+            NonZeroU32::MIN,
             NonZeroU64::new(self.config.query_limits.max_bytes)
                 .context("evaluation query byte limit is zero")?,
             NonZeroU32::new(self.config.query_limits.max_depth)
@@ -695,6 +705,7 @@ fn median(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
+
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
@@ -743,6 +754,7 @@ fn fixture_digest(root: &Path, files: &[RepoPath]) -> Result<String> {
         hash.update(std::fs::read(root.join(path.as_str()))?);
         hash.update([0]);
     }
+
     Ok(format!("sha256:{}", hex_lower(&hash.finalize())))
 }
 
@@ -753,6 +765,7 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte >> 4) as usize] as char);
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
+
     output
 }
 
@@ -760,6 +773,7 @@ fn write_fixture(root: &Path) -> Result<()> {
     for directory in ["config", "docs", "scripts", "src"] {
         std::fs::create_dir_all(root.join(directory))?;
     }
+
     std::fs::write(
         root.join("README.md"),
         "# Repository Graph Evaluation\nDeterministic navigation fixture.\n",
@@ -816,5 +830,6 @@ fn write_fixture(root: &Path) -> Result<()> {
             format!("pub struct Filler{index:02};\n"),
         )?;
     }
+
     Ok(())
 }

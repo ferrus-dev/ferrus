@@ -76,50 +76,60 @@ pub trait IndexJobCoordinator {
         request: &SubmitIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn inspect(
         &self,
         request: &InspectIndexJobRequest,
     ) -> Result<Option<IndexJobRecord>, Self::Error>;
+
     fn inspect_bounded(
         &self,
         request: &InspectIndexJobRequest,
         deadline: Instant,
     ) -> Result<BoundedJobInspection, Self::Error>;
+
     fn claim(
         &mut self,
         request: &ClaimIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<Option<IndexJobRecord>, Self::Error>;
+
     fn start(
         &mut self,
         request: &AdvanceIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn heartbeat(
         &mut self,
         request: &HeartbeatJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn begin_publication(
         &mut self,
         request: &AdvanceIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn complete(
         &mut self,
         request: &AdvanceIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn fail(
         &mut self,
         request: &FailIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn cancel(
         &mut self,
         request: &CancelIndexJobRequest,
         now: DateTime<Utc>,
     ) -> Result<IndexJobRecord, Self::Error>;
+
     fn reclaim(
         &mut self,
         request: &ReclaimIndexJobsRequest,

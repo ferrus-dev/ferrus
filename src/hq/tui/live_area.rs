@@ -65,10 +65,12 @@ pub(super) fn print_status_line(
         if remaining == 0 {
             break;
         }
+
         let visible = truncate_to_width(&text, remaining);
         if visible.is_empty() {
             break;
         }
+
         queue!(
             stdout,
             PrintStyledContent(style(visible.clone()).with(color))
@@ -114,6 +116,7 @@ pub(super) fn print_status_line(
         if pad > 0 {
             queue!(stdout, Print(" ".repeat(pad)))?;
         }
+
         queue!(
             stdout,
             PrintStyledContent(style("debug").with(Color::DarkBlue))
@@ -178,6 +181,7 @@ pub(super) fn visible_selection_rows(selection: &SelectionState) -> Vec<(bool, &
     if total == 0 {
         return Vec::new();
     }
+
     let window = total.min(6);
     let half = window / 2;
     let start = selection
@@ -196,6 +200,7 @@ pub(super) fn visible_completion_rows(app: &App) -> Vec<(bool, &'static str, &'s
     if total == 0 {
         return Vec::new();
     }
+
     let window = total.min(3);
     let start = if total <= window {
         0
@@ -253,6 +258,7 @@ pub(super) fn print_selection_line(
             PrintStyledContent(style(text).with(Color::Grey))
         )?;
     }
+
     Ok(())
 }
 
@@ -296,6 +302,7 @@ pub(super) fn print_completion_line(
             PrintStyledContent(style(desc).with(Color::DarkGrey))
         )?;
     }
+
     Ok(())
 }
 
@@ -322,6 +329,7 @@ pub(super) fn split_transcript(text: &str, kind: TranscriptKind) -> Vec<Transcri
             continuation: idx > 0,
         });
     }
+
     if lines.is_empty() {
         lines.push(TranscriptLine {
             text: String::new(),
@@ -329,6 +337,7 @@ pub(super) fn split_transcript(text: &str, kind: TranscriptKind) -> Vec<Transcri
             continuation: false,
         });
     }
+
     lines
 }
 

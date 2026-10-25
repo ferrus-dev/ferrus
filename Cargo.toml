@@ -35,6 +35,10 @@ update-check = ["dep:semver", "dep:ureq"]
 nano-openai = ["dep:reqwest", "dep:svir", "dep:bytes"]
 nano-mcp = ["neva/client", "dep:jsonschema"]
 
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 [dependencies]
 neva = { version = "0.8.2", features = ["server", "di", "legacy-spec"] }
 jsonschema = { version = "0.56.0", optional = true }

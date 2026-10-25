@@ -55,13 +55,16 @@ impl Backend for Transport {
             value.set_sensitive(!matches!(name.as_str(), "content-type" | "accept"));
             outgoing = outgoing.header(name, value);
         }
+
         if let Some(mut body) = request.body {
             let mut bytes = Vec::new();
             while let Some(chunk) = body.stream.next().await {
                 bytes.extend_from_slice(&chunk?);
             }
+
             outgoing = outgoing.header(CONTENT_LENGTH, body.length).body(bytes);
         }
+
         let mut response = outgoing.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
         let headers = response
@@ -85,6 +88,7 @@ impl Backend for Transport {
             {
                 return Err(Error::new(ErrorKind::Unsupported).with_source(UnexpectedContentType));
             }
+
             let body = stream::try_unfold(response, |mut response| async move {
                 Ok(response
                     .chunk()
@@ -94,6 +98,7 @@ impl Backend for Transport {
             });
             return Ok(HttpResponse::new(status, headers, Box::pin(body)));
         }
+
         // Keep bounded validation-error reads and immediate handling of other
         // HTTP failures, even if the server never finishes its error body.
         let mut bytes = Vec::new();
@@ -102,8 +107,10 @@ impl Backend for Transport {
                 if chunk.len() > self.event_bytes.saturating_sub(bytes.len()) {
                     return Err(Error::new(ErrorKind::ResponseLimit).with_status(status));
                 }
+
                 bytes.extend_from_slice(&chunk);
             }
+
             // svir inspects a bounded prefix of an error body. Preserve Nano's
             // explicit overflow codes even when a long message precedes them.
             let code = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -122,9 +129,11 @@ impl Backend for Transport {
                 {
                     error = error.with_retry_after(Duration::from_secs(delay.min(30)));
                 }
+
                 return Err(error);
             }
         }
+
         let body: BoxBody = Box::pin(stream::iter([Ok(bytes::Bytes::from(bytes))]));
         Ok(HttpResponse::new(status, headers, body))
     }

@@ -163,6 +163,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             evidence.settings_sha256 =
                 Some(effective_settings_sha256(provider, &self.limits, evidence)?);
         }
+
         if !self.commit(SessionEvent::Started {
             identity: self.identity.clone(),
             limits: self.limits.clone(),
@@ -178,11 +179,13 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         if let Some(text) = &self.system_prompt {
             self.messages.push(Message::System { text: text.clone() });
         }
+
         self.messages.push(Message::User { text: input });
 
         if self.interactive && !self.commit(SessionEvent::InteractionOpened) {
             return Ok(self.journal_failure());
         }
+
         let mut reason = if self.interactive && self.identity.task_id.is_none() {
             if let Err(reason) = self.input_capacity("") {
                 reason
@@ -208,6 +211,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 reason = terminal;
             }
         }
+
         if reason == EndReason::JournalFailed {
             return Ok(self.journal_failure());
         }
@@ -234,12 +238,15 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         ) {
             return Err(EndReason::Cancelled);
         }
+
         if !self.interactive {
             if !self.commit(SessionEvent::InteractionOpened) {
                 return Err(EndReason::JournalFailed);
             }
+
             self.interactive = true;
         }
+
         let SessionCommand::Steer { text, input_id } = command else {
             return Ok(false);
         };
@@ -251,6 +258,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         {
             return Err(EndReason::ProviderProtocol);
         }
+
         self.input_capacity(&text)?;
         let previous_no_progress = std::mem::replace(&mut self.budget.no_progress, 0);
         if !self.commit(SessionEvent::UserInput {
@@ -260,6 +268,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             self.budget.no_progress = previous_no_progress;
             return Err(EndReason::JournalFailed);
         }
+
         self.previous_call = None;
         self.latest_steering = Some(self.messages.len());
         self.messages.push(Message::User { text });
@@ -279,6 +288,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             let Some(command) = command else { break };
             accepted |= self.accept_input(command)?;
         }
+
         Ok(accepted)
     }
 
@@ -308,9 +318,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
+
             if let Some(reason) = self.next_turn_limit() {
                 return reason;
             }
+
             if let Err(reason) = self.drain_input() {
                 return reason;
             }
@@ -334,6 +346,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if preparation.projection.is_some() {
                 return EndReason::Limit(LimitKind::ContextBytes);
             }
+
             let base = match preparation.apply(&self.messages) {
                 Ok(messages) => messages,
                 Err(_) => return EndReason::Limit(LimitKind::ContextBytes),
@@ -358,12 +371,14 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if output_reservation == 0 {
                 return EndReason::Limit(LimitKind::Tokens);
             }
+
             if let Some(summary) = &self.summary {
                 preparation.projection = Some(Projection {
                     summary: Some(summary.clone()),
                     ..Default::default()
                 });
             }
+
             // Compaction may call the provider before the final projection is known.
             // Persist host replacements and observations before that inference.
             let committed_preparation = if had_preparation {
@@ -372,6 +387,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 }) {
                     return EndReason::JournalFailed;
                 }
+
                 Some(preparation.clone())
             } else {
                 None
@@ -418,8 +434,9 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     Err(reason) => return reason,
                 };
             }
-            if admitted.is_err() {
-                let limit = admitted.as_ref().unwrap_err().clone();
+
+            if let Err(limit) = &admitted {
+                let limit = limit.clone();
                 let summary = match self
                     .compact(
                         &base,
@@ -443,6 +460,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 if output_reservation == 0 {
                     return EndReason::Limit(LimitKind::Tokens);
                 }
+
                 let mut projection = preparation.projection.take().unwrap_or_default();
                 projection.evicted =
                     Projection::deterministic(&base, summary.retained_from).evicted;
@@ -463,6 +481,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     Err(reason) => return reason,
                 };
             }
+
             let (input_estimate, output_reservation) = match admitted {
                 Ok(value) => value,
                 Err(limit) => return EndReason::Limit(limit),
@@ -470,6 +489,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
+
             if let Some(projection) = &mut preparation.projection {
                 projection.original_bytes =
                     serde_json::to_vec(&base).map_or(0, |bytes| bytes.len());
@@ -481,6 +501,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     .map(|h| h.message)
                     .or_else(|| projection.summary.as_ref().map(|_| 1));
             }
+
             let composition = ContextComposition {
                 history_messages: self.messages.len(),
                 request_messages: messages.len(),
@@ -511,9 +532,11 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             {
                 return EndReason::JournalFailed;
             }
+
             if !self.commit(SessionEvent::ContextComposed { composition }) {
                 return EndReason::JournalFailed;
             }
+
             self.last_request = messages.clone();
 
             self.budget.model_turns += 1;
@@ -539,6 +562,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if !self.record_model_failure(false) {
                         return EndReason::JournalFailed;
                     }
+
                     return reason;
                 }
                 Ok(Err(error)) => Err(error),
@@ -548,6 +572,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                             if !self.record_model_failure(false) {
                                 return EndReason::JournalFailed;
                             }
+
                             return reason;
                         }
                         Ok(Err(error)) => break Err(error),
@@ -555,6 +580,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                             if !self.record_model_failure(false) {
                                 return EndReason::JournalFailed;
                             }
+
                             return EndReason::ProviderProtocol;
                         }
                         Ok(Ok(Some(
@@ -574,8 +600,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                                 if !self.record_model_failure(false) {
                                     return EndReason::JournalFailed;
                                 }
+
                                 return EndReason::Limit(LimitKind::ResponseBytes);
                             }
+
                             // Ready buffered fragments must not starve cancellation on this executor.
                             tokio::task::yield_now().await;
                         }
@@ -593,15 +621,19 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if retry {
                         self.budget.retries += 1;
                     }
+
                     if !self.record_failure(error.retryable, Some(error.clone())) {
                         return EndReason::JournalFailed;
                     }
+
                     if !error.retryable {
                         return Self::provider_failure(error.kind);
                     }
+
                     if !retry {
                         return EndReason::Limit(LimitKind::Retries);
                     }
+
                     let backoff = (250u64.saturating_mul(1 << self.budget.retries.min(6)))
                         .max(error.retry_after_ms)
                         .min(30_000);
@@ -614,6 +646,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     {
                         return reason;
                     }
+
                     continue;
                 }
             };
@@ -624,6 +657,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                     if !self.record_model_failure(false) {
                         return EndReason::JournalFailed;
                     }
+
                     return EndReason::Limit(LimitKind::ResponseBytes);
                 }
             };
@@ -644,6 +678,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             {
                 self.budget.no_progress += 1;
             }
+
             if !self.commit(SessionEvent::ModelCompleted {
                 response: response.clone(),
                 usage,
@@ -660,8 +695,10 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 if self.journal.checkpoint().is_err() {
                     return EndReason::JournalFailed;
                 }
+
                 continue;
             }
+
             if (response.finish == FinishReason::ToolCalls) == response.calls.is_empty() {
                 return EndReason::ProviderProtocol;
             }
@@ -671,6 +708,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             if let Some(reason) = self.stop(cancellation, deadline) {
                 return reason;
             }
+
             let mut ids = HashSet::new();
             if response
                 .calls
@@ -684,23 +722,29 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 if self.journal.checkpoint().is_err() {
                     return EndReason::JournalFailed;
                 }
+
                 match self.drain_input() {
                     Ok(true) => continue,
                     Ok(false) => (),
                     Err(reason) => return reason,
                 }
+
                 if self.interactive {
                     if let Err(reason) = self.input_capacity("") {
                         return reason;
                     }
+
                     if !self.commit(SessionEvent::InputRequested) {
                         return EndReason::JournalFailed;
                     }
+
                     if let Err(reason) = self.wait_for_input(cancellation, deadline).await {
                         return reason;
                     }
+
                     continue;
                 }
+
                 return EndReason::ModelFinished;
             }
 
@@ -708,6 +752,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                 if let Some(reason) = self.stop(cancellation, deadline) {
                     return reason;
                 }
+
                 if self.budget.tool_calls >= self.limits.tool_calls {
                     return EndReason::Limit(LimitKind::ToolCalls);
                 }
@@ -748,6 +793,7 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
                                 }) {
                                     return EndReason::JournalFailed;
                                 }
+
                                 match interrupt(
                                     self.tools.execute(validated, cancellation),
                                     cancellation,
@@ -820,350 +866,6 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
         }
     }
 
-    fn input_estimate(
-        &self,
-        messages: &[Message],
-        tools: &[super::tools::ToolDescriptor],
-        output: u64,
-    ) -> Result<Option<u64>, EndReason> {
-        match self.provider.estimate_input_tokens(&ModelRequest {
-            messages: messages.to_vec(),
-            tools: tools.to_vec(),
-            max_output_tokens: output,
-        }) {
-            Ok(estimate) => Ok(Some(estimate)),
-            Err(error) if error.kind == ProviderErrorKind::ContextOverflow => Ok(None),
-            Err(error)
-                if matches!(
-                    error.kind,
-                    ProviderErrorKind::Protocol | ProviderErrorKind::Unsupported
-                ) =>
-            {
-                Err(EndReason::ProviderProtocol)
-            }
-            Err(_) => Err(EndReason::ProviderFailed),
-        }
-    }
-
-    fn provider_failure(kind: ProviderErrorKind) -> EndReason {
-        match kind {
-            ProviderErrorKind::ContextOverflow => EndReason::Limit(LimitKind::ContextTokens),
-            ProviderErrorKind::ResponseLimit => EndReason::Limit(LimitKind::ResponseBytes),
-            ProviderErrorKind::Protocol | ProviderErrorKind::Unsupported => {
-                EndReason::ProviderProtocol
-            }
-            _ => EndReason::ProviderFailed,
-        }
-    }
-
-    fn fits(
-        &self,
-        messages: &[Message],
-        tools: &[super::tools::ToolDescriptor],
-        output: u64,
-        remaining: u64,
-        window: u64,
-        estimate: Option<u64>,
-    ) -> bool {
-        let Some(input) = estimate else { return false };
-        let margin = (window / 20).clamp(16, 1024);
-        encode(&(&messages, &tools), self.limits.context_bytes).is_ok()
-            && input.saturating_add(output).saturating_add(margin) <= window
-            && input.saturating_add(output) <= remaining
-    }
-
-    fn admit(
-        &self,
-        messages: &[Message],
-        tools: &[super::tools::ToolDescriptor],
-        mut output: u64,
-        remaining: u64,
-        window: u64,
-    ) -> Result<Result<(u64, u64), LimitKind>, EndReason> {
-        let automatic = self
-            .provider
-            .settings()
-            .is_some_and(|s| s.max_output_tokens.is_none());
-        if encode(&(&messages, &tools), self.limits.context_bytes).is_err() {
-            return Ok(Err(LimitKind::ContextBytes));
-        }
-        // An explicit ceiling retains the existing compaction policy. Automatic
-        // allocation can also fit the available window without a summary call.
-        // The serialized max-output field can change size as the cap shrinks.
-        for _ in 0..8 {
-            let Some(input) = self.input_estimate(messages, tools, output)? else {
-                return Ok(Err(LimitKind::ContextTokens));
-            };
-            if self.fits(messages, tools, output, remaining, window, Some(input)) {
-                return Ok(Ok((input, output)));
-            }
-            let mut reduced = output.min(remaining.saturating_sub(input));
-            if reduced == 0 {
-                return Ok(Err(LimitKind::Tokens));
-            }
-            if automatic {
-                let margin = (window / 20).clamp(16, 1024);
-                reduced = reduced.min(window.saturating_sub(input).saturating_sub(margin));
-                if reduced == 0 {
-                    return Ok(Err(LimitKind::ContextTokens));
-                }
-            }
-            if reduced >= output {
-                return Ok(Err(LimitKind::ContextTokens));
-            }
-            output = reduced;
-        }
-        Ok(Err(LimitKind::ContextTokens))
-    }
-
-    fn plan_compaction(
-        &self,
-        base: &[Message],
-        history: &[Message],
-        latest_steering: Option<usize>,
-        descriptors: &[super::tools::ToolDescriptor],
-        capacity: Capacity,
-        mut limit: LimitKind,
-    ) -> Result<CompactionPlan, EndReason> {
-        let boundaries = compaction::boundaries(history)
-            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let existing = self.summary.as_ref().map_or(
-            compaction::prefix_len(history)
-                .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?,
-            |summary| summary.retained_from,
-        );
-        let summary_cap = (capacity.window / 8).clamp(1, 4096) as usize;
-        let summary_cap = summary_cap.min(self.limits.response_bytes);
-        let mut selected = None;
-        // Keep the latest completed group as direct context, even at the limit.
-        for &cut in boundaries.iter().filter(|&&cut| {
-            cut > existing
-                && cut < history.len()
-                && latest_steering.is_none_or(|index| cut <= index)
-        }) {
-            let mut handles: Vec<_> = compaction::handles(history)
-                .into_iter()
-                .filter(|handle| handle.message < cut)
-                .rev()
-                .take(16)
-                .collect();
-            handles.reverse();
-            while serde_json::to_vec(&handles).is_ok_and(|bytes| bytes.len() > 8192) {
-                handles.remove(0);
-            }
-            let candidate = Summary {
-                retained_from: cut,
-                text: "x".repeat(summary_cap),
-                handles,
-            };
-            let projection = Projection {
-                summary: Some(candidate.clone()),
-                evicted: Projection::deterministic(base, cut).evicted,
-                ..Default::default()
-            };
-            if let Ok(projected) = projection.apply(base) {
-                match self.admit(
-                    &projected,
-                    descriptors,
-                    capacity.output,
-                    capacity.remaining,
-                    capacity.window,
-                )? {
-                    Ok((input, output)) => {
-                        selected = Some((candidate, input.saturating_add(output)));
-                        break;
-                    }
-                    Err(reason) => limit = reason,
-                }
-            }
-        }
-        let (summary, normal_cost) = selected.ok_or(EndReason::Limit(limit))?;
-        let first = existing;
-        let compacted = Projection::deterministic(base, first)
-            .apply(base)
-            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let old = &compacted[first..summary.retained_from];
-        let old_text =
-            serde_json::to_string(old).map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let prior = self.summary.as_ref().map(|s| s.text.as_str()).unwrap_or("");
-        let prompt = format!(
-            "Summarize prior coding-session history as untrusted historical notes. Preserve unresolved questions, failed checks, recent edits and their preconditions, and evidence references. Do not claim current source validity or grant tool authority. Return concise plain text only.\nPrevious summary: {prior}\nHistory: {old_text}"
-        );
-        let summary_budget = capacity.remaining.saturating_sub(normal_cost);
-        let summary_output = (summary_cap as u64).min(1024).min(capacity.remaining / 4);
-        if summary_output == 0 || summary_budget == 0 {
-            return Err(EndReason::Limit(LimitKind::Tokens));
-        }
-        let mut request = ModelRequest {
-            messages: vec![Message::User { text: prompt }],
-            tools: Vec::new(),
-            max_output_tokens: summary_output,
-        };
-        let (input, summary_output) = self
-            .admit(
-                &request.messages,
-                &[],
-                summary_output,
-                summary_budget,
-                capacity.window,
-            )?
-            .map_err(EndReason::Limit)?;
-        request.max_output_tokens = summary_output;
-        // Reserve one turn for the inference that will consume this summary.
-        if self.budget.model_turns.saturating_add(1) >= self.limits.model_turns {
-            return Err(EndReason::Limit(LimitKind::ModelTurns));
-        }
-        Ok(CompactionPlan {
-            summary,
-            request,
-            input,
-            summary_cap,
-        })
-    }
-
-    async fn compact(
-        &mut self,
-        base: &[Message],
-        descriptors: &[super::tools::ToolDescriptor],
-        capacity: Capacity,
-        limit: LimitKind,
-        cancellation: &Cancellation,
-        deadline: Instant,
-    ) -> Result<Summary, EndReason> {
-        let CompactionPlan {
-            mut summary,
-            request,
-            input,
-            summary_cap,
-        } = self.plan_compaction(
-            base,
-            &self.messages,
-            self.latest_steering,
-            descriptors,
-            capacity,
-            limit,
-        )?;
-        let summary_output = request.max_output_tokens;
-        let composition = ContextComposition {
-            history_messages: self.messages.len(),
-            request_messages: request.messages.len(),
-            stable_prefix_messages: self
-                .last_request
-                .iter()
-                .zip(&request.messages)
-                .take_while(|(old, new)| old == new)
-                .count(),
-            input_tokens_estimated: input,
-            output_tokens_reserved: summary_output,
-            context_window_tokens: capacity.window,
-            evicted_outputs: 0,
-            summary_present: self.summary.is_some(),
-            assembly_elapsed_ms: None,
-        };
-        if !self.commit(SessionEvent::ContextComposed { composition }) {
-            return Err(EndReason::JournalFailed);
-        }
-        self.last_request = request.messages.clone();
-        self.budget.model_turns += 1;
-        self.budget.reserved_input_tokens = input;
-        self.budget.reserved_output_tokens = summary_output;
-        if !self.commit(SessionEvent::CompactionStarted {
-            turn: self.budget.model_turns,
-            retained_from: summary.retained_from,
-        }) {
-            return Err(EndReason::JournalFailed);
-        }
-        match interrupt(self.provider.start(request), cancellation, deadline).await {
-            Ok(Ok(())) => (),
-            Ok(Err(error)) => {
-                if !self.record_failure(error.retryable, Some(error.clone())) {
-                    return Err(EndReason::JournalFailed);
-                }
-                return Err(Self::provider_failure(error.kind));
-            }
-            Err(reason) => {
-                if !self.record_model_failure(false) {
-                    return Err(EndReason::JournalFailed);
-                }
-                return Err(reason);
-            }
-        }
-        let mut streamed = 0usize;
-        let completed = loop {
-            match interrupt(self.provider.next_event(), cancellation, deadline).await {
-                Ok(Ok(Some(
-                    ProviderEvent::TextDelta(text) | ProviderEvent::ArgumentsDelta(text),
-                ))) => {
-                    streamed = streamed.saturating_add(text.len().max(1));
-                    if streamed > summary_cap {
-                        break Err(EndReason::Limit(LimitKind::ResponseBytes));
-                    }
-                    tokio::task::yield_now().await;
-                }
-                Ok(Ok(Some(ProviderEvent::Completed { response, usage }))) => {
-                    break Ok((response, usage));
-                }
-                Ok(Ok(None)) => break Err(EndReason::ProviderProtocol),
-                Ok(Err(error)) => {
-                    self.provider.cancel();
-                    if !self.record_failure(error.retryable, Some(error.clone())) {
-                        return Err(EndReason::JournalFailed);
-                    }
-                    return Err(Self::provider_failure(error.kind));
-                }
-                Err(reason) => break Err(reason),
-            }
-        };
-        self.provider.cancel();
-        let (response, reported) = match completed {
-            Ok(value) => value,
-            Err(reason) => {
-                if !self.record_model_failure(false) {
-                    return Err(EndReason::JournalFailed);
-                }
-                return Err(reason);
-            }
-        };
-        if response.finish != FinishReason::Stop
-            || !response.calls.is_empty()
-            || response.text.trim().is_empty()
-        {
-            if !self.record_model_failure(false) {
-                return Err(EndReason::JournalFailed);
-            }
-            return Err(EndReason::ProviderProtocol);
-        }
-        if response.text.len() > summary_cap
-            || encode(&response, self.limits.response_bytes).is_err()
-        {
-            if !self.record_model_failure(false) {
-                return Err(EndReason::JournalFailed);
-            }
-            return Err(EndReason::Limit(LimitKind::ResponseBytes));
-        }
-        let usage = reported.unwrap_or(Usage {
-            input_tokens: input,
-            output_tokens: streamed.max(response.text.len()) as u64,
-            reported: false,
-        });
-        self.budget.reserved_input_tokens = 0;
-        self.budget.reserved_output_tokens = 0;
-        self.budget.charge(&usage);
-        summary.text = response.text;
-        self.retryable_provider_failure = false;
-        if !self.commit(SessionEvent::CompactionCompleted {
-            summary: summary.clone(),
-            usage,
-        }) {
-            return Err(EndReason::JournalFailed);
-        }
-        if self.journal.checkpoint().is_err() {
-            return Err(EndReason::JournalFailed);
-        }
-        self.summary = Some(summary.clone());
-        Ok(summary)
-    }
-
     fn validate(
         &self,
         call_id: &str,
@@ -1217,80 +919,8 @@ impl<P: Provider, T: Tools, H: Host, J: Journal> Engine<P, T, H, J> {
             tracing::warn!(kind = ?error.kind, retryable, diagnostic = ?error.diagnostic,
                 "Nano provider attempt failed");
         }
+
         committed
-    }
-
-    fn input_capacity(&self, text: &str) -> Result<(), EndReason> {
-        if let Some(reason) = self.next_turn_limit() {
-            return Err(reason);
-        }
-        let mut messages = self.messages.clone();
-        messages.push(Message::User { text: text.into() });
-        let prefix = compaction::prefix_len(&messages)
-            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let mut projection = Projection::deterministic(
-            &messages,
-            self.summary
-                .as_ref()
-                .map_or(prefix, |summary| summary.retained_from),
-        );
-        projection.summary = self.summary.clone();
-        let projected = projection
-            .apply(&messages)
-            .map_err(|_| EndReason::Limit(LimitKind::ContextBytes))?;
-        let remaining = self.limits.tokens.saturating_sub(self.budget.tokens());
-        let window = self
-            .provider
-            .settings()
-            .map_or(self.limits.context_bytes as u64, |s| {
-                s.context_tokens.unwrap_or(u64::MAX)
-            });
-        let output = self.output_reservation(remaining, window);
-        if output == 0 {
-            return Err(EndReason::Limit(LimitKind::Tokens));
-        }
-        // Use the same reservation and serialized-request estimator as inference admission.
-        let descriptors = self.tools.descriptors();
-        match self.admit(&projected, &descriptors, output, remaining, window)? {
-            Ok(_) => Ok(()),
-            Err(limit) => self
-                .plan_compaction(
-                    &messages,
-                    &messages,
-                    Some(messages.len() - 1),
-                    &descriptors,
-                    Capacity {
-                        output,
-                        remaining,
-                        window,
-                    },
-                    limit,
-                )
-                .map(|_| ()),
-        }
-    }
-
-    fn output_reservation(&self, remaining: u64, window: u64) -> u64 {
-        (self.limits.response_bytes as u64)
-            .min(
-                self.provider
-                    .settings()
-                    .and_then(|s| s.max_output_tokens)
-                    .unwrap_or(u64::MAX),
-            )
-            .min(window / 4)
-            .min(remaining / 2)
-    }
-
-    fn next_turn_limit(&self) -> Option<EndReason> {
-        if self.budget.model_turns >= self.limits.model_turns {
-            Some(EndReason::Limit(LimitKind::ModelTurns))
-        } else if self.limits.tokens.saturating_sub(self.budget.tokens()) < 2 {
-            // Admission reserves at least one token each for input and output.
-            Some(EndReason::Limit(LimitKind::Tokens))
-        } else {
-            None
-        }
     }
 
     fn stop(&self, cancellation: &Cancellation, deadline: Instant) -> Option<EndReason> {
@@ -1349,3 +979,5 @@ async fn interrupt<T>(
         output = future => Ok(output),
     }
 }
+
+mod capacity;

@@ -255,6 +255,7 @@ async fn launch(
                 return;
             }
         }
+
         let _ = start_tx.send(Ok(()));
         loop {
             match wire::read_command(&mut input) {
@@ -287,11 +288,15 @@ async fn launch(
                     }
                 }
                 _ => {
-                    *input_error.lock().unwrap() = Some("invalid_command".into());
+                    *input_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some("invalid_command".into());
                     break;
                 }
             }
         }
+
         input_stop.cancel();
     });
     output.publish(Event::Ready);
@@ -363,6 +368,7 @@ async fn launch(
                 end.budget.tokens()
             );
         }
+
         anyhow::ensure!(
             !matches!(
                 end.reason,
@@ -378,10 +384,15 @@ async fn launch(
             code: "session_failed".into(),
         });
     }
-    let protocol_error = error.lock().unwrap().take();
+
+    let protocol_error = error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if let Some(code) = &protocol_error {
         output.publish(Event::Error { code: code.clone() });
     }
+
     output.close();
     // Stdout is advisory: do not wait indefinitely for a stalled frontend after durable cleanup.
     let _ = tokio::time::timeout(Duration::from_secs(2), drained).await;
@@ -408,12 +419,14 @@ fn prefetch_seeds(paths: Vec<String>, symbols: Vec<String>) -> Result<Vec<serde_
     if !seeds.is_empty() {
         super::context::Request::parse("repository_context", json!({"seeds":seeds}))?;
     }
+
     Ok(seeds)
 }
 
 #[cfg(test)]
 mod working_set_tests {
     use super::*;
+
     #[cfg(feature = "nano-openai")]
     #[test]
     fn launch_future_does_not_embed_the_session_engine() {

@@ -166,9 +166,11 @@ fn parse_input(input: serde_json::Value) -> Result<RepositorySearchInput> {
     if input.query.trim().is_empty() {
         anyhow::bail!("repository_search query must not be empty");
     }
+
     if input.query.len() > MAX_QUERY_BYTES {
         anyhow::bail!("repository_search query exceeds {MAX_QUERY_BYTES} bytes");
     }
+
     validate_filters("kinds", &input.kinds)?;
     validate_filters("paths", &input.paths)?;
     if input
@@ -178,6 +180,7 @@ fn parse_input(input: serde_json::Value) -> Result<RepositorySearchInput> {
     {
         anyhow::bail!("repository_search cursor exceeds {MAX_CURSOR_BYTES} bytes");
     }
+
     Ok(input)
 }
 
@@ -185,12 +188,15 @@ fn validate_filters(name: &str, values: &[String]) -> Result<()> {
     if values.len() > MAX_FILTERS {
         anyhow::bail!("repository_search {name} exceeds {MAX_FILTERS} entries");
     }
+
     if values.iter().any(|value| value.trim().is_empty()) {
         anyhow::bail!("repository_search {name} must not contain empty entries");
     }
+
     if values.iter().any(|value| value.len() > MAX_FILTER_BYTES) {
         anyhow::bail!("repository_search {name} entries exceed {MAX_FILTER_BYTES} bytes");
     }
+
     Ok(())
 }
 

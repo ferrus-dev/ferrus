@@ -1,5 +1,6 @@
 //! Exercise component installers against local release archives without network access.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![cfg(any(unix, windows))]
 
 use sha2::{Digest, Sha256};
@@ -168,6 +169,7 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
         if staging.exists() {
             fs::remove_dir_all(&staging).unwrap();
         }
+
         let directory = format!("ferrus-{}", self.target);
         let package = staging.join(&directory);
         fs::create_dir_all(&package).unwrap();
@@ -188,6 +190,7 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
                 fs::copy(source, path).unwrap();
             }
         }
+
         #[cfg(unix)]
         let mut command = {
             let mut command = Command::new("tar");
@@ -242,6 +245,7 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
         ] {
             command.env_remove(name);
         }
+
         command
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
@@ -264,9 +268,11 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
             if let Some(components) = components {
                 command.args(["--components", components]);
             }
+
             if help {
                 command.arg("--help");
             }
+
             if unknown {
                 command.arg("--unknown");
             }
@@ -277,12 +283,15 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
             if let Some(components) = components {
                 options.insert("Components".into(), components.into());
             }
+
             if help {
                 options.insert("Help".into(), true.into());
             }
+
             if unknown {
                 options.insert("Unknown".into(), true.into());
             }
+
             command.env("FERRUS_TEST_ARGS", serde_json::to_string(&options).unwrap());
         }
         self.execute(&mut command, None)
@@ -306,11 +315,13 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
         if let Some(input) = input {
             child.stdin.take().unwrap().write_all(input).unwrap();
         }
+
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
+
             if Instant::now() >= deadline {
                 child.kill().unwrap();
                 child.wait().unwrap();
@@ -320,6 +331,7 @@ Compress-Archive -Path $Source -DestinationPath $Destination -Force
                     fs::read_to_string(stderr).unwrap()
                 );
             }
+
             thread::sleep(Duration::from_millis(20));
         };
         Output {

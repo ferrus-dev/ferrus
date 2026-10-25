@@ -47,20 +47,15 @@ struct CanonicalSourceManifest<'a> {
 pub fn canonical_source_manifest_digest(
     files: &[SourceFileDescriptor],
     source_policy_digest: &super::domain::Digest,
-) -> super::domain::Digest {
+) -> Result<super::domain::Digest, serde_json::Error> {
     let canonical = CanonicalSourceManifest {
         version: SOURCE_MANIFEST_VERSION,
         source_policy_version: SOURCE_POLICY_VERSION,
         source_policy_digest,
         files,
     };
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical source manifest serialization cannot fail");
-    let value = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    super::domain::Digest::new("sha256", value).expect("sha256 source manifest digest is canonical")
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(Digest::from_sha256(Sha256::digest(&bytes).into()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +196,9 @@ impl std::error::Error for ExtractorFailure {}
 /// Object-safe view over heterogeneous extractor implementations.
 pub trait DynExtractor: Send + Sync {
     fn identity(&self) -> super::domain::ExtractorIdentity;
+
     fn supports(&self, file: &SourceFileDescriptor) -> bool;
+
     fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, ExtractorFailure>;
 }
 
@@ -220,8 +217,7 @@ where
     fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, ExtractorFailure> {
         Extractor::extract(self, input).map_err(|_| ExtractorFailure {
             extractor: Extractor::identity(self),
-            code: DiagnosticCode::new("extractor.failed")
-                .expect("static extractor failure code is canonical"),
+            code: const { DiagnosticCode::from_static("extractor.failed") },
         })
     }
 }
@@ -313,8 +309,11 @@ pub trait RepositorySource {
     type Error;
 
     fn repository(&self) -> &RepositoryRef;
+
     fn manifest(&self) -> &SourceManifest;
+
     fn read_verified(&self, file: &SourceFileDescriptor) -> Result<SourceContent, Self::Error>;
+
     /// Re-discovers the mutable source and compares all source-identity inputs.
     fn revalidate(&self) -> Result<bool, Self::Error>;
 
@@ -331,7 +330,9 @@ pub trait Extractor: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn identity(&self) -> super::domain::ExtractorIdentity;
+
     fn supports(&self, file: &SourceFileDescriptor) -> bool;
+
     fn extract(&self, input: FileExtractionInput<'_>) -> Result<GraphFragment, Self::Error>;
 }
 
@@ -339,6 +340,7 @@ pub trait CrossFileResolver: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn identity(&self) -> super::domain::ExtractorIdentity;
+
     fn resolve(&self, input: CrossFileResolutionInput<'_>) -> Result<GraphFragment, Self::Error>;
 }
 
@@ -346,12 +348,19 @@ pub trait GraphStore {
     type Error;
 
     fn start_build(&mut self, build: &GraphBuild) -> Result<(), Self::Error>;
+
     fn fail_build(&mut self, failure: &BuildFailure) -> Result<GraphBuild, Self::Error>;
+
     fn complete_build(&mut self, snapshot: &GraphSnapshot) -> Result<GraphSnapshot, Self::Error>;
+
     fn publish(&mut self, request: &PublishRequest) -> Result<PublicationOutcome, Self::Error>;
+
     fn supersede_build(&mut self, build_id: &BuildId) -> Result<GraphBuild, Self::Error>;
+
     fn build(&self, id: &BuildId) -> Result<Option<GraphBuild>, Self::Error>;
+
     fn snapshot(&self, id: &SnapshotId) -> Result<Option<GraphSnapshot>, Self::Error>;
+
     fn published_view(
         &self,
         repository: &RepositoryRef,
@@ -374,7 +383,9 @@ pub trait IndexStore: GraphStore {
         &mut self,
         key: &FragmentCacheKey,
     ) -> Result<Option<GraphFragment>, Self::Error>;
+
     fn complete_index(&mut self, commit: &IndexCommit) -> Result<GraphSnapshot, Self::Error>;
+
     fn record_build_metrics(
         &mut self,
         build_id: &BuildId,
@@ -384,12 +395,16 @@ pub trait IndexStore: GraphStore {
 
 pub trait GraphQuery {
     fn status(&self, request: &StatusRequest) -> Result<StatusResponse, QueryError>;
+
     fn search(&self, request: &SearchRequest) -> Result<SearchResponse, QueryError>;
+
     fn show(&self, request: &ShowRequest) -> Result<ShowResponse, QueryError>;
+
     fn neighborhood(
         &self,
         request: &NeighborhoodRequest,
     ) -> Result<NeighborhoodResponse, QueryError>;
+
     fn context(&self, request: &ContextRequest) -> Result<ContextResponse, QueryError>;
 }
 

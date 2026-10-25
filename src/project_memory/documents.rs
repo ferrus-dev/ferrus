@@ -184,10 +184,12 @@ pub(crate) fn sanitized_spec_source(
             {
                 preserve(title);
             }
+
             for (index, line) in lines.iter().enumerate() {
                 if milestone_header(line.text).is_none() {
                     continue;
                 }
+
                 preserve(line);
                 let end = lines
                     .iter()
@@ -217,12 +219,14 @@ pub(crate) fn sanitized_spec_source(
             for line in &lines[start..end] {
                 preserve(line);
             }
+
             if let Some(boundary) = lines.get(end) {
                 sanitized[boundary.start..boundary.start + 3].copy_from_slice(b"## ");
             }
         }
         _ => return None,
     }
+
     Some(sanitized)
 }
 
@@ -238,6 +242,7 @@ fn parse_outcome(lines: &[Line<'_>], start: usize, content: &str) -> Option<Spec
     if body.trim().is_empty() {
         return None;
     }
+
     let first = lines.get(body_start).unwrap_or(&lines[start]);
     let last = lines.get(end.saturating_sub(1)).unwrap_or(&lines[start]);
     let mut sections = Vec::new();
@@ -254,6 +259,7 @@ fn parse_outcome(lines: &[Line<'_>], start: usize, content: &str) -> Option<Spec
         if text.trim().is_empty() {
             continue;
         }
+
         let section_first = lines.get(section_start).unwrap_or(&lines[*heading]);
         let section_last = lines
             .get(section_end.saturating_sub(1))
@@ -264,6 +270,7 @@ fn parse_outcome(lines: &[Line<'_>], start: usize, content: &str) -> Option<Spec
             span: span_for_lines(section_first, section_last),
         });
     }
+
     Some(SpecOutcomeDocument {
         text: body.trim().to_string(),
         span: span_for_lines(first, last),
@@ -284,6 +291,7 @@ fn lines(content: &str) -> Vec<Line<'_>> {
         });
         start = end;
     }
+
     if content.is_empty() {
         result.push(Line {
             text: "",
@@ -299,6 +307,7 @@ fn lines(content: &str) -> Vec<Line<'_>> {
             number: 1,
         });
     }
+
     result
 }
 

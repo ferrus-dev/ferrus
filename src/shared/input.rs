@@ -5,6 +5,7 @@ pub(crate) struct Prompt {
     pub(crate) cursor_row: u16,
     pub(crate) cursor_col: u16,
 }
+
 pub(crate) fn prompt(input: &str, cursor_pos: usize, width: usize, prefix: &str) -> Prompt {
     let prefix_width = prefix.chars().count();
     let available = width.saturating_sub(prefix_width).max(1);
@@ -62,10 +63,12 @@ pub(crate) fn byte_index_for_char(s: &str, char_idx: usize) -> usize {
         .map(|(idx, _)| idx)
         .unwrap_or(s.len())
 }
+
 pub(crate) fn insert(input: &mut String, cursor: &mut usize, ch: char) {
     input.insert(byte_index_for_char(input, *cursor), ch);
     *cursor += 1;
 }
+
 pub(crate) fn delete(input: &mut String, cursor: &mut usize, before: bool) {
     let at = if before {
         let Some(at) = cursor.checked_sub(1) else {
@@ -82,6 +85,7 @@ pub(crate) fn delete(input: &mut String, cursor: &mut usize, before: bool) {
         *cursor = at;
     }
 }
+
 pub(crate) fn multiline_enter(modifiers: crossterm::event::KeyModifiers) -> bool {
     use crossterm::event::KeyModifiers as M;
     modifiers.intersects(M::SHIFT | M::ALT)

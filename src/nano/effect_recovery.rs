@@ -33,6 +33,7 @@ pub(super) fn recorded_commands(records: &[Record]) -> Option<BTreeSet<String>> 
             processes.insert(value.get("process_id")?.as_str()?.to_owned());
         }
     }
+
     Some(processes)
 }
 
@@ -45,6 +46,7 @@ pub(super) fn unresolved_commands(
     if !commands.try_exists()? {
         return Ok(!expected.is_empty());
     }
+
     super::private::check(&commands, true)?;
     let mut count = 0;
     let mut stdout = BTreeSet::new();
@@ -65,10 +67,12 @@ pub(super) fn unresolved_commands(
             stdout.insert(id.to_owned());
             continue;
         }
+
         if let Some(id) = name.strip_suffix("-stderr") {
             stderr.insert(id.to_owned());
             continue;
         }
+
         let Some(id) = name.strip_suffix(".json") else {
             return Ok(true);
         };
@@ -79,6 +83,7 @@ pub(super) fn unresolved_commands(
         if bytes.len() as u64 > super::commands::STATE_BYTES {
             return Ok(true);
         }
+
         let Ok(state) = serde_json::from_slice::<super::commands::Snapshot>(&bytes) else {
             return Ok(true);
         };
@@ -97,12 +102,15 @@ pub(super) fn unresolved_commands(
         {
             return Ok(true);
         }
+
         states.insert(id.to_owned(), state);
     }
+
     let ids: BTreeSet<_> = states.keys().cloned().collect();
     if ids != stdout || ids != stderr || !expected.is_subset(&ids) {
         return Ok(true);
     }
+
     for (id, state) in states {
         let out = super::private::file(&commands.join(format!("{id}-stdout")), false)?;
         let err = super::private::file(&commands.join(format!("{id}-stderr")), false)?;
@@ -112,5 +120,6 @@ pub(super) fn unresolved_commands(
             return Ok(true);
         }
     }
+
     Ok(false)
 }

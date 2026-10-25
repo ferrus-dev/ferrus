@@ -15,6 +15,7 @@ fn quota(fits: bool, message: &'static str) -> Result<()> {
     if !fits {
         return Err(LimitExceeded(message).into());
     }
+
     Ok(())
 }
 
@@ -24,6 +25,7 @@ pub(crate) struct Source {
     pub omitted_links: usize,
     pub omitted_paths: usize,
 }
+
 impl Drop for Source {
     fn drop(&mut self) {
         if self.owned {
@@ -31,13 +33,16 @@ impl Drop for Source {
         }
     }
 }
+
 struct Child(std::process::Child);
+
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
+
 fn git(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -65,6 +70,7 @@ pub(super) fn reclaim(parent: &Path, tx: &rusqlite::Transaction<'_>) -> Result<u
             live.insert(id);
         }
     }
+
     let mut removed = 0;
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
@@ -74,6 +80,7 @@ pub(super) fn reclaim(parent: &Path, tx: &rusqlite::Transaction<'_>) -> Result<u
         {
             continue;
         }
+
         match fs::remove_dir_all(entry.path()) {
             Ok(()) => removed += 1,
             Err(error) => {
@@ -81,6 +88,7 @@ pub(super) fn reclaim(parent: &Path, tx: &rusqlite::Transaction<'_>) -> Result<u
             }
         }
     }
+
     Ok(removed)
 }
 
@@ -141,6 +149,7 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             source.omitted_links += 1;
             continue;
         }
+
         ensure!(
             fields.len() == 4 && fields[1] == "blob",
             "Unsupported tree entry"
@@ -182,6 +191,7 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
             source.omitted_paths += 1;
             continue;
         }
+
         let create = || -> Result<fs::File> {
             fs::create_dir_all(target.parent().context("Missing source parent")?)?;
             super::super::private::file(&target, true)
@@ -217,6 +227,7 @@ pub(super) fn snapshot(root: &Path, destination: &Path, tree: &str) -> Result<So
         output.read_exact(&mut separator)?;
         ensure!(separator == *b"\n", "Invalid blob boundary");
     }
+
     drop(input);
     ensure!(batch.0.wait()?.success(), "Cannot read submitted blobs");
     Ok(source)
@@ -234,6 +245,7 @@ fn unsupported_name(error: &anyhow::Error) -> bool {
     ) {
         return true;
     }
+
     #[cfg(unix)]
     {
         error.raw_os_error() == Some(libc::EILSEQ)
@@ -301,6 +313,7 @@ mod tests {
             fs::create_dir(root.path().join(id)).unwrap();
             fs::write(root.path().join(id).join("source.rs"), "submitted source").unwrap();
         }
+
         fs::create_dir(root.path().join("orphan-review")).unwrap();
         fs::create_dir(root.path().join("not a run")).unwrap();
         fs::write(root.path().join("plain-file"), "leave alone").unwrap();
@@ -320,6 +333,7 @@ mod tests {
         ] {
             assert!(root.path().join(id).is_dir(), "{id}");
         }
+
         assert!(root.path().join("plain-file").is_file());
         #[cfg(unix)]
         assert!(root.path().join("linked-review").is_symlink() && outside.path().is_dir());
@@ -361,6 +375,7 @@ mod tests {
         ] {
             assert!(!windows_path_supported(path), "{path:?}");
         }
+
         for path in [
             "src/lib.rs",
             "console.txt",
@@ -502,8 +517,10 @@ mod tests {
         for name in ["ordinary.txt", "caf\u{e9}.txt"] {
             assert!(super::super::super::workspace::path(name).is_ok());
         }
+
         assert_eq!(source.omitted_links, 0);
     }
+
     #[test]
     fn snapshot_limits_are_typed_and_remove_partial_sources() {
         let dir = tempfile::tempdir().unwrap();
@@ -542,6 +559,7 @@ mod tests {
             assert!(error.is::<LimitExceeded>(), "{error:#}");
             assert!(!destination.exists());
         }
+
         let error = snapshot(root, &root.join("inspection"), "missing-tree")
             .err()
             .unwrap();

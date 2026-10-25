@@ -9,12 +9,15 @@ pub(super) fn initialize_schema(connection: &mut Connection) -> Result<(), Memor
     if application_id != MEMORY_APPLICATION_ID && (version > 0 || application_id != 0) {
         return Err(MemoryStoreError::RequiresRebuild);
     }
+
     if version > MEMORY_SIDECAR_SCHEMA_VERSION {
         return Err(MemoryStoreError::RequiresRebuild);
     }
+
     if version == MEMORY_SIDECAR_SCHEMA_VERSION {
         return Ok(());
     }
+
     if version == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
@@ -108,6 +111,7 @@ pub(super) fn initialize_schema(connection: &mut Connection) -> Result<(), Memor
         transaction.pragma_update(None, "user_version", 1)?;
         transaction.commit()?;
     }
+
     migrate_repository_link_schema(connection)?;
     Ok(())
 }
@@ -119,6 +123,7 @@ pub(super) fn migrate_repository_link_schema(
     if version >= 2 {
         return Ok(());
     }
+
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         r#"

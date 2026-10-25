@@ -76,7 +76,9 @@ pub(crate) struct ScopeSnapshot {
 
 pub(crate) trait InstructionScope {
     async fn snapshot(&self) -> Result<ScopeSnapshot>;
+
     fn project_root(&self) -> &std::path::Path;
+
     fn workspace(&self) -> &std::path::Path;
 }
 
@@ -122,6 +124,7 @@ impl<S: InstructionScope> Instructions<S> {
         if let Some(path) = scope.task_path {
             self.add(&mut set, Kind::Task, "project", &path, ".", true)?;
         }
+
         if let Some(path) = scope.review_path {
             self.add(&mut set, Kind::Rejection, "project", &path, ".", true)?;
         }

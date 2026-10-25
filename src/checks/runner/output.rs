@@ -49,8 +49,10 @@ impl Spool {
         }
     }
 
-    pub(crate) fn file(&self) -> &File {
-        self.file.as_ref().expect("spool is open")
+    pub(crate) fn file(&self) -> io::Result<&File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("spool is closed"))
     }
 }
 
@@ -82,11 +84,12 @@ pub(crate) fn finish_log(
     )?;
     let mut tail = OutputTail::new(max_lines);
     for (label, spool) in [("stdout", stdout), ("stderr", stderr)] {
-        let mut file = spool.file();
+        let mut file = spool.file()?;
         file.seek(SeekFrom::Start(0))?;
         if file.metadata()?.len() == 0 {
             continue;
         }
+
         writeln!(log, "--- {label} ---")?;
         let mut buffer = [0u8; 8192];
         let mut last = None;
@@ -95,14 +98,17 @@ pub(crate) fn finish_log(
             if read == 0 {
                 break;
             }
+
             log.write_all(&buffer[..read])?;
             tail.push(&buffer[..read]);
             last = buffer.get(read - 1).copied();
         }
+
         if last != Some(b'\n') {
             writeln!(log)?;
         }
     }
+
     writeln!(log)?;
     log.flush()?;
     Ok(tail.finish())
@@ -149,8 +155,11 @@ impl OutputTail {
                     }
                 }
             }
+
             while self.bytes.len() > MAX_FEEDBACK_BYTES {
-                let removed = self.bytes.pop_front().expect("tail exceeds cap");
+                let Some(removed) = self.bytes.pop_front() else {
+                    break;
+                };
                 self.newlines -= usize::from(removed == b'\n');
                 self.dropped = true;
             }
@@ -168,6 +177,7 @@ impl OutputTail {
                 self.bytes.pop_front();
             }
         }
+
         let bytes: Vec<_> = self.bytes.into_iter().collect();
         let decoded = String::from_utf8_lossy(&bytes);
         // Replacement characters can expand invalid source bytes. Bound the
@@ -176,14 +186,17 @@ impl OutputTail {
         while !decoded.is_char_boundary(start) {
             start += 1;
         }
+
         self.dropped |= start > 0;
         let mut tail = String::with_capacity(decoded.len() - start);
         for (index, line) in decoded[start..].lines().enumerate() {
             if index > 0 {
                 tail.push('\n');
             }
+
             tail.push_str(line);
         }
+
         CapturedOutput {
             tail,
             total_lines,
@@ -204,6 +217,7 @@ mod tests {
                 for byte in input.as_bytes() {
                     tail.push(&[*byte]);
                 }
+
                 let output = tail.finish();
                 let lines: Vec<_> = input.lines().collect();
                 assert_eq!(
@@ -221,9 +235,11 @@ mod tests {
         for _ in 0..100 {
             tail.push(&[b'x'; 8192]);
         }
+
         for byte in "\u{1f980}\nlast".as_bytes() {
             tail.push(&[*byte]);
         }
+
         assert!(tail.bytes.len() <= MAX_FEEDBACK_BYTES);
         let output = tail.finish();
         assert!(output.truncated);

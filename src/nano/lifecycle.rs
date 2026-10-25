@@ -120,6 +120,7 @@ async fn run_check(
                 project::task_check_passed_in_transaction(tx, scope.task_id.clone())?;
                 project::executor_event(tx, scope, "check_passed", json!({"commands":config.checks.commands.len()}))?;
             }
+
             Ok(json!({"status":"passed", "task_state":context.status}))
         } else {
             let outcome = project::task_check_failed_in_transaction(tx, scope.task_id.clone(), failure, config.limits.max_check_retries)?;
@@ -284,9 +285,11 @@ pub(super) async fn submit(
         if result["status"] != "passed" {
             return Ok(result);
         }
+
         if let Some(first) = &checked_digest {
             ensure!(first == &digest, "Check commands changed during submit");
         }
+
         checked_digest = Some(digest);
 
         ensure!(
@@ -516,6 +519,7 @@ pub(super) async fn poll_answer_checked(
 
                 return Ok(None);
             }
+
             ensure!(
                 context.status
                     == if human {
@@ -538,6 +542,7 @@ pub(super) async fn poll_answer_checked(
                     "Question belongs to another agent"
                 );
             }
+
             let directory = root.join(&context.run_dir);
             let name = if human {
                 "ANSWER.md"

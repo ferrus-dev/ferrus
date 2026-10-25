@@ -96,6 +96,7 @@ pub mod api {
     ] {
         assert!(kinds.contains(expected), "missing {expected}: {kinds:?}");
     }
+
     assert!(fragment.edges.iter().any(|edge| edge.kind == "imports"));
     assert!(fragment.edges.iter().any(|edge| edge.kind == "re_exports"));
     assert!(
@@ -239,6 +240,7 @@ fn sibling_declarations_do_not_inherit_each_others_lexical_scopes() {
             "fn function_{index}() {{ {{ struct Local; }} }}\n"
         ));
     }
+
     source.push_str("}\nstruct Root;\n");
     let graph = extract("src/lib.rs", source.as_bytes());
     let keys: BTreeSet<_> = graph
@@ -255,6 +257,7 @@ fn sibling_declarations_do_not_inherit_each_others_lexical_scopes() {
             )
         );
     }
+
     assert_eq!(
         graph
             .nodes

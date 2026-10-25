@@ -20,7 +20,13 @@ pub struct RuntimeProvenanceExtractor;
 
 impl MemoryExtractor for RuntimeProvenanceExtractor {
     fn identity(&self) -> super::super::domain::MemoryExtractorIdentity {
-        extractor_identity("ferrus.runtime-provenance")
+        extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.runtime-provenance",
+                )
+            },
+        )
     }
 
     fn supports(&self, category: MemorySourceCategory) -> bool {
@@ -32,22 +38,54 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
         input: MemoryExtractionInput<'_>,
     ) -> Result<MemoryFragment, MemoryExtractionFailure> {
         let document: RuntimeSourceDocument =
-            serde_json::from_slice(input.content).map_err(|_| failure("runtime.invalid"))?;
+            serde_json::from_slice(input.content).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "runtime.invalid",
+                        )
+                    },
+                )
+            })?;
         let provenance = |record: &str| provenance(input, record);
         let mut fragment = MemoryFragment::default();
         let mut task_entities = BTreeMap::new();
         let mut run_entities = BTreeMap::new();
 
         for task in document.tasks {
-            let task_record =
-                MemoryRecordId::new(&task.id).map_err(|_| failure("runtime.invalid_task_id"))?;
-            let task_entity = entity_id(&input.context.project, &("task", &task.id));
+            let task_record = MemoryRecordId::new(&task.id).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "runtime.invalid.task.id",
+                        )
+                    },
+                )
+            })?;
+            let task_entity =
+                entity_id(&input.context.project, &("task", &task.id)).map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "source.serialization",
+                            )
+                        },
+                    )
+                })?;
             task_entities.insert(task.id.clone(), task_entity.clone());
             let milestone_id = task
                 .milestone_id
                 .map(MemoryRecordId::new)
                 .transpose()
-                .map_err(|_| failure("runtime.invalid_milestone_id"))?;
+                .map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "runtime.invalid.milestone.id",
+                            )
+                        },
+                    )
+                })?;
             fragment.entities.push(MemoryEntity {
                 project: input.context.project.clone(),
                 memory_revision_id: input.context.revision_id.clone(),
@@ -56,7 +94,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     task_id: task_record,
                     milestone_id: milestone_id.clone(),
                     status: MemoryStatusToken::new(task.status)
-                        .map_err(|_| failure("runtime.invalid_status"))?,
+                        .map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("runtime.invalid.status") }))?,
                     baseline_snapshot_id: task.baseline_snapshot_id,
                     repository_snapshot_id: task.repository_snapshot_id,
                 },
@@ -69,7 +107,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     id: relationship_id(
                         &input.context.project,
                         &("implements", &task_entity, &milestone_id),
-                    ),
+                    ).map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("source.serialization") }))?,
                     kind: MemoryRelationshipKind::Implements,
                     source: task_entity,
                     target: MemoryRelationshipTarget::Milestone { milestone_id },
@@ -79,18 +117,49 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
         }
 
         for run in document.runs {
-            let run_record =
-                MemoryRecordId::new(&run.id).map_err(|_| failure("runtime.invalid_run_id"))?;
-            let task_record = MemoryRecordId::new(&run.task_id)
-                .map_err(|_| failure("runtime.invalid_task_id"))?;
-            let run_entity = entity_id(&input.context.project, &("run", &run.id));
+            let run_record = MemoryRecordId::new(&run.id).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "runtime.invalid.run.id",
+                        )
+                    },
+                )
+            })?;
+            let task_record = MemoryRecordId::new(&run.task_id).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "runtime.invalid.task.id",
+                        )
+                    },
+                )
+            })?;
+            let run_entity =
+                entity_id(&input.context.project, &("run", &run.id)).map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "source.serialization",
+                            )
+                        },
+                    )
+                })?;
             run_entities.insert(run.id.clone(), run_entity.clone());
             let check_ids = run
                 .check_ids
                 .into_iter()
                 .map(MemoryRecordId::new)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| failure("runtime.invalid_check_id"))?;
+                .map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "runtime.invalid.check.id",
+                            )
+                        },
+                    )
+                })?;
             fragment.entities.push(MemoryEntity {
                 project: input.context.project.clone(),
                 memory_revision_id: input.context.revision_id.clone(),
@@ -99,7 +168,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     run_id: run_record,
                     task_id: task_record,
                     status: MemoryStatusToken::new(run.status)
-                        .map_err(|_| failure("runtime.invalid_status"))?,
+                        .map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("runtime.invalid.status") }))?,
                     check_ids,
                     baseline_snapshot_id: run.baseline_snapshot_id,
                     repository_snapshot_id: run.repository_snapshot_id,
@@ -113,7 +182,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     id: relationship_id(
                         &input.context.project,
                         &("task-run", task_entity, &run_entity),
-                    ),
+                    ).map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("source.serialization") }))?,
                     kind: MemoryRelationshipKind::Contains,
                     source: task_entity.clone(),
                     target: MemoryRelationshipTarget::MemoryEntity {
@@ -125,9 +194,25 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
         }
 
         for check in document.checks {
-            let check_record =
-                MemoryRecordId::new(&check.id).map_err(|_| failure("runtime.invalid_check_id"))?;
-            let check_entity = entity_id(&input.context.project, &("check", &check.id));
+            let check_record = MemoryRecordId::new(&check.id).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "runtime.invalid.check.id",
+                        )
+                    },
+                )
+            })?;
+            let check_entity =
+                entity_id(&input.context.project, &("check", &check.id)).map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "source.serialization",
+                            )
+                        },
+                    )
+                })?;
             fragment.entities.push(MemoryEntity {
                 project: input.context.project.clone(),
                 memory_revision_id: input.context.revision_id.clone(),
@@ -137,7 +222,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     check_id: Some(check_record),
                     status: Some(
                         MemoryStatusToken::new(check.status)
-                            .map_err(|_| failure("runtime.invalid_status"))?,
+                            .map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("runtime.invalid.status") }))?,
                     ),
                 },
                 provenance: provenance(&check.id)?,
@@ -154,7 +239,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                     id: relationship_id(
                         &input.context.project,
                         &("validates", &check_entity, target),
-                    ),
+                    ).map_err(|_| failure(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("source.serialization") }))?,
                     kind: MemoryRelationshipKind::Validates,
                     source: check_entity,
                     target: MemoryRelationshipTarget::MemoryEntity {
@@ -164,6 +249,7 @@ impl MemoryExtractor for RuntimeProvenanceExtractor {
                 });
             }
         }
+
         Ok(fragment)
     }
 }
@@ -176,10 +262,22 @@ fn provenance(
         source_category: input.source.category,
         source_locator: input.source.locator.clone(),
         source_fingerprint: input.source.fingerprint.clone(),
-        extractor: extractor_identity("ferrus.runtime-provenance"),
-        evidence: MemoryEvidenceLocator::Record(
-            MemoryRecordId::new(record).map_err(|_| failure("runtime.invalid_record_id"))?,
+        extractor: extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.runtime-provenance",
+                )
+            },
         ),
+        evidence: MemoryEvidenceLocator::Record(MemoryRecordId::new(record).map_err(|_| {
+            failure(
+                const {
+                    crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                        "runtime.invalid.record.id",
+                    )
+                },
+            )
+        })?),
         resolution: MemoryResolutionState::Resolved,
         confidence: MemoryConfidence::Exact,
         timestamps: MemoryIndexTimestamps {
@@ -189,10 +287,17 @@ fn provenance(
     })
 }
 
-fn failure(code: &str) -> MemoryExtractionFailure {
+fn failure(
+    code: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryExtractionFailure {
     MemoryExtractionFailure {
-        extractor: extractor_identity("ferrus.runtime-provenance"),
-        code: super::super::diagnostics::MemoryDiagnosticCode::new(code)
-            .expect("static memory diagnostic code is valid"),
+        extractor: extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.runtime-provenance",
+                )
+            },
+        ),
+        code,
     }
 }

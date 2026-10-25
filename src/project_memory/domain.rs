@@ -1,6 +1,6 @@
 //! Validated memory identities, entities, provenance, immutable revisions, and publication values.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -39,6 +39,7 @@ fn validate_bounded_text(
     if value.trim().is_empty() || value.len() > max_bytes || !value.chars().all(valid_character) {
         return Err(MemoryValueError::Invalid { kind, max_bytes });
     }
+
     Ok(value)
 }
 
@@ -46,11 +47,37 @@ macro_rules! bounded_string {
     ($name:ident, $kind:literal, $max:expr, $allow_newlines:expr) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(Cow<'static, str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, MemoryValueError> {
-                validate_bounded_text(value.into(), $kind, $max, $allow_newlines).map(Self)
+                validate_bounded_text(value.into(), $kind, $max, $allow_newlines)
+                    .map(|value| Self(value.into()))
+            }
+
+            /// Constructs a built-in value. Use in a `const` block to validate at compile time.
+            pub const fn from_static(value: &'static str) -> Self {
+                assert!(
+                    !value.is_empty() && value.len() <= $max,
+                    "invalid static value length"
+                );
+                let bytes = value.as_bytes();
+                let mut index = 0;
+                let mut non_whitespace = false;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    assert!(
+                        byte.is_ascii()
+                            && (!byte.is_ascii_control()
+                                || ($allow_newlines
+                                    && (byte == b'\n' || byte == b'\r' || byte == b'\t'))),
+                        "invalid static value character"
+                    );
+                    non_whitespace |= !byte.is_ascii_whitespace();
+                    index += 1;
+                }
+                assert!(non_whitespace, "static value must not be blank");
+                Self(Cow::Borrowed(value))
             }
 
             pub fn as_str(&self) -> &str {
@@ -76,45 +103,60 @@ macro_rules! bounded_string {
 }
 
 bounded_string!(ProjectNamespace, "project namespace", MAX_ID_BYTES, false);
+
 bounded_string!(ProjectId, "project id", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryRevisionId, "memory revision id", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryBuildId, "memory build id", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryEntityId, "memory entity id", MAX_ID_BYTES, false);
+
 bounded_string!(
     MemoryRelationshipId,
     "memory relationship id",
     MAX_ID_BYTES,
     false
 );
+
 bounded_string!(
     MemoryRepositoryLinkSetId,
     "memory repository link set id",
     MAX_ID_BYTES,
     false
 );
+
 bounded_string!(
     MemoryExtractorId,
     "memory extractor id",
     MAX_ID_BYTES,
     false
 );
+
 bounded_string!(MemoryViewName, "memory view name", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryRecordId, "memory record id", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryStatusToken, "memory status", MAX_ID_BYTES, false);
+
 bounded_string!(MemoryPageCursor, "memory page cursor", MAX_ID_BYTES, false);
+
 bounded_string!(
     FederationPageCursor,
     "federation page cursor",
     MAX_ID_BYTES,
     false
 );
+
 bounded_string!(MemoryTitle, "memory title", MAX_TITLE_BYTES, false);
+
 bounded_string!(
     MemoryQueryText,
     "memory query text",
     MAX_QUERY_TEXT_BYTES,
     false
 );
+
 bounded_string!(MemoryText, "memory text", MAX_MEMORY_TEXT_BYTES, true);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -544,6 +586,8 @@ pub struct AuthorizedSourceManifest {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AuthorizedSourceManifestError {
+    #[error("authorized source identity serialization failed")]
+    Serialization,
     #[error("authorized source belongs to another project")]
     ProjectMismatch,
     #[error("authorized source-set digest does not match the manifest")]
@@ -567,6 +611,7 @@ impl AuthorizedSourceManifest {
         {
             return Err(AuthorizedSourceManifestError::ProjectMismatch);
         }
+
         let mut sources = self
             .sources
             .iter()
@@ -576,21 +621,16 @@ impl AuthorizedSourceManifest {
                 fingerprint: &source.fingerprint,
             })
             .collect::<Vec<_>>();
-        sources.sort_by(|left, right| {
-            serde_json::to_vec(left)
-                .expect("authorized source descriptors are serializable")
-                .cmp(
-                    &serde_json::to_vec(right)
-                        .expect("authorized source descriptors are serializable"),
-                )
-        });
-        Ok(canonical_digest(&(self.project.clone(), sources)))
+        sources = crate::json_size::sort_by_json_key(sources, serde_json::to_vec)
+            .map_err(|_| AuthorizedSourceManifestError::Serialization)?;
+        canonical_digest(&(self.project.clone(), sources))
     }
 
     pub fn validate(&self) -> Result<(), AuthorizedSourceManifestError> {
         if self.computed_source_set_digest()? != self.source_set_digest {
             return Err(AuthorizedSourceManifestError::SourceSetDigestMismatch);
         }
+
         Ok(())
     }
 
@@ -603,19 +643,16 @@ impl AuthorizedSourceManifest {
             &self.policy_digest,
             MEMORY_MODEL_VERSION,
             &self.extractor_set_digest,
-        ));
-        Ok(MemoryRevisionId::new(format!("memory:{}", digest.value()))
-            .expect("sha256 memory revision identity is bounded and non-empty"))
+        ))?;
+        MemoryRevisionId::new(format!("memory:{}", digest.value()))
+            .map_err(|_| AuthorizedSourceManifestError::Serialization)
     }
 }
 
-fn canonical_digest(value: &impl Serialize) -> Digest {
-    let encoded = serde_json::to_vec(value).expect("memory identity inputs are serializable");
-    let value = Sha256::digest(encoded)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Digest::new("sha256", value).expect("sha256 output is lowercase hexadecimal")
+fn canonical_digest(value: &impl Serialize) -> Result<Digest, AuthorizedSourceManifestError> {
+    let encoded =
+        serde_json::to_vec(value).map_err(|_| AuthorizedSourceManifestError::Serialization)?;
+    Ok(Digest::from_sha256(Sha256::digest(encoded).into()))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

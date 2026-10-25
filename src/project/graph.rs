@@ -55,6 +55,7 @@ pub(crate) async fn repository_graph_retention_references_at(
             {
                 references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
             }
+
             references
                 .view_names
                 .insert(PublishedViewName::new(format!("task-baseline:{task_id}"))?);
@@ -62,6 +63,7 @@ pub(crate) async fn repository_graph_retention_references_at(
                 .view_names
                 .insert(PublishedViewName::new(format!("task-overlay:{task_id}"))?);
         }
+
         let canonical_snapshot = connection
             .query_row(
                 "SELECT canonical_graph_snapshot_id FROM project_runtime_state WHERE row_id = 1",
@@ -73,6 +75,7 @@ pub(crate) async fn repository_graph_retention_references_at(
         if let Some(snapshot) = canonical_snapshot {
             references.snapshot_ids.insert(SnapshotId::new(snapshot)?);
         }
+
         Ok(references)
     })
     .await?
@@ -263,6 +266,7 @@ pub async fn record_canonical_graph_refresh(
             transaction.commit()?;
             return Ok(CanonicalGraphRefreshOutcome::Superseded);
         }
+
         insert_event_in_transaction(
             &transaction,
             run_id.as_deref(),
@@ -498,6 +502,7 @@ pub(crate) async fn compare_and_record_task_repository_view_at(
             transaction.commit()?;
             return Ok(false);
         }
+
         record_repository_view_in_transaction(&transaction, "tasks", &task_id, &repository_view)?;
         transaction.commit()?;
         Ok(true)
@@ -594,6 +599,7 @@ fn record_repository_view_in_transaction(
     if updated == 0 {
         anyhow::bail!("Cannot record repository view: {owner_table} row does not exist");
     }
+
     if owner_table == "tasks" {
         transaction.execute(
             r#"
@@ -621,6 +627,7 @@ fn record_repository_view_in_transaction(
             ],
         )?;
     }
+
     Ok(())
 }
 

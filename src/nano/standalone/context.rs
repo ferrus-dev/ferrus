@@ -116,10 +116,15 @@ impl LocalContext {
             },
         )?;
         match std::fs::remove_file(&self.invalidation) {
-            Ok(()) => super::super::private::sync_directory(self.invalidation.parent().unwrap())?,
+            Ok(()) => super::super::private::sync_directory(
+                self.invalidation
+                    .parent()
+                    .context("Missing invalidation parent")?,
+            )?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
+
         Ok(outcome)
     }
 
@@ -131,9 +136,14 @@ impl LocalContext {
             if !self.sidecar.try_exists()? || self.invalidation.try_exists()? {
                 return Ok(());
             }
+
             let file = super::super::private::file(&self.invalidation, true)?;
             file.sync_all()?;
-            super::super::private::sync_directory(self.invalidation.parent().unwrap())?;
+            super::super::private::sync_directory(
+                self.invalidation
+                    .parent()
+                    .context("Missing invalidation parent")?,
+            )?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -148,6 +158,7 @@ impl LocalContext {
         if !self.graph_enabled {
             return Ok(graph::sqlite::OpenQuerySidecarResult::Absent);
         }
+
         graph::sqlite::open_for_query_at(&self.sidecar)
     }
 
@@ -255,9 +266,11 @@ impl LocalContext {
                     .reason_codes
                     .push("standalone.workspace_changed".into());
             }
+
             if name == "repository_graph_status" {
                 return Ok(serde_json::to_value(Response::RepositoryStatus(status))?);
             }
+
             ensure!(
                 !dirty,
                 "Standalone graph is stale; use --index-graph or repository_fallback"
@@ -314,10 +327,12 @@ impl LocalContext {
                         request.scope.budget.max_diagnostics.get() as usize,
                     )?;
                 }
+
                 Response::RepositoryContext(response)
             };
             return Ok(serde_json::to_value(response)?);
         }
+
         let (path, project) = self
             .memory
             .as_ref()
@@ -349,15 +364,18 @@ impl LocalContext {
             };
         let limits = graph::config::QueryLimitsConfig::default();
         let budget = memory::query::MemoryQueryBudget {
-            max_results: NonZeroU32::new(input.max_results.unwrap_or(32).min(64)).unwrap(),
+            max_results: NonZeroU32::new(input.max_results.unwrap_or(32).min(64))
+                .context("Query limits must be positive")?,
             max_bytes: NonZeroU64::new(input.max_bytes.unwrap_or(24 * 1024).min(24 * 1024))
-                .unwrap(),
+                .context("Query limits must be positive")?,
             max_snippet_bytes: NonZeroU64::new(input.max_snippet_bytes.unwrap_or(4096).min(8192))
-                .unwrap(),
-            max_depth: NonZeroU32::new(input.max_depth.unwrap_or(2).min(8)).unwrap(),
+                .context("Query limits must be positive")?,
+            max_depth: NonZeroU32::new(input.max_depth.unwrap_or(2).min(8))
+                .context("Query limits must be positive")?,
             max_duration_ms: NonZeroU64::new(input.max_duration_ms.unwrap_or(1000).min(1000))
-                .unwrap(),
-            max_diagnostics: NonZeroU32::new(input.max_diagnostics.unwrap_or(16).min(16)).unwrap(),
+                .context("Query limits must be positive")?,
+            max_diagnostics: NonZeroU32::new(input.max_diagnostics.unwrap_or(16).min(16))
+                .context("Query limits must be positive")?,
         };
         let query = sidecar
             .as_deref()
@@ -382,6 +400,7 @@ impl LocalContext {
                 status.context("Memory sidecar unavailable")?,
             ))?);
         }
+
         ensure!(
             !input.include_snippets,
             "Standalone memory snippets require a verified content adapter; use structural memory context"
@@ -543,7 +562,7 @@ impl LocalContext {
             response.snapshot_id.clone(),
             &self.config().source,
             files,
-            NonZeroU64::new(8192).unwrap(),
+            NonZeroU64::new(8192).context("Snippet limit must be positive")?,
         )?;
         let mut seen = BTreeSet::new();
         let mut truncated = false;
@@ -551,6 +570,7 @@ impl LocalContext {
             if !seen.insert(serde_json::to_string(&(&item.path, &item.span))?) {
                 continue;
             }
+
             let Some(max_bytes) = NonZeroU64::new(remaining) else {
                 truncated = true;
                 break;
@@ -575,6 +595,7 @@ impl LocalContext {
                 truncated: snippet.truncated,
             });
         }
+
         if truncated {
             response.diagnostics.summary.warning += 1;
             if response.diagnostics.items.len() < max_diagnostics {
@@ -587,6 +608,7 @@ impl LocalContext {
                 response.diagnostics.truncated = true;
             }
         }
+
         Ok(())
     }
 }

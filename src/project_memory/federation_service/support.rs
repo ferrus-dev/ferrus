@@ -9,7 +9,13 @@ pub(super) fn repository_only_seeds(
         .iter()
         .map(|seed| match seed {
             FederatedContextSeed::Repository(seed) => Ok(seed.clone()),
-            _ => Err(backend_error("context.domainmismatch")),
+            _ => Err(backend_error(
+                const {
+                    crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                        "context.domainmismatch",
+                    )
+                },
+            )),
         })
         .collect()
 }
@@ -30,9 +36,13 @@ pub(super) fn memory_only_seeds(
             FederatedContextSeed::Repository(ContextSeed::Symbol(symbol)) => {
                 Ok(MemoryContextSeed::RepositorySymbol(symbol.clone()))
             }
-            FederatedContextSeed::Repository(ContextSeed::Node(_)) => {
-                Err(backend_error("context.domainmismatch"))
-            }
+            FederatedContextSeed::Repository(ContextSeed::Node(_)) => Err(backend_error(
+                const {
+                    crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                        "context.domainmismatch",
+                    )
+                },
+            )),
         })
         .collect()
 }
@@ -59,6 +69,7 @@ pub(super) fn split_all_seeds(
             }
         }
     }
+
     (repository, memory)
 }
 
@@ -258,20 +269,38 @@ pub(super) fn graph_error(error: QueryError) -> MemoryQueryError {
             MemoryQueryError::BudgetExceeded(MemoryTruncationReason::Duration)
         }
         QueryErrorCode::ContentChanged => MemoryQueryError::ContentChanged,
-        _ => backend_error("federation.repositoryquery"),
+        _ => backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "federation.repositoryquery",
+                )
+            },
+        ),
     }
 }
 
-pub(super) fn backend_error(value: &str) -> MemoryQueryError {
+pub(super) fn backend_error(
+    value: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryQueryError {
     MemoryQueryError::Backend(diagnostic_code(value))
 }
 
-pub(super) fn diagnostic_code(value: &str) -> MemoryDiagnosticCode {
-    MemoryDiagnosticCode::new(value).expect("static federation diagnostic code is valid")
+pub(super) fn diagnostic_code(
+    value: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryDiagnosticCode {
+    value
 }
 
 pub(super) fn serialized_len(value: &impl Serialize) -> Result<u64, MemoryQueryError> {
-    crate::json_size::serialized_len(value).map_err(|_| backend_error("federation.serialization"))
+    crate::json_size::serialized_len(value).map_err(|_| {
+        backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "federation.serialization",
+                )
+            },
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -300,6 +329,7 @@ pub(super) fn fit_federated_search_response(
     if stabilize_federated_search_size(response, started, duration)? <= max_bytes {
         return Ok(());
     }
+
     if response.results.len() <= 1 {
         return Err(MemoryQueryError::BudgetExceeded(
             MemoryTruncationReason::Bytes,
@@ -324,9 +354,16 @@ pub(super) fn fit_federated_search_response(
             fingerprint,
             revision_key,
         )?;
-        let extra_bytes = crate::json_size::serialized_len(&original_results[..midpoint])
-            .map_err(|_| backend_error("federation.serialization"))?
-            - 2;
+        let extra_bytes =
+            crate::json_size::serialized_len(&original_results[..midpoint]).map_err(|_| {
+                backend_error(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "federation.serialization",
+                        )
+                    },
+                )
+            })? - 2;
         if stabilize_federated_search_size_with_extra(response, extra_bytes, started, duration)?
             <= max_bytes
         {
@@ -336,6 +373,7 @@ pub(super) fn fit_federated_search_response(
             upper = midpoint - 1;
         }
     }
+
     let Some(best) = best else {
         return Err(MemoryQueryError::BudgetExceeded(
             MemoryTruncationReason::Bytes,
@@ -354,8 +392,15 @@ pub(super) fn fit_federated_search_response(
     )?;
     let encoded_bytes = stabilize_federated_search_size(response, started, duration)?;
     if encoded_bytes > max_bytes {
-        return Err(backend_error("federation.serialization"));
+        return Err(backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "federation.serialization",
+                )
+            },
+        ));
     }
+
     Ok(())
 }
 
@@ -409,9 +454,17 @@ fn stabilize_federated_search_size_with_extra(
         if truncation.returned_bytes == encoded_bytes {
             return Ok(encoded_bytes);
         }
+
         truncation.returned_bytes = encoded_bytes;
     }
-    Err(backend_error("federation.serialization"))
+
+    Err(backend_error(
+        const {
+            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                "federation.serialization",
+            )
+        },
+    ))
 }
 
 fn ensure_federated_search_fitting_deadline(
@@ -423,6 +476,7 @@ fn ensure_federated_search_fitting_deadline(
             MemoryTruncationReason::Duration,
         ));
     }
+
     Ok(())
 }
 
@@ -455,9 +509,11 @@ pub(super) fn fit_federated_context_response(
             MemoryTruncationReason::Duration,
         ));
     }
+
     if encoded_bytes <= max_bytes {
         return Ok(());
     }
+
     set_federated_context_page(
         response,
         Some(MemoryTruncationReason::Bytes),
@@ -478,6 +534,7 @@ pub(super) fn fit_federated_context_response(
     )? {
         return Ok(());
     }
+
     let snippets = std::mem::take(&mut response.repository_snippets);
     if fit_context_collection(
         response,
@@ -489,6 +546,7 @@ pub(super) fn fit_federated_context_response(
     )? {
         return Ok(());
     }
+
     let cross_links = std::mem::take(&mut response.cross_domain_links);
     if fit_context_collection(
         response,
@@ -500,6 +558,7 @@ pub(super) fn fit_federated_context_response(
     )? {
         return Ok(());
     }
+
     let memory_relationships = std::mem::take(&mut response.memory_relationships);
     if fit_context_collection(
         response,
@@ -542,16 +601,25 @@ fn fit_context_collection<T: Serialize>(
                 MemoryTruncationReason::Duration,
             ));
         }
+
         let midpoint = lower + (upper - lower) / 2;
-        let extra_bytes = crate::json_size::serialized_len(&original[..midpoint])
-            .map_err(|_| backend_error("federation.serialization"))?
-            - 2;
+        let extra_bytes =
+            crate::json_size::serialized_len(&original[..midpoint]).map_err(|_| {
+                backend_error(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "federation.serialization",
+                        )
+                    },
+                )
+            })? - 2;
         let encoded_bytes = stabilize_federated_context_size_with_extra(response, extra_bytes)?;
         if started.elapsed() >= duration {
             return Err(MemoryQueryError::BudgetExceeded(
                 MemoryTruncationReason::Duration,
             ));
         }
+
         if encoded_bytes <= max_bytes {
             best = Some(midpoint);
             lower = midpoint + 1;
@@ -559,6 +627,7 @@ fn fit_context_collection<T: Serialize>(
             upper = midpoint;
         }
     }
+
     let Some(best) = best else {
         assign(response, Vec::new());
         return Ok(false);
@@ -571,6 +640,7 @@ fn fit_context_collection<T: Serialize>(
             MemoryTruncationReason::Duration,
         ));
     }
+
     Ok(encoded_bytes <= max_bytes)
 }
 
@@ -592,6 +662,7 @@ fn fit_federated_context_items(
             MemoryTruncationReason::Bytes,
         ));
     }
+
     let mut lower = 1usize;
     let mut upper = original.len() + 1;
     let mut best = None;
@@ -601,6 +672,7 @@ fn fit_federated_context_items(
                 MemoryTruncationReason::Duration,
             ));
         }
+
         let midpoint = lower + (upper - lower) / 2;
         set_federated_context_page_with_count(
             response,
@@ -612,15 +684,23 @@ fn fit_federated_context_items(
             fingerprint,
             revision_key,
         )?;
-        let extra_bytes = crate::json_size::serialized_len(&original[..midpoint])
-            .map_err(|_| backend_error("federation.serialization"))?
-            - 2;
+        let extra_bytes =
+            crate::json_size::serialized_len(&original[..midpoint]).map_err(|_| {
+                backend_error(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "federation.serialization",
+                        )
+                    },
+                )
+            })? - 2;
         let encoded_bytes = stabilize_federated_context_size_with_extra(response, extra_bytes)?;
         if started.elapsed() >= duration {
             return Err(MemoryQueryError::BudgetExceeded(
                 MemoryTruncationReason::Duration,
             ));
         }
+
         if encoded_bytes <= max_bytes {
             best = Some(midpoint);
             lower = midpoint + 1;
@@ -628,6 +708,7 @@ fn fit_federated_context_items(
             upper = midpoint;
         }
     }
+
     let Some(best) = best else {
         return Err(MemoryQueryError::BudgetExceeded(
             MemoryTruncationReason::Bytes,
@@ -650,9 +731,17 @@ fn fit_federated_context_items(
             MemoryTruncationReason::Duration,
         ));
     }
+
     if encoded_bytes > max_bytes {
-        return Err(backend_error("federation.serialization"));
+        return Err(backend_error(
+            const {
+                crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                    "federation.serialization",
+                )
+            },
+        ));
     }
+
     Ok(())
 }
 
@@ -722,9 +811,17 @@ fn stabilize_federated_context_size_with_extra(
         if truncation.returned_bytes == encoded_bytes {
             return Ok(encoded_bytes);
         }
+
         truncation.returned_bytes = encoded_bytes;
     }
-    Err(backend_error("federation.serialization"))
+
+    Err(backend_error(
+        const {
+            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                "federation.serialization",
+            )
+        },
+    ))
 }
 
 pub(super) fn snippet_span_key(snippet: &ContextSnippet) -> (u64, u64) {
@@ -744,13 +841,16 @@ pub(super) fn retain_bounded<T: Serialize>(
         if retained.len() >= max_items {
             break;
         }
+
         let bytes = serialized_len(&value)?;
         if bytes > *remaining_bytes {
             break;
         }
+
         *remaining_bytes -= bytes;
         retained.push(value);
     }
+
     let truncated = retained.len() < original_len;
     *values = retained;
     Ok(truncated)
@@ -771,10 +871,12 @@ pub(super) fn retain_snippets_bounded(
         {
             break;
         }
+
         snippet_bytes = snippet_bytes.saturating_add(text_bytes);
         *remaining_bytes -= bytes;
         retained.push(snippet);
     }
+
     let truncated = retained.len() < original_len;
     *snippets = retained;
     Ok(truncated)
@@ -789,7 +891,15 @@ where
         .map(|value| {
             serde_json::to_string(&value)
                 .map(|key| (key, value))
-                .map_err(|_| backend_error("federation.serialization"))
+                .map_err(|_| {
+                    backend_error(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "federation.serialization",
+                            )
+                        },
+                    )
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     values.sort_by(|left, right| left.0.cmp(&right.0));
@@ -865,235 +975,5 @@ pub(super) fn context_item_key(item: &FederatedContextItem) -> String {
     }
 }
 
-pub(super) fn revision_key(
-    repository: Option<&RepositoryDomainState>,
-    memory: Option<&MemoryDomainState>,
-) -> String {
-    hash(&(
-        repository.and_then(|state| state.snapshot_id.as_ref().map(|id| id.as_str())),
-        repository
-            .and_then(|state| state.task_view.as_ref())
-            .map(|task_view| task_view.task_view_id.as_str()),
-        repository
-            .and_then(|state| state.task_view.as_ref())
-            .and_then(|task_view| task_view.overlay_revision_id.as_ref())
-            .map(|id| id.as_str()),
-        memory.and_then(|state| state.revision_id.as_ref().map(|id| id.as_str())),
-    ))
-    .expect("federation revision identity is serializable")
-}
-
-#[derive(Serialize)]
-pub(super) struct SearchCursorShape<'a> {
-    project: &'a super::super::domain::ProjectRef,
-    target: &'a FederatedTarget,
-    text: String,
-    repository_kinds: Vec<String>,
-    repository_paths: Vec<String>,
-    memory_kinds: Vec<String>,
-    memory_sources: Vec<String>,
-}
-
-impl<'a> From<&'a FederatedSearchRequest> for SearchCursorShape<'a> {
-    fn from(request: &'a FederatedSearchRequest) -> Self {
-        let mut repository_kinds = request
-            .repository_kinds
-            .iter()
-            .map(|kind| kind.as_str().to_string())
-            .collect::<Vec<_>>();
-        repository_kinds.sort();
-        repository_kinds.dedup();
-        let mut repository_paths = request
-            .repository_paths
-            .iter()
-            .map(|path| path.as_str().to_string())
-            .collect::<Vec<_>>();
-        repository_paths.sort();
-        repository_paths.dedup();
-        let mut memory_kinds = request
-            .memory_kinds
-            .iter()
-            .map(|kind| kind.as_str().to_string())
-            .collect::<Vec<_>>();
-        memory_kinds.sort();
-        memory_kinds.dedup();
-        let mut memory_sources = request
-            .memory_sources
-            .iter()
-            .map(|source| format!("{source:?}"))
-            .collect::<Vec<_>>();
-        memory_sources.sort();
-        memory_sources.dedup();
-        Self {
-            project: &request.scope.project,
-            target: &request.scope.target,
-            text: request.text.as_str().trim().to_lowercase(),
-            repository_kinds,
-            repository_paths,
-            memory_kinds,
-            memory_sources,
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub(super) struct ContextCursorShape<'a> {
-    project: &'a super::super::domain::ProjectRef,
-    target: &'a FederatedTarget,
-    seeds: Vec<String>,
-    repository_policy: &'a crate::repository_graph::query::ContextPolicy,
-    memory_policy: &'a super::super::query::MemoryContextPolicy,
-    max_depth: u32,
-}
-
-impl<'a> From<&'a FederatedContextRequest> for ContextCursorShape<'a> {
-    fn from(request: &'a FederatedContextRequest) -> Self {
-        let mut seeds = request
-            .seeds
-            .iter()
-            .map(|seed| serde_json::to_string(seed).expect("federation seed is serializable"))
-            .collect::<Vec<_>>();
-        seeds.sort();
-        seeds.dedup();
-        Self {
-            project: &request.scope.project,
-            target: &request.scope.target,
-            seeds,
-            repository_policy: &request.repository_policy,
-            memory_policy: &request.memory_policy,
-            max_depth: request.scope.budget.max_depth.get(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct FederationCursorPayload {
-    version: u32,
-    operation: String,
-    fingerprint: String,
-    revision_key: String,
-    pub(super) offset: u64,
-}
-
-pub(super) fn request_fingerprint(
-    operation: &str,
-    value: &impl Serialize,
-) -> Result<String, MemoryQueryError> {
-    hash(&(operation, value))
-}
-
-pub(super) fn hash(value: &impl Serialize) -> Result<String, MemoryQueryError> {
-    let encoded =
-        serde_json::to_vec(value).map_err(|_| backend_error("federation.serialization"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"ferrus.project-memory.federation.v1\0");
-    hasher.update(encoded);
-    Ok(hex(&hasher.finalize()))
-}
-
-pub(super) fn encode_cursor(
-    operation: &str,
-    fingerprint: &str,
-    revision_key: &str,
-    offset: usize,
-) -> Result<FederationPageCursor, MemoryQueryError> {
-    let payload = FederationCursorPayload {
-        version: CURSOR_VERSION,
-        operation: operation.to_string(),
-        fingerprint: fingerprint.to_string(),
-        revision_key: revision_key.to_string(),
-        offset: u64::try_from(offset).unwrap_or(u64::MAX),
-    };
-    let bytes =
-        serde_json::to_vec(&payload).map_err(|_| backend_error("federation.serialization"))?;
-    FederationPageCursor::new(format!("cursor:{}", hex(&bytes)))
-        .map_err(|_| backend_error("federation.cursor"))
-}
-
-pub(super) fn decode_cursor(
-    cursor: Option<&FederationPageCursor>,
-    operation: &str,
-    fingerprint: &str,
-) -> Result<Option<FederationCursorPayload>, MemoryQueryError> {
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    let encoded = cursor
-        .as_str()
-        .strip_prefix("cursor:")
-        .ok_or(MemoryQueryError::StaleCursor)?;
-    if encoded.len() > 4_096 || encoded.len() % 2 != 0 {
-        return Err(MemoryQueryError::StaleCursor);
-    }
-    let bytes = unhex(encoded).ok_or(MemoryQueryError::StaleCursor)?;
-    let payload: FederationCursorPayload =
-        serde_json::from_slice(&bytes).map_err(|_| MemoryQueryError::StaleCursor)?;
-    if payload.version != CURSOR_VERSION
-        || payload.operation != operation
-        || payload.fingerprint != fingerprint
-    {
-        return Err(MemoryQueryError::StaleCursor);
-    }
-    Ok(Some(payload))
-}
-
-pub(super) fn validate_cursor_revision(
-    cursor: Option<&FederationCursorPayload>,
-    revision_key: &str,
-) -> Result<(), MemoryQueryError> {
-    if cursor.is_some_and(|cursor| cursor.revision_key != revision_key) {
-        Err(MemoryQueryError::StaleCursor)
-    } else {
-        Ok(())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn federated_page(
-    reason: Option<MemoryTruncationReason>,
-    returned_results: usize,
-    returned_bytes: u64,
-    explored_depth: u32,
-    has_more: bool,
-    operation: &str,
-    fingerprint: &str,
-    revision_key: &str,
-    offset: usize,
-) -> Result<FederatedPageInfo, MemoryQueryError> {
-    let truncation = reason.map(|reason| MemoryTruncation {
-        reason,
-        returned_results: u32::try_from(returned_results).unwrap_or(u32::MAX),
-        returned_bytes,
-        explored_depth,
-    });
-    let next_cursor = (has_more
-        && returned_results > 0
-        && matches!(
-            reason,
-            Some(MemoryTruncationReason::Results | MemoryTruncationReason::Bytes)
-        ))
-    .then(|| encode_cursor(operation, fingerprint, revision_key, offset))
-    .transpose()?;
-    Ok(FederatedPageInfo {
-        next_cursor,
-        truncation,
-    })
-}
-
-pub(super) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-pub(super) fn unhex(value: &str) -> Option<Vec<u8>> {
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
-            Some(((high << 4) | low) as u8)
-        })
-        .collect()
-}
+mod cursor;
+pub(super) use cursor::*;

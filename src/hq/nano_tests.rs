@@ -10,11 +10,13 @@ struct Fixture {
     root: PathBuf,
     data: PathBuf,
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::env::set_current_dir(&self.previous).unwrap();
     }
 }
+
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -49,6 +51,7 @@ impl Fixture {
             data,
         }
     }
+
     fn dispatches(&self) -> i64 {
         rusqlite::Connection::open(self.data.join("ferrus.db"))
             .unwrap()
@@ -65,6 +68,7 @@ struct FakeNative {
     script: PathBuf,
     reject: bool,
 }
+
 impl ExecutorAgent for FakeNative {
     fn capabilities(&self) -> crate::agents::ExecutorCapabilities {
         crate::agents::ExecutorCapabilities {
@@ -74,23 +78,29 @@ impl ExecutorAgent for FakeNative {
             event_output: true,
         }
     }
+
     fn name(&self) -> &'static str {
         "nano"
     }
+
     fn model(&self) -> Option<&str> {
         None
     }
+
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         HeadlessPromptTransport::Jsonl
     }
+
     fn validate_headless_launch(&self, _: &str, _: u32) -> Result<()> {
         anyhow::ensure!(!self.reject, "invalid native config");
         Ok(())
     }
+
     fn validate_interactive_launch(&self, _: &str, _: u32) -> Result<()> {
         anyhow::ensure!(!self.reject, "invalid native config");
         Ok(())
     }
+
     fn spawn_with_index(&self, _: AgentRunMode<'_>, _: u32) -> Result<StdCommand> {
         #[cfg(unix)]
         {
@@ -133,13 +143,16 @@ struct ReviewLaunchProbe {
     name: &'static str,
     attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
+
 impl crate::agents::SupervisorAgent for ReviewLaunchProbe {
     fn name(&self) -> &'static str {
         self.name
     }
+
     fn model(&self) -> Option<&str> {
         None
     }
+
     fn spawn_with_index(&self, _: AgentRunMode<'_>, _: u32) -> Result<StdCommand> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -178,6 +191,7 @@ async fn unavailable_nano_review_does_not_redispatch_or_change_the_task() {
             for _ in 0..3 {
                 ctx.reconcile_runtime_schedule().await.unwrap();
             }
+
             let mut diagnostics = 0;
             while let Ok(message) = received.try_recv() {
                 if matches!(message, tui::UiMessage::Error(text) if text.contains("frozen submitted view"))
@@ -185,11 +199,13 @@ async fn unavailable_nano_review_does_not_redispatch_or_change_the_task() {
                     diagnostics += 1;
                 }
             }
+
             assert_eq!(diagnostics, 1);
             assert!(ctx.headless.is_empty());
             assert_eq!(crate::project::list_tasks().await.unwrap(), tasks);
         }
     }
+
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(crate::project::list_runs(100).await.unwrap().is_empty());
     assert!(!f.root.join(".ferrus/logs").exists());
@@ -226,6 +242,7 @@ async fn unavailable_nano_review_does_not_occupy_a_ready_review_slot() {
         .await
         .unwrap();
     }
+
     let snapshot = SnapshotId::new("submitted-snapshot").unwrap();
     let view = RepositoryViewReference::materialized(
         snapshot.clone(),
@@ -721,6 +738,7 @@ async fn shared_executor_reservations_exclude_managed_and_direct_runs() {
             .unwrap();
             drop(direct);
         }
+
         drop(first);
     }
 }
@@ -782,6 +800,7 @@ $null = [Console]::In.ReadLine()
     if let Ok(handle) = direct {
         handle.terminate().await;
     }
+
     ctx.shutdown_all_headless().await;
     // A failed managed setup also releases the same shared slot.
     std::fs::write(&direct_agent.script, "echo malformed-event\n").unwrap();

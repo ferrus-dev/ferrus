@@ -60,6 +60,7 @@ fn distributed_contracts_have_no_credential_or_free_form_error_channel() {
             "security contract leaked credential material: {forbidden}"
         );
     }
+
     for forbidden in ["pub message:", "pub details:", "pub stack_trace:"] {
         assert!(
             !protocol.contains(forbidden),

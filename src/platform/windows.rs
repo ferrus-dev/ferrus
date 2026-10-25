@@ -150,6 +150,7 @@ pub(crate) fn flush_stdin_input_buffer() {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return;
         }
+
         let _ = FlushConsoleInputBuffer(handle);
     }
 }
@@ -191,6 +192,7 @@ fn open_parent_process_handle(pid: u32) -> Option<(u32, ParentProcessHandle)> {
     if handle.is_null() {
         return None;
     }
+
     Some((parent_pid, ParentProcessHandle(handle)))
 }
 
@@ -212,6 +214,7 @@ fn parent_process_id(pid: u32) -> Option<u32> {
             found = Some(entry.th32ParentProcessID);
             break;
         }
+
         has_entry = unsafe { Process32NextW(snapshot, &mut entry) != 0 };
     }
 

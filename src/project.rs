@@ -158,9 +158,11 @@ impl RepositoryViewReference {
         if overlay_revision_id.is_some() && baseline_snapshot_id.is_none() {
             anyhow::bail!("A repository overlay revision requires a baseline snapshot");
         }
+
         if status == RepositoryViewStatus::Available && baseline_snapshot_id.is_none() {
             anyhow::bail!("An available repository view requires a baseline snapshot");
         }
+
         Ok(Self {
             baseline_snapshot_id,
             overlay_revision_id,
@@ -180,6 +182,7 @@ impl RepositoryViewReference {
         if status == RepositoryViewStatus::NotBuilt {
             anyhow::bail!("A materialized repository view cannot be not_built");
         }
+
         Ok(Self {
             baseline_snapshot_id: Some(baseline_snapshot_id),
             overlay_revision_id,
@@ -196,6 +199,7 @@ impl RepositoryViewReference {
                 "A frozen repository view requires materialized baseline and view snapshots"
             );
         }
+
         self.lifecycle = TaskViewLifecycle::FrozenSubmitted;
         self.frozen_source_tree = Some(source_tree);
         Ok(self)
@@ -211,9 +215,11 @@ impl RepositoryViewReference {
         if self.overlay_revision_id.is_some() && self.baseline_snapshot_id.is_none() {
             anyhow::bail!("A repository overlay revision requires a baseline snapshot");
         }
+
         if self.status == RepositoryViewStatus::Available && self.baseline_snapshot_id.is_none() {
             anyhow::bail!("An available repository view requires a baseline snapshot");
         }
+
         match self.lifecycle {
             TaskViewLifecycle::Mutable if self.frozen_source_tree.is_some() => {
                 anyhow::bail!("A mutable repository view cannot retain a frozen source tree");
@@ -225,6 +231,7 @@ impl RepositoryViewReference {
             }
             _ => {}
         }
+
         Ok(())
     }
 }
@@ -506,12 +513,14 @@ async fn copy_legacy_artifacts(copy_task: bool) -> Result<()> {
     if copy_task {
         copy_if_nonempty(".ferrus/TASK.md", ".ferrus/tasks/t-001.md").await?;
     }
+
     tokio::fs::write(".ferrus/TASK.md", crate::templates::TASK_TEMPLATE)
         .await
         .context("Failed to restore .ferrus/TASK.md template")?;
     if !copy_task {
         return Ok(());
     }
+
     tokio::fs::create_dir_all(".ferrus/runs/t-001")
         .await
         .context("Failed to create .ferrus/runs/t-001")?;
@@ -637,6 +646,7 @@ async fn remove_legacy_state_files() -> Result<()> {
             Err(err) => return Err(err).with_context(|| format!("Failed to remove {path}")),
         }
     }
+
     Ok(())
 }
 
@@ -644,195 +654,17 @@ async fn copy_if_nonempty(from: &str, to: &str) -> Result<()> {
     if Path::new(to).exists() {
         return Ok(());
     }
+
     let Ok(contents) = tokio::fs::read_to_string(from).await else {
         return Ok(());
     };
     if contents.trim().is_empty() {
         return Ok(());
     }
+
     tokio::fs::write(to, contents)
         .await
         .with_context(|| format!("Failed to write {to}"))
-}
-
-#[derive(Debug, Serialize)]
-struct SpecArchiveManifest {
-    spec_path: String,
-    archived_at: String,
-    tasks: Vec<SpecArchiveTaskManifest>,
-}
-
-#[derive(Debug, Serialize)]
-struct SpecArchiveTaskManifest {
-    id: String,
-    status: String,
-    milestone_id: Option<String>,
-    original_task_path: String,
-    archived_task_path: String,
-    original_run_dir: String,
-    archived_run_dir: String,
-}
-
-impl SpecArchiveManifest {
-    fn new(spec_path: &str, archived_at: &str, tasks: &[TaskRecord]) -> Self {
-        let tasks = tasks
-            .iter()
-            .map(|task| SpecArchiveTaskManifest {
-                id: task.id.clone(),
-                status: task.status.clone(),
-                milestone_id: task.milestone_id.clone(),
-                original_task_path: task.path.clone(),
-                archived_task_path: format!("tasks/{}.md", task.id),
-                original_run_dir: run_dir_for_task(&task.id),
-                archived_run_dir: format!("runs/{}", task.id),
-            })
-            .collect();
-        Self {
-            spec_path: spec_path.to_string(),
-            archived_at: archived_at.to_string(),
-            tasks,
-        }
-    }
-}
-
-async fn unique_spec_archive_dir(
-    data_dir: &Path,
-    spec_path: &str,
-    closed_at: &str,
-) -> Result<PathBuf> {
-    let slug = spec_archive_slug(spec_path);
-    let safe_time = closed_at.replace([':', '-'], "").replace('T', "-");
-    let base = data_dir
-        .join("archive")
-        .join("specs")
-        .join(format!("{slug}-{safe_time}"));
-    let mut candidate = base.clone();
-    let mut suffix = 2u32;
-    while tokio::fs::metadata(&candidate).await.is_ok() {
-        candidate = data_dir
-            .join("archive")
-            .join("specs")
-            .join(format!("{slug}-{safe_time}-{suffix}"));
-        suffix += 1;
-    }
-    Ok(candidate)
-}
-
-fn spec_archive_slug(spec_path: &str) -> String {
-    let stem = Path::new(spec_path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("spec");
-    let mut slug = String::new();
-    let mut previous_dash = false;
-    for ch in stem.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            previous_dash = false;
-        } else if !previous_dash && !slug.is_empty() {
-            slug.push('-');
-            previous_dash = true;
-        }
-    }
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "spec".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-fn stage_spec_archive_files(
-    archive_dir: &Path,
-    spec_path: &str,
-    tasks: &[TaskRecord],
-    manifest: &SpecArchiveManifest,
-) -> Result<(usize, usize)> {
-    let tasks_dir = archive_dir.join("tasks");
-    let runs_dir = archive_dir.join("runs");
-    std::fs::create_dir_all(&tasks_dir)
-        .with_context(|| format!("Failed to create {}", tasks_dir.display()))?;
-    std::fs::create_dir_all(&runs_dir)
-        .with_context(|| format!("Failed to create {}", runs_dir.display()))?;
-
-    std::fs::copy(spec_path, archive_dir.join("spec.md")).with_context(|| {
-        format!(
-            "Failed to copy spec {} to {}",
-            spec_path,
-            archive_dir.join("spec.md").display()
-        )
-    })?;
-
-    let manifest_text =
-        toml::to_string_pretty(manifest).context("Failed to render archive manifest")?;
-    std::fs::write(archive_dir.join("manifest.toml"), manifest_text).with_context(|| {
-        format!(
-            "Failed to write archive manifest {}",
-            archive_dir.join("manifest.toml").display()
-        )
-    })?;
-
-    let mut archived_tasks = 0usize;
-    let mut archived_runs = 0usize;
-    for task in tasks {
-        let task_path = Path::new(&task.path);
-        if registry::checkout_task_artifact_path(task_path) && task_path.exists() {
-            copy_path_recursive(task_path, &tasks_dir.join(format!("{}.md", task.id)))?;
-            archived_tasks += 1;
-        }
-
-        let run_dir = PathBuf::from(run_dir_for_task(&task.id));
-        if registry::checkout_task_artifact_path(task_path) && run_dir.exists() {
-            copy_path_recursive(&run_dir, &runs_dir.join(&task.id))?;
-            archived_runs += 1;
-        }
-    }
-    Ok((archived_tasks, archived_runs))
-}
-
-fn cleanup_checkout_archive_artifacts(tasks: &[TaskRecord]) -> Result<()> {
-    for task in tasks {
-        let task_path = Path::new(&task.path);
-        if registry::checkout_task_artifact_path(task_path) && task_path.exists() {
-            remove_path_recursive(task_path)?;
-        }
-
-        let run_dir = PathBuf::from(run_dir_for_task(&task.id));
-        if registry::checkout_task_artifact_path(task_path) && run_dir.exists() {
-            remove_path_recursive(&run_dir)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_path_recursive(from: &Path, to: &Path) -> Result<()> {
-    let metadata =
-        std::fs::metadata(from).with_context(|| format!("Failed to inspect {}", from.display()))?;
-    if metadata.is_dir() {
-        std::fs::create_dir_all(to)
-            .with_context(|| format!("Failed to create {}", to.display()))?;
-        for entry in
-            std::fs::read_dir(from).with_context(|| format!("Failed to read {}", from.display()))?
-        {
-            let entry = entry?;
-            copy_path_recursive(&entry.path(), &to.join(entry.file_name()))?;
-        }
-    } else {
-        std::fs::copy(from, to)
-            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
-    }
-    Ok(())
-}
-
-fn remove_path_recursive(path: &Path) -> Result<()> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("Failed to inspect {}", path.display()))?;
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
-    .with_context(|| format!("Failed to remove {}", path.display()))
 }
 
 async fn read_local_project_ref() -> Result<LocalProjectRef> {
@@ -848,9 +680,11 @@ fn project_path(path: impl AsRef<Path>) -> PathBuf {
     if path.is_absolute() || !starts_with_ferrus_dir(path) {
         return path.to_path_buf();
     }
+
     if path == Path::new(LOCAL_PROJECT_TOML) {
         return path.to_path_buf();
     }
+
     std::env::var(ENV_PROJECT_ROOT)
         .ok()
         .map(|value| value.trim().to_string())
@@ -985,6 +819,7 @@ async fn read_git_metadata() -> Option<GitMetadata> {
     if git_output(["rev-parse", "--is-inside-work-tree"]).await? != "true" {
         return None;
     }
+
     Some(GitMetadata {
         origin_repo: git_output(["config", "--get", "remote.origin.url"]).await,
         default_branch: read_default_branch().await,
@@ -1001,6 +836,7 @@ async fn read_default_branch() -> Option<String> {
             .to_string()
             .into();
     }
+
     git_output(["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
 
@@ -1009,6 +845,7 @@ async fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
+
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
 }
@@ -1050,6 +887,7 @@ pub async fn live_active_run_task_ids_for_role(
                 task_ids.insert(task_id);
             }
         }
+
         Ok(task_ids)
     })
     .await?
@@ -1072,6 +910,7 @@ pub async fn live_active_run_agents() -> Result<std::collections::HashSet<String
                 agents.insert(agent);
             }
         }
+
         Ok(agents)
     })
     .await?
@@ -1093,11 +932,15 @@ fn live_active_run_task_ids_from_database(
             task_ids.insert(task_id);
         }
     }
+
     Ok(task_ids)
 }
+
+pub(crate) use graph::repository_view_reference_from_row;
+
+mod archive;
+use archive::*;
 
 #[cfg(test)]
 #[path = "project_tests.rs"]
 mod tests;
-
-pub(crate) use graph::repository_view_reference_from_row;

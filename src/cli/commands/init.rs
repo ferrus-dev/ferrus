@@ -595,6 +595,7 @@ async fn create_ferrus_toml(agents_path: &str) -> Result<()> {
             .context("Failed to write ferrus.toml")?;
         println!("Created ferrus.toml");
     }
+
     Ok(())
 }
 
@@ -657,6 +658,7 @@ async fn create_spec_dir() -> Result<()> {
     if !existed {
         println!("Created docs/specs/");
     }
+
     Ok(())
 }
 
@@ -702,6 +704,7 @@ async fn create_skill_files(agents_path: &str) -> Result<()> {
             println!("Created {}", role_path.display());
         }
     }
+
     Ok(())
 }
 
@@ -723,6 +726,7 @@ async fn update_gitignore() -> Result<()> {
             if !contents.is_empty() && !contents.ends_with('\n') {
                 contents.push('\n');
             }
+
             contents.push_str(entry);
             contents.push('\n');
             added_entries.push(entry);
@@ -746,5 +750,6 @@ async fn update_gitignore() -> Result<()> {
             .context("Failed to create .gitignore")?;
         println!("Created .gitignore");
     }
+
     Ok(())
 }

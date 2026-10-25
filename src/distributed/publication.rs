@@ -142,34 +142,41 @@ pub trait RemotePublicationStore {
         batches: &[FactBatch],
         now: DateTime<Utc>,
     ) -> Result<GraphPublicationOutcome, Self::Error>;
+
     fn publish_memory(
         &mut self,
         request: &PublishMemoryRequest,
         batches: &[FactBatch],
         now: DateTime<Utc>,
     ) -> Result<MemoryPublicationOutcome, Self::Error>;
+
     fn graph_snapshot(
         &self,
         snapshot: &RemoteGraphSnapshotRef,
     ) -> Result<Option<StoredRemoteGraphSnapshot>, Self::Error>;
+
     fn memory_revision(
         &self,
         revision: &RemoteMemoryRevisionRef,
     ) -> Result<Option<StoredRemoteMemoryRevision>, Self::Error>;
+
     fn memory_repository_links(
         &self,
         view: &FederatedViewRef,
     ) -> Result<Option<StoredRemoteMemoryRepositoryLinks>, Self::Error>;
+
     fn graph_view(
         &self,
         repository: &RemoteRepositoryRef,
         view_name: &PublishedViewName,
     ) -> Result<Option<PublishedRemoteGraphView>, Self::Error>;
+
     fn memory_view(
         &self,
         project: &RemoteProjectRef,
         view_name: &MemoryViewName,
     ) -> Result<Option<PublishedRemoteMemoryView>, Self::Error>;
+
     fn federated_view(
         &self,
         repository: &RemoteRepositoryRef,
