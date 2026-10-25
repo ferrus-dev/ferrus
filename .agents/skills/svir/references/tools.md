@@ -165,7 +165,9 @@ and the user's message. Four things keep the loop correct:
 * **Every call gets a result.** A model can ask for several tools at once;
   `call_all` answers them all, in order.
 * **Test `calls`, not `finish`.** An answer cut off by the output limit is
-  `FinishReason::Length` with no calls, and ends the loop as an answer.
+  `FinishReason::Length` with no calls, and ends the loop as an answer. The
+  calls it began are in `cut_calls`, never to run (svir 0.1.7; on 0.1.6 they
+  are in `calls`, so test the finish too).
 * **The bound is yours.** So is what happens at the bound.
 
 `call_all` runs the handlers one after another. For handlers that are slow

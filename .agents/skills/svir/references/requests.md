@@ -151,16 +151,23 @@ fn attach(path: &str, escaped: u64) -> TextFile {
 
 ## Reasoning effort
 
-`Effort` is `Off`, `Low`, `Medium`, `High`, or `XHigh`. Unset sends nothing
-and leaves the choice to the server. `Off` asks for no reasoning; whether
-the model obeys is the model's business.
+`Effort` is `Off`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, or `Max`
+(`Minimal` and `Max`: svir 0.1.7). `Max` is as much as the model offers,
+and `XHigh` the level below it. Unset sends nothing and leaves the choice to
+the server. `Off` asks for no reasoning; whether the model obeys is the
+model's business. A level is sent as set, by its Chat Completions name, and
+never moved to one the server takes: which levels a model takes is the
+model's.
 
 A server that rejects the field is handled by the client: the request is sent
 again without it, once, and the server is remembered. No code is needed for
 that. vLLM hands the effort to the model's chat template, which may name only
 some values (Qwen3.8's rejects `High` with a 400); the client then stops
 sending the optional fields to that server, usage included. Use an effort the
-template names.
+template names. Code that records the effort it asked with turns the retry
+off with `ClientBuilder::lean_retry(false)` (svir 0.1.7): the rejection is
+then `Unsupported`, and `server_message()` names the levels the template
+takes. See `client.md`.
 
 Reasoning comes back as `Event::Reasoning` and in `Completion::reasoning`; see
 `streaming.md`.

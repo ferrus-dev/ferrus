@@ -50,7 +50,8 @@ After `Completed`, or after an `Err`, `next()` returns `None`. `Event` is
 | `finish` | `FinishReason` | `Stop`, `ToolCalls`, `Length`, `ContentFilter`, or `Refusal` |
 | `text` | `String` | The answer, exactly as sent |
 | `reasoning` | `Vec<Reasoning>` | Reasoning, one entry per source |
-| `calls` | `Vec<ToolCall>` | Complete tool calls, in order |
+| `calls` | `Vec<ToolCall>` | Complete tool calls, in order. Empty with a `Length` finish |
+| `cut_calls` | `Vec<ToolCallDelta>` | With a `Length` finish, the calls the output limit cut off, as far as they arrived (svir 0.1.7). Never to run |
 | `usage` | `Option<Usage>` | Token counts, when the server reported them |
 | `timing` | `Option<Timing>` | When the first and last visible tokens arrived |
 
@@ -65,7 +66,8 @@ fn describe(done: &Completion) -> &'static str {
         // Run the tools in `done.calls` and ask again; see tools.md.
         FinishReason::ToolCalls => "the model is waiting for tool results",
         // The output limit cut it off. With a reasoning model the text can be
-        // empty: the reasoning used the budget. Raise `max_tokens`.
+        // empty: the reasoning used the budget. Raise `max_tokens`. Calls it
+        // began are in `done.cut_calls`, never to run.
         FinishReason::Length => "the answer was cut off",
         // The server's content filter stopped it, or flagged it after it was
         // streamed. `done.text` holds what was sent, which may be what was
@@ -93,6 +95,15 @@ and makes the finish `Refusal`, so a chat shows it with no code of its own
 and code that asked for JSON learns the text is not JSON. A refusal the
 content filter stopped is `ContentFilter`. Do not look for a `refusal` field
 on the completion: there is none.
+
+A `Length` finish can cut tool calls short: their arguments, their name, even
+their ID. svir 0.1.7 leaves `calls` empty then, and puts each call the
+answer began in `cut_calls`: a `ToolCallDelta` with its index, its ID and
+name only if they arrived, and its arguments as received. Show or record
+them; do not run them, and do not build a `ToolCall` from one.
+`request.assistant(done)` leaves them out, so the next request can ask the
+model to go on. On a lock file on 0.1.6 such calls are in `calls`: check the
+finish before running them.
 
 `done.parse::<T>()` reads an answer asked for as JSON into a type, and only
 when `finish` is `Stop`; see `requests.md`.

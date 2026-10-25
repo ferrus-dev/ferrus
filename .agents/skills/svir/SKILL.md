@@ -3,7 +3,7 @@ name: svir
 description: Talk to LLMs from Rust with the svir crate -- whole and streamed answers from OpenAI-compatible servers (LM Studio, llama.cpp, vLLM, mlx-lm, mlx-vlm, hosted endpoints), tool calling and the loop that feeds results back, a tool call required or forbidden, structured output (JSON to a schema, parsed into a type), image and file attachments, reasoning, typed errors, retries and timeouts as layers, relaying a model's event stream through a proxy, and the Chat Completions codec on its own. Use whenever Rust code depends on `svir`, whenever the task is to call a model, stream its answer, give it tools, get JSON out of it or relay its stream from Rust through an OpenAI-compatible endpoint, and when reviewing or debugging such code.
 license: MIT OR Apache-2.0
 metadata:
-  svir-version: "0.1.6"
+  svir-version: "0.1.7"
   msrv: "1.85"
   edition: "2024"
   wire-api: "OpenAI-compatible Chat Completions, streaming"
@@ -48,6 +48,7 @@ In an existing project, read `Cargo.toml` first:
 | `svir = "=0.1.3"`, or a lock file on 0.1.3 | No `ToolResult::error` and no `is_error`: a failed call is a plain `ToolResult` whose content starts with `error: `, which is also what `Tools` writes. No `ClientBuilder::header`, no `TextFile::escaped_len`. Later 0.1 releases are drop-in, except that a `Tools` failure no longer has `error: ` in its `content`: test `result.is_error` |
 | `svir = "=0.1.4"`, or a lock file on 0.1.4 | No `tool_choice`, no `response_format`, no `Schema`, no `Completion::parse`, no `FinishReason::Refusal`: a refusal fails strict decoding with `Unsupported`, and lenient decoding drops it and completes with `Stop` and no text. 0.1.5 is drop-in, except that a refusal now completes with its text and the finish `Refusal` |
 | `svir = "=0.1.5"`, or a lock file on 0.1.5 | Reasoning that mlx-vlm sends under both `reasoning_content` and `reasoning` arrives twice: two `Reasoning` events for every piece, and two entries in `Completion::reasoning`. A call of a named tool that vLLM finishes with `stop` fails with `Protocol`. An error in FastAPI's form, `{"detail": ...}` (mlx-vlm), has no `server_message()`, and mlx-vlm's context overflows are `Unsupported`. 0.1.6 is drop-in |
+| `svir = "=0.1.6"`, or a lock file on 0.1.6 | No `Effort::Minimal` or `Effort::Max`, no `Completion::cut_calls`, no `ClientBuilder::lean_retry`. With a `Length` finish, calls the output limit may have cut short are in `calls`, where they look executable: check the finish before running them. A call with no ID or no name in such an answer fails with `Protocol`. 0.1.7 is drop-in, except that `calls` is empty with a `Length` finish: the calls are in `cut_calls` |
 | `features = ["schemars"]` | `Tools::add`, which derives a tool's input schema from its argument type, and `Schema::of`, which derives an answer's schema from a type |
 | `features = ["tracing"]` | The `Trace` layer |
 | `default-features = false` | Types and the codec only: no `Client`, no `EventStream`, no layers, no attachments read from disk. Read `references/codec.md` |
@@ -197,7 +198,9 @@ compile, or compiles and misbehaves.
 3. **A tool call is executable only from `Completion::calls`.**
    `Event::ToolCallDelta` is a piece of a call for display. Its arguments are
    incomplete JSON until the stream ends, and a stream cut short never
-   produces a completion at all.
+   produces a completion at all. With a `Length` finish `calls` is empty:
+   the output limit may have cut any call short, so the calls it began are
+   in `Completion::cut_calls`, for display and records, never to run.
 
 4. **The builder consumes the request.** `request.user(..)`, `.assistant(..)`,
    and `.tool_results(..)` take `self` and return it, so a conversation is

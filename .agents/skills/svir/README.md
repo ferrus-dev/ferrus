@@ -4,7 +4,7 @@ A model-neutral [Agent Skill](https://agentskills.io/specification) for
 talking to LLMs from Rust with the
 [svir](https://github.com/RomanEmreis/svir) crate.
 
-Covers svir **0.1.6** (MSRV 1.85, edition 2024): OpenAI-compatible Chat
+Covers svir **0.1.7** (MSRV 1.85, edition 2024): OpenAI-compatible Chat
 Completions, streamed.
 
 ```
@@ -61,7 +61,7 @@ For Rust code that talks to LLMs with the `svir` crate, read
 ## Verifying
 
 Every Rust snippet in this skill is a complete set of items and compiles
-against svir 0.1.6 with the `schemars` and `tracing` features on, so the
+against svir 0.1.7 with the `schemars` and `tracing` features on, so the
 code an agent copies out of it builds. The
 [docs repository](https://github.com/RomanEmreis/svir-docs)'s CI compiles
 every one of them against the published crate. A block that needs a feature
