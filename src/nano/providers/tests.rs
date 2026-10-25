@@ -1,6 +1,6 @@
 //! Offline wire fixtures and loopback HTTP tests; live inference is explicitly ignored.
 
-use super::{openai::OpenAi, sse::Decoder};
+use super::openai::{self, OpenAi};
 use crate::nano::{
     config::Config,
     engine::Engine,
@@ -166,13 +166,28 @@ fn reasoning_effort_is_explicit_and_bound_to_effective_settings() {
 }
 
 fn decode(wire: &str, stride: usize) -> Result<Vec<ProviderEvent>, ProviderError> {
-    let mut decoder = Decoder::new(config("http://127.0.0.1:1234/v1").validate().unwrap().1);
+    decode_with_settings(
+        wire,
+        stride,
+        config("http://127.0.0.1:1234/v1").validate().unwrap().1,
+    )
+}
+
+fn decode_with_settings(
+    wire: &str,
+    stride: usize,
+    settings: ProviderSettings,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
+    let mut decoder = svir::openai::chat::Decoder::strict()
+        .think(svir::Think::Keep)
+        .limits(openai::limits(&settings));
     let mut events = Vec::new();
 
     for bytes in wire.as_bytes().chunks(stride) {
-        decoder.push(bytes)?;
-        while let Some(event) = decoder.next() {
-            events.push(event);
+        for event in decoder.push(bytes) {
+            if let Some(event) = openai::event_to_provider(event.map_err(openai::map_error)?)? {
+                events.push(event);
+            }
         }
     }
 
@@ -450,6 +465,185 @@ async fn rejected_requests_keep_http_status_without_echoing_server_details() {
     }
 }
 
+#[tokio::test]
+async fn explicit_reasoning_rejection_never_falls_back_or_retries() {
+    for status in [400, 422] {
+        let (url, server) = server(vec![Reply::failure(status, "unsupported")]).await;
+        let mut cfg = config(&url);
+        cfg.reasoning_effort = Some(ReasoningEffort::Max);
+        let directory = TempDir::new().unwrap();
+        let mut engine = engine(OpenAi::new(cfg).unwrap(), &directory);
+        let end = engine
+            .run(
+                SessionCommand::Start {
+                    input: "Use lookup".into(),
+                },
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.reason, EndReason::ProviderProtocol);
+        assert_eq!(end.budget.model_turns, 1);
+        assert_eq!(end.budget.retries, 0);
+        assert_eq!(engine.tools.calls, 0);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["reasoning_effort"], "max");
+        assert_eq!(requests[0].1["stream_options"]["include_usage"], true);
+    }
+}
+
+#[tokio::test]
+async fn normalized_temperature_matches_wire_journal_and_settings_digest() {
+    let (url, server) = server(vec![Reply::stream(FINAL)]).await;
+    let mut cfg = config(&url);
+    cfg.temperature = Some(0.123456789123);
+    let legacy = cfg.validate().unwrap().1;
+    let provider = OpenAi::new(cfg).unwrap();
+    let effective = provider.settings().unwrap();
+    assert_eq!(effective.temperature, Some(0.12345679));
+    let mut old_record = serde_json::to_value(&legacy).unwrap();
+    old_record["temperature"] = json!(0.123456789123);
+    assert_eq!(
+        serde_json::from_value::<ProviderSettings>(old_record).unwrap(),
+        legacy
+    );
+    let evidence = LaunchEvidence {
+        baseline_tree: "fixture".into(),
+        native_context_enabled: true,
+        working_set_enabled: true,
+        graph_peer_mode: Some(GraphPeerMode::Absent),
+        graph_peer_id: None,
+        mcp_peer_count: Some(0),
+        mcp_tool_count: Some(0),
+        graph_peer_timeout_ms: None,
+        settings_sha256: None,
+    };
+    let directory = TempDir::new().unwrap();
+    let mut engine = engine(provider, &directory);
+    engine.set_launch_evidence(evidence.clone());
+    let end = engine
+        .run(
+            SessionCommand::Start {
+                input: "Answer".into(),
+            },
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end.reason, EndReason::ModelFinished);
+    let SessionEvent::Started {
+        provider: Some(recorded),
+        launch_evidence: Some(recorded_evidence),
+        limits: recorded_limits,
+        ..
+    } = &engine.host.records[0].event
+    else {
+        panic!("Missing provider evidence");
+    };
+    assert_eq!(**recorded, effective);
+    assert_eq!(
+        recorded_evidence.settings_sha256.as_ref().unwrap(),
+        &effective_settings_sha256(&effective, recorded_limits, &evidence).unwrap()
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests[0].1["temperature"],
+        json!(recorded.temperature.unwrap())
+    );
+    let replay = crate::nano::replay::Replay::from_records(&engine.host.records).unwrap();
+    assert_eq!(replay.budget, end.budget);
+}
+
+#[tokio::test]
+async fn unexpected_content_type_keeps_typed_diagnostic_without_body_or_headers() {
+    for headers in [
+        "",
+        "Content-Type: application/json; secret-header-detail\r\n",
+    ] {
+        let mut reply = Reply::stream("secret-response-body");
+        reply.headers = headers;
+        reply.stall = true;
+        let (url, server) = server(vec![reply]).await;
+        let mut provider = OpenAi::new(config(&url)).unwrap();
+        let error = provider.start(request()).await.unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.diagnostic,
+            Some(ProviderDiagnostic::UnexpectedContentType)
+        );
+        assert!(!format!("{error:?}").contains("secret-"));
+        assert!(provider.next_event().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_http_error_preserves_response_limit_and_status() {
+    let mut reply = Reply::failure(400, "unsupported");
+    reply.body = "secret-body".repeat(100);
+    let (url, server) = server(vec![reply]).await;
+    let mut cfg = config(&url);
+    cfg.event_bytes = 256;
+    let mut provider = OpenAi::new(cfg).unwrap();
+    let error = provider.start(request()).await.unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::ResponseLimit);
+    assert_eq!(
+        error.diagnostic,
+        Some(ProviderDiagnostic::Http { status: 400 })
+    );
+    assert!(!error.retryable);
+    assert!(!format!("{error:?}").contains("secret-body"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn context_error_after_a_long_message_keeps_its_typed_limit() {
+    let mut reply = Reply::failure(400, "context_length_exceeded");
+    reply.body = format!(
+        "{{\"error\":{{\"message\":{},\"code\":\"context_length_exceeded\"}}}}",
+        serde_json::to_string(&"secret-detail".repeat(7000)).unwrap()
+    );
+    let (url, server) = server(vec![reply]).await;
+    let mut provider = OpenAi::new(config(&url)).unwrap();
+    let error = provider.start(request()).await.unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::ContextOverflow);
+    assert_eq!(
+        error.diagnostic,
+        Some(ProviderDiagnostic::Http { status: 400 })
+    );
+    assert_eq!(error.retry_after_ms, 1000);
+    assert!(!error.retryable);
+    assert!(!format!("{error:?}").contains("secret-detail"));
+    server.await.unwrap();
+}
+
+#[test]
+fn tool_outcome_envelopes_and_inline_reasoning_remain_unchanged() {
+    let provider = OpenAi::new(config("http://127.0.0.1:1234/v1")).unwrap();
+    for outcome in [
+        ToolOutcome::Success(json!(42)),
+        ToolOutcome::Failed(ToolError::Denied),
+        ToolOutcome::Unknown(ToolError::Interrupted),
+    ] {
+        let mut req = request();
+        req.messages.push(Message::Tool {
+            provider_call_id: "opaque-1".into(),
+            outcome: outcome.clone(),
+        });
+        let body: Value = serde_json::from_slice(&provider.body(req).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content, serde_json::to_value(outcome).unwrap());
+        assert_eq!(body["messages"][1]["tool_call_id"], "opaque-1");
+    }
+    let wire = FINAL.replace("42", "<think>opaque</think>42");
+    assert!(
+        matches!(decode(&wire, 1).unwrap().last(), Some(ProviderEvent::Completed { response, .. }) if response.text == "<think>opaque</think>42" && response.continuation.is_none())
+    );
+}
+
 #[test]
 fn advertised_tools_are_bounded_by_context_not_generated_call_count() {
     for max_tool_calls in [1, 64] {
@@ -525,21 +719,24 @@ fn configuration_and_transport_bounds_fail_explicitly() {
     );
     let mut settings = config("http://127.0.0.1:1234/v1").validate().unwrap().1;
     settings.max_tool_calls = 1;
-    let mut decoder = Decoder::new(settings.clone());
     assert_eq!(
-        decoder.push(TOOLS.as_bytes()).unwrap_err().kind,
+        decode_with_settings(TOOLS, 8192, settings.clone())
+            .unwrap_err()
+            .kind,
         ProviderErrorKind::ResponseLimit
     );
     settings.event_bytes = 256;
-    let mut decoder = Decoder::new(settings.clone());
     assert_eq!(
-        decoder.push(&vec![b'x'; 257]).unwrap_err().kind,
+        decode_with_settings(&"x".repeat(257), 8192, settings.clone())
+            .unwrap_err()
+            .kind,
         ProviderErrorKind::ResponseLimit
     );
     settings.wire_bytes = 1024;
-    let mut decoder = Decoder::new(settings);
     assert_eq!(
-        decoder.push(&vec![b'\n'; 1025]).unwrap_err().kind,
+        decode_with_settings(&"\n".repeat(1025), 8192, settings)
+            .unwrap_err()
+            .kind,
         ProviderErrorKind::ResponseLimit
     );
 }

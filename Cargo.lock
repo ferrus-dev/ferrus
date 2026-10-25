@@ -712,6 +712,7 @@ name = "ferrus"
 version = "0.6.0-alpha.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "caseless",
  "chrono",
  "clap",
@@ -732,6 +733,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
+ "svir",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2538,6 +2540,24 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "svir"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e44d73f61d0fbd7bbf9b7539d7f6c87a81f8b889d1a6129b1944d3cf547ef375"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures-core",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "syn"
