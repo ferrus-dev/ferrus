@@ -5,42 +5,25 @@
 //! making local Ferrus depend on a network, queue, object store, or cloud SDK.
 
 pub mod api;
-
 pub mod api_sqlite;
-
-pub mod coordinator;
-
-pub mod coordinator_sqlite;
-
-pub mod fact_store;
-
-pub mod fact_store_sqlite;
-
-pub mod identity;
-
-pub mod maintenance;
-
-pub mod maintenance_sqlite;
-
-pub mod object_store;
-
-pub mod protocol;
-
-pub mod publication;
-
-pub mod publication_sqlite;
-
-pub mod security;
-
-pub mod source;
-
-pub mod worker;
-
 #[cfg(test)]
 mod contracts;
-
+pub mod coordinator;
+pub mod coordinator_sqlite;
+pub mod fact_store;
+pub mod fact_store_sqlite;
+pub mod identity;
+pub mod maintenance;
+pub mod maintenance_sqlite;
 #[cfg(test)]
 mod maintenance_sqlite_tests;
+pub mod object_store;
+pub mod protocol;
+pub mod publication;
+pub mod publication_sqlite;
+pub mod security;
+pub mod source;
+pub mod worker;
 
 /// Version of distributed control-plane request and response envelopes.
 pub const DISTRIBUTED_CONTROL_PROTOCOL_VERSION: u32 = 3;

@@ -839,7 +839,6 @@ mod approval_tests {
         assert_eq!(ui.text, "Unsent user draft");
     }
 }
-
 #[cfg(test)]
 #[path = "frontend_tests.rs"]
 mod tests;

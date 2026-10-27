@@ -594,7 +594,6 @@ fn assert_deletion_quiesces_writers(
 
 #[path = "maintenance_sqlite_tests/authorization.rs"]
 mod authorization_tests;
-
 #[path = "maintenance_sqlite_tests/memory.rs"]
 mod memory_tests;
 

@@ -879,7 +879,6 @@ mod support;
 use support::*;
 
 mod service;
-
 #[cfg(test)]
 #[path = "query_sqlite_tests.rs"]
 mod tests;

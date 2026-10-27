@@ -12,7 +12,6 @@ use crate::platform;
 
 mod prompts;
 mod resources;
-
 pub(crate) mod tools;
 
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]

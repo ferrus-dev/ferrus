@@ -347,14 +347,12 @@ fn memory_batch_for_project(
     .unwrap()
 }
 
-#[path = "publication_sqlite_tests/review.rs"]
-mod review_tests;
-
-#[path = "publication_sqlite_tests/publication.rs"]
-mod publication_tests;
-
 #[path = "publication_sqlite_tests/cancellation.rs"]
 mod cancellation_tests;
+#[path = "publication_sqlite_tests/publication.rs"]
+mod publication_tests;
+#[path = "publication_sqlite_tests/review.rs"]
+mod review_tests;
 
 #[test]
 fn encrypted_fact_tampering_fails_closed() {

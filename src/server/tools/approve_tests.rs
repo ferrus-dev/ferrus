@@ -141,17 +141,14 @@ fn git_output_bytes<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> V
     output.stdout
 }
 
-#[path = "approve_tests/review_workspaces.rs"]
-mod review_workspaces_tests;
-
-#[path = "approve_tests/review_behavior.rs"]
-mod review_behavior_tests;
-
-#[path = "approve_tests/review_checks.rs"]
-mod review_checks_tests;
-
 #[path = "approve_tests/conflicts.rs"]
 mod conflicts_tests;
+#[path = "approve_tests/review_behavior.rs"]
+mod review_behavior_tests;
+#[path = "approve_tests/review_checks.rs"]
+mod review_checks_tests;
+#[path = "approve_tests/review_workspaces.rs"]
+mod review_workspaces_tests;
 
 #[tokio::test]
 async fn approve_uses_database_context_when_state_json_is_absent() {

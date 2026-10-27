@@ -385,33 +385,24 @@ mod reviewer_profiles {
 
     include!("review/lifecycle_tests.rs");
 }
-
-#[path = "lifecycle_tests/recovery.rs"]
-mod recovery_tests;
-
-#[path = "lifecycle_tests/submission.rs"]
-mod submission_tests;
-
-#[path = "lifecycle_tests/ownership.rs"]
-mod ownership_tests;
-
 #[path = "lifecycle_tests/behavior.rs"]
 mod behavior_tests;
-
-#[path = "lifecycle_tests/human_waits.rs"]
-mod human_waits_tests;
-
-#[path = "lifecycle_tests/review.rs"]
-mod review_tests;
-
 #[path = "lifecycle_tests/cancellation.rs"]
 mod cancellation_tests;
-
 #[path = "lifecycle_tests/checks.rs"]
 mod checks_tests;
-
 #[path = "lifecycle_tests/compaction.rs"]
 mod compaction_tests;
+#[path = "lifecycle_tests/human_waits.rs"]
+mod human_waits_tests;
+#[path = "lifecycle_tests/ownership.rs"]
+mod ownership_tests;
+#[path = "lifecycle_tests/recovery.rs"]
+mod recovery_tests;
+#[path = "lifecycle_tests/review.rs"]
+mod review_tests;
+#[path = "lifecycle_tests/submission.rs"]
+mod submission_tests;
 
 #[tokio::test]
 async fn managed_consultation_relaunch_rejects_invalid_resume_and_foreign_live_lease() {

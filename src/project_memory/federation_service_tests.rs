@@ -232,15 +232,12 @@ fn service<'a>(
     )
 }
 
-#[path = "federation_service_tests/pagination.rs"]
-mod pagination_tests;
-
 #[path = "federation_service_tests/authorization.rs"]
 mod authorization_tests;
-
 #[path = "federation_service_tests/memory.rs"]
 mod memory_tests;
-
+#[path = "federation_service_tests/pagination.rs"]
+mod pagination_tests;
 #[path = "federation_service_tests/review.rs"]
 mod review_tests;
 

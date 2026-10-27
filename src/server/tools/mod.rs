@@ -1,61 +1,34 @@
 //! MCP tool modules and shared task-context and lease-ownership guards.
 
 pub mod answer;
-
 pub mod approve;
-
 pub mod archive_spec;
-
 pub mod ask_human;
-
 pub mod check;
-
 pub mod check_gate;
-
 pub mod consult;
-
 pub mod create_spec;
-
 pub mod create_task;
-
 pub mod enqueue_task;
-
 pub mod heartbeat;
-
 pub mod project_context;
-
 pub mod project_context_search;
 mod project_context_telemetry;
-
 pub mod project_memory_status;
-
 pub mod reject;
-
 pub mod repository_context;
-
 pub mod repository_graph_status;
 mod repository_query_telemetry;
-
 pub mod repository_search;
-
 pub mod reset;
-
 pub mod respond_consult;
-
 pub mod review_pending;
-
 pub mod status;
-
 pub mod submit;
-
 pub mod wait_for_answer;
-
 pub mod wait_for_consult;
-
 pub mod wait_for_consultation;
-
 pub mod wait_for_review;
-
 pub mod wait_for_task;
 
 use neva::prelude::*;

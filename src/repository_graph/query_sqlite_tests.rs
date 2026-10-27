@@ -128,29 +128,22 @@ fn fixture_symbol(query: &SqliteGraphQuery<'_>, config: &RepositoryGraphConfig) 
         .unwrap()
 }
 
-#[path = "query_sqlite_tests/context.rs"]
-mod context_tests;
-
-#[path = "query_sqlite_tests/pagination.rs"]
-mod pagination_tests;
-
 #[path = "query_sqlite_tests/cancellation.rs"]
 mod cancellation_tests;
-
-#[path = "query_sqlite_tests/limits.rs"]
-mod limits_tests;
-
-#[path = "query_sqlite_tests/snapshots.rs"]
-mod snapshots_tests;
-
 #[path = "query_sqlite_tests/checks.rs"]
 mod checks_tests;
-
-#[path = "query_sqlite_tests/files.rs"]
-mod files_tests;
-
+#[path = "query_sqlite_tests/context.rs"]
+mod context_tests;
 #[path = "query_sqlite_tests/events.rs"]
 mod events_tests;
+#[path = "query_sqlite_tests/files.rs"]
+mod files_tests;
+#[path = "query_sqlite_tests/limits.rs"]
+mod limits_tests;
+#[path = "query_sqlite_tests/pagination.rs"]
+mod pagination_tests;
+#[path = "query_sqlite_tests/snapshots.rs"]
+mod snapshots_tests;
 
 #[test]
 fn context_rejects_empty_and_missing_seeds() {

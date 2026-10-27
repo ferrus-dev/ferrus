@@ -5,37 +5,23 @@
 //! here owns only the deletable `repo-graph.db` sidecar.
 
 pub mod config;
-
-pub mod diagnostics;
-mod diagnostics_sqlite;
-
-pub mod domain;
-
-pub mod extractors;
-
-pub mod health;
-
-pub mod index;
-mod index_store;
-
-pub mod maintenance;
-
-pub mod ports;
-
-pub mod query;
-
-pub mod query_sqlite;
-
-pub mod resolution;
-
-pub mod source;
-
-pub mod sqlite;
-
-pub mod store;
-
 #[cfg(test)]
 mod contracts;
+pub mod diagnostics;
+mod diagnostics_sqlite;
+pub mod domain;
+pub mod extractors;
+pub mod health;
+pub mod index;
+mod index_store;
+pub mod maintenance;
+pub mod ports;
+pub mod query;
+pub mod query_sqlite;
+pub mod resolution;
+pub mod source;
+pub mod sqlite;
+pub mod store;
 
 /// Schema-independent graph model version.
 pub const GRAPH_MODEL_VERSION: u32 = 1;

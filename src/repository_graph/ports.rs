@@ -44,6 +44,8 @@ struct CanonicalSourceManifest<'a> {
     files: &'a [SourceFileDescriptor],
 }
 
+/// Hashes the existing canonical manifest encoding without changing file order.
+/// Returns an error if the manifest cannot be serialized as JSON.
 pub fn canonical_source_manifest_digest(
     files: &[SourceFileDescriptor],
     source_policy_digest: &super::domain::Digest,

@@ -787,7 +787,7 @@ impl<'a> SqliteGraphQuery<'a> {
 
         let mut candidates = candidates
             .into_values()
-            .filter(|candidate| candidate.node.provenance.evidence.is_some())
+            .filter_map(ContextCandidate::with_evidence)
             .collect::<Vec<_>>();
         for candidate in &mut candidates {
             sort_context_reasons(&mut candidate.selection_reasons);

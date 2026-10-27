@@ -1,23 +1,13 @@
 //! Implementations of the Ferrus command-line subcommands.
 
 pub mod doctor;
-
 pub mod events;
-
 pub mod graph;
-
 pub mod init;
-
 pub mod migrate;
-
 pub mod projects;
-
 pub mod recover;
-
 pub mod register;
-
 pub mod runs;
-
 pub mod serve;
-
 pub mod tasks;

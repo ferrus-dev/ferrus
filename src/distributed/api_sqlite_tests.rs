@@ -657,24 +657,18 @@ fn assert_snapshot_query_contract(
     );
 }
 
-#[path = "api_sqlite_tests/context.rs"]
-mod context_tests;
-
-#[path = "api_sqlite_tests/cancellation.rs"]
-mod cancellation_tests;
-
-#[path = "api_sqlite_tests/pagination.rs"]
-mod pagination_tests;
-
 #[path = "api_sqlite_tests/authorization.rs"]
 mod authorization_tests;
-
-#[path = "api_sqlite_tests/review.rs"]
-mod review_tests;
-
+#[path = "api_sqlite_tests/cancellation.rs"]
+mod cancellation_tests;
+#[path = "api_sqlite_tests/context.rs"]
+mod context_tests;
 #[path = "api_sqlite_tests/memory.rs"]
 mod memory_tests;
-
+#[path = "api_sqlite_tests/pagination.rs"]
+mod pagination_tests;
+#[path = "api_sqlite_tests/review.rs"]
+mod review_tests;
 #[path = "api_sqlite_tests/snapshots.rs"]
 mod snapshots_tests;
 

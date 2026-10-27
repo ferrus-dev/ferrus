@@ -4,13 +4,9 @@
 //! interactively or headlessly, and derives the MCP configuration used by HQ.
 
 pub(crate) mod claude;
-
 pub(crate) mod codex;
-
 pub(crate) mod goose;
-
 pub(crate) mod opencode;
-
 pub(crate) mod qwen;
 
 use anyhow::{Context, Result, bail};

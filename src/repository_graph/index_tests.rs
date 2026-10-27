@@ -339,14 +339,12 @@ impl RepositorySource for PublishingRaceSource {
     }
 }
 
-#[path = "index_tests/snapshots.rs"]
-mod snapshots_tests;
-
-#[path = "index_tests/publication.rs"]
-mod publication_tests;
-
 #[path = "index_tests/behavior.rs"]
 mod behavior_tests;
+#[path = "index_tests/publication.rs"]
+mod publication_tests;
+#[path = "index_tests/snapshots.rs"]
+mod snapshots_tests;
 
 #[test]
 fn analysis_config_change_invalidates_all_cached_fragments() {

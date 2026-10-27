@@ -1,7 +1,6 @@
 //! Bounded current-workspace tools. Host roots never come from model arguments.
 
 mod fs;
-
 pub(crate) mod patch;
 
 use super::{journal::encode, tools::*};

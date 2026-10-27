@@ -82,6 +82,7 @@ impl Default for MemoryPolicy {
 }
 
 impl MemoryPolicy {
+    /// Hashes the canonical policy encoding, propagating JSON serialization failures.
     pub fn digest(&self) -> Result<Digest, serde_json::Error> {
         let encoded = serde_json::to_vec(self)?;
         Ok(Digest::from_sha256(Sha256::digest(encoded).into()))

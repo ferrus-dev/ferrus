@@ -85,7 +85,27 @@ struct NodeRows {
     deadline_exceeded: bool,
 }
 
+/// Traversal entries may lack evidence and still connect to evidenced descendants.
 struct ContextCandidate {
+    node: GraphNode,
+    depth: u32,
+    selection_reasons: Vec<ContextSelectionReason>,
+}
+
+impl ContextCandidate {
+    fn with_evidence(self) -> Option<EvidencedContextCandidate> {
+        let evidence = self.node.provenance.evidence.clone()?;
+        Some(EvidencedContextCandidate {
+            node: self.node,
+            evidence,
+            depth: self.depth,
+            selection_reasons: self.selection_reasons,
+        })
+    }
+}
+
+/// Response candidates acquire mandatory evidence only after traversal is complete.
+struct EvidencedContextCandidate {
     node: GraphNode,
     evidence: SourceEvidence,
     depth: u32,
@@ -93,7 +113,7 @@ struct ContextCandidate {
 }
 
 struct ContextAssembly {
-    candidates: Vec<ContextCandidate>,
+    candidates: Vec<EvidencedContextCandidate>,
     explored_depth: u32,
     truncation: Option<TruncationReason>,
 }
@@ -423,9 +443,6 @@ fn insert_context_candidate(
     depth: u32,
     reason: ContextSelectionReason,
 ) -> bool {
-    let Some(evidence) = node.provenance.evidence.clone() else {
-        return false;
-    };
     match candidates.entry(node.id.clone()) {
         std::collections::btree_map::Entry::Occupied(mut entry) => {
             let candidate = entry.get_mut();
@@ -439,7 +456,6 @@ fn insert_context_candidate(
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(ContextCandidate {
                 node,
-                evidence,
                 depth,
                 selection_reasons: vec![reason],
             });
@@ -560,8 +576,8 @@ fn sort_context_reasons(reasons: &mut Vec<ContextSelectionReason>) {
 }
 
 fn context_candidate_order(
-    left: &ContextCandidate,
-    right: &ContextCandidate,
+    left: &EvidencedContextCandidate,
+    right: &EvidencedContextCandidate,
 ) -> std::cmp::Ordering {
     let left_evidence = &left.evidence;
     let right_evidence = &right.evidence;
@@ -600,7 +616,7 @@ fn context_candidate_order(
         .then_with(|| left.node.id.cmp(&right.node.id))
 }
 
-fn context_item(candidate: ContextCandidate) -> ContextItem {
+fn context_item(candidate: EvidencedContextCandidate) -> ContextItem {
     let evidence = candidate.evidence;
     ContextItem {
         node_id: candidate.node.id,

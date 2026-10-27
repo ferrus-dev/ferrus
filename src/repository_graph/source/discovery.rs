@@ -531,6 +531,8 @@ struct CanonicalExtractorIdentity<'a> {
     contract_version: u32,
 }
 
+/// Hashes the sorted, deduplicated extractor identities using the canonical encoding.
+/// Returns an error if the identities cannot be serialized as JSON.
 pub fn extractor_set_digest(extractors: &[ExtractorIdentity]) -> Result<Digest, serde_json::Error> {
     let canonical = extractors
         .iter()

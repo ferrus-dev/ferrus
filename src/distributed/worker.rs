@@ -594,7 +594,6 @@ fn progress_is_complete(progress: &FactBatchProgress) -> bool {
 }
 
 mod execution;
-
 #[cfg(test)]
 #[path = "worker_tests.rs"]
 mod tests;

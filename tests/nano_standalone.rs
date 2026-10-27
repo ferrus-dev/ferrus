@@ -225,14 +225,12 @@ fn interactive_requires_a_terminal_before_creating_storage() {
     fixture.assert_unregistered();
 }
 
-#[path = "nano_standalone/snapshots.rs"]
-mod snapshots_tests;
-
-#[path = "nano_standalone/registration.rs"]
-mod registration_tests;
-
 #[path = "nano_standalone/memory.rs"]
 mod memory_tests;
+#[path = "nano_standalone/registration.rs"]
+mod registration_tests;
+#[path = "nano_standalone/snapshots.rs"]
+mod snapshots_tests;
 
 #[test]
 fn storage_binding_rejects_another_workspace_and_paths_inside_workspace() {

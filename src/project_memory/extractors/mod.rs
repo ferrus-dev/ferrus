@@ -29,6 +29,8 @@ pub fn built_in_extractors() -> Vec<Box<dyn MemoryExtractor>> {
     ]
 }
 
+/// Hashes the built-in extractor identities, including their package version.
+/// Returns an error if the identities cannot be serialized as JSON.
 pub fn built_in_extractor_set_digest() -> Result<Digest, serde_json::Error> {
     let identities = built_in_extractors()
         .iter()

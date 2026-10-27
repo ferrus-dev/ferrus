@@ -620,7 +620,6 @@ mod support;
 use support::*;
 
 mod context;
-
 #[cfg(test)]
 #[path = "federation_service_tests.rs"]
 mod tests;

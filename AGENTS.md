@@ -42,6 +42,7 @@ characters themselves are the behavior under test or part of the rendered interf
 - Separate functions, methods, type declarations, and distinct logical steps with one
   blank line. Keep closely related statements together when they form one operation;
   avoid adding blank lines inside compact expressions or between every statement.
+  Keep related `mod`/`pub mod` declarations together without blank lines, like `use` imports.
 - Keep Rust source files at or below 1000 lines, including tests. Split larger modules
   by responsibility into focused submodules, preserving visibility and behavior. Do
   not use `include!` or arbitrary numbered chunks to work around the limit.

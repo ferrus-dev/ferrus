@@ -60,12 +60,9 @@ fn teardown(previous: PathBuf) {
 
 #[path = "project_tests/graph_and_schema.rs"]
 mod graph_and_schema;
-
 #[path = "project_tests/migration_and_archive.rs"]
 mod migration_and_archive;
-
-#[path = "project_tests/task_lifecycle.rs"]
-mod task_lifecycle;
-
 #[path = "project_tests/recovery_and_runs.rs"]
 mod recovery_and_runs;
+#[path = "project_tests/task_lifecycle.rs"]
+mod task_lifecycle;

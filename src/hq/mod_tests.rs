@@ -35,21 +35,16 @@ fn failed_exit_status() -> std::process::ExitStatus {
 
 #[path = "mod_tests/behavior.rs"]
 mod behavior_tests;
-
-#[path = "mod_tests/workspaces.rs"]
-mod workspaces_tests;
-
-#[path = "mod_tests/terminal.rs"]
-mod terminal_tests;
-
 #[path = "mod_tests/consultation.rs"]
 mod consultation_tests;
-
-#[path = "mod_tests/input.rs"]
-mod input_tests;
-
 #[path = "mod_tests/human_waits.rs"]
 mod human_waits_tests;
+#[path = "mod_tests/input.rs"]
+mod input_tests;
+#[path = "mod_tests/terminal.rs"]
+mod terminal_tests;
+#[path = "mod_tests/workspaces.rs"]
+mod workspaces_tests;
 
 #[test]
 fn run_plan_lines_do_not_report_batch_launch_as_unwired() {

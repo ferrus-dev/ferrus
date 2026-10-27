@@ -199,15 +199,10 @@ impl Journal for LostDecisionReceipt {
 
 #[path = "lifecycle_tests/review.rs"]
 mod review_tests;
-
 #[path = "lifecycle_tests/recovery.rs"]
 mod recovery_tests;
-
-
-
 #[path = "lifecycle_tests/rollback.rs"]
 mod rollback_tests;
-
 #[path = "lifecycle_tests/cancellation.rs"]
 mod cancellation_tests;
 

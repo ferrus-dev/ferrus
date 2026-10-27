@@ -135,26 +135,20 @@ impl MemoryContent for RecordingContent {
     }
 }
 
-#[path = "query_sqlite_tests/limits.rs"]
-mod limits_tests;
-
-#[path = "query_sqlite_tests/memory.rs"]
-mod memory_tests;
-
 #[path = "query_sqlite_tests/authorization.rs"]
 mod authorization_tests;
-
-#[path = "query_sqlite_tests/snapshots.rs"]
-mod snapshots_tests;
-
-#[path = "query_sqlite_tests/context.rs"]
-mod context_tests;
-
 #[path = "query_sqlite_tests/cancellation.rs"]
 mod cancellation_tests;
-
+#[path = "query_sqlite_tests/context.rs"]
+mod context_tests;
+#[path = "query_sqlite_tests/limits.rs"]
+mod limits_tests;
+#[path = "query_sqlite_tests/memory.rs"]
+mod memory_tests;
 #[path = "query_sqlite_tests/pagination.rs"]
 mod pagination_tests;
+#[path = "query_sqlite_tests/snapshots.rs"]
+mod snapshots_tests;
 
 #[test]
 fn cursor_rejects_a_different_request_fingerprint() {

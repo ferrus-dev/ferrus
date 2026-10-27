@@ -268,20 +268,16 @@ fn engine_with_limits(
     .unwrap()
 }
 
-#[path = "tests/provider.rs"]
-mod provider_tests;
-
 #[path = "tests/behavior.rs"]
 mod behavior_tests;
-
-#[path = "tests/review.rs"]
-mod review_tests;
-
-#[path = "tests/recovery.rs"]
-mod recovery_tests;
-
 #[path = "tests/limits.rs"]
 mod limits_tests;
+#[path = "tests/provider.rs"]
+mod provider_tests;
+#[path = "tests/recovery.rs"]
+mod recovery_tests;
+#[path = "tests/review.rs"]
+mod review_tests;
 
 #[tokio::test]
 async fn status_errors_and_context_overflow_are_typed_and_not_retried() {

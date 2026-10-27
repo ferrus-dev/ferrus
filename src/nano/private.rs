@@ -110,7 +110,6 @@ mod imp {
         fs::rename(from, to)
     }
 }
-
 #[cfg(windows)]
 mod imp {
     use super::*;

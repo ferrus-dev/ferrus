@@ -798,10 +798,14 @@ struct SnapshotIdentity<'a> {
     extractor_set_digest: &'a super::domain::Digest,
 }
 
+/// Derives the snapshot identity from the canonical manifest inputs.
+/// Returns an error if those inputs cannot be serialized as JSON.
 pub fn snapshot_identity(manifest: &SourceManifest) -> Result<SnapshotId, serde_json::Error> {
     snapshot_identity_from_revision(&manifest.revision, &manifest.extractor_set_digest)
 }
 
+/// Derives the same snapshot identity from a revision and its extractor set digest.
+/// Returns an error if those inputs cannot be serialized as JSON.
 pub fn snapshot_identity_from_revision(
     revision: &super::domain::SourceRevision,
     extractor_set_digest: &super::domain::Digest,

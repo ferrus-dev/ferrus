@@ -192,3 +192,81 @@ fn search_show_and_neighborhood_return_evidence_and_provenance() {
             .any(|node| node.id == hit.node_id)
     );
 }
+
+#[test]
+fn context_traverses_evidence_free_seeds_and_intermediate_nodes() {
+    for strip_seed in [false, true] {
+        let (_source, _sidecar_dir, sidecar, config, _comparison) = indexed_fixture();
+
+        let (first_edge, second_edge, seed, bridge, target): (String, String, String, String, String) =
+            sidecar.connection().query_row(
+                "SELECT first.id, second.id, first.source_node_id, first.target_node_id, second.target_node_id \
+                 FROM edges AS first JOIN edges AS second \
+                   ON first.snapshot_id = second.snapshot_id \
+                  AND first.target_node_id = second.source_node_id \
+                 JOIN nodes AS target ON target.snapshot_id = second.snapshot_id \
+                                     AND target.id = second.target_node_id \
+                 WHERE first.source_node_id != first.target_node_id \
+                   AND first.source_node_id != second.target_node_id \
+                   AND first.target_node_id != second.target_node_id \
+                   AND first.resolution_state = 'resolved' \
+                   AND second.resolution_state = 'resolved' \
+                   AND target.evidence_path IS NOT NULL ORDER BY first.id, second.id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+
+        sidecar
+            .connection()
+            .execute(
+                "DELETE FROM edges WHERE id NOT IN (?1, ?2)",
+                rusqlite::params![first_edge, second_edge],
+            )
+            .unwrap();
+
+        for node in std::iter::once(&bridge).chain(strip_seed.then_some(&seed)) {
+            sidecar.connection().execute(
+                "UPDATE nodes SET evidence_path=NULL, evidence_content_algorithm=NULL, \
+                 evidence_content_digest=NULL, span_start_byte=NULL, span_end_byte=NULL WHERE id=?1",
+                [node],
+            ).unwrap();
+        }
+
+        let query = SqliteGraphQuery::new(&sidecar, config.query_limits.clone(), None);
+        let mut request = context_request(&config, ContextSeed::Node(NodeId::new(&seed).unwrap()));
+        request.policy.direction = EdgeDirection::Outgoing;
+        request.scope.budget.max_depth = NonZeroU32::new(2).unwrap();
+        let response = query.context(&request).unwrap();
+
+        assert!(
+            response
+                .data
+                .items
+                .iter()
+                .any(|item| item.node_id.as_str() == target)
+        );
+        assert!(
+            response
+                .data
+                .items
+                .iter()
+                .all(|item| item.node_id.as_str() != bridge)
+        );
+        if strip_seed {
+            assert!(
+                response
+                    .data
+                    .items
+                    .iter()
+                    .all(|item| item.node_id.as_str() != seed)
+            );
+        }
+        assert!(
+            response
+                .data
+                .items
+                .iter()
+                .all(|item| item.provenance.evidence.is_some())
+        );
+    }
+}

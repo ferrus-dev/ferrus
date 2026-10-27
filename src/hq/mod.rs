@@ -3,7 +3,6 @@
 pub mod agent_manager;
 mod commands;
 mod display;
-
 #[cfg(test)]
 mod nano_tests;
 mod state_watcher;

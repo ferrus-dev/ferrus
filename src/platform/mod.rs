@@ -12,7 +12,6 @@ pub(crate) enum ShutdownSignal {
 
 #[cfg(unix)]
 mod unix;
-
 #[cfg(windows)]
 mod windows;
 

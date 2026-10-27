@@ -519,21 +519,16 @@ fn run_interactive_task(interactive: bool) {
     assert_eq!(status, "reviewing");
 }
 
-#[path = "nano_headless/review.rs"]
-mod review_tests;
-
-#[path = "nano_headless/recovery.rs"]
-mod recovery_tests;
-
 #[path = "nano_headless/cancellation.rs"]
 mod cancellation_tests;
-
-#[path = "nano_headless/provider.rs"]
-mod provider_tests;
-
 #[path = "nano_headless/checks.rs"]
 mod checks_tests;
-
+#[path = "nano_headless/provider.rs"]
+mod provider_tests;
+#[path = "nano_headless/recovery.rs"]
+mod recovery_tests;
+#[path = "nano_headless/review.rs"]
+mod review_tests;
 #[path = "nano_headless/tasks.rs"]
 mod tasks;
 use tasks::*;

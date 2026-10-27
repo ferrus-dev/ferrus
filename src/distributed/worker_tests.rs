@@ -412,17 +412,14 @@ impl MemorySource for FakeMemorySource {
     }
 }
 
-#[path = "worker_tests/recovery.rs"]
-mod recovery_tests;
-
 #[path = "worker_tests/cancellation.rs"]
 mod cancellation_tests;
-
-#[path = "worker_tests/workspaces.rs"]
-mod workspaces_tests;
-
 #[path = "worker_tests/memory.rs"]
 mod memory_tests;
+#[path = "worker_tests/recovery.rs"]
+mod recovery_tests;
+#[path = "worker_tests/workspaces.rs"]
+mod workspaces_tests;
 
 #[test]
 fn repository_worker_applies_one_diagnostic_budget_to_the_whole_job() {

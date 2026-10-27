@@ -4,9 +4,7 @@
 //! They never access SQLite, invoke project tools, or execute repository code.
 
 pub mod cargo;
-
 pub mod generic;
-
 pub mod rust;
 
 use sha2::{Digest as _, Sha256};

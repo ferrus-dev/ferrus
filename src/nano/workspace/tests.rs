@@ -39,15 +39,12 @@ use super::patch::PatchResult;
 
 #[path = "tests/behavior.rs"]
 mod behavior_tests;
-
-#[path = "tests/limits.rs"]
-mod limits_tests;
-
 #[path = "tests/context.rs"]
 mod context_tests;
-
 #[path = "tests/files.rs"]
 mod files_tests;
+#[path = "tests/limits.rs"]
+mod limits_tests;
 
 #[tokio::test]
 async fn partial_tool_outcomes_retain_reconciliation_details() {

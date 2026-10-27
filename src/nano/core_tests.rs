@@ -537,26 +537,20 @@ impl Journal for InteractiveJournal {
     }
 }
 
-#[path = "core_tests/recovery.rs"]
-mod recovery_tests;
-
 #[path = "core_tests/behavior.rs"]
 mod behavior_tests;
-
-#[path = "core_tests/provider.rs"]
-mod provider_tests;
-
 #[path = "core_tests/cancellation.rs"]
 mod cancellation_tests;
-
-#[path = "core_tests/limits.rs"]
-mod limits_tests;
-
-#[path = "core_tests/context.rs"]
-mod context_tests;
-
 #[path = "core_tests/compaction.rs"]
 mod compaction_tests;
+#[path = "core_tests/context.rs"]
+mod context_tests;
+#[path = "core_tests/limits.rs"]
+mod limits_tests;
+#[path = "core_tests/provider.rs"]
+mod provider_tests;
+#[path = "core_tests/recovery.rs"]
+mod recovery_tests;
 
 #[tokio::test]
 async fn repeated_failures_and_identical_successes_stop_no_progress_loops() {
