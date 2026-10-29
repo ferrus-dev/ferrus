@@ -110,7 +110,6 @@ mod imp {
         fs::rename(from, to)
     }
 }
-
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -247,6 +246,7 @@ mod imp {
 
         Ok(())
     }
+
     pub(super) fn directory(path: &Path) -> std::io::Result<()> {
         let descriptor = descriptor()?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -289,6 +289,7 @@ mod imp {
         if result != 0 {
             return Err(std::io::Error::from_raw_os_error(result as i32).into());
         }
+
         Ok(Descriptor(pointer))
     }
 
@@ -319,6 +320,7 @@ mod imp {
                 }
             }
         }
+
         anyhow::bail!("Host input must have a protected owner-only DACL")
     }
 
@@ -389,6 +391,7 @@ mod imp {
                     }
                 }
             }
+
             for dacl in [
                 "D:P(A;;FR;;;WD)".to_owned(),
                 "D:P(A;;FR;;;S-1-5-21-100-200-300-1002)".to_owned(),

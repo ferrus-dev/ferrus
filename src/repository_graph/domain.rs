@@ -1,6 +1,7 @@
 //! Validated graph identities, source manifests, facts, snapshots, and publication values.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt,
     num::{NonZeroU32, NonZeroU64},
@@ -19,7 +20,7 @@ macro_rules! opaque_id {
     ($name:ident, $kind:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(Cow<'static, str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
@@ -27,7 +28,13 @@ macro_rules! opaque_id {
                 if value.is_empty() {
                     return Err(IdentityError::Empty { kind: $kind });
                 }
-                Ok(Self(value))
+                Ok(Self(value.into()))
+            }
+
+            /// Constructs a built-in identity. Use in a `const` block to validate at compile time.
+            pub const fn from_static(value: &'static str) -> Self {
+                assert!(!value.is_empty(), "identity must not be empty");
+                Self(Cow::Borrowed(value))
             }
 
             pub fn as_str(&self) -> &str {
@@ -54,18 +61,46 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(RepositoryNamespace, "repository namespace");
+
 opaque_id!(RepositoryId, "repository id");
+
 opaque_id!(SourceRevisionId, "source revision id");
+
 opaque_id!(SnapshotId, "snapshot id");
+
 opaque_id!(BuildId, "build id");
+
 opaque_id!(NodeId, "node id");
+
 opaque_id!(EdgeId, "edge id");
+
 opaque_id!(SemanticKey, "semantic key");
+
 opaque_id!(TaskViewId, "task view id");
+
 opaque_id!(OverlayRevisionId, "overlay revision id");
+
 opaque_id!(ExtractorId, "extractor id");
+
 opaque_id!(PublishedViewName, "published view name");
+
 opaque_id!(PageCursor, "page cursor");
+
+macro_rules! digest_identity {
+    ($name:ident, $prefix:literal) => {
+        impl $name {
+            pub(crate) fn from_content_digest(digest: &str) -> Self {
+                Self(format!(concat!($prefix, ":{}"), digest).into())
+            }
+        }
+    };
+}
+
+digest_identity!(NodeId, "node");
+digest_identity!(EdgeId, "edge");
+digest_identity!(SnapshotId, "snapshot");
+digest_identity!(SourceRevisionId, "sha256");
+digest_identity!(OverlayRevisionId, "sha256");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryRef {
@@ -108,9 +143,11 @@ impl RepoPath {
         if value.is_empty() {
             return Err(RepoPathError::Empty);
         }
+
         if value.contains('\0') {
             return Err(RepoPathError::Nul);
         }
+
         let normalized = value.replace('\\', "/");
         if normalized.starts_with('/')
             || normalized.starts_with("//")
@@ -121,11 +158,13 @@ impl RepoPath {
         {
             return Err(RepoPathError::AbsoluteOrPrefixed);
         }
+
         for component in normalized.split('/') {
             if component.is_empty() || component == "." || component == ".." {
                 return Err(RepoPathError::ForbiddenComponent(component.to_string()));
             }
         }
+
         Ok(Self(normalized))
     }
 
@@ -171,6 +210,14 @@ pub struct Digest {
 }
 
 impl Digest {
+    /// Encodes the output of SHA-256 as a canonical digest.
+    pub fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self {
+            algorithm: "sha256".to_owned(),
+            value: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+
     pub fn new(
         algorithm: impl Into<String>,
         value: impl Into<String>,
@@ -307,7 +354,7 @@ pub enum Confidence {
     Low,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourcePosition {
     /// Zero-based byte offset in the exact content identified by the evidence digest.
     pub byte_offset: u64,
@@ -318,7 +365,7 @@ pub struct SourcePosition {
 }
 
 /// A half-open source range: `start` is inclusive and `end` is exclusive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start: SourcePosition,
     pub end: SourcePosition,
@@ -405,9 +452,32 @@ pub enum DiagnosticCodeError {
 /// are deliberately not representable as diagnostic messages.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct DiagnosticCode(String);
+pub struct DiagnosticCode(Cow<'static, str>);
 
 impl DiagnosticCode {
+    /// Constructs a built-in code. Use in a `const` block to validate at compile time.
+    pub const fn from_static(value: &'static str) -> Self {
+        assert!(
+            !value.is_empty() && value.len() <= 64,
+            "invalid diagnostic code length"
+        );
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            assert!(
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || byte == b'.'
+                    || byte == b'_'
+                    || byte == b'-',
+                "invalid diagnostic code"
+            );
+            index += 1;
+        }
+        Self(Cow::Borrowed(value))
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self, DiagnosticCodeError> {
         let value = value.into();
         if value.is_empty()
@@ -418,7 +488,8 @@ impl DiagnosticCode {
         {
             return Err(DiagnosticCodeError::Invalid);
         }
-        Ok(Self(value))
+
+        Ok(Self(value.into()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -546,6 +617,7 @@ impl TaskRepositoryView {
         if task_id.trim().is_empty() {
             return Err(TaskRepositoryViewError::EmptyTaskId);
         }
+
         let overlay_identity_is_complete =
             overlay_revision_id.is_some() == overlay_manifest_digest.is_some();
         let state_is_consistent = match state {
@@ -563,6 +635,7 @@ impl TaskRepositoryView {
         if !overlay_identity_is_complete || !state_is_consistent {
             return Err(TaskRepositoryViewError::InconsistentState);
         }
+
         Ok(Self {
             id,
             task_id,
@@ -648,6 +721,7 @@ mod tests {
         for algorithm in ["", "SHA256", "sha 256", "sha/256"] {
             assert!(Digest::new(algorithm, "00").is_err());
         }
+
         for value in ["", "AB", "0g", "00-ff"] {
             assert!(Digest::new("sha256", value).is_err());
         }

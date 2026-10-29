@@ -191,11 +191,11 @@ pub(super) fn attach_snippets_at(
     let mut remaining = total_limit;
     let mut omitted_for_budget = false;
     for (path, span, content_identity) in evidence {
-        let key = serde_json::to_string(&(path.clone(), span.clone(), content_identity.clone()))
-            .expect("context evidence is always serializable");
+        let key = (path.clone(), span.clone(), content_identity.clone());
         if !seen.insert(key) {
             continue;
         }
+
         let Some(max_bytes) = NonZeroU64::new(remaining) else {
             omitted_for_budget = true;
             break;
@@ -226,7 +226,7 @@ pub(super) fn attach_snippets_at(
                 Err(_) => add_content_diagnostic(
                     &mut response,
                     max_diagnostics,
-                    "content.non_utf8",
+                    const { DiagnosticCode::from_static("content.non_utf8") },
                     path,
                     span,
                 ),
@@ -235,28 +235,32 @@ pub(super) fn attach_snippets_at(
                 &mut response,
                 max_diagnostics,
                 match error.code {
-                    QueryErrorCode::ContentChanged => "content.changed",
-                    _ => "content.unavailable",
+                    QueryErrorCode::ContentChanged => {
+                        const { DiagnosticCode::from_static("content.changed") }
+                    }
+                    _ => const { DiagnosticCode::from_static("content.unavailable") },
                 },
                 path,
                 span,
             ),
         }
     }
+
     if omitted_for_budget {
         add_content_diagnostic_without_location(
             &mut response,
             max_diagnostics,
-            "content.snippets_truncated",
+            const { DiagnosticCode::from_static("content.snippets_truncated") },
         );
     }
+
     Ok(response)
 }
 
 pub(super) fn add_content_diagnostic(
     response: &mut ContextResponse,
     max_diagnostics: usize,
-    code: &str,
+    code: DiagnosticCode,
     path: repository_graph::domain::RepoPath,
     span: Option<repository_graph::domain::SourceSpan>,
 ) {
@@ -271,7 +275,7 @@ pub(super) fn add_content_diagnostic(
 pub(super) fn add_content_diagnostic_without_location(
     response: &mut ContextResponse,
     max_diagnostics: usize,
-    code: &str,
+    code: DiagnosticCode,
 ) {
     add_bounded_content_diagnostic(response, max_diagnostics, code, None);
 }
@@ -279,14 +283,14 @@ pub(super) fn add_content_diagnostic_without_location(
 pub(super) fn add_bounded_content_diagnostic(
     response: &mut ContextResponse,
     max_diagnostics: usize,
-    code: &str,
+    code: DiagnosticCode,
     location: Option<DiagnosticLocation>,
 ) {
     response.diagnostics.summary.warning += 1;
     if response.diagnostics.items.len() < max_diagnostics {
         response.diagnostics.items.push(QueryDiagnostic {
             severity: DiagnosticSeverity::Warning,
-            code: DiagnosticCode::new(code).expect("static content diagnostic code is canonical"),
+            code,
             location,
         });
     } else {

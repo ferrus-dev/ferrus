@@ -18,6 +18,7 @@ pub async fn run() -> Result<()> {
     for message in register::migrate_legacy_mcp_configs().await? {
         println!("{message}");
     }
+
     register::ensure_configured_hq_mcp_configs().await?;
     Ok(())
 }

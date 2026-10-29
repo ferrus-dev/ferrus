@@ -1,4 +1,5 @@
 use super::*;
+
 #[test]
 fn authority_and_schemas_follow_the_host_profile() {
     for mode in [Mode::Review, Mode::Consult] {
@@ -15,6 +16,7 @@ fn authority_and_schemas_follow_the_host_profile() {
             assert!(!readable(forbidden));
             assert!(!tools.iter().any(|tool| tool.name == forbidden));
         }
+
         assert_eq!(
             tools.iter().any(|tool| tool.name == "approve"),
             mode == Mode::Review

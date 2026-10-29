@@ -211,6 +211,7 @@ fn overlong_complete_records_are_rejected_without_rewriting_the_journal() {
                 "Journal record exceeds quota"
             );
         }
+
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 }
@@ -274,6 +275,7 @@ fn checkpoints_require_whole_model_tool_groups_and_verified_prefixes() {
             assert!(journal.checkpoint().is_err());
         }
     }
+
     journal.checkpoint().unwrap();
     let directory = journal.directory().to_path_buf();
     let checkpoint_path = directory
@@ -374,6 +376,7 @@ fn recovery_charges_unfinished_elapsed_budget_once_and_preserves_pending_work() 
             }
             _ => (),
         }
+
         let directory = journal.directory().to_path_buf();
         let prefix = fs::read(directory.join("events.jsonl")).unwrap();
         drop(journal);
@@ -604,6 +607,7 @@ fn record_and_total_byte_quotas_fail_before_writing() {
             0
         );
     }
+
     assert!(encode(&json!({"data":"x".repeat(10000)}), 10).is_err());
 }
 
@@ -619,6 +623,7 @@ fn versions_sequences_and_mixed_session_ids_are_rejected() {
             "sequence" => record.sequence += 1,
             _ => record.session_id = "other".into(),
         }
+
         let mut bytes = serde_json::to_vec(&record).unwrap();
         bytes.push(b'\n');
         fs::write(directory.join("events.jsonl"), &bytes).unwrap();
@@ -649,6 +654,7 @@ fn private_permissions_are_enforced_for_new_storage_and_recovery() {
             );
         }
     }
+
     super::private::check(journal.directory(), true).unwrap();
     #[cfg(unix)]
     {

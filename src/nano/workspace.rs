@@ -2,8 +2,6 @@
 
 mod fs;
 pub(crate) mod patch;
-#[cfg(test)]
-mod tests;
 
 use super::{journal::encode, tools::*};
 use crate::repository_graph::domain::RepoPath;
@@ -100,6 +98,7 @@ impl Failure {
             },
         }
     }
+
     fn io(path: &str, error: std::io::Error) -> Self {
         Self::new(
             match error.kind() {
@@ -149,6 +148,7 @@ fn digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
 pub(super) fn path(value: &str) -> Result<String> {
     if value.len() > 256 || value.contains('\\') {
         return Err(Failure::new(Code::InvalidPath, value));
@@ -235,6 +235,7 @@ impl Workspace {
         if *remaining == 0 {
             return Err(Failure::new(Code::OutputLimit, &path));
         }
+
         let file = self.root.open(&path).map_err(|e| Failure::io(&path, e))?;
         let mut inspected = 0;
         let content = self.read_content_limited(file, &path, *remaining, &mut inspected);
@@ -320,10 +321,7 @@ impl Workspace {
                 break;
             }
 
-            let encoded = serde_json::to_string(line)
-                .expect("serializable text")
-                .len()
-                - 2;
+            let encoded = Value::String(line.to_owned()).to_string().len() - 2;
 
             if encoded_bytes + encoded > self.limits.output_bytes - 1024 {
                 truncated = true;
@@ -344,6 +342,7 @@ impl Workspace {
             truncated,
         })
     }
+
     pub(crate) async fn search_text(
         &self,
         request: SearchRequest,
@@ -455,6 +454,7 @@ impl Workspace {
 
                     return Ok(());
                 }
+
                 let remaining = self.limits.scan_bytes.saturating_sub(result.scanned_bytes);
                 if remaining == 0 {
                     result.truncated = true;
@@ -489,7 +489,10 @@ impl Workspace {
                         truncated: snippet.len() < line.len(),
                     };
 
-                    let size = serde_json::to_vec(&hit).expect("serializable match").len() + 1;
+                    let size = serde_json::to_vec(&hit)
+                        .map_err(|_| Failure::new(Code::Io, &path))?
+                        .len()
+                        + 1;
                     if output_bytes + size > self.limits.output_bytes - 512 {
                         result.truncated = true;
                         output_full = true;
@@ -525,6 +528,7 @@ fn prefix(text: &str, bytes: usize) -> &str {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
+
     &text[..end]
 }
 
@@ -633,10 +637,12 @@ pub(crate) struct SearchResult {
 
 impl SearchResult {
     fn issue(&mut self, failure: Failure, used: &mut usize, limit: usize) {
-        let size = serde_json::to_vec(&failure)
-            .expect("serializable issue")
-            .len()
-            + 1;
+        let Ok(encoded) = serde_json::to_vec(&failure) else {
+            self.suppressed_issues += 1;
+            self.truncated = true;
+            return;
+        };
+        let size = encoded.len() + 1;
 
         if self.issues.len() < 4 && *used + size <= limit - 512 {
             *used += size;
@@ -652,6 +658,7 @@ impl Tools for Workspace {
         if call.name != "apply_patch" {
             return None;
         }
+
         let Request::Patch(request) = decode(&call.name, &call.arguments).ok()? else {
             return None;
         };
@@ -665,11 +672,13 @@ impl Tools for Workspace {
             "required":["start_line","old_text","new_text"],"additionalProperties":false});
 
         let edit = |operation: &str, extra: Value, required: &[&str]| {
-            let mut properties = json!({"operation":{"const":operation},"path":string});
-            properties
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
+            let mut properties = serde_json::Map::from_iter([
+                ("operation".into(), json!({"const":operation})),
+                ("path".into(), string.clone()),
+            ]);
+            if let Value::Object(extra) = extra {
+                properties.extend(extra);
+            }
             let mut fields = vec!["operation", "path"];
             fields.extend_from_slice(required);
             json!({"type":"object","properties":properties,"required":fields,"additionalProperties":false})
@@ -727,11 +736,13 @@ impl Tools for Workspace {
         let result = match request {
             Request::Read(request) => self
                 .read_file(request)
-                .map(|v| serde_json::to_value(v).unwrap()),
+                .map_err(workspace_error)
+                .and_then(|value| serde_json::to_value(value).map_err(|_| ToolError::Failed)),
             Request::Search(request) => self
                 .search_text(request, cancellation)
                 .await
-                .map(|v| serde_json::to_value(v).unwrap()),
+                .map_err(workspace_error)
+                .and_then(|value| serde_json::to_value(value).map_err(|_| ToolError::Failed)),
             Request::Patch(request) => {
                 let result = self.apply_patch(request, cancellation).await;
                 if !result.complete {
@@ -739,22 +750,24 @@ impl Tools for Workspace {
                         .changes
                         .iter()
                         .any(|change| change.state != patch::State::NotApplied);
-                    let error = ToolError::Workspace(serde_json::to_value(result).unwrap());
+                    let error = workspace_error(result);
                     return if partial {
                         ToolOutcome::Unknown(error)
                     } else {
                         ToolOutcome::Failed(error)
                     };
                 }
-                Ok(serde_json::to_value(result).unwrap())
+
+                match serde_json::to_value(result) {
+                    Ok(value) => Ok(value),
+                    Err(_) => return ToolOutcome::Unknown(ToolError::Failed),
+                }
             }
         };
 
         let outcome = match result {
             Ok(value) => ToolOutcome::Success(value),
-            Err(failure) => {
-                ToolOutcome::Failed(ToolError::Workspace(serde_json::to_value(failure).unwrap()))
-            }
+            Err(error) => ToolOutcome::Failed(error),
         };
 
         if encode(&outcome, self.limits.output_bytes).is_err() {
@@ -908,6 +921,7 @@ pub(super) fn runtime_artifact(
     } else if existing.is_some() {
         parent.delete().map_err(|e| e.error)?;
     }
+
     Ok(())
 }
 
@@ -935,6 +949,7 @@ pub(super) fn source_stamp(directory: &Path) -> anyhow::Result<String> {
                 if path == "." && matches!(name.as_str(), ".git" | ".ferrus") {
                     continue;
                 }
+
                 paths.push(if path == "." {
                     name
                 } else {
@@ -963,9 +978,20 @@ pub(super) fn source_stamp(directory: &Path) -> anyhow::Result<String> {
             hash.update(&bytes);
         }
     }
+
     Ok(hash
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
+
+fn workspace_error(value: impl Serialize) -> ToolError {
+    match serde_json::to_value(value) {
+        Ok(value) => ToolError::Workspace(value),
+        Err(_) => ToolError::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests;

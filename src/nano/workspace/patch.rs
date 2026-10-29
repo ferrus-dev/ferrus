@@ -224,7 +224,7 @@ impl Workspace {
                 } => {
                     let current = self
                         .check_base(&parent, &path, Some(&expected_digest))?
-                        .unwrap();
+                        .ok_or_else(|| Failure::new(Code::NotFound, &path))?;
                     let after = apply_hunks(&path, &current.text, &hunks, self.limits.file_bytes)?;
                     self.check_text(&path, &after)?;
                     (Some(current.digest), Some(after))
@@ -237,7 +237,7 @@ impl Workspace {
                 } => {
                     let current = self
                         .check_base(&parent, &path, Some(&expected_digest))?
-                        .unwrap();
+                        .ok_or_else(|| Failure::new(Code::NotFound, &path))?;
                     let after = replace_exact(
                         &path,
                         &current.text,
@@ -253,7 +253,7 @@ impl Workspace {
                 } => {
                     let current = self
                         .check_base(&parent, &path, Some(&expected_digest))?
-                        .unwrap();
+                        .ok_or_else(|| Failure::new(Code::NotFound, &path))?;
                     (Some(current.digest), None)
                 }
             };
@@ -389,6 +389,7 @@ impl Workspace {
                             result.changes[index].intended_digest.clone();
                         self.generation = self.generation.saturating_add(1);
                     }
+
                     result.failure = Some(Failure::io(&plan.path, error.error));
                     break;
                 }
@@ -421,6 +422,7 @@ fn replace_exact(path: &str, before: &str, old: &str, new: &str, limit: usize) -
             "old_text occurs more than once. Include more surrounding text to select exactly one occurrence; no files were changed.",
         ));
     }
+
     let size = before
         .len()
         .saturating_sub(old.len())
@@ -428,6 +430,7 @@ fn replace_exact(path: &str, before: &str, old: &str, new: &str, limit: usize) -
     if size > limit {
         return Err(Failure::new(Code::FileTooLarge, path));
     }
+
     let mut after = String::with_capacity(size);
     after.push_str(&before[..start]);
     after.push_str(new);
@@ -495,6 +498,7 @@ fn apply_hunks(path: &str, before: &str, hunks: &[Hunk], limit: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn exact_replacement_rejects_missing_ambiguous_and_overlapping_anchors() {
         for (before, old) in [
@@ -511,6 +515,7 @@ mod tests {
                 Code::InvalidPatch
             );
         }
+
         assert_eq!(
             replace_exact("x", "prefix old\r\nsuffix", "old", "new", 1024).unwrap(),
             "prefix new\r\nsuffix"
@@ -573,6 +578,7 @@ mod tests {
         );
         assert!(!directory.path().join("third").exists());
     }
+
     #[tokio::test]
     async fn a_concurrent_create_is_not_overwritten_and_temporary_files_are_removed() {
         let directory = tempfile::TempDir::new().unwrap();

@@ -20,9 +20,8 @@ mod provider;
 mod providers;
 mod replay;
 mod session;
+pub mod standalone;
 mod tools;
 pub(crate) mod wire;
 mod working_set;
 mod workspace;
-
-pub mod standalone;

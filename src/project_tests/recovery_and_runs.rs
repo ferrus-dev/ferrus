@@ -16,12 +16,14 @@ async fn latest_run_filters_agent_and_role_before_limiting_history() {
                 params![format!("{agent}-{suffix}"), agent],
             ).unwrap();
         }
+
         connection.execute(
             "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, workspace_path)
              VALUES (?1, 't-001', 'reviewer', ?2, 'finished', '2030', '2030', '/workspace')",
             params![format!("{agent}-reviewer"), agent],
         ).unwrap();
     }
+
     for index in 0..101 {
         connection.execute(
             "INSERT INTO runs (id, task_id, role, agent, status, started_at, updated_at, workspace_path)
@@ -29,6 +31,7 @@ async fn latest_run_filters_agent_and_role_before_limiting_history() {
             [format!("other-{index}")],
         ).unwrap();
     }
+
     assert!(
         list_runs(100)
             .await
@@ -45,6 +48,7 @@ async fn latest_run_filters_agent_and_role_before_limiting_history() {
         assert_eq!(run.agent, agent);
         assert_eq!(run.role, "executor");
     }
+
     assert!(
         latest_run_for_agent_role("executor:nano:missing", "executor")
             .await

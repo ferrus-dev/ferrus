@@ -116,6 +116,7 @@ fn validate_input(input: EnqueueTaskInput) -> Result<EnqueueTaskInput> {
     if input.description.trim().is_empty() {
         anyhow::bail!("Cannot enqueue task: description is required.");
     }
+
     Ok(input)
 }
 

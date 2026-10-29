@@ -22,6 +22,7 @@ pub(crate) struct Preview {
     text: String,
     published: Option<std::time::Instant>,
 }
+
 impl Preview {
     pub(crate) fn update(&mut self, turn: u64, text: &str) -> Option<Event> {
         if self.turn != turn {
@@ -29,12 +30,14 @@ impl Preview {
             self.text.clear();
             self.published = None;
         }
+
         let mut end = text
             .len()
             .min(PREVIEW_BYTES.saturating_sub(self.text.len()));
         while !text.is_char_boundary(end) {
             end -= 1;
         }
+
         self.text.push_str(&text[..end]);
         if end < text.len() {
             const NOTICE: &str =
@@ -43,9 +46,11 @@ impl Preview {
             while !self.text.is_char_boundary(keep) {
                 keep -= 1;
             }
+
             self.text.truncate(keep);
             self.text.push_str(NOTICE);
         }
+
         // Keep provider callbacks cheap; the UI paints at most ten times a second.
         if self
             .published
@@ -53,6 +58,7 @@ impl Preview {
         {
             return None;
         }
+
         self.published = Some(std::time::Instant::now());
         Some(Event::Text {
             turn,
@@ -98,6 +104,7 @@ pub(crate) struct Command {
     pub version: u32,
     pub command: CommandKind,
 }
+
 impl Command {
     pub(crate) fn new(command: CommandKind) -> Self {
         Self {
@@ -129,6 +136,7 @@ pub(crate) enum Event {
         code: String,
     },
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
@@ -157,15 +165,18 @@ pub(crate) struct ObservedEvents {
     pub notice_sequence: u64,
     pub rejected_input: Option<String>,
 }
+
 impl ObservedEvents {
     pub(crate) fn observe(&mut self, event: Event) {
         if let Event::Error { code } = &event {
             if let Some(id) = code.strip_prefix("input_queue_full:") {
                 self.rejected_input = Some(id.into());
             }
+
             self.notice = Some(code.clone());
             self.notice_sequence = self.notice_sequence.saturating_add(1);
         }
+
         self.latest = Some(event);
     }
 }
@@ -202,6 +213,7 @@ impl Event {
                         "session ended: ProviderTruncated (model output limit reached), durable={durable}"
                     );
                 }
+
                 format!("session ended: {reason:?}, durable={durable}")
             }
             Self::Error { .. } => "session error; see diagnostics".into(),
@@ -254,16 +266,19 @@ pub(crate) struct Frame {
 pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
     read_bounded_line(reader, FRAME_BYTES)
 }
+
 fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     std::io::Read::take(reader, limit as u64 + 1).read_until(b'\n', &mut line)?;
     if line.is_empty() {
         return Ok(None);
     }
+
     ensure!(line.len() <= limit, "Nano frame exceeds byte limit");
     ensure!(line.last() == Some(&b'\n'), "Incomplete nano frame");
     Ok(Some(line))
 }
+
 pub(crate) fn read_command(reader: &mut impl BufRead) -> Result<Option<CommandKind>> {
     let Some(line) = read_line(reader)? else {
         return Ok(None);
@@ -276,6 +291,7 @@ pub(crate) fn read_command(reader: &mut impl BufRead) -> Result<Option<CommandKi
     );
     Ok(Some(frame.command))
 }
+
 pub(crate) fn read_event(reader: &mut impl BufRead) -> Result<Option<Event>> {
     let Some(line) = read_bounded_line(reader, EVENT_FRAME_BYTES)? else {
         return Ok(None);
@@ -288,6 +304,7 @@ pub(crate) fn read_event(reader: &mut impl BufRead) -> Result<Option<Event>> {
     );
     Ok(Some(frame.event))
 }
+
 pub(crate) fn write_command(writer: &mut impl Write, command: CommandKind) -> Result<()> {
     writer.write_all(&super::journal::encode(
         &Command::new(command),
@@ -324,6 +341,7 @@ struct Mailbox {
 /// One coalesced pending event; a blocked UI never holds up a journal append or heartbeat.
 #[derive(Clone)]
 pub(crate) struct Output(Arc<(Mutex<Mailbox>, Condvar)>);
+
 impl Output {
     pub(crate) fn spawn(
         writer: impl Write + Send + 'static,
@@ -337,8 +355,13 @@ impl Output {
         });
         (output, receiver)
     }
+
     pub(crate) fn publish(&self, event: Event) {
-        let mut mailbox = self.0.0.lock().unwrap();
+        let mut mailbox = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !mailbox.closed {
             if matches!(&event, Event::Error { code } if code.starts_with("input_queue_full:")) {
                 mailbox.rejection = Some(event);
@@ -347,24 +370,40 @@ impl Output {
             } else {
                 mailbox.latest = Some(event);
             }
+
             self.0.1.notify_one();
         }
     }
+
     pub(crate) fn close(&self) {
-        self.0.0.lock().unwrap().closed = true;
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
         self.0.1.notify_one();
     }
+
     fn write(&self, mut writer: impl Write) -> Result<()> {
         loop {
             let event = {
-                let mut mailbox = self.0.0.lock().unwrap();
+                let mut mailbox = self
+                    .0
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 while mailbox.latest.is_none()
                     && mailbox.notice.is_none()
                     && mailbox.rejection.is_none()
                     && !mailbox.closed
                 {
-                    mailbox = self.0.1.wait(mailbox).unwrap();
+                    mailbox = self
+                        .0
+                        .1
+                        .wait(mailbox)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+
                 match mailbox
                     .rejection
                     .take()
@@ -396,25 +435,31 @@ pub(crate) struct ObservedJournal<J> {
     pub interactive: bool,
     pub preview_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
+
 impl<J: Journal> Journal for ObservedJournal<J> {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
         let record = self.journal.append(event, budget)?;
         if let Some(event) = progress(&record) {
             self.output.publish(event);
         }
+
         Ok(record)
     }
+
     fn checkpoint(&mut self) -> Result<()> {
         self.journal.checkpoint()
     }
+
     fn take_commands(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<super::session::SessionCommand>> {
         self.commands.take()
     }
+
     fn interactive(&self) -> bool {
         self.interactive
     }
+
     fn model_delta(&mut self, turn: u64, text: &str) {
         if self
             .preview_enabled
@@ -532,6 +577,7 @@ mod tests {
         ] {
             assert!(read_command(&mut Cursor::new(invalid)).is_err());
         }
+
         assert!(read_event(&mut Cursor::new(b"command output\n")).is_err());
         assert!(
             read_event(&mut Cursor::new(
@@ -583,6 +629,7 @@ mod tests {
             line.push(b'\n');
             assert_eq!(read_event(&mut Cursor::new(line)).unwrap(), Some(event));
         }
+
         record.event = SessionEvent::ModelFailed {
             retryable: true,
             usage: crate::nano::provider::Usage {
@@ -625,15 +672,21 @@ mod tests {
             release: std::sync::mpsc::Receiver<()>,
             bytes: Arc<Mutex<Vec<u8>>>,
         }
+
         impl Write for Blocked {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some(entered) = self.entered.take() {
                     entered.send(()).unwrap();
                     self.release.recv().unwrap();
                 }
-                self.bytes.lock().unwrap().extend_from_slice(bytes);
+
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
                 Ok(bytes.len())
             }
+
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
@@ -657,6 +710,7 @@ mod tests {
                 detail: None,
             });
         }
+
         let notice = Event::Error {
             code: "input_queue_full".into(),
         };
@@ -671,10 +725,23 @@ mod tests {
         };
         output.publish(end.clone());
         output.close();
-        assert_eq!(output.0.0.lock().unwrap().latest, Some(end.clone()));
+        assert_eq!(
+            output
+                .0
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .latest,
+            Some(end.clone())
+        );
         release.send(()).unwrap();
         done.await.unwrap();
-        let mut reader = Cursor::new(bytes.lock().unwrap().clone());
+        let mut reader = Cursor::new(
+            bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
         assert_eq!(read_event(&mut reader).unwrap(), Some(Event::Ready));
         assert_eq!(read_event(&mut reader).unwrap(), Some(rejection));
         assert_eq!(read_event(&mut reader).unwrap(), Some(notice));

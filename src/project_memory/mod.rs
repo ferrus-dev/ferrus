@@ -13,7 +13,10 @@ pub mod federation;
 pub mod federation_service;
 pub mod index;
 pub mod links;
+
 // Shared by local binary adapters and the optional standalone host.
+#[cfg(test)]
+mod contracts;
 #[doc(hidden)]
 pub mod local_query;
 pub mod policy;
@@ -22,9 +25,6 @@ pub mod query;
 pub mod query_sqlite;
 pub mod source;
 pub mod sqlite;
-
-#[cfg(test)]
-mod contracts;
 
 /// Schema-independent project-memory model version.
 pub const MEMORY_MODEL_VERSION: u32 = 1;

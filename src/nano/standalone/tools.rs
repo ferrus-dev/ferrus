@@ -24,6 +24,7 @@ pub(super) struct StandaloneTools {
     #[cfg(feature = "nano-mcp")]
     pub mcp: Option<super::super::mcp::McpTools>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
@@ -80,8 +81,10 @@ impl Tools for StandaloneTools {
         if let Some(mcp) = &self.mcp {
             tools.extend(mcp.descriptors());
         }
+
         tools
     }
+
     fn validate(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
         #[cfg(feature = "nano-mcp")]
         if let Some(mcp) = &self.mcp
@@ -89,6 +92,7 @@ impl Tools for StandaloneTools {
         {
             return mcp.validate(name, arguments);
         }
+
         if name == "load_instructions" {
             serde_json::from_value::<Selection>(arguments.clone())
                 .map(|_| ())
@@ -105,9 +109,11 @@ impl Tools for StandaloneTools {
             self.coding.validate(name, arguments)
         }
     }
+
     fn effect_plan(&self, call: &ValidatedCall) -> Option<EffectPlan> {
         self.coding.effect_plan(call)
     }
+
     async fn prepare_context(
         &mut self,
         messages: &[super::super::provider::Message],
@@ -116,6 +122,7 @@ impl Tools for StandaloneTools {
         if !self.working_set_enabled {
             return Ok(None);
         }
+
         let revisions = self
             .context
             .revisions()
@@ -131,10 +138,12 @@ impl Tools for StandaloneTools {
         .map(Some)
         .map_err(|_| ToolError::Failed)
     }
+
     async fn execute(&mut self, call: &ValidatedCall, cancellation: &Cancellation) -> ToolOutcome {
         if matches!(call.name.as_str(), "exec" | "apply_patch") || call.name.starts_with("mcp_") {
             self.context.invalidate();
         }
+
         if context_request::NAMES.contains(&call.name.as_str())
             && call.name != "repository_fallback"
             && self.coding.commands.potentially_active_writers() > 0
@@ -150,6 +159,7 @@ impl Tools for StandaloneTools {
         {
             return mcp.execute(call, cancellation).await;
         }
+
         let result: Result<Value> = if call.name == "load_instructions" {
             async {
                 let selection: Selection = serde_json::from_value(call.arguments.clone())?;
@@ -196,19 +206,23 @@ impl Tools for StandaloneTools {
             )),
         }
     }
+
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         #[cfg(feature = "nano-mcp")]
         if let Some(mcp) = &mut self.mcp {
             return mcp.interrupted().await;
         }
+
         None
     }
+
     async fn shutdown(&mut self) -> bool {
         let clean = self.coding.shutdown().await;
         #[cfg(feature = "nano-mcp")]
         if let Some(mcp) = &mut self.mcp {
             return mcp.shutdown().await && clean;
         }
+
         clean
     }
 }
@@ -221,6 +235,7 @@ fn ensure_fallback(value: &Value) -> Result<(), ToolError> {
     {
         return Err(ToolError::InvalidArguments);
     }
+
     match value["operation"].as_str() {
         Some("read") => {
             serde_json::from_value::<super::super::workspace::ReadRequest>(value["input"].clone())

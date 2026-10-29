@@ -58,17 +58,20 @@ pub trait FactBatchStore {
     type Error;
 
     fn protection(&self) -> FactStoreProtection;
+
     fn put(
         &mut self,
         batch: &FactBatch,
         authority: &FactBatchWriteAuthority,
         deadline: Instant,
     ) -> Result<PutFactBatchOutcome, Self::Error>;
+
     fn progress(
         &self,
         job: &IndexJobRef,
         deadline: Instant,
     ) -> Result<FactBatchProgressOutcome, Self::Error>;
+
     fn load_for_ingestion(&self, job: &IndexJobRef) -> Result<Vec<FactBatch>, Self::Error>;
 }
 

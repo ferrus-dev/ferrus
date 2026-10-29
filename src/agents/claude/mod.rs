@@ -122,9 +122,11 @@ fn claude_command(
     if isolation == ClaudeMcpIsolation::FerrusOnly {
         cmd.arg("--strict-mcp-config");
     }
+
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
+
     match mode {
         AgentRunMode::Interactive { prompt } => {
             if let Some(prompt) = prompt {
@@ -137,6 +139,7 @@ fn claude_command(
             cmd.arg("-p").arg(prompt);
         }
     }
+
     cmd
 }
 
@@ -160,6 +163,7 @@ fn claude_config_paths() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".claude").join("settings.json"));
     }
+
     paths
 }
 

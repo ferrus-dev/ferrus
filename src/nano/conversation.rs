@@ -31,6 +31,7 @@ pub(crate) struct Reader {
     replay: Replay,
     snapshot: Snapshot,
 }
+
 impl Reader {
     pub(crate) fn new(path: PathBuf, run_id: String) -> Self {
         Self {
@@ -41,6 +42,7 @@ impl Reader {
             snapshot: Snapshot::default(),
         }
     }
+
     pub(crate) fn poll(&mut self) -> Result<Option<Snapshot>> {
         let mut file = match private::read_only_file(&self.path) {
             Ok(file) => file,
@@ -72,6 +74,7 @@ impl Reader {
             if line.last() != Some(&b'\n') {
                 break;
             }
+
             let record: Record = serde_json::from_slice(&line)?;
             ensure!(
                 record.session_id == self.expected_run,
@@ -81,6 +84,7 @@ impl Reader {
             self.snapshot.apply(&record);
             self.offset += line.len() as u64;
         }
+
         Ok((self.offset != before).then(|| self.snapshot.clone()))
     }
 
@@ -98,6 +102,7 @@ impl Reader {
                 status.as_deref().unwrap_or("missing")
             );
         }
+
         Ok(snapshot)
     }
 }
@@ -107,6 +112,7 @@ pub(crate) struct InputWriter {
     sender: mpsc::SyncSender<CommandKind>,
     cancel: Arc<AtomicBool>,
 }
+
 impl InputWriter {
     pub(crate) fn new(mut writer: impl Write + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::sync_channel(8);
@@ -118,6 +124,7 @@ impl InputWriter {
                     let _ = wire::write_command(&mut writer, CommandKind::Cancel);
                     break;
                 }
+
                 match receiver.recv_timeout(Duration::from_millis(25)) {
                     Ok(command) => {
                         if wire::write_command(&mut writer, command).is_err() {
@@ -131,11 +138,13 @@ impl InputWriter {
         });
         Self { sender, cancel }
     }
+
     pub(crate) fn open(&self) -> Result<()> {
         self.sender
             .try_send(CommandKind::Interact)
             .map_err(|_| anyhow::anyhow!("Nano input queue is full or disconnected"))
     }
+
     pub(crate) fn steer(&self, text: String, input_id: Option<String>) -> Result<()> {
         ensure!(!text.trim().is_empty(), "Input cannot be empty");
         wire::validate_identified_steer(&text, input_id.as_deref())?;
@@ -144,10 +153,12 @@ impl InputWriter {
             .try_send(command)
             .map_err(|_| anyhow::anyhow!("Nano input queue is full or disconnected"))
     }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
 }
+
 impl Drop for InputWriter {
     fn drop(&mut self) {
         self.cancel();
@@ -161,6 +172,7 @@ pub(crate) struct View {
     pub snapshots: tokio::sync::watch::Receiver<Option<Snapshot>>,
     stop: Arc<AtomicBool>,
 }
+
 impl View {
     pub(crate) fn spawn(name: String, path: PathBuf, run: String, database: PathBuf) -> Self {
         let (sender, snapshots) = tokio::sync::watch::channel(None);
@@ -188,6 +200,7 @@ impl View {
                         break;
                     }
                 }
+
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
@@ -199,6 +212,7 @@ impl View {
         }
     }
 }
+
 impl Drop for View {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -257,12 +271,14 @@ mod tests {
                 )
                 .unwrap();
         }
+
         let path = root.join("nano/sessions/view-test/events.jsonl");
         let mut reader = Reader::new(path.clone(), "view-test".into());
         let mut snapshot = None;
         while let Some(next) = reader.poll().unwrap() {
             snapshot = Some(next)
         }
+
         let snapshot = snapshot.unwrap();
         assert_eq!(snapshot.task_id, "t-001");
         assert_eq!(snapshot.sequence, 152);
@@ -300,6 +316,7 @@ mod tests {
         while let Some(next) = reattached.poll().unwrap() {
             restored = Some(next)
         }
+
         assert_eq!(restored.unwrap(), reader.snapshot);
     }
 
@@ -337,6 +354,7 @@ mod tests {
                     .contains("no complete terminal session record")
             );
         }
+
         assert!(!path.exists());
         let mut missing = Reader::new(path, "unknown-run".into());
         assert!(missing.poll_persisted(&database).is_err());
@@ -396,17 +414,20 @@ mod tests {
                         .unwrap();
                     assert!(reader.poll_persisted(&database).unwrap().is_none());
                 }
+
                 for status in ["failed", "completed", "interrupted"] {
                     connection
                         .execute("UPDATE runs SET status = ?1", [status])
                         .unwrap();
                     assert!(reader.poll_persisted(&database).is_err());
                 }
+
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 connection
                     .execute("UPDATE runs SET status = 'running'", [])
                     .unwrap();
             }
+
             if with_history {
                 // A complete Ended record remains authoritative, even with a partial tail.
                 let file = private::file(&path, false).unwrap();
@@ -439,15 +460,18 @@ mod tests {
             release: mpsc::Receiver<()>,
             bytes: Arc<std::sync::Mutex<Vec<u8>>>,
         }
+
         impl Write for SlowWriter {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some(entered) = self.entered.take() {
                     entered.send(()).unwrap();
                     self.release.recv().unwrap();
                 }
+
                 self.bytes.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
+
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
@@ -465,6 +489,7 @@ mod tests {
         for _ in 0..8 {
             writer.steer("queued".into(), None).unwrap();
         }
+
         assert!(writer.steer("overflow".into(), None).is_err());
         assert!(writer.steer("x".repeat(wire::FRAME_BYTES), None).is_err());
         writer.cancel();
@@ -476,6 +501,7 @@ mod tests {
                 assert!(!text.contains("queued"));
                 break;
             }
+
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }

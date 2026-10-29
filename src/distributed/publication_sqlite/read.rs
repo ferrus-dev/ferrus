@@ -316,8 +316,10 @@ pub(super) fn load_facts(
         if u64::try_from(plaintext.len()).ok() != u64::try_from(byte_len).ok() {
             return Err(RemoteStoreError::IntegrityFailure);
         }
+
         facts.push((kind, plaintext.to_vec()));
     }
+
     Ok(facts)
 }
 
@@ -394,6 +396,7 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
     if !coordinator_exists {
         return Err(RemoteStoreError::MissingCoordinatorSchema);
     }
+
     let coordinator_version = connection
         .query_row(
             "SELECT schema_version FROM distributed_coordinator_metadata WHERE singleton = 1",
@@ -404,6 +407,7 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
     if coordinator_version != Some(COORDINATOR_SCHEMA_VERSION) {
         return Err(RemoteStoreError::IncompatibleSchema);
     }
+
     let jobs_exist = connection
         .query_row(
             "SELECT 1 FROM sqlite_master
@@ -416,6 +420,7 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
     if !jobs_exist {
         return Err(RemoteStoreError::MissingCoordinatorSchema);
     }
+
     let version = connection
         .query_row(
             "SELECT schema_version, protocol_version FROM remote_storage_metadata WHERE singleton = 1",
@@ -436,6 +441,7 @@ pub(super) fn initialize_schema(connection: &Connection) -> Result<(), RemoteSto
                 && protocol == DISTRIBUTED_STORAGE_PROTOCOL_VERSION => {}
         Some(_) => return Err(RemoteStoreError::IncompatibleSchema),
     }
+
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
              tenant_id TEXT NOT NULL,

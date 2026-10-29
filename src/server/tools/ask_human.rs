@@ -81,9 +81,11 @@ async fn ensure_can_ask_human(
             context.status
         );
     }
+
     if can_supervisor_ask_during_consultation(context, agent_id) {
         return Ok(());
     }
+
     ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await
 }
 
@@ -103,6 +105,7 @@ fn can_supervisor_ask_during_consultation(context: &RuntimeTaskContext, agent_id
     if !is_supervisor(agent_id) {
         return false;
     }
+
     context.status.parse::<project::TaskStatus>().ok() == Some(project::TaskStatus::Consultation)
 }
 
@@ -118,6 +121,7 @@ fn human_pause_context(
             .transpose()?;
         return Ok((project::TaskStatus::Consultation, paused_status));
     }
+
     Ok((current_status, Some(current_status)))
 }
 

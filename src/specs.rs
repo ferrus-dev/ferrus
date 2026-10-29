@@ -91,6 +91,7 @@ pub async fn list_spec_paths() -> Result<Vec<String>> {
             paths.push(path.display().to_string());
         }
     }
+
     paths.sort();
     Ok(paths)
 }
@@ -119,13 +120,16 @@ pub fn parse_spec(path: &str, content: &str) -> SpecDocument {
                 if parse_milestone_header(&lines[child]).is_some() {
                     break;
                 }
+
                 if let Some(value) = parse_child_field(&lines[child], "ID") {
                     id = Some(value.to_string());
                 } else if let Some(value) = parse_child_field(&lines[child], "Depends on") {
                     depends_on = Some(value.to_string());
                 }
+
                 child += 1;
             }
+
             if let Some(id) = id.filter(|id| !id.is_empty()) {
                 milestones.push(Milestone {
                     marker: marker.to_string(),
@@ -136,6 +140,7 @@ pub fn parse_spec(path: &str, content: &str) -> SpecDocument {
                     line_index: idx,
                 });
             }
+
             idx = child;
         } else {
             idx += 1;
@@ -277,6 +282,7 @@ fn normalize_outcome_section(outcome: &str) -> Result<String> {
     if outcome.is_empty() {
         anyhow::bail!("Cannot archive spec: outcome content is empty.");
     }
+
     if outcome.starts_with("## Outcome") {
         Ok(outcome.to_string())
     } else {
@@ -321,6 +327,7 @@ fn upsert_outcome_section_text(content: &str, outcome: &str) -> String {
             if !lines.last().is_some_and(|line| line.ends_with('\n')) {
                 lines.push("\n".to_string());
             }
+
             if !lines
                 .iter()
                 .rev()
@@ -329,6 +336,7 @@ fn upsert_outcome_section_text(content: &str, outcome: &str) -> String {
             {
                 lines.push("\n".to_string());
             }
+
             lines.extend(outcome_lines);
         }
     }
@@ -337,9 +345,11 @@ fn upsert_outcome_section_text(content: &str, outcome: &str) -> String {
     while updated.ends_with("\n\n\n") {
         updated.pop();
     }
+
     if !updated.ends_with('\n') {
         updated.push('\n');
     }
+
     updated
 }
 
@@ -372,12 +382,14 @@ pub(crate) fn parse_milestone_header(line: &str) -> Option<(bool, &str, &str)> {
     if !rest.starts_with('#') {
         return None;
     }
+
     let mut parts = rest.splitn(2, char::is_whitespace);
     let marker = parts.next()?.trim();
     let title = parts.next().unwrap_or_default().trim();
     if marker.len() <= 1 || title.is_empty() {
         return None;
     }
+
     Some((completed, marker, title))
 }
 
@@ -415,6 +427,7 @@ fn milestone_refs(milestone: &Milestone) -> Vec<String> {
     if let Some(marker) = milestone.marker.strip_prefix('#') {
         refs.push(normalize_ref(marker));
     }
+
     refs
 }
 
@@ -435,6 +448,7 @@ fn write_spec_lines(path: &str, lines: &[String]) -> Result<()> {
     if !content.ends_with('\n') {
         content.push('\n');
     }
+
     std::fs::write(path, content).with_context(|| format!("Failed to write spec {path}"))
 }
 

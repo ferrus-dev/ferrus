@@ -100,6 +100,7 @@ fn qwen_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
+
     match mode {
         AgentRunMode::Interactive { prompt } => {
             if let Some(prompt) = prompt {
@@ -111,6 +112,7 @@ fn qwen_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
             cmd.arg("-p").arg(prompt);
         }
     }
+
     cmd
 }
 
@@ -124,6 +126,7 @@ fn qwen_config_paths() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".qwen").join("settings.json"));
     }
+
     paths
 }
 

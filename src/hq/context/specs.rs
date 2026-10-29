@@ -46,6 +46,7 @@ impl HqContext {
         if !confirm {
             return Ok(TaskMilestoneSelection::Use(selected));
         }
+
         self.display.muted(format!(
             "\n  • Using next ready milestone\n  ╰─ {} / {}\n",
             selected.spec_path,
@@ -118,6 +119,7 @@ impl HqContext {
         if reply_rx.await.unwrap_or(false) {
             self.task(false, false).await?;
         }
+
         Ok(())
     }
 
@@ -129,6 +131,7 @@ impl HqContext {
         if !self.archive_completed_selected_spec_before_spec().await? {
             return Ok(());
         }
+
         prepare_spec_session_files().await?;
 
         let supervisor = std::sync::Arc::clone(
@@ -202,6 +205,7 @@ impl HqContext {
                 }
             }
         }
+
         let stderr = finish_interactive_stderr(stderr).await;
         clear_primary_screen();
         resume_guard.resume_now();
@@ -234,6 +238,7 @@ impl HqContext {
             self.display
                 .info("No specification created. Re-run /spec when ready.");
         }
+
         Ok(())
     }
 
@@ -311,6 +316,7 @@ impl HqContext {
             ));
             return Ok(false);
         }
+
         let active = tasks
             .iter()
             .filter(|task| {
@@ -397,6 +403,7 @@ impl HqContext {
                 }
             }
         }
+
         let stderr = finish_interactive_stderr(stderr).await;
         clear_primary_screen();
         resume_guard.resume_now();

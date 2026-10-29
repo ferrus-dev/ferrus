@@ -27,6 +27,7 @@ impl RemoteDeleteRequest {
         if self.protocol_version != DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION {
             return Err(DistributedProtocolError::UnsupportedVersion);
         }
+
         self.deletion
             .validate()
             .map_err(|_| DistributedProtocolError::DeletionMismatch)
@@ -47,6 +48,7 @@ impl InspectRemoteDeletionRequest {
         if self.protocol_version != DISTRIBUTED_MAINTENANCE_PROTOCOL_VERSION {
             return Err(DistributedProtocolError::UnsupportedVersion);
         }
+
         Ok(())
     }
 }

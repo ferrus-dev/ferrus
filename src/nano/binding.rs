@@ -75,6 +75,7 @@ impl Binding {
             Self::Interactive { .. } | Self::Supervisor(_) => None,
         }
     }
+
     pub(crate) fn project_root(&self) -> &Path {
         match self {
             Self::Supervisor(session) => &session.root,
@@ -82,6 +83,7 @@ impl Binding {
             Self::Interactive { project_root, .. } => project_root,
         }
     }
+
     pub(crate) fn workspace(&self) -> &Path {
         match self {
             Self::Managed(session) => session.workspace(),
@@ -89,6 +91,7 @@ impl Binding {
             Self::Interactive { project_root, .. } => project_root,
         }
     }
+
     pub(crate) fn project_id(&self) -> &str {
         match self {
             Self::Supervisor(session) => &session.project_id,
@@ -96,6 +99,7 @@ impl Binding {
             Self::Interactive { project_id, .. } => project_id,
         }
     }
+
     pub(crate) fn data_dir(&self) -> &Path {
         match self {
             Self::Supervisor(session) => &session.data,
@@ -103,6 +107,7 @@ impl Binding {
             Self::Interactive { data_dir, .. } => data_dir,
         }
     }
+
     pub(crate) fn run_id(&self) -> &str {
         match self {
             Self::Supervisor(session) => &session.scope.run_id,
@@ -110,6 +115,7 @@ impl Binding {
             Self::Interactive { run_id, .. } => run_id,
         }
     }
+
     pub(crate) fn task_id(&self) -> Option<&str> {
         match self {
             Self::Managed(session) => Some(&session.scope.task_id),
@@ -117,6 +123,7 @@ impl Binding {
             _ => None,
         }
     }
+
     pub(crate) async fn status(&self) -> Result<Option<crate::project::RuntimeTaskContext>> {
         match self {
             Self::Managed(session) => session.status().await.map(Some),
@@ -143,6 +150,7 @@ impl Binding {
             }
         }
     }
+
     pub(crate) async fn graph(&self) -> Result<crate::repository_graph_runtime::LocalGraphContext> {
         match self.status().await? {
             Some(runtime) => {
@@ -164,6 +172,7 @@ impl Binding {
             }
         }
     }
+
     pub(crate) async fn project_context(
         &self,
         domain: crate::project_memory::federation::ContextDomain,
@@ -245,11 +254,14 @@ impl super::instructions::InstructionScope for Binding {
                 scope.review_path = Some(format!(".ferrus/runs/{}/REVIEW.md", runtime.task_id));
             }
         }
+
         Ok(scope)
     }
+
     fn project_root(&self) -> &std::path::Path {
         Binding::project_root(self)
     }
+
     fn workspace(&self) -> &std::path::Path {
         Binding::workspace(self)
     }
@@ -259,9 +271,11 @@ impl super::instructions::InstructionScope for super::ferrus::FerrusSession {
     async fn snapshot(&self) -> anyhow::Result<super::instructions::ScopeSnapshot> {
         Binding::from(self.clone()).snapshot().await
     }
+
     fn project_root(&self) -> &std::path::Path {
         super::ferrus::FerrusSession::project_root(self)
     }
+
     fn workspace(&self) -> &std::path::Path {
         super::ferrus::FerrusSession::workspace(self)
     }

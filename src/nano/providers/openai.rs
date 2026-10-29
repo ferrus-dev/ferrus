@@ -42,6 +42,7 @@ impl OpenAi {
                 .ok_or_else(|| anyhow::anyhow!("Invalid provider credential"))?;
             builder = builder.api_key(key);
         }
+
         Ok(Self {
             client: builder
                 .build()
@@ -58,6 +59,7 @@ impl OpenAi {
         if output == 0 {
             return Err(failure(ProviderErrorKind::ContextOverflow));
         }
+
         let mut encoded = Request::new(&self.settings.model)
             .max_tokens(output)
             .include_usage(self.settings.include_usage)
@@ -65,6 +67,7 @@ impl OpenAi {
         if let Some(value) = self.settings.temperature {
             encoded = encoded.temperature(value as f32);
         }
+
         if let Some(value) = self.settings.reasoning_effort {
             encoded = encoded.reasoning(match value {
                 ReasoningEffort::None => svir::Effort::Off,
@@ -76,6 +79,7 @@ impl OpenAi {
                 ReasoningEffort::Max => svir::Effort::Max,
             });
         }
+
         for (index, message) in request.messages.into_iter().enumerate() {
             encoded = match message {
                 Message::System { text } if index == 0 => encoded.system(text),
@@ -93,10 +97,12 @@ impl OpenAi {
                 ),
             };
         }
+
         for tool in request.tools {
             encoded = encoded
                 .tool(svir::Tool::new(tool.name, tool.description).schema(tool.input_schema));
         }
+
         Ok(encoded)
     }
 
@@ -107,6 +113,7 @@ impl OpenAi {
         if let Some(window) = self.settings.context_tokens {
             encoder = encoder.context_tokens(window);
         }
+
         encoder
             .encode(&request)
             .map_err(map_error)?
@@ -142,6 +149,7 @@ impl Provider for OpenAi {
                 .encode(&request)
                 .map_err(map_error)?;
         }
+
         self.active = Some(self.client.stream(request).await.map_err(map_error)?);
         Ok(())
     }
@@ -162,8 +170,10 @@ impl Provider for OpenAi {
                 if !matches!(event, ProviderEvent::Completed { .. }) {
                     self.active = Some(active);
                 }
+
                 return Ok(Some(event));
             }
+
             // Reasoning is retained as continuation, not displayed. Ready
             // fragments must not starve cancellation while it is assembled.
             tokio::task::yield_now().await;
@@ -185,6 +195,7 @@ fn continuation(response: ModelResponse) -> Result<Completion, ProviderError> {
             .map(|call| svir::ToolCall::new(call.provider_call_id, call.name, call.arguments))
             .collect();
     }
+
     if let Some(data) = response.continuation {
         for (key, value) in data
             .as_object()
@@ -203,6 +214,7 @@ fn continuation(response: ModelResponse) -> Result<Completion, ProviderError> {
             ));
         }
     }
+
     Ok(done)
 }
 
@@ -238,6 +250,7 @@ pub(super) fn event_to_provider(event: Event) -> Result<Option<ProviderEvent>, P
                 };
                 reasoning.insert(key.into(), part.text.into());
             }
+
             let calls = if finish == FinishReason::Length {
                 // Raw audit calls in the existing Nano journal. Engine/replay
                 // exclude every Length call from execution and future history.

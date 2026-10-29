@@ -34,6 +34,7 @@ impl<B: ExecutionBackend> NativeTools<B> {
     pub(super) fn belongs_to_supervisor(&self, session: &super::review::Session) -> bool {
         matches!(&self.session, Binding::Supervisor(bound) if bound.project_id==session.project_id && bound.root==session.root && bound.data==session.data && bound.scope.database_path==session.scope.database_path && bound.scope.run_id==session.scope.run_id && bound.scope.agent_id==session.scope.agent_id && bound.scope.task_id==session.scope.task_id && bound.scope.workspace_path==session.scope.workspace_path && bound.source.path==session.source.path && bound.mode==session.mode)
     }
+
     pub(super) fn belongs_to(&self, session: &FerrusSession) -> bool {
         self.session.managed().is_some_and(|bound| {
             bound.scope.database_path == session.scope.database_path
@@ -43,6 +44,7 @@ impl<B: ExecutionBackend> NativeTools<B> {
                 && bound.workspace() == session.workspace()
         })
     }
+
     pub(crate) fn new(
         session: impl Into<Binding>,
         coding: CodingTools<B>,
@@ -81,10 +83,12 @@ impl<B: ExecutionBackend> NativeTools<B> {
         {
             tracing::warn!(error = ?error, "failed to invalidate the canonical graph before a Nano mutation");
         }
+
         if !self.working_set_enabled {
             self.prefetch_invalidated = true;
             return;
         }
+
         self.context.invalidate();
         self.refresh.invalidate();
         self.prefetch_invalidated = true;
@@ -100,9 +104,11 @@ impl<B: ExecutionBackend> NativeTools<B> {
         if observation["status"] == "published" {
             self.prefetch_invalidated = false;
         }
+
         self.observations.push(observation);
     }
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
@@ -127,9 +133,11 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if !self.working_set_enabled && self.prefetch.is_empty() {
             return Ok(None);
         }
+
         if cancellation.is_cancelled() {
             return Err(ToolError::Interrupted);
         }
+
         let writers = self.coding.commands.potentially_active_writers() > 0;
         if self.working_set_enabled {
             // Resolve the task view before selecting prior graph packets or
@@ -138,10 +146,12 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             for observation in self.refresh.prepare(&self.session, writers).await {
                 self.record_refresh(observation);
             }
+
             if let Some(observation) = self.refresh.settle().await {
                 self.record_refresh(observation);
             }
         }
+
         let revisions = self
             .context
             .revisions()
@@ -201,24 +211,29 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
                 .observations
                 .push(json!({"kind":"prefetch_unavailable", "reason":"overlay_not_current"}));
         }
+
         prepared.observations.append(&mut self.observations);
         if self.working_set_enabled {
             prepared
                 .observations
                 .extend(self.refresh.prepare(&self.session, writers).await);
         }
+
         Ok(Some(prepared))
     }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.coding.descriptors();
         if self.native_context_enabled {
             tools.extend(context::NAMES.iter().map(|name| descriptor(name)));
         }
+
         tools.push(descriptor("load_instructions"));
         #[cfg(feature = "nano-mcp")]
         if let Some(mcp) = &self.mcp {
             tools.extend(mcp.descriptors());
         }
+
         tools
     }
 
@@ -233,8 +248,10 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             {
                 return Err(ToolError::InvalidArguments);
             }
+
             return Ok(());
         }
+
         let valid = if context::NAMES.contains(&name) && !self.native_context_enabled {
             return Err(ToolError::UnknownTool);
         } else if name == "load_instructions" {
@@ -263,6 +280,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if self.session.status().await.is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
         }
+
         if context::NAMES.contains(&call.name.as_str()) && !self.native_context_enabled {
             return ToolOutcome::Failed(ToolError::UnknownTool);
         }
@@ -299,10 +317,10 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
                 None
             };
             self.invalidate_unknown().await;
-            let outcome = self
-                .mcp
-                .as_mut()
-                .unwrap()
+            let Some(mcp) = self.mcp.as_mut() else {
+                return ToolOutcome::Failed(ToolError::UnknownTool);
+            };
+            let outcome = mcp
                 .execute(normalized.as_ref().unwrap_or(call), cancellation)
                 .await;
             if self.working_set_enabled {
@@ -310,6 +328,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
                 self.observations
                     .extend(self.refresh.prepare(&self.session, writers).await);
             }
+
             return outcome;
         }
 
@@ -322,8 +341,10 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
                     self.observations
                         .extend(self.refresh.prepare(&self.session, writers).await);
                 }
+
                 return outcome;
             }
+
             return self.coding.execute(call, cancellation).await;
         }
 
@@ -338,6 +359,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
             if let Some(observation) = self.refresh.settle().await {
                 self.record_refresh(observation);
             }
+
             if let Some(reason) = self.refresh.pending_reason() {
                 return ToolOutcome::Failed(ToolError::Context(json!({
                     "code":reason, "canonical_fallback":false,
@@ -395,16 +417,20 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         {
             return false;
         }
+
         if !coding_clean {
             return false;
         }
+
         if self.working_set_enabled {
             self.before_mutation().await;
             for observation in self.refresh.prepare(&self.session, false).await {
                 self.record_refresh(observation);
             }
+
             self.before_mutation().await;
         }
+
         true
     }
 
@@ -413,6 +439,7 @@ impl<B: ExecutionBackend> Tools for NativeTools<B> {
         if let Some(mcp) = &mut self.mcp {
             return mcp.interrupted().await;
         }
+
         None
     }
 }

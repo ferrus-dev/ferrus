@@ -17,6 +17,7 @@ fn digest(value: &str) -> Digest {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
+
     Digest::new("sha256", encoded).unwrap()
 }
 

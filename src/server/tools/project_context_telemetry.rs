@@ -144,8 +144,9 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 fn emit(metric: Metric<'_>) {
-    let encoded = serde_json::to_string(&metric)
-        .expect("privacy-safe project context metric is always serializable");
+    let Ok(encoded) = serde_json::to_string(&metric) else {
+        return;
+    };
     tracing::info!(
         target: "ferrus::project_memory::query",
         metric = %encoded,

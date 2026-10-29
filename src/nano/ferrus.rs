@@ -60,6 +60,7 @@ pub(crate) struct FerrusSession {
     project_root: PathBuf,
     baseline_tree: Option<String>,
     baseline_path: PathBuf,
+    data_dir: PathBuf,
     ttl_secs: u64,
 }
 
@@ -114,6 +115,7 @@ impl FerrusSession {
             project_root,
             baseline_tree: launch.baseline_tree,
             baseline_path,
+            data_dir: registration.data_dir,
         };
 
         session.status().await?;
@@ -121,10 +123,7 @@ impl FerrusSession {
     }
 
     pub(crate) fn data_dir(&self) -> &std::path::Path {
-        self.scope
-            .database_path
-            .parent()
-            .expect("bound database has a parent")
+        &self.data_dir
     }
 
     pub(crate) fn workspace(&self) -> &std::path::Path {
@@ -207,12 +206,14 @@ impl FerrusSession {
                 if agent != scope.agent_id || path != workspace {
                     break;
                 }
+
                 ensure!(
                     matches!(status.as_str(), "failed" | "interrupted" | "completed"),
                     "Previous Executor run is still active"
                 );
                 runs.push(id);
             }
+
             Ok(runs)
         })
         .await

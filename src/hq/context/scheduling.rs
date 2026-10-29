@@ -50,6 +50,7 @@ impl HqContext {
             if task_claim_blocks_spawn(task, &expected_agent_id, now, &live_run_task_ids) {
                 continue;
             }
+
             if self
                 .supervisor
                 .as_ref()
@@ -70,9 +71,11 @@ impl HqContext {
                             task.id
                         ));
                     }
+
                     continue;
                 }
             }
+
             self.announced_unavailable_nano_reviews.remove(&task.id);
             review_tasks.push(task.clone());
             if review_tasks.len() == slots {
@@ -109,6 +112,7 @@ impl HqContext {
                 "Could not start more reviewer sessions after starting {spawned} task(s): {err}",
             ));
         }
+
         Ok(spawned)
     }
 
@@ -166,6 +170,7 @@ impl HqContext {
                 "Could not start more consultation supervisor sessions after starting {spawned} task(s): {err}",
             ));
         }
+
         Ok(spawned)
     }
 
@@ -189,6 +194,7 @@ impl HqContext {
             if self.nano_paused_tasks.contains(&task.id) {
                 continue;
             }
+
             let name = self.executor_agent_id_for_task(&task.id)?;
             if task_claim_blocks_spawn(&task, &name, now, &live_run_task_ids)
                 || self
@@ -198,6 +204,7 @@ impl HqContext {
             {
                 continue;
             }
+
             spawn_tasks.push((task, name));
             if spawn_tasks.len() == slots {
                 break;
@@ -230,6 +237,7 @@ impl HqContext {
                 "Could not resume more consultation executors after starting {spawned} task(s): {err}",
             ));
         }
+
         Ok(spawned)
     }
 
@@ -255,6 +263,7 @@ impl HqContext {
             {
                 continue;
             }
+
             if answered_human_owner_is_live(
                 &waiter.awaiting_human_by,
                 &live_run_agents,
@@ -320,6 +329,7 @@ impl HqContext {
                 ready_tasks.push(task);
             }
         }
+
         let ready_count = ready_tasks.len();
         if ready_count == 0 {
             return Ok(0);
@@ -333,6 +343,7 @@ impl HqContext {
                     "{ready_count} executor-ready task(s) waiting; executor parallelism limit is {max_parallel}."
                 ));
             }
+
             return Ok(0);
         }
 
@@ -352,6 +363,7 @@ impl HqContext {
             if spawned >= slots {
                 break;
             }
+
             let index = u32::try_from(spawned + 1).context("Executor index exceeds u32 range")?;
             let name = self.executor_agent_id_for_task(&task.id)?;
             if self
@@ -381,6 +393,7 @@ impl HqContext {
                 "Could not start more executor sessions after starting {spawned} task(s): {err}",
             ));
         }
+
         Ok(spawned)
     }
 
@@ -403,6 +416,7 @@ impl HqContext {
         if managed_workspaces_isolated || local_taskless_executor {
             live_db_task_ids.remove("current");
         }
+
         Ok(occupied_executor_slots_from_handles(
             live_db_task_ids,
             self.headless.iter().filter_map(|(name, handle)| {

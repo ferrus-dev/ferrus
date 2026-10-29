@@ -33,6 +33,20 @@ Keep punctuation plain ASCII.
 Intentional Unicode test fixtures and terminal UI glyph tables are exceptions when the
 characters themselves are the behavior under test or part of the rendered interface.
 
+## Code Style
+
+- Do not call `unwrap()` or `expect()` outside tests. Propagate errors, handle missing
+  values explicitly, or model invariants so invalid states cannot be constructed.
+  Clippy enforces this rule; do not replace these calls with panic-based equivalents
+  or suppress the lints to bypass it.
+- Separate functions, methods, type declarations, and distinct logical steps with one
+  blank line. Keep closely related statements together when they form one operation;
+  avoid adding blank lines inside compact expressions or between every statement.
+  Keep related `mod`/`pub mod` declarations together without blank lines, like `use` imports.
+- Keep Rust source files at or below 1000 lines, including tests. Split larger modules
+  by responsibility into focused submodules, preserving visibility and behavior. Do
+  not use `include!` or arbitrary numbered chunks to work around the limit.
+
 ## Build and Test
 
 ```sh
@@ -44,10 +58,11 @@ cargo clippy -- -D warnings        # lint (warnings are errors)
 cargo fmt                          # format
 cargo fmt --check                  # check formatting without writing
 cargo check                        # fast type-check
+python3 scripts/check_module_size.py # Rust files must not exceed 1000 lines
 ```
 
 Before submitting, `cargo clippy -- -D warnings`, `cargo fmt --check`, and `cargo test` must
-all pass.
+all pass. Run `python3 scripts/check_module_size.py` as well.
 
 For Nano development, add `--features nano-openai` to build, test, and Clippy commands;
 include `nano-mcp` when testing external MCP peers.

@@ -70,6 +70,7 @@ impl<B: ExecutionBackend> ManagedTools<B> {
         ) {
             return;
         }
+
         if let Ok(context) = self.session.status().await {
             self.terminal = match context.status.as_str() {
                 "reviewing" => Some(EndReason::AuthorityLost),
@@ -119,6 +120,7 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
     ) -> std::result::Result<Option<super::working_set::Preparation>, ToolError> {
         self.native.prepare_context(messages, cancellation).await
     }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.native.descriptors();
         for name in lifecycle::NAMES {
@@ -155,6 +157,7 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
                 input_schema: schema,
             });
         }
+
         tools
     }
 
@@ -235,13 +238,17 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
                         if let Some(answer) = lifecycle::poll_answer(&session, human).await? {
                             return Ok(answer);
                         }
+
                         tokio::select! { _ = stop.cancelled() => anyhow::bail!("Native wait interrupted"), _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
                     }
                 }
             }
         }));
 
-        let result = self.pending.as_mut().unwrap().await;
+        let Some(pending) = self.pending.as_mut() else {
+            return ToolOutcome::Unknown(ToolError::Interrupted);
+        };
+        let result = pending.await;
         self.pending = None;
 
         if let Ok(Ok(value)) = &result {
@@ -269,6 +276,7 @@ impl<B: ExecutionBackend> Tools for ManagedTools<B> {
                 if let Ok(Ok(value)) = &result {
                     self.observe(value);
                 }
+
                 result.is_ok()
             }
             None => true,
@@ -312,11 +320,13 @@ struct ManagedHost {
     lost: Arc<AtomicBool>,
     stop: Cancellation,
 }
+
 impl Host for ManagedHost {
     async fn authorize(&mut self, _: &ValidatedCall) -> std::result::Result<(), ToolError> {
         if self.lost.load(Ordering::Acquire) {
             return Err(ToolError::Denied);
         }
+
         let context = match self.session.authorize().await {
             Ok(context) => context,
             Err(_) => {
@@ -328,8 +338,10 @@ impl Host for ManagedHost {
         if !matches!(context.status.as_str(), "executing" | "addressing") {
             return Err(ToolError::Denied);
         }
+
         Ok(())
     }
+
     fn committed(&mut self, _: &Record) {}
 }
 
@@ -337,6 +349,7 @@ struct Heartbeat {
     stop: Cancellation,
     task: JoinHandle<()>,
 }
+
 impl Drop for Heartbeat {
     fn drop(&mut self) {
         self.stop.cancel();
@@ -381,6 +394,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             "Relaunched Executor could not renew its lease"
         );
     }
+
     let stop = Cancellation::default();
     let heartbeat_stop = Cancellation::default();
     let lost = Arc::new(AtomicBool::new(false));
@@ -414,6 +428,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if cancellation.is_cancelled() {
         stop.cancel();
     }
+
     #[cfg(feature = "nano-mcp")]
     let mut native = native;
     let recovery = super::resume::recover_previous(&session, &native.coding.workspace).await?;
@@ -440,6 +455,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             Err(error) => return Err(error),
         }
     }
+
     #[cfg(feature = "nano-mcp")]
     let graph_peer_mode = native
         .mcp
@@ -520,6 +536,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         })?;
         input = answered_input(&input, &answer, human);
     }
+
     let host = ManagedHost {
         session: session.clone(),
         lost: lost.clone(),
@@ -530,9 +547,11 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if let Some(evidence) = launch_evidence {
         engine.set_launch_evidence(evidence);
     }
+
     if let Some(recovery) = recovery {
         engine.inherit_budget(recovery.budget)?;
     }
+
     // Match direct sessions: keep the inference/tool future off the host stack.
     let mut execution = Box::pin(engine.run(SessionCommand::Start { input }, &stop));
     // External cancellation must not wait behind a busy heartbeat transaction.
@@ -556,6 +575,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             .fail_stopped(&end.reason, end.retryable_provider_failure)
             .await?;
     }
+
     result
 }
 

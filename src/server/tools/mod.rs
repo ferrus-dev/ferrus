@@ -288,6 +288,7 @@ mod tests {
                 Some(value) => std::env::set_var(crate::agent_id::ENV_AGENT_ID, value),
                 None => std::env::remove_var(crate::agent_id::ENV_AGENT_ID),
             }
+
             match previous_task_id {
                 Some(value) => std::env::set_var(crate::agent_id::ENV_TASK_ID, value),
                 None => std::env::remove_var(crate::agent_id::ENV_TASK_ID),

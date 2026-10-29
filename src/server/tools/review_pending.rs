@@ -35,6 +35,7 @@ async fn run(agent_id: &str) -> Result<String> {
             context.status
         );
     }
+
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     let (task, submission, review, patch, integration_error) =
@@ -58,6 +59,7 @@ async fn run(agent_id: &str) -> Result<String> {
         if !patch.ends_with('\n') {
             response.push('\n');
         }
+
         response.push_str("```\n");
     }
 

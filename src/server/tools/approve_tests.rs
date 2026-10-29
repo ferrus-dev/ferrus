@@ -2,72 +2,6 @@
 
 use super::*;
 
-#[test]
-fn approval_git_commands_do_not_inherit_an_open_control_pipe() {
-    use std::{io::Write, time::Instant};
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    const CHILD: &str = "FERRUS_TEST_APPROVAL_GIT_STDIN";
-    if std::env::var_os(CHILD).is_some() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("init")
-                .arg("--quiet")
-                .arg(directory.path())
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            // Batch mode must see EOF even while the host control pipe stays open.
-            let output = tokio::time::timeout(
-                Duration::from_secs(5),
-                approval_git_command()
-                    .arg("-C")
-                    .arg(directory.path())
-                    .args(["cat-file", "--batch"])
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .expect("approval Git inherited the host control pipe")
-            .unwrap();
-            assert!(output.status.success());
-            assert!(output.stdout.is_empty());
-        });
-        return;
-    }
-    let log = tempfile::NamedTempFile::new().unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "server::tools::approve::tests::approval_git_commands_do_not_inherit_an_open_control_pipe", "--nocapture"])
-        .env(CHILD, "1")
-        .stdin(Stdio::piped())
-        .stdout(log.reopen().unwrap())
-        .stderr(log.reopen().unwrap())
-        .spawn().unwrap();
-    let mut input = child.stdin.take().unwrap();
-    writeln!(input, "host control frame").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "{}",
-                std::fs::read_to_string(log.path()).unwrap()
-            );
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("approval Git did not finish with the host pipe open");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    drop(input);
-}
 use crate::state::store;
 use tempfile::TempDir;
 
@@ -160,115 +94,112 @@ fn teardown(previous: std::path::PathBuf) {
     std::env::set_current_dir(previous).unwrap();
 }
 
-#[tokio::test]
-async fn canonical_approval_lock_is_released_on_drop() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-
-    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
-        .await
-        .unwrap();
-
-    assert!(lock_path.exists());
-    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
-    assert_eq!(
-        canonical_approval_lock_pid(&contents),
-        Some(std::process::id())
-    );
-    drop(lock);
-    assert!(!lock_path.exists());
+fn git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> std::process::ExitStatus {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .status()
+        .unwrap()
 }
 
-#[tokio::test]
-async fn canonical_approval_lock_replaces_dead_owner() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-    tokio::fs::write(&lock_path, "pid=2147483647\ntask_id=t-old\n")
-        .await
-        .unwrap();
-
-    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
-        .await
-        .unwrap();
-
-    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
-    assert!(contents.contains("task_id=t-007"));
-    drop(lock);
+fn git_path<const N: usize, const M: usize>(
+    cwd: &std::path::Path,
+    before: [&str; N],
+    path: &std::path::Path,
+    after: [&str; M],
+) -> std::process::ExitStatus {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(before)
+        .arg(path)
+        .args(after)
+        .status()
+        .unwrap()
 }
 
+fn git_output<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn git_output_bytes<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
+#[path = "approve_tests/conflicts.rs"]
+mod conflicts_tests;
+#[path = "approve_tests/review_behavior.rs"]
+mod review_behavior_tests;
+#[path = "approve_tests/review_checks.rs"]
+mod review_checks_tests;
+#[path = "approve_tests/review_workspaces.rs"]
+mod review_workspaces_tests;
+
 #[tokio::test]
-async fn canonical_approval_lock_replaces_reused_live_pid_without_inode_lock() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-    tokio::fs::write(
-        &lock_path,
-        format!("pid={}\ntask_id=t-old\n", std::process::id()),
+async fn approve_uses_database_context_when_state_json_is_absent() {
+    let _guard = crate::test_support::cwd_lock().lock().unwrap();
+    let (_dir, previous) = setup().await;
+    crate::project::record_task_status(
+        "t-007",
+        ".ferrus/tasks/t-007.md",
+        crate::project::TaskStatus::Reviewing,
     )
     .await
     .unwrap();
+    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+        .await
+        .unwrap();
 
+    run("supervisor:codex:7").await.unwrap();
+
+    let tasks = crate::project::list_tasks().await.unwrap();
+    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
+    assert_eq!(task.status, "complete");
+    assert_eq!(task.claimed_by, None);
+
+    teardown(previous);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_approval_guard_contention_is_cancellable() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    let guard = acquire_canonical_approval_lock_guard(&lock_path)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_canonical_approval_lock_at(&lock_path, "direct-run"),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!lock_path.exists());
+    drop(guard);
     let lock = tokio::time::timeout(
-        Duration::from_secs(2),
-        acquire_canonical_approval_lock_at(&lock_path, "t-007"),
+        Duration::from_secs(5),
+        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
     )
     .await
     .unwrap()
     .unwrap();
-
-    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
-    assert!(contents.contains("task_id=t-007"));
     drop(lock);
-}
-
-#[tokio::test]
-async fn canonical_approval_lock_replaces_malformed_owner() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-    tokio::fs::write(&lock_path, "task_id=t-old\n")
-        .await
-        .unwrap();
-
-    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
-        .await
-        .unwrap();
-
-    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
-    assert_eq!(
-        canonical_approval_lock_pid(&contents),
-        Some(std::process::id())
-    );
-    assert!(contents.contains("task_id=t-007"));
-    drop(lock);
-}
-
-#[tokio::test]
-async fn canonical_approval_lock_preserves_a_live_external_owner() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-    let owner_path = canonical_approval_lock_owner_path(&lock_path);
-    let contents = "pid=2147483647\ntask_id=t-external\n";
-    std::fs::write(&lock_path, contents).unwrap();
-    let owner = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&owner_path)
-        .unwrap();
-    owner.lock_exclusive().unwrap();
-    // Bypass the in-process owner registry, as another Ferrus process would.
-    assert!(
-        !remove_stale_canonical_approval_lock(&lock_path)
-            .await
-            .unwrap()
-    );
-    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), contents);
-    assert!(owner_path.exists());
-    drop(owner);
-    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-next")
-        .await
-        .unwrap();
-    drop(lock);
-    assert!(!lock_path.exists());
 }
 
 #[tokio::test]
@@ -299,33 +230,6 @@ async fn canonical_approval_lock_contention_preserves_existing_lock() {
         })
         .count();
     assert_eq!(temp_files, 0);
-    drop(lock);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn canonical_approval_guard_contention_is_cancellable() {
-    let dir = TempDir::new().unwrap();
-    let lock_path = dir.path().join("canonical-approval.lock");
-    let guard = acquire_canonical_approval_lock_guard(&lock_path)
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            acquire_canonical_approval_lock_at(&lock_path, "direct-run"),
-        )
-        .await
-        .is_err()
-    );
-    assert!(!lock_path.exists());
-    drop(guard);
-    let lock = tokio::time::timeout(
-        Duration::from_secs(5),
-        acquire_canonical_approval_lock_at(&lock_path, "t-review"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
     drop(lock);
 }
 
@@ -366,51 +270,70 @@ async fn canonical_approval_lock_stale_recovery_admits_one_owner_at_a_time() {
 }
 
 #[tokio::test]
-async fn approve_updates_agent_review_task_in_database() {
+async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (_dir, previous) = setup().await;
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+    let (dir, previous) = setup().await;
+    if !git(dir.path(), ["init"]).success() {
+        teardown(previous);
+        return;
+    }
+
+    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
+    assert!(git(dir.path(), ["add", "file.txt"]).success());
+    assert!(
+        git(
+            dir.path(),
+            [
+                "-c",
+                "user.email=ferrus@example.invalid",
+                "-c",
+                "user.name=Ferrus",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        )
+        .success()
+    );
+    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+
+    let gitlink_target = git_output(dir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let cache_info = format!("160000,{gitlink_target},dependency");
+    assert!(
+        git(
+            dir.path(),
+            ["update-index", "--add", "--cacheinfo", &cache_info],
+        )
+        .success()
+    );
+    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
+    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
+    assert!(!patch.trim().is_empty());
+    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
+    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
+
+    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
+
+    assert!(error.contains("change submodules are not supported"));
+    assert!(!dir.path().join("dependency").exists());
+    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
+    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
         .await
         .unwrap();
-    run("supervisor:codex:7").await.unwrap();
-
-    crate::test_support::assert_no_state_json();
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-    assert_eq!(task.status, "complete");
-    assert_eq!(task.claimed_by, None);
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_uses_database_context_when_state_json_is_absent() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (_dir, previous) = setup().await;
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
+    assert!(integration_error.contains("change submodules are not supported"));
+    let task = crate::project::list_tasks()
         .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "t-007")
         .unwrap();
-
-    run("supervisor:codex:7").await.unwrap();
-
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-    assert_eq!(task.status, "complete");
-    assert_eq!(task.claimed_by, None);
+    assert_eq!(task.status, "reviewing");
 
     teardown(previous);
 }
@@ -423,6 +346,7 @@ async fn approve_applies_scoped_patch_before_marking_task_complete() {
         teardown(previous);
         return;
     }
+
     tokio::fs::write("file.txt", "old\n").await.unwrap();
     assert!(git(dir.path(), ["add", "file.txt"]).success());
     assert!(
@@ -486,644 +410,90 @@ async fn approve_applies_scoped_patch_before_marking_task_complete() {
 }
 
 #[tokio::test]
-async fn approve_three_way_merges_disjoint_hunks_from_a_pinned_baseline() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    let baseline_content = "first\nsecond\nthird\nfourth\nfifth\nsixth\n";
-    tokio::fs::write("file.txt", baseline_content)
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "baseline",
-            ],
-        )
-        .success()
-    );
-    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
-        .trim()
-        .to_string();
-    crate::project::pin_executor_baseline_tree(dir.path(), "t-007", &baseline_tree)
+async fn canonical_approval_lock_is_released_on_drop() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+
+    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
         .await
         .unwrap();
 
-    tokio::fs::write(
-        "file.txt",
-        "first\nsecond\nthird\nfourth\nfifth\ntask change\n",
-    )
-    .await
-    .unwrap();
-    let submitted_tree =
-        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
-    crate::repository_graph::source::pin_submitted_tree(dir.path(), "t-007", &submitted_tree)
-        .unwrap();
-    let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
-    tokio::fs::write(
-        "file.txt",
-        "canonical change\nsecond\nthird\nfourth\nfifth\nsixth\n",
-    )
-    .await
-    .unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "canonical advance",
-            ],
-        )
-        .success()
-    );
-
-    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
-        .await
-        .unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    let frozen_view = crate::project::RepositoryViewReference::materialized(
-        crate::repository_graph::domain::SnapshotId::new("baseline-snapshot").unwrap(),
-        None,
-        crate::repository_graph::domain::SnapshotId::new("submitted-snapshot").unwrap(),
-        crate::project::RepositoryViewStatus::Available,
-    )
-    .unwrap()
-    .frozen(submitted_tree)
-    .unwrap();
-    crate::project::record_task_repository_view("t-007", &frozen_view)
-        .await
-        .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-
-    run("supervisor:codex:7").await.unwrap();
-
+    assert!(lock_path.exists());
+    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
     assert_eq!(
-        tokio::fs::read_to_string("file.txt")
+        canonical_approval_lock_pid(&contents),
+        Some(std::process::id())
+    );
+    drop(lock);
+    assert!(!lock_path.exists());
+}
+
+#[tokio::test]
+async fn canonical_approval_lock_replaces_dead_owner() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    tokio::fs::write(&lock_path, "pid=2147483647\ntask_id=t-old\n")
+        .await
+        .unwrap();
+
+    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+        .await
+        .unwrap();
+
+    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+    assert!(contents.contains("task_id=t-007"));
+    drop(lock);
+}
+
+#[tokio::test]
+async fn canonical_approval_lock_replaces_malformed_owner() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    tokio::fs::write(&lock_path, "task_id=t-old\n")
+        .await
+        .unwrap();
+
+    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-007")
+        .await
+        .unwrap();
+
+    let contents = tokio::fs::read_to_string(&lock_path).await.unwrap();
+    assert_eq!(
+        canonical_approval_lock_pid(&contents),
+        Some(std::process::id())
+    );
+    assert!(contents.contains("task_id=t-007"));
+    drop(lock);
+}
+
+#[tokio::test]
+async fn canonical_approval_lock_preserves_a_live_external_owner() {
+    let dir = TempDir::new().unwrap();
+    let lock_path = dir.path().join("canonical-approval.lock");
+    let owner_path = canonical_approval_lock_owner_path(&lock_path);
+    let contents = "pid=2147483647\ntask_id=t-external\n";
+    std::fs::write(&lock_path, contents).unwrap();
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&owner_path)
+        .unwrap();
+    owner.lock_exclusive().unwrap();
+    // Bypass the in-process owner registry, as another Ferrus process would.
+    assert!(
+        !remove_stale_canonical_approval_lock(&lock_path)
             .await
             .unwrap()
-            .replace("\r\n", "\n"),
-        "canonical change\nsecond\nthird\nfourth\nfifth\ntask change\n"
     );
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_rejects_submodule_gitlink_changes_without_completing_task() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "baseline",
-            ],
-        )
-        .success()
-    );
-    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
-        .trim()
-        .to_string();
-
-    let gitlink_target = git_output(dir.path(), ["rev-parse", "HEAD"])
-        .trim()
-        .to_string();
-    let cache_info = format!("160000,{gitlink_target},dependency");
-    assert!(
-        git(
-            dir.path(),
-            ["update-index", "--add", "--cacheinfo", &cache_info],
-        )
-        .success()
-    );
-    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
-    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
-    assert!(!patch.trim().is_empty());
-    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
-    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
-
-    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
-
-    assert!(error.contains("change submodules are not supported"));
-    assert!(!dir.path().join("dependency").exists());
-    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
-    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), contents);
+    assert!(owner_path.exists());
+    drop(owner);
+    let lock = acquire_canonical_approval_lock_at(&lock_path, "t-next")
         .await
         .unwrap();
-    assert!(integration_error.contains("change submodules are not supported"));
-    let task = crate::project::list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.id == "t-007")
-        .unwrap();
-    assert_eq!(task.status, "reviewing");
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_preserves_ignored_file_that_conflicts_with_submitted_addition() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    tokio::fs::write(".gitignore", "ignored.txt\n")
-        .await
-        .unwrap();
-    tokio::fs::write("file.txt", "baseline\n").await.unwrap();
-    assert!(git(dir.path(), ["add", ".gitignore", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "baseline",
-            ],
-        )
-        .success()
-    );
-    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
-        .trim()
-        .to_string();
-
-    tokio::fs::write("ignored.txt", "submitted\n")
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "-f", "ignored.txt"]).success());
-    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
-    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
-    assert!(!patch.trim().is_empty());
-    assert!(git(dir.path(), ["reset", "--mixed", "HEAD"]).success());
-    tokio::fs::write("ignored.txt", "canonical local content\n")
-        .await
-        .unwrap();
-    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
-
-    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
-
-    assert!(error.contains("ignored local content"), "{error}");
-    assert_eq!(
-        tokio::fs::read_to_string("ignored.txt").await.unwrap(),
-        "canonical local content\n"
-    );
-    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
-    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
-        .await
-        .unwrap();
-    assert!(integration_error.contains("ignored local content"));
-    let task = crate::project::list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.id == "t-007")
-        .unwrap();
-    assert_eq!(task.status, "reviewing");
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_rejects_changes_outside_canonical_sparse_checkout() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    tokio::fs::create_dir_all("included").await.unwrap();
-    tokio::fs::create_dir_all("skipped").await.unwrap();
-    tokio::fs::write("included/file.txt", "included\n")
-        .await
-        .unwrap();
-    tokio::fs::write("skipped/file.txt", "baseline\n")
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "included", "skipped"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "baseline",
-            ],
-        )
-        .success()
-    );
-    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
-        .trim()
-        .to_string();
-
-    tokio::fs::write("skipped/file.txt", "submitted\n")
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "skipped/file.txt"]).success());
-    let submitted_tree = git_output(dir.path(), ["write-tree"]).trim().to_string();
-    let patch = git_output(dir.path(), ["diff", "--cached", "--binary", "HEAD"]);
-    assert!(!patch.trim().is_empty());
-    assert!(git(dir.path(), ["reset", "--hard", "HEAD"]).success());
-    assert!(
-        git(dir.path(), ["sparse-checkout", "set", "included"]).success(),
-        "Git must support sparse-checkout check-rules for this test"
-    );
-    assert!(!dir.path().join("skipped/file.txt").exists());
-    prepare_frozen_review(dir.path(), &baseline_tree, &submitted_tree, &patch).await;
-
-    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
-
-    assert!(
-        error.contains("outside the canonical sparse checkout"),
-        "{error}"
-    );
-    assert!(!dir.path().join("skipped/file.txt").exists());
-    assert_eq!(git_output(dir.path(), ["write-tree"]).trim(), baseline_tree);
-    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
-        .await
-        .unwrap();
-    assert!(integration_error.contains("outside the canonical sparse checkout"));
-    let task = crate::project::list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.id == "t-007")
-        .unwrap();
-    assert_eq!(task.status, "reviewing");
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_from_executor_worktree_updates_and_checks_canonical_workspace() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    tokio::fs::write("file.txt", "old\n").await.unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        )
-        .success()
-    );
-    tokio::fs::write("file.txt", "new\n").await.unwrap();
-    let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
-    tokio::fs::write("file.txt", "old\n").await.unwrap();
-    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
-        .await
-        .unwrap();
-    tokio::fs::write(
-        "ferrus.toml",
-        "[checks]\ncommands = [\"git grep -q new -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
-    )
-    .await
-    .unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-
-    let review_workspace = dir.path().join("review-worktree");
-    assert!(
-        git_path(
-            dir.path(),
-            ["worktree", "add", "--detach"],
-            &review_workspace,
-            ["HEAD"],
-        )
-        .success()
-    );
-    tokio::fs::create_dir_all(review_workspace.join(".ferrus"))
-        .await
-        .unwrap();
-    tokio::fs::copy(
-        ".ferrus/project.toml",
-        review_workspace.join(".ferrus/project.toml"),
-    )
-    .await
-    .unwrap();
-    tokio::fs::copy("ferrus.toml", review_workspace.join("ferrus.toml"))
-        .await
-        .unwrap();
-    std::env::set_current_dir(&review_workspace).unwrap();
-
-    run("supervisor:codex:7").await.unwrap();
-
-    assert_eq!(
-        tokio::fs::read_to_string(dir.path().join("file.txt"))
-            .await
-            .unwrap()
-            .replace("\r\n", "\n"),
-        "new\n"
-    );
-    assert_eq!(
-        tokio::fs::read_to_string(review_workspace.join("file.txt"))
-            .await
-            .unwrap()
-            .replace("\r\n", "\n"),
-        "old\n"
-    );
-    let task = crate::project::list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.id == "t-007")
-        .unwrap();
-    assert_eq!(task.status, "complete");
-
-    std::env::set_current_dir(dir.path()).unwrap();
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_patch_conflict_records_recoverable_integration_error() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    tokio::fs::write("file.txt", "old\n").await.unwrap();
-    tokio::fs::write("deleted.txt", "delete me\n")
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "file.txt", "deleted.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        )
-        .success()
-    );
-    tokio::fs::write("file.txt", "new\n").await.unwrap();
-    let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
-    tokio::fs::write("file.txt", "conflicting local change\n")
-        .await
-        .unwrap();
-    tokio::fs::write("staged.txt", "staged canonical addition\n")
-        .await
-        .unwrap();
-    assert!(git(dir.path(), ["add", "staged.txt"]).success());
-    tokio::fs::remove_file("deleted.txt").await.unwrap();
-    tokio::fs::write("untracked.bin", [0_u8, 159, 146, 150])
-        .await
-        .unwrap();
-    assert!(!patch.trim().is_empty());
-
-    let status_before = git_output_bytes(
-        dir.path(),
-        [
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--",
-            "file.txt",
-            "staged.txt",
-            "deleted.txt",
-            "untracked.bin",
-        ],
-    );
-    let index_before = git_output(dir.path(), ["write-tree"]);
-    let worktree_before =
-        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
-
-    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
-        .await
-        .unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-
-    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
-
-    assert!(error.contains("INTEGRATION_ERROR.md"));
-    assert!(error.contains("Reject this review"));
-    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
-        .await
-        .unwrap();
-    assert!(integration_error.contains("Cannot approve task t-007"));
-    assert!(integration_error.contains("Suggested next step"));
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-    assert_eq!(task.status, "reviewing");
-    assert!(
-        task.failure_reason
-            .as_deref()
-            .is_some_and(|reason| { reason.contains("could not be merged") })
-    );
-    assert_eq!(
-        git_output_bytes(
-            dir.path(),
-            [
-                "status",
-                "--porcelain=v2",
-                "-z",
-                "--",
-                "file.txt",
-                "staged.txt",
-                "deleted.txt",
-                "untracked.bin",
-            ],
-        ),
-        status_before
-    );
-    assert_eq!(git_output(dir.path(), ["write-tree"]), index_before);
-    assert_eq!(
-        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap(),
-        worktree_before
-    );
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_rolls_back_patch_when_post_apply_checks_fail() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    tokio::fs::write(
-        "ferrus.toml",
-        "[repository_graph]\nenabled = true\n\n[checks]\ncommands = [\"git show HEAD:file.txt > generated.txt\", \"git add file.txt generated.txt\", \"git grep -q base -- file.txt\"]\n\n[limits]\nmax_check_retries = 20\nmax_review_cycles = 3\nmax_feedback_lines = 30\nwait_timeout_secs = 1\n\n[lease]\nttl_secs = 60\n",
-    )
-    .await
-    .unwrap();
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
-    }
-    // Keep the rollback byte-exact on Windows too. Otherwise Git's global
-    // autocrlf setting can turn the restored LF source into CRLF, correctly
-    // making the canonical source manifest stale after the rollback.
-    assert!(git(dir.path(), ["config", "core.autocrlf", "false"]).success());
-    tokio::fs::write("file.txt", "base\n").await.unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        )
-        .success()
-    );
-    tokio::fs::write("file.txt", "broken\n").await.unwrap();
-    let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
-    tokio::fs::write("file.txt", "base\n").await.unwrap();
-    assert!(!patch.trim().is_empty());
-
-    store::write_patch_for_run_dir(".ferrus/runs/t-007", &patch)
-        .await
-        .unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-    let worktree_before =
-        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap();
-    let index_before = git_output(dir.path(), ["write-tree"]);
-
-    let error = run("supervisor:codex:7").await.unwrap_err().to_string();
-
-    assert!(error.contains("configured checks failed"));
-    assert!(error.contains("rolled back"));
-    let file = tokio::fs::read_to_string("file.txt").await.unwrap();
-    assert_eq!(file.replace("\r\n", "\n"), "base\n");
-    assert!(!dir.path().join("generated.txt").exists());
-    assert_eq!(git_output(dir.path(), ["write-tree"]), index_before);
-    assert_eq!(
-        crate::repository_graph::source::capture_worktree_tree(dir.path()).unwrap(),
-        worktree_before
-    );
-    let integration_error = store::read_integration_error_for_run_dir(".ferrus/runs/t-007")
-        .await
-        .unwrap();
-    assert!(integration_error.contains("configured checks failed"));
-    assert!(integration_error.contains("git grep -q base -- file.txt"));
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-    assert_eq!(task.status, "reviewing");
-    assert!(
-        task.failure_reason
-            .as_deref()
-            .is_some_and(|reason| { reason.contains("Commands failed") })
-    );
-    assert_eq!(
-        crate::project::canonical_graph_reference()
-            .await
-            .unwrap()
-            .status,
-        crate::project::CanonicalGraphStatus::Unknown
-    );
-
-    teardown(previous);
+    drop(lock);
+    assert!(!lock_path.exists());
 }
 
 #[tokio::test]
@@ -1134,6 +504,7 @@ async fn approve_rollback_preserves_files_ignored_before_integration() {
         teardown(previous);
         return;
     }
+
     assert!(git(dir.path(), ["config", "core.autocrlf", "false"]).success());
     tokio::fs::write(
         "ferrus.toml",
@@ -1212,310 +583,73 @@ async fn approve_rollback_preserves_files_ignored_before_integration() {
     teardown(previous);
 }
 
-#[tokio::test]
-async fn failed_integration_marks_actual_partial_canonical_manifest_stale() {
+#[test]
+fn approval_git_commands_do_not_inherit_an_open_control_pipe() {
+    use std::{io::Write, time::Instant};
     let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    tokio::fs::write(
-        "ferrus.toml",
-        "[repository_graph]\nenabled = true\n\n[checks]\ncommands = []\n",
-    )
-    .await
-    .unwrap();
-    tokio::fs::write("stable.txt", "stable\n").await.unwrap();
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-    let context = crate::project::runtime_task_context_for_agent("supervisor:codex:7")
-        .await
-        .unwrap()
-        .unwrap();
-    let observer = CanonicalIntegrationObserver::capture(dir.path()).await;
-
-    tokio::fs::write("partial.txt", "left behind\n")
-        .await
-        .unwrap();
-    assert!(observer.finish(&context, dir.path(), false).await);
-
-    let canonical = crate::project::canonical_graph_reference().await.unwrap();
-    assert_eq!(
-        canonical.status,
-        crate::project::CanonicalGraphStatus::Stale
-    );
-    assert!(canonical.source.is_some());
-    let task = crate::project::list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.id == "t-007")
-        .unwrap();
-    assert_eq!(task.status, crate::project::TaskStatus::Reviewing.as_str());
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_keeps_task_reviewing_when_spec_update_fails() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (_dir, previous) = setup().await;
-    tokio::fs::create_dir_all("docs/specs/spec.md")
-        .await
-        .unwrap();
-    crate::project::record_task_status_with_origin(
-        "t-009",
-        ".ferrus/tasks/t-009.md",
-        crate::project::TaskStatus::Reviewing,
-        Some("docs/specs/spec.md"),
-        Some("m1.0"),
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-009", ".ferrus/tasks/t-009.md", "supervisor:codex:9", 60)
-        .await
-        .unwrap();
-
-    let error = run("supervisor:codex:9").await.unwrap_err().to_string();
-
-    assert!(
-        error.replace('\\', "/").contains("docs/specs/spec.md"),
-        "unexpected error: {error}"
-    );
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-009").unwrap();
-    assert_eq!(task.status, "reviewing");
-    assert_eq!(task.claimed_by.as_deref(), Some("supervisor:codex:9"));
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_rolls_back_patch_when_spec_update_fails() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
+    const CHILD: &str = "FERRUS_TEST_APPROVAL_GIT_STDIN";
+    if std::env::var_os(CHILD).is_some() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(directory.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Batch mode must see EOF even while the host control pipe stays open.
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                approval_git_command()
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(["cat-file", "--batch"])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("approval Git inherited the host control pipe")
+            .unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty());
+        });
         return;
     }
-    tokio::fs::write("file.txt", "old\n").await.unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        )
-        .success()
-    );
-    tokio::fs::write("file.txt", "new\n").await.unwrap();
-    let patch = git_output(dir.path(), ["diff", "--binary", "HEAD", "--", "file.txt"]);
-    tokio::fs::write("file.txt", "old\n").await.unwrap();
-    assert!(!patch.trim().is_empty());
-    tokio::fs::create_dir_all("docs/specs/spec.md")
-        .await
-        .unwrap();
 
-    store::write_patch_for_run_dir(".ferrus/runs/t-010", &patch)
-        .await
-        .unwrap();
-    crate::project::record_task_status_with_origin(
-        "t-010",
-        ".ferrus/tasks/t-010.md",
-        crate::project::TaskStatus::Reviewing,
-        Some("docs/specs/spec.md"),
-        Some("m1.0"),
-    )
-    .await
-    .unwrap();
-    crate::project::claim_task("t-010", ".ferrus/tasks/t-010.md", "supervisor:codex:10", 60)
-        .await
-        .unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "server::tools::approve::tests::approval_git_commands_do_not_inherit_an_open_control_pipe", "--nocapture"])
+        .env(CHILD, "1")
+        .stdin(Stdio::piped())
+        .stdout(log.reopen().unwrap())
+        .stderr(log.reopen().unwrap())
+        .spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "host control frame").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(log.path()).unwrap()
+            );
+            break;
+        }
 
-    let error = run("supervisor:codex:10").await.unwrap_err().to_string();
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("approval Git did not finish with the host pipe open");
+        }
 
-    assert!(
-        error.replace('\\', "/").contains("docs/specs/spec.md"),
-        "unexpected error: {error}"
-    );
-    let file = tokio::fs::read_to_string("file.txt").await.unwrap();
-    assert_eq!(file.replace("\r\n", "\n"), "old\n");
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-010").unwrap();
-    assert_eq!(task.status, "reviewing");
-    assert_eq!(task.claimed_by.as_deref(), Some("supervisor:codex:10"));
-
-    teardown(previous);
-}
-
-#[tokio::test]
-async fn approve_removes_managed_worktree_after_completion() {
-    let _guard = crate::test_support::cwd_lock().lock().unwrap();
-    let (dir, previous) = setup().await;
-    if !git(dir.path(), ["init"]).success() {
-        teardown(previous);
-        return;
+        std::thread::sleep(Duration::from_millis(10));
     }
-    tokio::fs::write("file.txt", "base\n").await.unwrap();
-    assert!(git(dir.path(), ["add", "file.txt"]).success());
-    assert!(
-        git(
-            dir.path(),
-            [
-                "-c",
-                "user.email=ferrus@example.invalid",
-                "-c",
-                "user.name=Ferrus",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        )
-        .success()
-    );
 
-    let workspace_path = dir
-        .path()
-        .join(".ferrus/projects/test-project/worktrees/t-007");
-    assert!(
-        git_path(
-            dir.path(),
-            ["worktree", "add", "--detach"],
-            &workspace_path,
-            ["HEAD"],
-        )
-        .success()
-    );
-    assert!(workspace_path.is_dir());
-    let baseline_tree = git_output(dir.path(), ["rev-parse", "HEAD^{tree}"])
-        .trim()
-        .to_string();
-    crate::project::pin_executor_baseline_tree(dir.path(), "t-007", &baseline_tree)
-        .await
-        .unwrap();
-    let baseline_metadata = dir
-        .path()
-        .join(".ferrus/projects/test-project/worktrees/.baseline-trees/t-007.txt");
-    tokio::fs::create_dir_all(baseline_metadata.parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(&baseline_metadata, format!("{baseline_tree}\n"))
-        .await
-        .unwrap();
-
-    crate::project::record_task_status(
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-        crate::project::TaskStatus::Reviewing,
-    )
-    .await
-    .unwrap();
-    let run_record = crate::project::record_run_started_with_workspace(
-        "supervisor-run-t-007",
-        "supervisor",
-        "supervisor:codex:7",
-        std::process::id(),
-        dir.path().to_string_lossy().into_owned(),
-    )
-    .await
-    .unwrap();
-    let attached = crate::project::attach_running_run_to_task(
-        "supervisor:codex:7",
-        "t-007",
-        ".ferrus/tasks/t-007.md",
-    )
-    .await
-    .unwrap();
-    assert_eq!(attached.as_deref(), Some(run_record.id.as_str()));
-    crate::project::claim_task("t-007", ".ferrus/tasks/t-007.md", "supervisor:codex:7", 60)
-        .await
-        .unwrap();
-    let context = crate::project::runtime_task_context_for_agent("supervisor:codex:7")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        context.workspace_path.as_deref(),
-        Some(dir.path().to_string_lossy().as_ref())
-    );
-
-    run("supervisor:codex:7").await.unwrap();
-
-    assert!(!workspace_path.exists());
-    assert!(!baseline_metadata.exists());
-    let baseline_ref = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir.path())
-        .args(["rev-parse", "--verify", "refs/ferrus/baselines/t-007"])
-        .output()
-        .unwrap();
-    assert!(!baseline_ref.status.success());
-    let tasks = crate::project::list_tasks().await.unwrap();
-    let task = tasks.iter().find(|task| task.id == "t-007").unwrap();
-    assert_eq!(task.status, "complete");
-
-    teardown(previous);
-}
-
-fn git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> std::process::ExitStatus {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .status()
-        .unwrap()
-}
-
-fn git_path<const N: usize, const M: usize>(
-    cwd: &std::path::Path,
-    before: [&str; N],
-    path: &std::path::Path,
-    after: [&str; M],
-) -> std::process::ExitStatus {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(before)
-        .arg(path)
-        .args(after)
-        .status()
-        .unwrap()
-}
-
-fn git_output<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn git_output_bytes<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> Vec<u8> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    output.stdout
+    drop(input);
 }

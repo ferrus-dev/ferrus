@@ -111,6 +111,7 @@ pub async fn read(
                 .with_mime("application/json"),
         ));
     }
+
     read_for_agent(Some(agent_id), file).await
 }
 
@@ -120,6 +121,7 @@ async fn read_review_for_agent(agent_id: Option<&str>) -> anyhow::Result<String>
     {
         return store::read_review_for_run_dir(&context.run_dir).await;
     }
+
     Ok(String::new())
 }
 
@@ -129,6 +131,7 @@ async fn read_submission_for_agent(agent_id: Option<&str>) -> anyhow::Result<Str
     {
         return store::read_submission_for_run_dir(&context.run_dir).await;
     }
+
     Ok(String::new())
 }
 
@@ -139,6 +142,7 @@ async fn read_question_for_agent(agent_id: Option<&str>) -> anyhow::Result<Strin
     {
         return Ok(contents);
     }
+
     Ok(String::new())
 }
 
@@ -149,6 +153,7 @@ async fn read_answer_for_agent(agent_id: Option<&str>) -> anyhow::Result<String>
     {
         return Ok(contents);
     }
+
     Ok(String::new())
 }
 
@@ -159,6 +164,7 @@ async fn read_consult_request_for_agent(agent_id: Option<&str>) -> anyhow::Resul
     {
         return Ok(contents);
     }
+
     Ok(String::new())
 }
 
@@ -169,6 +175,7 @@ async fn read_consult_response_for_agent(agent_id: Option<&str>) -> anyhow::Resu
     {
         return Ok(contents);
     }
+
     Ok(String::new())
 }
 
@@ -179,6 +186,7 @@ async fn read_current_task_for_agent(agent_id: Option<&str>) -> anyhow::Result<S
     {
         return Ok(contents);
     }
+
     store::read_task().await
 }
 

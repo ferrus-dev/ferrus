@@ -16,6 +16,7 @@ pub async fn run() -> Result<()> {
         let status = if check.ok { "ok" } else { "error" };
         println!("{status}: {}", check.message);
     }
+
     for observation in crate::repository_graph_runtime::graph_doctor_observations().await {
         let status = if observation.healthy { "ok" } else { "warning" };
         println!("{status}: {}", observation.message);
@@ -24,6 +25,7 @@ pub async fn run() -> Result<()> {
     for warning in register::legacy_mcp_config_warnings().await? {
         println!("warning: {warning}");
     }
+
     let mcp_checks = register::configured_hq_mcp_checks().await?;
     for check in &mcp_checks {
         let status = if check.ok {
@@ -39,5 +41,6 @@ pub async fn run() -> Result<()> {
     if report.has_errors() || mcp_checks.iter().any(|check| check.fatal) {
         anyhow::bail!("ferrus doctor found project registration issues");
     }
+
     Ok(())
 }

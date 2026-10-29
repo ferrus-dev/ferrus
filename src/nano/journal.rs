@@ -304,6 +304,7 @@ impl FileJournal {
 
             records.push(self.append(SessionEvent::Ended { reason }, &budget)?);
         }
+
         Ok(())
     }
 
@@ -488,6 +489,7 @@ fn measure(directory: &Path, quotas: &Quotas) -> Result<(u64, usize)> {
                     _ => {}
                 }
             }
+
             private::check(&path, false)?;
 
             let size = fs::metadata(path)?.len();

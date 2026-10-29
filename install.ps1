@@ -1,4 +1,37 @@
+[CmdletBinding()]
+param(
+    [ValidateSet("all", "ferrus", "nano")]
+    [string]$Components = $(if ($env:FERRUS_INSTALL_COMPONENTS) { $env:FERRUS_INSTALL_COMPONENTS } else { "all" }),
+    [switch]$Help
+)
+
 $ErrorActionPreference = "Stop"
+
+if ($Help) {
+    Write-Host @"
+Usage: install.ps1 [-Components all|ferrus|nano] [-Help]
+
+Components default to FERRUS_INSTALL_COMPONENTS, or all when unset.
+  all     Install ferrus and ferrus-nano when available (default).
+  ferrus  Install only ferrus; retain any existing ferrus-nano.
+  nano    Install only ferrus-nano; fail if unavailable; retain existing ferrus.
+
+All modes download the same release archive. Selecting ferrus does not
+disable the Nano support compiled into the ferrus binary.
+"@
+    return
+}
+
+# Parameter validation does not validate a default supplied by the environment.
+if ($Components -notin @("all", "ferrus", "nano")) {
+    throw "invalid components: $Components (expected all, ferrus, or nano)"
+}
+
+$Binaries = switch ($Components) {
+    "all"    { "ferrus"; "ferrus-nano" }
+    "ferrus" { "ferrus" }
+    "nano"   { "ferrus-nano" }
+}
 
 $Repo = if ($env:FERRUS_INSTALL_REPO) { $env:FERRUS_INSTALL_REPO } else { "ferrus-dev/ferrus" }
 $Version = if ($env:FERRUS_INSTALL_VERSION) { $env:FERRUS_INSTALL_VERSION } else { "latest" }
@@ -41,11 +74,11 @@ function Get-Target {
 
 function Resolve-Urls {
     if ($Version -eq "latest") {
-        $script:ReleaseUrl = "https://github.com/$Repo/releases/latest/download/$Archive"
-        $script:ChecksumUrl = "https://github.com/$Repo/releases/latest/download/$ChecksumFile"
+        "https://github.com/$Repo/releases/latest/download/$Archive"
+        "https://github.com/$Repo/releases/latest/download/$ChecksumFile"
     } else {
-        $script:ReleaseUrl = "https://github.com/$Repo/releases/download/$Version/$Archive"
-        $script:ChecksumUrl = "https://github.com/$Repo/releases/download/$Version/$ChecksumFile"
+        "https://github.com/$Repo/releases/download/$Version/$Archive"
+        "https://github.com/$Repo/releases/download/$Version/$ChecksumFile"
     }
 }
 
@@ -111,16 +144,15 @@ function Download-Archive {
 function Download-Checksum {
     $checksumPath = Join-Path $TempDir $ChecksumFile
     if (Download-File -Url $ChecksumUrl -Output $checksumPath -Label "checksum file" -AssetName $ChecksumFile -AllowMissing $true) {
-        $script:HasChecksum = $true
-        return
+        return $true
     }
 
     if ($Version -eq "latest") {
         throw "checksum file was not found: $ChecksumUrl`nhint: the latest release is expected to publish asset $ChecksumFile"
     }
 
-    $script:HasChecksum = $false
     Write-Warning "checksum file $ChecksumFile is not available for $Version; proceeding without checksum verification for this pinned install"
+    return $false
 }
 
 function Verify-Checksum {
@@ -140,56 +172,55 @@ function Verify-Checksum {
 }
 
 function Verify-ArchiveLayout {
-    $extractDir = Join-Path $TempDir "verify"
-    Expand-Archive -Path (Join-Path $TempDir $Archive) -DestinationPath $extractDir -Force
-
-    $expectedPath = Join-Path $extractDir "ferrus-$Target\ferrus.exe"
-    if (-not (Test-Path $expectedPath)) {
-        throw "archive does not contain expected binary entry: ferrus-$Target/ferrus.exe"
+    Expand-Archive -Path (Join-Path $TempDir $Archive) -DestinationPath $TempDir -Force
+    # Validate every selected binary before changing an existing installation.
+    foreach ($binary in $Binaries) {
+        $expectedEntry = "ferrus-$Target/$binary.exe"
+        if (Test-Path (Join-Path $TempDir $expectedEntry) -PathType Leaf) {
+            $binary
+        } else {
+            # Older releases contain only ferrus.
+            if ($Components -eq "all" -and $binary -eq "ferrus-nano") {
+                Write-Warning "this release does not include ferrus-nano; installing only ferrus"
+                if (Test-Path (Join-Path $InstallDir "ferrus-nano.exe")) {
+                    Write-Warning "existing $(Join-Path $InstallDir 'ferrus-nano.exe') was retained and may be incompatible. Remove it or install a release that includes Nano."
+                }
+            } else {
+                throw "archive does not contain expected binary entry: $expectedEntry"
+            }
+        }
     }
-
-    Remove-Item -Recurse -Force $extractDir
 }
 
-function Install-Binary {
+function Install-Binaries {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path $HOME ".ferrus\projects") | Out-Null
-    Expand-Archive -Path (Join-Path $TempDir $Archive) -DestinationPath $TempDir -Force
-
-    $binPath = Join-Path $TempDir "ferrus-$Target\ferrus.exe"
-    if (-not (Test-Path $binPath)) {
-        throw "ferrus.exe not found in archive"
+    if ($Components -ne "nano") {
+        New-Item -ItemType Directory -Force -Path (Join-Path $HOME ".ferrus\projects") | Out-Null
     }
-
-    $destination = Join-Path $InstallDir "ferrus.exe"
-    if (Test-Path $destination) {
-        Write-Warning "overwriting existing installation at $destination"
-    }
-
-    Copy-Item $binPath $destination -Force
-    # Older releases contain only ferrus; install the companion when present.
-    $nanoPath = Join-Path $TempDir "ferrus-$Target\ferrus-nano.exe"
-    if (Test-Path $nanoPath) {
-        Copy-Item $nanoPath (Join-Path $InstallDir "ferrus-nano.exe") -Force
-    } elseif (Test-Path (Join-Path $InstallDir "ferrus-nano.exe")) {
-        Write-Warning "this release does not include ferrus-nano; existing $(Join-Path $InstallDir 'ferrus-nano.exe') was retained and may be incompatible. Remove it or install a release that includes Nano."
+    foreach ($binary in $Binaries) {
+        $destination = Join-Path $InstallDir "$binary.exe"
+        if (Test-Path $destination) {
+            Write-Warning "overwriting existing installation at $destination"
+        }
+        Copy-Item (Join-Path $TempDir "ferrus-$Target/$binary.exe") $destination -Force
     }
 }
 
 function Print-Success {
-    $destination = Join-Path $InstallDir "ferrus.exe"
-    $installedVersion = ""
-    try {
-        $installedVersion = (& $destination --version 2>$null)
-    } catch {
+    foreach ($binary in $Binaries) {
+        $destination = Join-Path $InstallDir "$binary.exe"
         $installedVersion = ""
-    }
-
-    Write-Host "installed ferrus to $destination"
-    if ($installedVersion) {
-        Write-Host "version: $installedVersion"
-    } else {
-        Write-Warning "failed to determine installed ferrus version"
+        try {
+            $installedVersion = (& $destination --version 2>$null)
+        } catch {
+            $installedVersion = ""
+        }
+        Write-Host "installed $binary to $destination"
+        if ($installedVersion) {
+            Write-Host "version: $installedVersion"
+        } else {
+            Write-Warning "failed to determine installed $binary version"
+        }
     }
 
     $pathEntries = $env:PATH -split ';'
@@ -205,9 +236,9 @@ $Archive = "ferrus-$Target.zip"
 $ChecksumFile = "$Archive.sha256"
 $InstallDir = Get-InstallDir
 
-Resolve-Urls
+$ReleaseUrl, $ChecksumUrl = Resolve-Urls
 
-Write-Host "installing ferrus ($Version) for $Target"
+Write-Host "installing ferrus components: $Components ($Version) for $Target"
 Write-Host "download: $ReleaseUrl"
 
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ferrus-install-" + [System.Guid]::NewGuid().ToString("N"))
@@ -215,10 +246,10 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 try {
     Download-Archive
-    Download-Checksum
+    $HasChecksum = Download-Checksum
     Verify-Checksum
-    Verify-ArchiveLayout
-    Install-Binary
+    $Binaries = @(Verify-ArchiveLayout)
+    Install-Binaries
     Print-Success
 } finally {
     if (Test-Path $TempDir) {

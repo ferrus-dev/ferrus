@@ -271,8 +271,9 @@ impl LocalProjectContext {
                 "repository graph is disabled; enable it before repository or combined retrieval"
             );
         }
+
         let memory = MemoryRevisionSelector::Published(
-            MemoryViewName::new(PROJECT_MEMORY_VIEW).expect("static memory view is valid"),
+            const { MemoryViewName::from_static(PROJECT_MEMORY_VIEW) },
         );
         let repository_scope = || -> AnyResult<RepositoryContextTarget> {
             let graph = graph.context("repository graph context was not loaded")?;
@@ -321,6 +322,7 @@ impl LocalProjectContext {
             }
             _ => (),
         }
+
         match &mut scope.target {
             FederatedTarget::Memory { memory } | FederatedTarget::All { memory, .. } => {
                 let revision = self
@@ -331,6 +333,7 @@ impl LocalProjectContext {
             }
             _ => (),
         }
+
         Ok(scope)
     }
 
@@ -363,7 +366,7 @@ impl LocalProjectContext {
         let mut scope = MemoryQueryScope::current(
             self.project.clone(),
             MemoryRevisionSelector::Published(
-                MemoryViewName::new(PROJECT_MEMORY_VIEW).expect("static memory view is valid"),
+                const { MemoryViewName::from_static(PROJECT_MEMORY_VIEW) },
             ),
             budget,
         );
@@ -396,9 +399,11 @@ impl LocalProjectContext {
         if includes_repository && graph_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
+
         if includes_memory && memory_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
+
         let graph_query = OptionalGraphQuery::new(
             graph_sidecar.as_deref(),
             self.query_limits.clone(),
@@ -429,6 +434,7 @@ impl LocalProjectContext {
                 .as_ref()
                 .and_then(LocalGraphContext::task_view_envelope);
         }
+
         Ok(response)
     }
 
@@ -457,9 +463,11 @@ impl LocalProjectContext {
         if includes_repository && graph_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
+
         if includes_memory && memory_sidecar.is_none() {
             return Err(MemoryQueryError::Unavailable);
         }
+
         let graph_query = OptionalGraphQuery::new(
             graph_sidecar.as_deref(),
             self.query_limits.clone(),
@@ -490,6 +498,7 @@ impl LocalProjectContext {
                 .as_ref()
                 .and_then(LocalGraphContext::task_view_envelope);
         }
+
         Ok(response)
     }
 
@@ -508,6 +517,7 @@ impl LocalProjectContext {
         if !self.compare_local_freshness {
             return Ok(None);
         }
+
         self.exact_memory_source
             .as_ref()
             .map(|source| {

@@ -6,6 +6,7 @@ use std::{
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
+
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod platform;
@@ -78,6 +79,7 @@ impl Root {
                     name: name.into(),
                 });
             }
+
             directory = platform::child(&directory, name, true, false)?;
         }
 
@@ -178,6 +180,7 @@ impl Parent {
         })
     }
 }
+
 impl Drop for Staged {
     fn drop(&mut self) {
         if !self.published {
@@ -189,6 +192,7 @@ impl Drop for Staged {
                 permissions.set_readonly(false);
                 let _ = self.file.set_permissions(permissions);
             }
+
             #[cfg(unix)]
             let _ = platform::delete(&self.directory, &self.name);
             #[cfg(windows)]
@@ -252,6 +256,7 @@ mod tests {
                 assert_eq!(fs::read(directory.path().join(name)).unwrap(), b"unrelated");
                 assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
             }
+
             parent.delete().unwrap_or_else(|error| {
                 panic!(
                     "deletion failed (changed={}): {}",
@@ -282,6 +287,7 @@ mod tests {
             file.read_to_string(&mut text).unwrap();
             assert_eq!(text, "body");
         }
+
         fs::hard_link(
             directory.path().join("file"),
             directory.path().join("alias"),
@@ -387,6 +393,7 @@ mod tests {
                 io::ErrorKind::PermissionDenied
             );
         }
+
         drop(parent.stage(b"discarded", None).unwrap());
         let mode = parent.open().unwrap().metadata().unwrap().permissions();
         assert_eq!(

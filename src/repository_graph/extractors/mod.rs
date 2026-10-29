@@ -29,11 +29,9 @@ pub(crate) fn deterministic_node_id(
     kind: &str,
     local_key: &str,
 ) -> NodeId {
-    NodeId::new(format!(
-        "node:{}",
-        framed_digest(&[extractor.id.as_str(), &extractor.version, kind, local_key,])
-    ))
-    .expect("a prefixed sha256 digest is never empty")
+    NodeId::from_content_digest(
+        &(framed_digest(&[extractor.id.as_str(), &extractor.version, kind, local_key])),
+    )
 }
 
 pub(crate) fn deterministic_edge_id(
@@ -48,18 +46,16 @@ pub(crate) fn deterministic_edge_id(
         EdgeTarget::External(value) => format!("external:{value}"),
         EdgeTarget::Unresolved(value) => format!("unresolved:{value}"),
     };
-    EdgeId::new(format!(
-        "edge:{}",
-        framed_digest(&[
+    EdgeId::from_content_digest(
+        &(framed_digest(&[
             extractor.id.as_str(),
             &extractor.version,
             kind,
             source.as_str(),
             &target,
             local_key,
-        ])
-    ))
-    .expect("a prefixed sha256 digest is never empty")
+        ])),
+    )
 }
 
 fn framed_digest(parts: &[&str]) -> String {
@@ -69,12 +65,13 @@ fn framed_digest(parts: &[&str]) -> String {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
+
     let bytes = digest.finalize();
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        encoded.push_str(&format!("{byte:02x}"));
     }
+
     encoded
 }
 

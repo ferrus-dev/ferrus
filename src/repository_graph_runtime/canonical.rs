@@ -22,6 +22,7 @@ pub(crate) async fn maintain_graph() -> Result<GraphMaintenanceReport> {
     if !path.exists() {
         return Ok(GraphMaintenanceReport::default());
     }
+
     let references = project::repository_graph_retention_references().await?;
     maintain_graph_with_references(config, repository, path, references).await
 }
@@ -33,11 +34,13 @@ pub(super) async fn maintain_graph_explicit_best_effort(
     if !context.config.enabled {
         return;
     }
+
     let result = async {
         let path = context.query_sidecar_path().await?;
         if !path.exists() {
             return Ok(GraphMaintenanceReport::default());
         }
+
         let references =
             project::repository_graph_retention_references_at(&data_dir.join("ferrus.db")).await?;
         maintain_graph_with_references(
@@ -88,9 +91,7 @@ async fn maintain_graph_with_references(
         })
     })
     .await??;
-    if telemetry_enabled {
-        let encoded = serde_json::to_string(&report)
-            .expect("privacy-safe graph maintenance metrics are always serializable");
+    if telemetry_enabled && let Ok(encoded) = serde_json::to_string(&report) {
         tracing::info!(
             target: "ferrus::repository_graph::maintenance",
             repository_namespace = metric_repository.namespace.as_str(),
@@ -99,6 +100,7 @@ async fn maintain_graph_with_references(
             "repository graph maintenance"
         );
     }
+
     Ok(report)
 }
 
@@ -135,6 +137,7 @@ pub(crate) async fn graph_doctor_observations() -> Vec<GraphDoctorObservation> {
             }];
         }
     }
+
     let mut observations = Vec::new();
     match project::canonical_graph_reference().await {
         Ok(reference) => observations.push(GraphDoctorObservation {
@@ -156,6 +159,7 @@ pub(crate) async fn graph_doctor_observations() -> Vec<GraphDoctorObservation> {
             message: format!("canonical repository graph state is unreadable ({error})"),
         }),
     }
+
     match preview_graph_recovery().await {
         Ok(report) => observations.push(GraphDoctorObservation {
             healthy: report.pending_recovery() == 0,
@@ -175,6 +179,7 @@ pub(crate) async fn graph_doctor_observations() -> Vec<GraphDoctorObservation> {
             message: format!("repository graph recovery state is unreadable ({error})"),
         }),
     }
+
     observations
 }
 
@@ -205,6 +210,7 @@ async fn canonical_source_at(
     if !config.enabled {
         return Ok(None);
     }
+
     let project_id = project::current_project_id().await?;
     let repository = RepositoryRef {
         namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
@@ -345,6 +351,7 @@ async fn refresh_canonical_graph_at(
     if !config.enabled {
         return Ok(None);
     }
+
     let project_id = project::current_project_id().await?;
     let repository = RepositoryRef {
         namespace: RepositoryNamespace::new(format!("local:{project_id}"))?,
@@ -373,6 +380,7 @@ async fn refresh_canonical_graph_at(
         {
             return Err(RefreshAlreadyInProgress.into());
         }
+
         let heartbeat = sidecar.start_refresh_lease_heartbeat(
             &indexed_repository,
             &view_name,
@@ -415,6 +423,7 @@ async fn refresh_canonical_graph_at(
         if !lease_healthy || !released? {
             anyhow::bail!("canonical repository graph refresh lease was lost");
         }
+
         Ok(indexed)
     })
     .await??;
@@ -463,6 +472,7 @@ pub(crate) async fn schedule_task_baseline_pin(
                     "failed to persist unavailable task repository graph baseline"
                 );
             }
+
             None
         }
     };

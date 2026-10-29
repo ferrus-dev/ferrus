@@ -6,8 +6,22 @@ claim a task, or open/create `ferrus.db`.
 
 ## Installation and provider settings
 
-Release archives include `ferrus-nano` alongside `ferrus`; the installers copy both
-when present. For a source installation:
+Release archives include `ferrus-nano` alongside `ferrus`. To install only Nano:
+
+```sh
+curl -fsSL https://ferrus.dev/cli/install.sh | sh -s -- --components nano
+```
+
+```powershell
+& ([scriptblock]::Create((iwr https://ferrus.dev/cli/install.ps1 -useb).Content)) -Components nano
+```
+
+Both modes download and verify the shared archive, install only `ferrus-nano`, and
+retain any existing `ferrus` binary. A release without Nano fails before installation.
+Omitting the component parameter installs both binaries when available. See the
+[installation options](../../README.md#quick-start) for component and destination settings.
+
+For a source installation:
 
 ```sh
 cargo install ferrus --locked --profile dist --features nano-openai,nano-mcp --bin ferrus-nano

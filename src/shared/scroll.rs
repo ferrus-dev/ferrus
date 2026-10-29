@@ -7,6 +7,7 @@ pub(crate) struct Scroll {
     start: Option<usize>,
     maximum: Cell<usize>,
 }
+
 impl Scroll {
     pub(crate) fn range(&self, lines: usize, height: usize) -> Range<usize> {
         let maximum = lines.saturating_sub(height);
@@ -14,6 +15,7 @@ impl Scroll {
         let start = self.start.unwrap_or(maximum).min(maximum);
         start..start.saturating_add(height).min(lines)
     }
+
     pub(crate) fn up(&mut self, lines: usize) {
         self.start = Some(
             self.start
@@ -22,6 +24,7 @@ impl Scroll {
                 .saturating_sub(lines),
         );
     }
+
     pub(crate) fn down(&mut self, lines: usize) {
         let start = self
             .start
@@ -29,12 +32,15 @@ impl Scroll {
             .saturating_add(lines);
         self.start = (start < self.maximum.get()).then_some(start);
     }
+
     pub(crate) fn home(&mut self) {
         self.start = Some(0);
     }
+
     pub(crate) fn end(&mut self) {
         self.start = None;
     }
+
     pub(crate) fn following(&self) -> bool {
         self.start.is_none()
     }
@@ -43,6 +49,7 @@ impl Scroll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn reading_stays_put_when_output_grows_and_end_resumes_following() {
         let mut scroll = Scroll::default();
@@ -56,6 +63,7 @@ mod tests {
         assert_eq!(scroll.range(200, 20), 180..200);
         assert_eq!(scroll.range(220, 20), 200..220);
     }
+
     #[test]
     fn scrolling_clamps_to_resized_content_and_bottom_rejoins_output() {
         let mut scroll = Scroll::default();

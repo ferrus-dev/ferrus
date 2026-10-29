@@ -45,6 +45,7 @@ pub(crate) struct DisplayJournal {
     streaming: wire::Preview,
     interactive: bool,
 }
+
 impl Journal for DisplayJournal {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
         let record = self.inner.append(event, budget)?;
@@ -52,21 +53,27 @@ impl Journal for DisplayJournal {
             self.snapshot.apply(&record);
             self.snapshots.send_replace(Some(self.snapshot.clone()));
         }
+
         Ok(record)
     }
+
     fn checkpoint(&mut self) -> Result<()> {
         self.inner.checkpoint()
     }
+
     fn take_commands(&mut self) -> Option<mpsc::Receiver<SessionCommand>> {
         self.commands.take()
     }
+
     fn interactive(&self) -> bool {
         self.interactive
     }
+
     fn model_delta(&mut self, turn: u64, text: &str) {
         if !self.interactive {
             return;
         }
+
         if let Some(event) = self.streaming.update(turn, text) {
             self.events.send_modify(|state| state.observe(event));
         }
@@ -150,16 +157,19 @@ pub(crate) struct Frontend {
     approval_scroll: crate::shared::scroll::Scroll,
     exit_on_end: bool,
 }
+
 impl Frontend {
     pub(crate) fn authoring(mut self, approvals: mpsc::Receiver<Approval>) -> Self {
         self.approvals = Some(approvals);
         self.exit_on_end = true;
         self
     }
+
     fn receive_approval(&mut self) -> bool {
         if self.approval.is_some() {
             return false;
         }
+
         if let Some(approval) = self.approvals.as_mut().and_then(|rx| rx.try_recv().ok()) {
             self.approval = Some(approval);
             self.approval_text.clear();
@@ -167,8 +177,10 @@ impl Frontend {
             self.error = None;
             return true;
         }
+
         false
     }
+
     fn approval_event(&mut self, event: Event, stop: &Cancellation) {
         match event {
             Event::Paste(text) => {
@@ -201,6 +213,7 @@ impl Frontend {
                         if let Some(request) = self.approval.take() {
                             let _ = request.reply.send(approved);
                         }
+
                         self.approval_text.clear();
                         self.error = None;
                     } else {
@@ -222,8 +235,11 @@ impl Frontend {
             _ => (),
         }
     }
+
     fn approval_rows(&self, width: usize, height: usize) -> (Vec<(String, Color)>, (u16, u16)) {
-        let request = self.approval.as_ref().unwrap();
+        let Some(request) = self.approval.as_ref() else {
+            return (Vec::new(), (0, 0));
+        };
         let title = match request.tool.as_str() {
             "archive_spec" => "Archive specification",
             "create_spec" => "Save specification",
@@ -265,6 +281,7 @@ impl Frontend {
         for (text, _) in &mut rows {
             *text = text.chars().take(width).collect();
         }
+
         (
             rows,
             (
@@ -278,6 +295,7 @@ impl Frontend {
         if self.pending.is_some() || self.text.trim().is_empty() {
             return;
         }
+
         if self.view.snapshot.ended {
             self.error = Some(format!(
                 "Session {} ended. The request remains in the editor; use --resume to continue.",
@@ -285,12 +303,14 @@ impl Frontend {
             ));
             return;
         }
+
         static INPUT: AtomicU64 = AtomicU64::new(1);
         let id = format!("input-{}", INPUT.fetch_add(1, Ordering::Relaxed));
         if let Err(error) = wire::validate_identified_steer(&self.text, Some(&id)) {
             self.error = Some(format!("Input exceeds the command frame limit: {error}"));
             return;
         }
+
         let command = SessionCommand::Steer {
             text: self.text.clone(),
             input_id: Some(id.clone()),
@@ -301,10 +321,12 @@ impl Frontend {
             ));
             return;
         }
+
         self.pending = Some((id, self.text.clone()));
         self.view.scroll.end();
         self.error = None;
     }
+
     fn poll(&mut self) -> bool {
         let changed = self.view.poll();
         if let Some((id, text)) = &self.pending {
@@ -314,9 +336,11 @@ impl Frontend {
                     if self.history.last() != Some(text) {
                         self.history.push(text.clone());
                     }
+
                     if self.history.len() > 100 {
                         self.history.remove(0);
                     }
+
                     if self.text == *text {
                         self.text.clear();
                         self.cursor = 0;
@@ -326,17 +350,22 @@ impl Frontend {
                         if !self.text.is_empty() {
                             self.history.push(self.text.clone());
                         }
+
                         self.text = text.clone();
                         self.cursor = self.text.chars().count();
                     }
+
                     self.error = Some("Session ended before input confirmation. The request remains in the editor; inspect the journal before retrying.".into());
                 }
+
                 self.pending = None;
                 return true;
             }
         }
+
         changed
     }
+
     fn insert(&mut self, text: &str) {
         for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
             if (ch.is_control() && ch != '\n')
@@ -344,14 +373,18 @@ impl Frontend {
             {
                 continue;
             }
+
             input::insert(&mut self.text, &mut self.cursor, ch);
         }
+
         self.history_index = None;
     }
+
     fn history(&mut self, up: bool) {
         if self.history.is_empty() {
             return;
         }
+
         if up {
             self.history_index = Some(match self.history_index {
                 None => {
@@ -365,11 +398,13 @@ impl Frontend {
                 .history_index
                 .and_then(|index| (index + 1 < self.history.len()).then_some(index + 1));
         }
+
         self.text = self
             .history_index
             .map_or_else(|| self.saved.clone(), |index| self.history[index].clone());
         self.cursor = self.text.chars().count();
     }
+
     fn event(&mut self, event: Event, stop: &Cancellation, _width: usize) {
         // A receipt can arrive while EventStream is asleep. Settle it before
         // editing, so the next draft cannot be appended to already accepted text.
@@ -381,9 +416,11 @@ impl Frontend {
             if new_approval && matches!(&event, Event::Key(key) if key.code == KeyCode::Enter) {
                 return;
             }
+
             self.approval_event(event, stop);
             return;
         }
+
         match event {
             Event::Paste(text) => self.insert(&text),
             Event::Key(key) if key.kind != KeyEventKind::Release => match (key.code, key.modifiers)
@@ -426,6 +463,7 @@ impl Frontend {
             _ => (),
         }
     }
+
     fn quit(&mut self, stop: &Cancellation) {
         self.quitting = true;
         stop.cancel();
@@ -447,6 +485,7 @@ impl Frontend {
     ) -> Result<()> {
         // Cancellation is requested even if terminal setup, rendering or input fails.
         struct CancelOnDrop(Cancellation);
+
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
                 self.0.cancel();
@@ -468,21 +507,25 @@ impl Frontend {
                 self.submit();
                 dirty = true;
             }
+
             if *done.borrow() && !self.view.snapshot.ended {
                 self.view.snapshot.ended = true;
                 self.view.snapshot.status =
                     "Session stopped; inspect the journal and diagnostics".into();
                 dirty = true;
             }
+
             if self.should_exit(*done.borrow()) {
                 _terminal.finish()?;
                 return Ok(());
             }
+
             if dirty {
                 let (width, height) = size()?;
                 self.draw(&mut io::stdout(), width as usize, height as usize)?;
                 dirty = false;
             }
+
             tokio::select! {
                 event = events.next(), if input_open => {
                     match event {
@@ -498,6 +541,7 @@ impl Frontend {
             }
         }
     }
+
     fn draw(&self, out: &mut impl Write, width: usize, height: usize) -> Result<()> {
         let (rows, cursor) = self.rows(width.max(1), height.max(1));
         queue!(out, Hide)?;
@@ -511,14 +555,17 @@ impl Frontend {
                 queue!(out, SetForegroundColor(color), Print(text))?;
             }
         }
+
         queue!(out, ResetColor, MoveTo(cursor.1, cursor.0), Show)?;
         out.flush()?;
         Ok(())
     }
+
     fn rows(&self, width: usize, height: usize) -> (Vec<(String, Color)>, (u16, u16)) {
         if self.approval.is_some() {
             return self.approval_rows(width, height);
         }
+
         let prompt = input::prompt(
             &display_text(&self.text, wire::FRAME_BYTES),
             self.cursor,
@@ -557,6 +604,7 @@ impl Frontend {
                     }),
             );
         }
+
         footer.push((
             format!(
                 "{} · {} · Ctrl-C exit",
@@ -592,6 +640,7 @@ impl Frontend {
                 Color::White,
             ));
         }
+
         rows.push((crate::shared::style::separator(width), Color::DarkGrey));
         rows.extend(footer);
         rows.resize(height, (String::new(), Color::Grey));
@@ -605,227 +654,9 @@ impl Frontend {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::journal::Quotas;
-    use super::*;
-
-    fn frontend() -> (tempfile::TempDir, DisplayJournal, Frontend) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let journal = FileJournal::create(&root, "ui-test", Quotas::default()).unwrap();
-        let (journal, frontend) = session(journal, "ui-test", true, None, None);
-        (temp, journal, frontend)
-    }
-    #[test]
-    fn input_is_retained_until_durable_acceptance_and_rejected_queues_keep_it() {
-        let (_temp, mut journal, mut ui) = frontend();
-        let mut commands = journal.take_commands().unwrap();
-        ui.insert("Inspect the result\nthen explain");
-        let original = ui.text.clone();
-        ui.submit();
-        ui.submit();
-        let SessionCommand::Steer { input_id, text } = commands.try_recv().unwrap() else {
-            panic!("steering expected")
-        };
-        assert_eq!(text, original);
-        assert!(commands.try_recv().is_err());
-        assert_eq!(ui.text, original);
-        journal.snapshots.send_replace(Some(Snapshot {
-            accepted_inputs: [input_id.unwrap()].into(),
-            ..Default::default()
-        }));
-        ui.poll();
-        assert!(ui.text.is_empty());
-        assert!(ui.pending.is_none());
-        ui.history(true);
-        assert_eq!(ui.text, original);
-        drop(commands);
-        ui.submit();
-        assert!(ui.pending.is_none());
-        assert_eq!(ui.text, original);
-        assert!(ui.error.as_deref().unwrap().contains("not queued"));
-    }
-    #[test]
-    fn a_receipt_arriving_between_ticks_is_applied_before_the_next_edit() {
-        let (_temp, journal, mut ui) = frontend();
-        ui.insert("Previous request");
-        ui.submit();
-        let id = ui.pending.as_ref().unwrap().0.clone();
-        journal.snapshots.send_replace(Some(Snapshot {
-            accepted_inputs: [id].into(),
-            ..Default::default()
-        }));
-        ui.event(
-            Event::Paste("New request".into()),
-            &Cancellation::default(),
-            80,
-        );
-        assert_eq!(ui.text, "New request");
-        assert!(ui.pending.is_none());
-    }
-    #[test]
-    fn full_command_queue_and_oversized_serialized_input_preserve_the_editor() {
-        let (_temp, journal, mut ui) = frontend();
-        for _ in 0..8 {
-            ui.sender.try_send(SessionCommand::Interact).unwrap();
-        }
-        ui.insert("Still needed\nrequest");
-        let draft = ui.text.clone();
-        ui.submit();
-        assert!(ui.pending.is_none());
-        assert_eq!(ui.text, draft);
-        assert!(ui.error.as_deref().unwrap().contains("not queued"));
-        drop(journal);
-        ui.text = "\"".repeat(wire::FRAME_BYTES / 2);
-        ui.submit();
-        assert!(ui.error.as_deref().unwrap().contains("frame limit"));
-        assert_eq!(ui.text.len(), wire::FRAME_BYTES / 2);
-    }
-    #[test]
-    fn shutdown_keeps_unconfirmed_input_and_newer_drafts_and_rejects_further_turns() {
-        let (_temp, journal, mut ui) = frontend();
-        ui.insert("First request");
-        ui.submit();
-        ui.insert(" with newer detail");
-        journal.snapshots.send_replace(Some(Snapshot {
-            ended: true,
-            ..Default::default()
-        }));
-        ui.poll();
-        assert_eq!(ui.text, "First request");
-        assert_eq!(
-            ui.history.last().unwrap(),
-            "First request with newer detail"
-        );
-        ui.submit();
-        assert!(ui.pending.is_none());
-        assert!(ui.error.as_deref().unwrap().contains("--resume"));
-    }
-    #[test]
-    fn resize_scroll_streaming_tools_and_multiline_editor_stay_within_geometry() {
-        let (_temp, journal, mut ui) = frontend();
-        journal.snapshots.send_replace(Some(Snapshot {
-            turn: 2,
-            status: "Generating response (turn 2)".into(),
-            entries: (0..128)
-                .map(|i| format!("Tool result {i}: {}", "long output ".repeat(100)))
-                .collect(),
-            ..Default::default()
-        }));
-        for _ in 0..10_000 {
-            journal.events.send_modify(|state| {
-                state.observe(wire::Event::Text {
-                    turn: 2,
-                    text: "preview".repeat(300),
-                })
-            });
-        }
-        ui.poll();
-        ui.insert(&"multiline input\n".repeat(80));
-        for width in [1, 2, 8, 40, 80] {
-            for height in [1, 3, 8, 24] {
-                for scroll in [0, 10, usize::MAX] {
-                    ui.view.scroll.end();
-                    if scroll > 0 {
-                        ui.view.scroll.up(scroll);
-                    }
-                    let (rows, (row, col)) = ui.rows(width, height);
-                    assert_eq!(rows.len(), height);
-                    assert!(rows.iter().all(|(text, _)| text.chars().count() <= width));
-                    assert!(usize::from(row) < height);
-                    assert!(usize::from(col) < width);
-                }
-            }
-        }
-        let stop = Cancellation::default();
-        ui.event(
-            Event::Key(crossterm::event::KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )),
-            &stop,
-            80,
-        );
-        assert!(stop.is_cancelled());
-        assert!(ui.quitting);
-    }
-    #[test]
-    fn failed_append_never_publishes_a_display_receipt() {
-        let (_temp, mut journal, _ui) = frontend();
-        assert!(
-            journal
-                .append(
-                    SessionEvent::UserInput {
-                        text: "Not durable".into(),
-                        input_id: Some("input-1".into())
-                    },
-                    &Budget::default()
-                )
-                .is_err()
-        );
-        assert!(journal.snapshots.borrow().is_none());
-    }
-
-    #[test]
-    fn long_streaming_response_keeps_its_beginning_and_the_readers_position() {
-        let (_temp, mut journal, mut ui) = frontend();
-        let text = (0..100)
-            .map(|i| format!("Paragraph {i}\n"))
-            .collect::<String>();
-        journal.snapshots.send_replace(Some(Snapshot {
-            turn: 1,
-            status: "Generating response (turn 1)".into(),
-            ..Default::default()
-        }));
-        journal.model_delta(1, &text);
-        ui.poll();
-        assert_eq!(ui.view.preview.as_ref().unwrap().1, text);
-        ui.view.scroll.home();
-        let before = ui.rows(80, 24).0;
-        assert!(
-            before
-                .iter()
-                .any(|(row, _)| row.contains("Nano: Paragraph 0"))
-        );
-        journal.events.send_modify(|state| {
-            state.observe(wire::Event::Text {
-                turn: 1,
-                text: format!("{text}New paragraph\n"),
-            })
-        });
-        ui.poll();
-        let during = ui.rows(80, 24).0;
-        assert_eq!(&before[3..10], &during[3..10]);
-        journal.snapshots.send_replace(Some(Snapshot {
-            turn: 1,
-            status: "Waiting for your input".into(),
-            entries: [format!("Nano: {text}New paragraph\n")].into(),
-            ..Default::default()
-        }));
-        ui.poll();
-        assert!(ui.view.preview.is_none());
-        assert_eq!(&before[3..10], &ui.rows(80, 24).0[3..10]);
-        ui.event(
-            Event::Key(crossterm::event::KeyEvent::new(
-                KeyCode::End,
-                KeyModifiers::CONTROL,
-            )),
-            &Cancellation::default(),
-            80,
-        );
-        assert!(ui.view.scroll.following());
-        assert!(
-            ui.rows(80, 24)
-                .0
-                .iter()
-                .any(|(row, _)| row.contains("New paragraph"))
-        );
-    }
-}
-
-#[cfg(test)]
 mod approval_tests {
     use super::*;
+
     #[test]
     fn authoring_failures_remain_visible_until_the_user_closes_them() {
         let temp = tempfile::tempdir().unwrap();
@@ -846,6 +677,7 @@ mod approval_tests {
             ui.view.snapshot.end_reason = Some(reason);
             assert!(!ui.should_exit(true));
         }
+
         ui.view.snapshot.end_reason = Some(EndReason::DefinitionCompleted);
         assert!(!ui.should_exit(false));
         assert!(ui.should_exit(true));
@@ -862,6 +694,7 @@ mod approval_tests {
         );
         assert!(ui.should_exit(true));
     }
+
     #[tokio::test]
     async fn approval_accepts_plain_user_confirmation_and_never_uses_queued_steering() {
         let temp = tempfile::tempdir().unwrap();
@@ -918,6 +751,7 @@ mod approval_tests {
                     .any(|(row, _)| row.contains("Enter: approve"))
             );
         }
+
         for width in [1, 2, 8, 80] {
             for height in [1, 3, 24] {
                 let (rows, (row, col)) = ui.rows(width, height);
@@ -926,6 +760,7 @@ mod approval_tests {
                 assert!((row as usize) < height && (col as usize) < width);
             }
         }
+
         ui.approval_text.clear();
         ui.event(Event::Paste("approve\n".into()), &stop, 80);
         assert!(result.try_recv().is_err());
@@ -940,6 +775,7 @@ mod approval_tests {
         assert!(result.await.unwrap());
         assert!(ui.approval.is_none());
     }
+
     #[tokio::test]
     async fn enter_approves_the_displayed_content_without_a_challenge_code() {
         let temp = tempfile::tempdir().unwrap();
@@ -969,6 +805,7 @@ mod approval_tests {
         );
         assert!(result.await.unwrap());
     }
+
     #[tokio::test]
     async fn escape_declines_without_altering_the_normal_draft() {
         let temp = tempfile::tempdir().unwrap();
@@ -1002,3 +839,6 @@ mod approval_tests {
         assert_eq!(ui.text, "Unsent user draft");
     }
 }
+#[cfg(test)]
+#[path = "frontend_tests.rs"]
+mod tests;

@@ -5,6 +5,8 @@
 //! here owns only the deletable `repo-graph.db` sidecar.
 
 pub mod config;
+#[cfg(test)]
+mod contracts;
 pub mod diagnostics;
 mod diagnostics_sqlite;
 pub mod domain;
@@ -20,9 +22,6 @@ pub mod resolution;
 pub mod source;
 pub mod sqlite;
 pub mod store;
-
-#[cfg(test)]
-mod contracts;
 
 /// Schema-independent graph model version.
 pub const GRAPH_MODEL_VERSION: u32 = 1;

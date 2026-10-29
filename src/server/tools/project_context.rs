@@ -119,6 +119,7 @@ async fn run(agent_id: &str, input: ProjectContextInput) -> Result<String> {
     if input.seeds.is_empty() || input.seeds.len() > 32 {
         anyhow::bail!("project_context requires 1..=32 seeds");
     }
+
     let context = LocalProjectContext::load_for_agent(
         agent_id,
         requires_memory_content(input.domain, input.include_snippets),
@@ -209,11 +210,13 @@ fn validate_seed_domains(domain: ContextDomain, seeds: &[FederatedContextSeed]) 
     if matches!(domain, ContextDomain::Repository) && has_memory {
         anyhow::bail!("project_context repository domain accepts only node, symbol, or path seeds");
     }
+
     if matches!(domain, ContextDomain::Memory) && has_repository_node {
         anyhow::bail!(
             "project_context memory domain accepts memory seeds and repository path or symbol references"
         );
     }
+
     Ok(())
 }
 

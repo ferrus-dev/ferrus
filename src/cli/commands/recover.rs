@@ -45,6 +45,7 @@ pub async fn run(dry_run: bool, worktrees: bool) -> Result<()> {
             println!("Repository graph recovery: unavailable (runtime recovery completed)");
         }
     }
+
     if worktrees {
         if dry_run {
             let orphaned = project::preview_orphaned_worktrees().await?;
@@ -55,5 +56,6 @@ pub async fn run(dry_run: bool, worktrees: bool) -> Result<()> {
             println!("Worktrees removed: {removed}");
         }
     }
+
     Ok(())
 }

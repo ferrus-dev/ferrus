@@ -202,8 +202,10 @@ fn emit(context: &LocalGraphContext, metric: RepositoryQueryMetric<'_>) {
     if !context.config.telemetry.enabled {
         return;
     }
-    let encoded = serde_json::to_string(&metric)
-        .expect("privacy-safe repository query metrics are always serializable");
+
+    let Ok(encoded) = serde_json::to_string(&metric) else {
+        return;
+    };
     tracing::info!(
         target: "ferrus::repository_graph::query",
         metric = %encoded,

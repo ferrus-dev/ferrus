@@ -117,12 +117,14 @@ pub trait TenantObjectStore {
     type Error;
 
     fn protection(&self) -> ObjectStoreProtection;
+
     fn put_verified(
         &mut self,
         project: &RemoteProjectRef,
         content_identity: &Digest,
         content: &[u8],
     ) -> Result<PutObjectResult, Self::Error>;
+
     /// Persists a complete package atomically. Either every unique object is
     /// available after this call or none of the newly stored objects are.
     fn put_verified_batch(
@@ -130,7 +132,9 @@ pub trait TenantObjectStore {
         project: &RemoteProjectRef,
         objects: &[VerifiedObject<'_>],
     ) -> Result<Vec<PutObjectResult>, Self::Error>;
+
     fn read_verified(&self, object: &TenantObjectRef) -> Result<Vec<u8>, Self::Error>;
+
     fn read_verified_bounded(
         &self,
         object: &TenantObjectRef,
@@ -200,6 +204,7 @@ impl EncryptedFilesystemObjectStore {
         if !authenticated_transport {
             return Err(ObjectStoreError::InsecureProtection);
         }
+
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("objects"))?;
         let database = Connection::open(root.join("object-store.db"))?;
@@ -271,6 +276,7 @@ impl EncryptedFilesystemObjectStore {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         let mut encoded = Vec::new();
         let mut file = File::open(path)?;
         let max_encoded_bytes = max_plaintext_bytes.map(|limit| {
@@ -284,30 +290,37 @@ impl EncryptedFilesystemObjectStore {
         {
             return Ok(BoundedObjectRead::SizeExceeded);
         }
+
         let mut buffer = [0u8; 64 * 1024];
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Ok(BoundedObjectRead::DeadlineExceeded);
             }
+
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
+
             if max_encoded_bytes.is_some_and(|limit| {
                 u64::try_from(encoded.len().saturating_add(read)).unwrap_or(u64::MAX) > limit
             }) {
                 return Ok(BoundedObjectRead::SizeExceeded);
             }
+
             encoded.extend_from_slice(&buffer[..read]);
         }
+
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         if encoded.len() < ENVELOPE_MAGIC.len() + NONCE_BYTES + AES_256_GCM.tag_len()
             || &encoded[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC
         {
             return Err(ObjectStoreError::IntegrityFailure);
         }
+
         let nonce_start = ENVELOPE_MAGIC.len();
         let payload_start = nonce_start + NONCE_BYTES;
         let nonce = Nonce::try_assume_unique_for_key(&encoded[nonce_start..payload_start])
@@ -316,6 +329,7 @@ impl EncryptedFilesystemObjectStore {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         let plaintext = key
             .open_in_place(nonce, Aad::from(Self::aad(object)), &mut payload)
             .map_err(|_| ObjectStoreError::IntegrityFailure)?;
@@ -325,12 +339,15 @@ impl EncryptedFilesystemObjectStore {
         {
             return Ok(BoundedObjectRead::SizeExceeded);
         }
+
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         if !verify_digest_until(&object.content_identity, &plaintext, deadline)? {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         Ok(BoundedObjectRead::Content(plaintext))
     }
 
@@ -431,11 +448,13 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if !self.protection.authenticated_transport || !self.protection.encrypted_at_rest {
             return Err(ObjectStoreError::InsecureProtection);
         }
+
         verify_digest(content_identity, content)?;
         let byte_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
         if byte_len > self.quota.max_object_bytes.get() {
             return Err(ObjectStoreError::ObjectQuotaExceeded);
         }
+
         let object = TenantObjectRef {
             project: project.clone(),
             object_id: ObjectId::new(content_identity.value())
@@ -449,6 +468,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if project_has_deletion_tombstone(&transaction, project)? {
             return Err(ObjectStoreError::ProjectDeleted);
         }
+
         let existing = transaction
             .query_row(
                 "SELECT byte_len FROM source_objects
@@ -465,10 +485,12 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
             if stored_len < 0 || stored_len as u64 != byte_len {
                 return Err(ObjectStoreError::IntegrityFailure);
             }
+
             drop(transaction);
             if Self::decrypt_file(&self.key, &object, &path)? != content {
                 return Err(ObjectStoreError::IntegrityFailure);
             }
+
             return Ok(PutObjectResult {
                 object,
                 outcome: PutObjectOutcome::Reused,
@@ -486,6 +508,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if objects >= self.quota.max_objects_per_project.get() {
             return Err(ObjectStoreError::ProjectObjectQuotaExceeded);
         }
+
         if bytes.saturating_add(byte_len) > self.quota.max_bytes_per_project.get() {
             return Err(ObjectStoreError::ProjectByteQuotaExceeded);
         }
@@ -535,6 +558,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
             if byte_len > self.quota.max_object_bytes.get() {
                 return Err(ObjectStoreError::ObjectQuotaExceeded);
             }
+
             let object = TenantObjectRef {
                 project: project.clone(),
                 object_id: ObjectId::new(input.content_identity.value())
@@ -551,8 +575,10 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                 {
                     return Err(ObjectStoreError::IntegrityFailure);
                 }
+
                 continue;
             }
+
             staged.push(StagedObject {
                 path: self.object_path(&object),
                 object,
@@ -587,9 +613,11 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                 if stored_len < 0 || stored_len as u64 != item.byte_len {
                     return Err(ObjectStoreError::IntegrityFailure);
                 }
+
                 if Self::decrypt_file(&self.key, &item.object, &item.path)? != item.content {
                     return Err(ObjectStoreError::IntegrityFailure);
                 }
+
                 outcomes.insert(
                     item.object.object_id.as_str().to_string(),
                     PutObjectOutcome::Reused,
@@ -620,6 +648,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         {
             return Err(ObjectStoreError::ProjectObjectQuotaExceeded);
         }
+
         if stored_bytes.saturating_add(pending_bytes) > self.quota.max_bytes_per_project.get() {
             return Err(ObjectStoreError::ProjectByteQuotaExceeded);
         }
@@ -633,6 +662,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                 if !path_existed {
                     created_paths.push(item.path.clone());
                 }
+
                 transaction.execute(
                     "INSERT INTO source_objects (
                         tenant_id, project_id, object_id, digest_algorithm, digest_value, byte_len
@@ -652,6 +682,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                     PutObjectOutcome::Stored,
                 );
             }
+
             transaction.commit()?;
             Ok(requested
                 .into_iter()
@@ -666,6 +697,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
                 let _ = fs::remove_file(path);
             }
         }
+
         result
     }
 
@@ -673,6 +705,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if !self.contains(object)? {
             return Err(ObjectStoreError::ObjectUnavailable);
         }
+
         Self::decrypt_file(&self.key, object, &self.object_path(object))
     }
 
@@ -685,6 +718,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if Instant::now() >= deadline {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         let read_deadline = match ReadDeadline::install(&self.database, deadline)? {
             Some(read_deadline) => read_deadline,
             None => {
@@ -711,6 +745,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if Instant::now() >= deadline || sqlite_read_timed_out(&byte_len) {
             return Ok(BoundedObjectRead::DeadlineExceeded);
         }
+
         let byte_len = byte_len?;
         let Some(byte_len) = byte_len else {
             return Err(ObjectStoreError::ObjectUnavailable);
@@ -719,6 +754,7 @@ impl TenantObjectStore for EncryptedFilesystemObjectStore {
         if byte_len > max_bytes {
             return Ok(BoundedObjectRead::SizeExceeded);
         }
+
         Self::decrypt_file_bounded(
             &self.key,
             object,
@@ -779,6 +815,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), ObjectStoreError> {
         Some(OBJECT_SCHEMA_VERSION) => {}
         Some(_) => return Err(ObjectStoreError::IncompatibleSchema),
     }
+
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS project_deletion_tombstones (
              tenant_id TEXT NOT NULL,
@@ -816,16 +853,20 @@ fn verify_digest_until(
     if expected.algorithm() != "sha256" {
         return Err(ObjectStoreError::ContentIdentityMismatch);
     }
+
     let mut digest = Sha256::new();
     for chunk in content.chunks(64 * 1024) {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(false);
         }
+
         digest.update(chunk);
     }
+
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(false);
     }
+
     let actual = digest
         .finalize()
         .iter()
@@ -834,331 +875,14 @@ fn verify_digest_until(
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(false);
     }
+
     if actual != expected.value() {
         return Err(ObjectStoreError::ContentIdentityMismatch);
     }
+
     Ok(true)
 }
 
 #[cfg(test)]
-mod tests {
-    //! Encrypted object integrity, quota enforcement, and idempotent storage.
-
-    use super::*;
-    use crate::distributed::identity::{RemoteProjectId, TenantId};
-
-    fn project(tenant: &str) -> RemoteProjectRef {
-        RemoteProjectRef {
-            tenant_id: TenantId::new(tenant).unwrap(),
-            project_id: RemoteProjectId::new("project").unwrap(),
-        }
-    }
-
-    fn digest(content: &[u8]) -> Digest {
-        let value = Sha256::digest(content)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Digest::new("sha256", value).unwrap()
-    }
-
-    fn quota() -> ObjectStoreQuota {
-        ObjectStoreQuota {
-            max_objects_per_project: NonZeroU64::new(4).unwrap(),
-            max_bytes_per_project: NonZeroU64::new(1024).unwrap(),
-            max_object_bytes: NonZeroU64::new(512).unwrap(),
-        }
-    }
-
-    #[test]
-    fn encrypted_objects_are_idempotent_and_plaintext_is_not_at_rest() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [7; 32], quota(), true).unwrap();
-        let content = b"private repository content";
-        let first = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        assert_eq!(first.outcome, PutObjectOutcome::Stored);
-        let repeated = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        assert_eq!(repeated.outcome, PutObjectOutcome::Reused);
-        assert_eq!(store.read_verified(&first.object).unwrap(), content);
-        let encoded = fs::read(store.object_path(&first.object)).unwrap();
-        assert!(
-            !encoded
-                .windows(content.len())
-                .any(|window| window == content)
-        );
-    }
-
-    #[test]
-    fn verified_batch_rejects_quota_without_persisting_a_prefix() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = EncryptedFilesystemObjectStore::open(
-            directory.path(),
-            [7; 32],
-            ObjectStoreQuota {
-                max_objects_per_project: NonZeroU64::new(1).unwrap(),
-                max_bytes_per_project: NonZeroU64::new(1024).unwrap(),
-                max_object_bytes: NonZeroU64::new(512).unwrap(),
-            },
-            true,
-        )
-        .unwrap();
-        let first = b"first package object";
-        let second = b"second package object";
-        let first_digest = digest(first);
-        let second_digest = digest(second);
-
-        let result = store.put_verified_batch(
-            &project("tenant-a"),
-            &[
-                VerifiedObject {
-                    content_identity: &first_digest,
-                    content: first,
-                },
-                VerifiedObject {
-                    content_identity: &second_digest,
-                    content: second,
-                },
-            ],
-        );
-
-        assert!(matches!(
-            result,
-            Err(ObjectStoreError::ProjectObjectQuotaExceeded)
-        ));
-        let stored: i64 = store
-            .database
-            .query_row("SELECT COUNT(*) FROM source_objects", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(stored, 0);
-    }
-
-    #[test]
-    fn verified_reads_stop_at_the_caller_deadline() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [8; 32], quota(), true).unwrap();
-        let content = b"deadline-bounded content";
-        let stored = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-
-        assert_eq!(
-            store
-                .read_verified_until(&stored.object, Instant::now())
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            store
-                .read_verified_until(
-                    &stored.object,
-                    Instant::now() + std::time::Duration::from_secs(1),
-                )
-                .unwrap()
-                .unwrap(),
-            content
-        );
-    }
-
-    #[test]
-    fn bounded_reads_reject_oversized_objects_before_returning_content() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [10; 32], quota(), true)
-                .unwrap();
-        let content = b"manifest larger than worker limit";
-        let stored = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-
-        assert_eq!(
-            store
-                .read_verified_bounded(
-                    &stored.object,
-                    u64::try_from(content.len() - 1).unwrap(),
-                    deadline,
-                )
-                .unwrap(),
-            BoundedObjectRead::SizeExceeded
-        );
-        assert_eq!(
-            store
-                .read_verified_bounded(
-                    &stored.object,
-                    u64::try_from(content.len()).unwrap(),
-                    deadline,
-                )
-                .unwrap(),
-            BoundedObjectRead::Content(content.to_vec())
-        );
-    }
-
-    #[test]
-    fn bounded_reads_stop_at_the_sqlite_lock_deadline() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("object-store.db");
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [12; 32], quota(), true)
-                .unwrap();
-        let content = b"lock-bounded content";
-        let stored = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        store
-            .database
-            .query_row("PRAGMA journal_mode = DELETE", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap();
-        let blocker = Connection::open(database_path).unwrap();
-        blocker
-            .execute_batch(
-                "BEGIN EXCLUSIVE;
-                 UPDATE source_objects SET byte_len = byte_len;",
-            )
-            .unwrap();
-        let started = Instant::now();
-
-        let result = store
-            .read_verified_bounded(
-                &stored.object,
-                u64::try_from(content.len()).unwrap(),
-                started + std::time::Duration::from_millis(25),
-            )
-            .unwrap();
-
-        assert_eq!(result, BoundedObjectRead::DeadlineExceeded);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        blocker.execute_batch("ROLLBACK").unwrap();
-    }
-
-    #[test]
-    fn project_deletion_tombstone_rejects_new_objects() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [11; 32], quota(), true)
-                .unwrap();
-        let project = project("tenant-a");
-        store
-            .database
-            .execute(
-                "INSERT INTO project_deletion_tombstones (
-                     tenant_id, project_id, deletion_id, created_at_ms
-                 ) VALUES (?1, ?2, 'delete-project', 1)",
-                params![project.tenant_id.as_str(), project.project_id.as_str()],
-            )
-            .unwrap();
-
-        assert!(matches!(
-            store.put_verified(&project, &digest(b"new source"), b"new source"),
-            Err(ObjectStoreError::ProjectDeleted)
-        ));
-    }
-
-    #[test]
-    fn identical_content_remains_separate_and_unreadable_across_tenants() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [9; 32], quota(), true).unwrap();
-        let content = b"same bytes";
-        let left = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        let right = store
-            .put_verified(&project("tenant-b"), &digest(content), content)
-            .unwrap();
-        assert_ne!(left.object, right.object);
-        assert_ne!(
-            store.object_path(&left.object),
-            store.object_path(&right.object)
-        );
-        let mut foreign = left.object.clone();
-        foreign.project = project("tenant-c");
-        assert!(matches!(
-            store.read_verified(&foreign),
-            Err(ObjectStoreError::ObjectUnavailable)
-        ));
-    }
-
-    #[test]
-    fn quotas_and_protection_fail_closed() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            EncryptedFilesystemObjectStore::open(directory.path(), [1; 32], quota(), false),
-            Err(ObjectStoreError::InsecureProtection)
-        ));
-        let mut store = EncryptedFilesystemObjectStore::open(
-            directory.path(),
-            [1; 32],
-            ObjectStoreQuota {
-                max_objects_per_project: NonZeroU64::new(1).unwrap(),
-                ..quota()
-            },
-            true,
-        )
-        .unwrap();
-        store
-            .put_verified(&project("tenant-a"), &digest(b"first"), b"first")
-            .unwrap();
-        assert!(matches!(
-            store.put_verified(&project("tenant-a"), &digest(b"second"), b"second"),
-            Err(ObjectStoreError::ProjectObjectQuotaExceeded)
-        ));
-    }
-
-    #[test]
-    fn authenticated_encryption_rejects_tampered_ciphertext() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store =
-            EncryptedFilesystemObjectStore::open(directory.path(), [3; 32], quota(), true).unwrap();
-        let content = b"integrity protected";
-        let stored = store
-            .put_verified(&project("tenant-a"), &digest(content), content)
-            .unwrap();
-        let path = store.object_path(&stored.object);
-        let mut encoded = fs::read(&path).unwrap();
-        *encoded.last_mut().unwrap() ^= 1;
-        fs::write(path, encoded).unwrap();
-        assert!(matches!(
-            store.read_verified(&stored.object),
-            Err(ObjectStoreError::IntegrityFailure)
-        ));
-    }
-
-    #[test]
-    fn incompatible_metadata_does_not_create_object_tables() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("object-store.db");
-        let connection = Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE object_store_metadata (
-                     singleton INTEGER PRIMARY KEY,
-                     schema_version INTEGER NOT NULL
-                 );
-                 INSERT INTO object_store_metadata VALUES (1, 999);",
-            )
-            .unwrap();
-        drop(connection);
-        assert!(matches!(
-            EncryptedFilesystemObjectStore::open(directory.path(), [1; 32], quota(), true),
-            Err(ObjectStoreError::IncompatibleSchema)
-        ));
-        let connection = Connection::open(database_path).unwrap();
-        let created = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_objects'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap();
-        assert!(created.is_none());
-    }
-}
+#[path = "object_store_tests.rs"]
+mod tests;

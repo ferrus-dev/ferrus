@@ -137,7 +137,7 @@ impl CrossFileResolver for ConservativeResolver {
 
 pub fn resolver_identity() -> ExtractorIdentity {
     ExtractorIdentity {
-        id: ExtractorId::new(RESOLVER_ID).expect("built-in resolver ID is non-empty"),
+        id: const { ExtractorId::from_static(RESOLVER_ID) },
         version: RESOLVER_VERSION.to_string(),
         contract_version: EXTRACTOR_CONTRACT_VERSION,
     }
@@ -159,9 +159,11 @@ fn validate_input(input: &CrossFileResolutionInput<'_>) -> Result<(), Resolution
         if node.snapshot_id != input.context.snapshot_id {
             return Err(ResolutionError::SnapshotMismatch);
         }
+
         if !nodes.insert(node.id.clone()) {
             return Err(ResolutionError::DuplicateNode(node.id.clone()));
         }
+
         validate_evidence(node.provenance.evidence.as_ref(), &manifest_files)?;
     }
 
@@ -170,23 +172,29 @@ fn validate_input(input: &CrossFileResolutionInput<'_>) -> Result<(), Resolution
         if edge.snapshot_id != input.context.snapshot_id {
             return Err(ResolutionError::SnapshotMismatch);
         }
+
         if !edges.insert(edge.id.clone()) {
             return Err(ResolutionError::DuplicateEdge(edge.id.clone()));
         }
+
         if !nodes.contains(&edge.source) {
             return Err(ResolutionError::MissingSource(edge.source.clone()));
         }
+
         if let EdgeTarget::Node(target) = &edge.target
             && !nodes.contains(target)
         {
             return Err(ResolutionError::MissingTarget(target.clone()));
         }
+
         validate_evidence(edge.provenance.evidence.as_ref(), &manifest_files)?;
     }
+
     for diagnostic in &input.fragment.diagnostics {
         if diagnostic.build_id != input.context.build_id {
             return Err(ResolutionError::BuildMismatch);
         }
+
         if diagnostic
             .snapshot_id
             .as_ref()
@@ -195,6 +203,7 @@ fn validate_input(input: &CrossFileResolutionInput<'_>) -> Result<(), Resolution
             return Err(ResolutionError::SnapshotMismatch);
         }
     }
+
     Ok(())
 }
 
@@ -214,6 +223,7 @@ fn validate_evidence(
     if evidence.content_identity != file.content_identity || !span_valid {
         return Err(ResolutionError::InvalidEvidence(evidence.path.clone()));
     }
+
     Ok(())
 }
 
@@ -249,6 +259,7 @@ impl<'a> Indexes<'a> {
                     .or_default()
                     .push(node.id.clone());
             }
+
             if node.kind == "cargo_package"
                 && let Some(path) = string_property(node, "manifest_path")
             {
@@ -257,12 +268,14 @@ impl<'a> Indexes<'a> {
                     .or_default()
                     .push(node.id.clone());
             }
+
             if node.kind == "entry_point"
                 && string_property(node, "language") == Some("rust")
                 && let Some(path) = string_property(node, "path")
             {
                 entry_paths.insert(node.id.clone(), path.to_string());
             }
+
             if node.kind == "mod_declaration"
                 && boolean_property(node, "path_override") == Some(true)
                 && let Some(key) = evidence_key(node.provenance.evidence.as_ref())
@@ -270,6 +283,7 @@ impl<'a> Indexes<'a> {
                 path_override_evidence.insert(key);
             }
         }
+
         sort_values(&mut rust_roots_by_path);
         sort_values(&mut packages_by_manifest_candidate);
 
@@ -315,14 +329,22 @@ fn apply_plan(
             node.provenance.confidence = Confidence::High;
         }
     }
+
     fragment
         .edges
         .retain(|edge| !plan.replacements.contains_key(&edge.id));
     fragment.edges.extend(plan.replacements.into_values());
     fragment.edges.extend(plan.additions.into_values());
     if plan.truncated {
-        diagnostics.push_without_location("resolution.relationship_limit");
+        diagnostics.push_without_location(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static(
+                    "resolution.relationship_limit",
+                )
+            },
+        );
     }
+
     fragment.diagnostics.extend(diagnostics.finish());
     sort_fragment(&mut fragment);
     fragment
@@ -332,7 +354,7 @@ fn timeout_fragment(
     input: CrossFileResolutionInput<'_>,
     mut diagnostics: DiagnosticBuffer,
 ) -> GraphFragment {
-    diagnostics.replace_with("resolution.timeout");
+    diagnostics.replace_with(const { crate::repository_graph::domain::DiagnosticCode::from_static("resolution.timeout") });
     let mut fragment = input.fragment;
     fragment.diagnostics.extend(diagnostics.finish());
     sort_fragment(&mut fragment);
@@ -385,11 +407,11 @@ impl DiagnosticBuffer {
         }
     }
 
-    fn push(&mut self, code: &'static str, edge: &GraphEdge) {
+    fn push(&mut self, code: DiagnosticCode, edge: &GraphEdge) {
         self.push_evidence(code, edge.provenance.evidence.as_ref());
     }
 
-    fn push_evidence(&mut self, code: &'static str, evidence: Option<&SourceEvidence>) {
+    fn push_evidence(&mut self, code: DiagnosticCode, evidence: Option<&SourceEvidence>) {
         let location = evidence.map(|evidence| DiagnosticLocation {
             path: evidence.path.clone(),
             span: evidence.span.clone(),
@@ -397,19 +419,20 @@ impl DiagnosticBuffer {
         self.push_location(code, location);
     }
 
-    fn push_without_location(&mut self, code: &'static str) {
+    fn push_without_location(&mut self, code: DiagnosticCode) {
         self.push_location(code, None);
     }
 
-    fn push_location(&mut self, code: &'static str, location: Option<DiagnosticLocation>) {
+    fn push_location(&mut self, code: DiagnosticCode, location: Option<DiagnosticLocation>) {
         if self.diagnostics.len() as u64 >= self.limit {
             self.suppressed = self.suppressed.saturating_add(1);
             return;
         }
+
         self.diagnostics.push(self.diagnostic(code, location));
     }
 
-    fn replace_with(&mut self, code: &'static str) {
+    fn replace_with(&mut self, code: DiagnosticCode) {
         self.diagnostics.clear();
         self.suppressed = 0;
         self.push_without_location(code);
@@ -418,9 +441,16 @@ impl DiagnosticBuffer {
     fn finish(mut self) -> Vec<GraphDiagnostic> {
         if self.suppressed > 0 && self.limit > 0 {
             let replaced = u64::from(!self.diagnostics.is_empty());
-            let mut summary = self.diagnostic("resolution.diagnostics_truncated", None);
+            let mut summary = self.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "resolution.diagnostics_truncated",
+                    )
+                },
+                None,
+            );
             summary.metrics.insert(
-                DiagnosticCode::new("suppressed").expect("static metric is canonical"),
+                const { DiagnosticCode::from_static("suppressed") },
                 i64::try_from(self.suppressed.saturating_add(replaced)).unwrap_or(i64::MAX),
             );
             if let Some(last) = self.diagnostics.last_mut() {
@@ -429,19 +459,20 @@ impl DiagnosticBuffer {
                 self.diagnostics.push(summary);
             }
         }
+
         self.diagnostics
     }
 
     fn diagnostic(
         &self,
-        code: &'static str,
+        code: DiagnosticCode,
         location: Option<DiagnosticLocation>,
     ) -> GraphDiagnostic {
         GraphDiagnostic {
             build_id: self.build_id.clone(),
             snapshot_id: Some(self.snapshot_id.clone()),
             severity: DiagnosticSeverity::Warning,
-            code: DiagnosticCode::new(code).expect("static resolver diagnostic is canonical"),
+            code,
             location,
             metrics: BTreeMap::new(),
         }
@@ -573,9 +604,11 @@ fn match_workspace_pattern(pattern: &str, path: &str) -> Option<bool> {
     if pattern.contains(['[', ']', '{', '}', '\\']) {
         return None;
     }
+
     if pattern == "." || path == "." {
         return Some(pattern == path);
     }
+
     let pattern = pattern.split('/').collect::<Vec<_>>();
     let path = path.split('/').collect::<Vec<_>>();
     Some(match_path_segments(&pattern, &path))
@@ -589,6 +622,7 @@ fn match_path_segments(pattern: &[&str], path: &[&str]) -> bool {
             if !reachable[pattern_index][path_index] {
                 continue;
             }
+
             if pattern[pattern_index] == "**" {
                 reachable[pattern_index + 1][path_index] = true;
                 if path_index < path.len() {
@@ -601,6 +635,7 @@ fn match_path_segments(pattern: &[&str], path: &[&str]) -> bool {
             }
         }
     }
+
     reachable[pattern.len()][path.len()]
 }
 
@@ -614,6 +649,7 @@ fn match_path_segment(pattern: &str, value: &str) -> bool {
             if !reachable[pattern_index][value_index] {
                 continue;
             }
+
             match pattern[pattern_index] {
                 '*' => {
                     reachable[pattern_index + 1][value_index] = true;
@@ -631,6 +667,7 @@ fn match_path_segment(pattern: &str, value: &str) -> bool {
             }
         }
     }
+
     reachable[pattern.len()][value.len()]
 }
 
@@ -656,10 +693,10 @@ fn escape_component(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || b"-._/".contains(&byte) {
             escaped.push(char::from(byte));
         } else {
-            use std::fmt::Write as _;
-            write!(escaped, "%{byte:02X}").expect("writing to a String cannot fail");
+            escaped.push_str(&format!("%{byte:02X}"));
         }
     }
+
     escaped
 }
 

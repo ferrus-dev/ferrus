@@ -919,6 +919,7 @@ async fn dispatch_pins_git_baseline_without_changing_task_lifecycle() {
             Some(value) => std::env::set_var(ENV_AGENT_ID, value),
             None => std::env::remove_var(ENV_AGENT_ID),
         }
+
         match previous_task {
             Some(value) => std::env::set_var(ENV_TASK_ID, value),
             None => std::env::remove_var(ENV_TASK_ID),

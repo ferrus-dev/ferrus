@@ -6,6 +6,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agents::{ExecutorAgent, SupervisorAgent, parse_executor_agent, parse_supervisor_agent};
+
 mod claude;
 pub use claude::{
     ClaudeMcpIsolation, ensure_claude_mcp_isolation_default, load_claude_mcp_isolation,
@@ -224,27 +225,35 @@ impl Default for SpecConfig {
 const fn default_max_check_retries() -> u32 {
     20
 }
+
 const fn default_max_review_cycles() -> u32 {
     3
 }
+
 const fn default_max_feedback_lines() -> usize {
     30
 }
+
 const fn default_wait_timeout_secs() -> u64 {
     60
 }
+
 const fn default_max_parallel_tasks() -> usize {
     1
 }
+
 const fn default_max_executor_dispatches() -> u32 {
     6
 }
+
 const fn default_ttl_secs() -> u64 {
     90
 }
+
 const fn default_heartbeat_interval_secs() -> u64 {
     30
 }
+
 fn default_spec_directory() -> String {
     "docs/specs".to_string()
 }
@@ -296,6 +305,7 @@ fn update_hq_agent_config_in_contents(
     if !doc.contains_key("hq") {
         doc["hq"] = Item::Table(Table::new());
     }
+
     let hq = doc["hq"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("ferrus.toml [hq] must be a table"))?;
@@ -311,6 +321,7 @@ fn update_hq_agent_config_in_contents(
     if flat_supervisor.is_some() {
         hq.remove("supervisor");
     }
+
     if flat_executor.is_some() {
         hq.remove("executor");
     }
@@ -319,12 +330,15 @@ fn update_hq_agent_config_in_contents(
     if !hq.contains_key(table_name) {
         hq[table_name] = Item::Table(Table::new());
     }
+
     if flat_supervisor.is_some() && !hq.contains_key(HqRole::Supervisor.table_name()) {
         hq[HqRole::Supervisor.table_name()] = Item::Table(Table::new());
     }
+
     if flat_executor.is_some() && !hq.contains_key(HqRole::Executor.table_name()) {
         hq[HqRole::Executor.table_name()] = Item::Table(Table::new());
     }
+
     if let Some(supervisor) = flat_supervisor {
         let supervisor_table = hq[HqRole::Supervisor.table_name()]
             .as_table_mut()
@@ -333,6 +347,7 @@ fn update_hq_agent_config_in_contents(
             supervisor_table["agent"] = value(supervisor);
         }
     }
+
     if let Some(executor) = flat_executor {
         let executor_table = hq[HqRole::Executor.table_name()]
             .as_table_mut()
@@ -341,6 +356,7 @@ fn update_hq_agent_config_in_contents(
             executor_table["agent"] = value(executor);
         }
     }
+
     let agent_table = hq[table_name]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("ferrus.toml [hq.{table_name}] must be a table"))?;
@@ -348,6 +364,7 @@ fn update_hq_agent_config_in_contents(
     if let Some(agent) = agent {
         agent_table["agent"] = value(agent);
     }
+
     if let Some(model) = model {
         agent_table["model"] = value(model.unwrap_or(""));
     }

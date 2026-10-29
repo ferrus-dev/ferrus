@@ -33,6 +33,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check Rust module sizes
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check_module_size.py
+
       - name: Run clippy
         # Lint the feature variants once on Linux. Cross-platform compilation
         # remains covered by the all-feature test suite and the smoke build.
@@ -79,7 +83,7 @@ jobs:
 
       - name: Test core on Windows
         if: matrix.os == 'windows-latest'
-        run: "cargo test --locked --features nano-openai,nano-mcp --lib --bin ferrus --test repository_graph_eval -- --skip nano::"
+        run: "cargo test --locked --features nano-openai,nano-mcp --lib --bin ferrus --test repository_graph_eval --test installers -- --skip nano::"
 
   nano-windows:
     runs-on: windows-latest

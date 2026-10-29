@@ -1,6 +1,6 @@
 //! Tenant-scoped identities for remote repository graph and project memory.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -35,6 +35,7 @@ fn validate_remote_id(value: String, kind: &'static str) -> Result<String, Remot
     {
         return Err(RemoteIdentityError::Invalid { kind });
     }
+
     Ok(value)
 }
 
@@ -42,11 +43,38 @@ macro_rules! remote_id {
     ($name:ident, $kind:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(Cow<'static, str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, RemoteIdentityError> {
-                validate_remote_id(value.into(), $kind).map(Self)
+                validate_remote_id(value.into(), $kind).map(|value| Self(value.into()))
+            }
+
+            /// Constructs a built-in identity. Use in a `const` block to validate at compile time.
+            pub const fn from_static(value: &'static str) -> Self {
+                assert!(
+                    !value.is_empty() && value.len() <= MAX_REMOTE_ID_BYTES,
+                    "invalid remote identity length"
+                );
+                let bytes = value.as_bytes();
+                assert!(
+                    bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit(),
+                    "invalid remote identity prefix"
+                );
+                let mut index = 0;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    assert!(
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'.'
+                            || byte == b'_'
+                            || byte == b'-',
+                        "invalid remote identity"
+                    );
+                    index += 1;
+                }
+                Self(Cow::Borrowed(value))
             }
 
             pub fn as_str(&self) -> &str {
@@ -72,21 +100,37 @@ macro_rules! remote_id {
 }
 
 remote_id!(TenantId, "tenant id");
+
 remote_id!(RemoteProjectId, "remote project id");
+
 remote_id!(RemoteRepositoryId, "remote repository id");
+
 remote_id!(RepositoryManifestId, "repository manifest id");
+
 remote_id!(MemoryManifestId, "memory manifest id");
+
 remote_id!(IndexJobId, "index job id");
+
 remote_id!(IndexJobFailureCode, "index job failure code");
+
 remote_id!(FactBatchId, "fact batch id");
+
 remote_id!(FactShardId, "fact shard id");
+
 remote_id!(WorkerId, "worker id");
+
 remote_id!(PrincipalId, "principal id");
+
 remote_id!(CredentialId, "credential id");
+
 remote_id!(RequestId, "request id");
+
 remote_id!(RemotePageCursor, "remote page cursor");
+
 remote_id!(DeletionId, "deletion id");
+
 remote_id!(AuditEventId, "audit event id");
+
 remote_id!(ObjectId, "tenant object id");
 
 /// Cloud scope is intentionally distinct from Ferrus's machine-local project identity.
@@ -147,6 +191,7 @@ impl RepositoryManifestRef {
         {
             return Err(RemoteIdentityError::ManifestObjectMismatch);
         }
+
         Ok(())
     }
 }
@@ -201,6 +246,7 @@ impl MemoryManifestRef {
         {
             return Err(RemoteIdentityError::ManifestObjectMismatch);
         }
+
         Ok(())
     }
 }
@@ -227,6 +273,7 @@ impl FederatedViewRef {
         if self.graph.repository.project != self.memory.project {
             return Err(RemoteIdentityError::FederatedScopeMismatch);
         }
+
         Ok(())
     }
 

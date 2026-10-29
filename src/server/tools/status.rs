@@ -54,9 +54,11 @@ async fn run(agent_id: Option<&str>) -> Result<String> {
         if let Some(run_id) = context.run_id {
             lines.push(format!("**Run:** {run_id}"));
         }
+
         if let Some(workspace_path) = context.workspace_path {
             lines.push(format!("**Workspace:** {workspace_path}"));
         }
+
         if let Some(reason) = context.failure_reason {
             lines.push(format!("**Task failure reason:** {reason}"));
         }
@@ -122,6 +124,7 @@ async fn sqlite_status_lines() -> Result<Vec<String>> {
             task.id, task.status, task.path, claim
         ));
     }
+
     Ok(lines)
 }
 

@@ -25,6 +25,7 @@ fn authoring_previews_present_the_proposed_document_instead_of_json() {
         );
     }
 }
+
 struct Fixture {
     _temp: tempfile::TempDir,
     previous: PathBuf,
@@ -32,11 +33,13 @@ struct Fixture {
     data: PathBuf,
     binding: Binding,
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::env::set_current_dir(&self.previous).unwrap();
     }
 }
+
 impl Fixture {
     async fn new(mode: DefinitionMode) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -104,6 +107,7 @@ impl Fixture {
             binding,
         }
     }
+
     async fn tools(&self, mode: DefinitionMode) -> (SupervisorTools, FileJournal) {
         let journal = FileJournal::create(&self.data, "definition", Quotas::default()).unwrap();
         let coding = CodingTools {
@@ -124,6 +128,7 @@ impl Fixture {
         .unwrap();
         (
             SupervisorTools {
+                operation_schema: definition_schema(mode).unwrap(),
                 native,
                 scope: Scope {
                     binding: self.binding.clone(),
@@ -140,6 +145,7 @@ impl Fixture {
             journal,
         )
     }
+
     fn count_tasks(&self) -> i64 {
         rusqlite::Connection::open(self.data.join("ferrus.db"))
             .unwrap()
@@ -151,6 +157,7 @@ impl Fixture {
             .unwrap()
     }
 }
+
 fn call(name: &str, arguments: Value) -> ValidatedCall {
     ValidatedCall {
         call_id: "call-1".into(),
@@ -179,6 +186,7 @@ async fn profile_tools_and_exact_run_role_are_independent_of_model_requests() {
         for name in ["enqueue_task", "create_spec", "archive_spec"] {
             assert_eq!(names.contains(&name.to_string()), operation == Some(name));
         }
+
         for name in [
             "exec",
             "apply_patch",
@@ -192,10 +200,12 @@ async fn profile_tools_and_exact_run_role_are_independent_of_model_requests() {
             assert!(!names.contains(&name.to_string()));
             assert!(tools.validate(name, &json!({})).is_err());
         }
+
         let mut scope = tools.scope.clone();
         if let Binding::Interactive { definition, .. } = &mut scope.binding {
             *definition = None;
         }
+
         assert!(scope.check().await.is_err());
         let db = rusqlite::Connection::open(fixture.data.join("ferrus.db")).unwrap();
         db.execute("UPDATE runs SET role='executor' WHERE id='definition'", [])
@@ -215,6 +225,7 @@ fn invalid_tasks_specs_and_outcomes_are_rejected_before_authoring() {
     ] {
         assert!(Operation::parse("enqueue_task", &args).is_err());
     }
+
     for markdown in [
         "",
         "# No milestones",
@@ -229,6 +240,7 @@ fn invalid_tasks_specs_and_outcomes_are_rejected_before_authoring() {
             "{markdown}"
         );
     }
+
     assert!(Operation::parse("create_spec", &json!({"markdown":SPEC})).is_ok());
     assert!(
         Operation::parse(
@@ -309,10 +321,12 @@ async fn duplicate_and_unknown_milestones_are_denied_before_approval() {
 struct OneCall {
     response: Option<ModelResponse>,
 }
+
 impl Provider for OneCall {
     async fn start(&mut self, _: ModelRequest) -> Result<(), ProviderError> {
         Ok(())
     }
+
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderError> {
         Ok(self
             .response
@@ -398,6 +412,7 @@ async fn engine_journals_intent_before_approval_and_stops_after_confirmed_author
     );
     assert!(super::super::replay::Replay::from_records(&read_records(&path)).is_ok());
 }
+
 fn read_records(path: &Path) -> Vec<Record> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -442,6 +457,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
         std::fs::remove_dir_all(fixture.root.join(&old.run_dir)).unwrap();
         missing_tasks.push(old.id);
     }
+
     let task =
         project::create_pending_task_artifact("Implemented feature", Some(&path), Some("m1.0"))
             .await
@@ -455,6 +471,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
     if let Binding::Interactive { definition, .. } = &mut fixture.binding {
         *definition = Some(DefinitionMode::Archive);
     }
+
     let archive_journal =
         FileJournal::create(&fixture.data, "archive-tools", Quotas::default()).unwrap();
     let coding = CodingTools {
@@ -479,6 +496,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
         archive_path: Some(path.clone()),
     };
     let archive = SupervisorTools {
+        operation_schema: definition_schema(DefinitionMode::Archive).unwrap(),
         native,
         scope,
         goal: 1,
@@ -622,6 +640,7 @@ async fn specification_and_approved_archive_use_existing_selection_and_provenanc
                     && entry["status"].as_str() == Some("failed"))
         );
     }
+
     assert!(!fixture.root.join(task.path).exists());
 }
 
@@ -701,6 +720,7 @@ async fn archive_evidence_reads_only_terminal_tasks_of_the_pinned_spec() {
         };
         assert_eq!(value["text"], format!("{artifact} evidence\n"));
     }
+
     assert!(matches!(
         tools
             .execute(
@@ -740,6 +760,7 @@ async fn archive_evidence_reads_only_terminal_tasks_of_the_pinned_spec() {
     ] {
         assert!(tools.validate(artifacts::NAME, &invalid).is_err());
     }
+
     std::fs::write(fixture.root.join(&task.path), "\u{e9}vidence").unwrap();
     assert!(
         artifacts::read(

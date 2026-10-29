@@ -18,7 +18,13 @@ pub struct SpecificationExtractor;
 
 impl MemoryExtractor for SpecificationExtractor {
     fn identity(&self) -> super::super::domain::MemoryExtractorIdentity {
-        extractor_identity("ferrus.specification")
+        extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.specification",
+                )
+            },
+        )
     }
 
     fn supports(&self, category: MemorySourceCategory) -> bool {
@@ -32,16 +38,43 @@ impl MemoryExtractor for SpecificationExtractor {
         &self,
         input: MemoryExtractionInput<'_>,
     ) -> Result<MemoryFragment, MemoryExtractionFailure> {
-        let content = std::str::from_utf8(input.content).map_err(|_| failure("source.non_utf8"))?;
+        let content = std::str::from_utf8(input.content).map_err(|_| {
+            failure(
+                const {
+                    crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                        "source.non.utf8",
+                    )
+                },
+            )
+        })?;
         let parsed = parse_spec_memory(content);
         match input.source.category {
-            MemorySourceCategory::SpecificationStructure => {
-                extract_structure(input, parsed).map_err(|_| failure("spec.invalid"))
-            }
-            MemorySourceCategory::ApprovedOutcome => {
-                extract_outcome(input, parsed).map_err(|_| failure("outcome.invalid"))
-            }
-            _ => Err(failure("source.unsupported")),
+            MemorySourceCategory::SpecificationStructure => extract_structure(input, parsed)
+                .map_err(|_| {
+                    failure(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "spec.invalid",
+                            )
+                        },
+                    )
+                }),
+            MemorySourceCategory::ApprovedOutcome => extract_outcome(input, parsed).map_err(|_| {
+                failure(
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "outcome.invalid",
+                        )
+                    },
+                )
+            }),
+            _ => Err(failure(
+                const {
+                    crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                        "source.unsupported",
+                    )
+                },
+            )),
         }
     }
 }
@@ -55,7 +88,8 @@ fn extract_structure(
     let spec_id = entity_id(
         &input.context.project,
         &("specification", &input.source.locator),
-    );
+    )
+    .map_err(|_| ())?;
     let mut fragment = MemoryFragment::default();
     fragment.entities.push(MemoryEntity {
         project: input.context.project.clone(),
@@ -72,7 +106,8 @@ fn extract_structure(
         let entity_id = entity_id(
             &input.context.project,
             &("milestone", &input.source.locator, &milestone.id),
-        );
+        )
+        .map_err(|_| ())?;
         let evidence = milestone.span.clone();
         fragment.entities.push(MemoryEntity {
             project: input.context.project.clone(),
@@ -92,13 +127,15 @@ fn extract_structure(
         fragment.relationships.push(MemoryRelationship {
             project: input.context.project.clone(),
             memory_revision_id: input.context.revision_id.clone(),
-            id: relationship_id(&input.context.project, &("contains", &spec_id, &entity_id)),
+            id: relationship_id(&input.context.project, &("contains", &spec_id, &entity_id))
+                .map_err(|_| ())?,
             kind: MemoryRelationshipKind::Contains,
             source: spec_id.clone(),
             target: MemoryRelationshipTarget::MemoryEntity { entity_id },
             provenance: provenance(input, evidence),
         });
     }
+
     Ok(fragment)
 }
 
@@ -107,11 +144,13 @@ fn extract_outcome(
     parsed: crate::project_memory::documents::ParsedSpecMemory,
 ) -> Result<MemoryFragment, ()> {
     let outcome = parsed.outcome.ok_or(())?;
-    let outcome_id = entity_id(&input.context.project, &("outcome", &input.source.locator));
+    let outcome_id =
+        entity_id(&input.context.project, &("outcome", &input.source.locator)).map_err(|_| ())?;
     let spec_id = entity_id(
         &input.context.project,
         &("specification", &input.source.locator),
-    );
+    )
+    .map_err(|_| ())?;
     let mut fragment = MemoryFragment::default();
     fragment.entities.push(MemoryEntity {
         project: input.context.project.clone(),
@@ -125,7 +164,8 @@ fn extract_outcome(
     fragment.relationships.push(MemoryRelationship {
         project: input.context.project.clone(),
         memory_revision_id: input.context.revision_id.clone(),
-        id: relationship_id(&input.context.project, &("concerns", &outcome_id, &spec_id)),
+        id: relationship_id(&input.context.project, &("concerns", &outcome_id, &spec_id))
+            .map_err(|_| ())?,
         kind: MemoryRelationshipKind::Concerns,
         source: outcome_id.clone(),
         target: MemoryRelationshipTarget::MemoryEntity { entity_id: spec_id },
@@ -133,7 +173,7 @@ fn extract_outcome(
     });
     let mut section_occurrences = std::collections::BTreeMap::new();
     for section in outcome.sections {
-        let section_digest = super::canonical_digest(&section.text);
+        let section_digest = super::canonical_digest(&section.text).map_err(|_| ())?;
         let occurrence = section_occurrences
             .entry((section.kind, section_digest.clone()))
             .or_insert(0u32);
@@ -146,7 +186,8 @@ fn extract_outcome(
                 &section_digest,
                 *occurrence,
             ),
-        );
+        )
+        .map_err(|_| ())?;
         *occurrence += 1;
         let text = MemoryText::new(section.text).map_err(|_| ())?;
         let data = match section.kind {
@@ -176,7 +217,8 @@ fn extract_outcome(
             id: relationship_id(
                 &input.context.project,
                 &("contains", &outcome_id, &section_id),
-            ),
+            )
+            .map_err(|_| ())?,
             kind: MemoryRelationshipKind::Contains,
             source: outcome_id.clone(),
             target: MemoryRelationshipTarget::MemoryEntity {
@@ -185,6 +227,7 @@ fn extract_outcome(
             provenance: provenance(input, evidence),
         });
     }
+
     Ok(fragment)
 }
 
@@ -196,7 +239,13 @@ fn provenance(
         source_category: input.source.category,
         source_locator: input.source.locator.clone(),
         source_fingerprint: input.source.fingerprint.clone(),
-        extractor: extractor_identity("ferrus.specification"),
+        extractor: extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.specification",
+                )
+            },
+        ),
         evidence: MemoryEvidenceLocator::Span(span),
         resolution: MemoryResolutionState::Resolved,
         confidence: MemoryConfidence::Exact,
@@ -207,10 +256,17 @@ fn provenance(
     }
 }
 
-fn failure(code: &str) -> MemoryExtractionFailure {
+fn failure(
+    code: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryExtractionFailure {
     MemoryExtractionFailure {
-        extractor: extractor_identity("ferrus.specification"),
-        code: super::super::diagnostics::MemoryDiagnosticCode::new(code)
-            .expect("static memory diagnostic code is valid"),
+        extractor: extractor_identity(
+            const {
+                crate::project_memory::domain::MemoryExtractorId::from_static(
+                    "ferrus.specification",
+                )
+            },
+        ),
+        code,
     }
 }

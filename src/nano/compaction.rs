@@ -83,13 +83,16 @@ pub(crate) fn boundaries(messages: &[Message]) -> Result<Vec<usize>> {
                         "Incomplete tool group"
                     );
                 }
+
                 index += calls.len() + 1;
             }
             Message::Tool { .. } => anyhow::bail!("Orphaned tool result"),
             Message::System { .. } => anyhow::bail!("System prompt inside conversation history"),
         }
+
         boundaries.push(index);
     }
+
     Ok(boundaries)
 }
 
@@ -117,17 +120,21 @@ pub(crate) fn handles(messages: &[Message]) -> Vec<Handle> {
                     && arguments.is_object()
                     && serde_json::to_vec(&arguments).is_ok_and(|bytes| bytes.len() <= 2048)
                 {
+                    let Ok(digest) = identity(value) else {
+                        continue;
+                    };
                     result.push(Handle {
                         message: index,
                         name: name.clone(),
                         arguments,
-                        digest: identity(value),
+                        digest,
                     });
                 }
             }
             Message::User { .. } | Message::System { .. } => (),
         }
     }
+
     result
 }
 
@@ -181,6 +188,7 @@ impl Projection {
             *outcome = ToolOutcome::Success(evicted_value(handle));
             previous = Some(handle.message);
         }
+
         if let Some(summary) = &self.summary {
             ensure!(
                 boundaries.contains(&summary.retained_from)
@@ -204,6 +212,7 @@ impl Projection {
                 summary.text, catalog
             ) });
         }
+
         Ok(projected)
     }
 }
@@ -239,6 +248,7 @@ mod tests {
                 outcome: ToolOutcome::Success(json!({"text":"x".repeat(1024)})),
             });
         }
+
         messages
     }
 
@@ -360,6 +370,7 @@ mod tests {
                 outcome: ToolOutcome::Success(json!({"text":"x".repeat(1024)})),
             });
         }
+
         let retained_from = 131;
         assert!(boundaries(&messages).unwrap().contains(&retained_from));
         let projection = Projection::deterministic(&messages, retained_from);

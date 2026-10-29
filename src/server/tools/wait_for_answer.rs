@@ -40,6 +40,7 @@ async fn run(agent_id: &str) -> Result<String> {
             context.status
         );
     }
+
     ensure_scoped_answer_waiter(&context, agent_id, config.lease.ttl_secs).await?;
 
     let timeout = Duration::from_secs(config.limits.wait_timeout_secs);
@@ -88,10 +89,13 @@ async fn ensure_scoped_answer_waiter(
             if is_consultation_supervisor_human_wait(context, agent_id).await? {
                 return Ok(());
             }
+
             return ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await;
         }
+
         anyhow::bail!("Cannot wait for answer: question was asked by {owner}, not {agent_id}");
     }
+
     ensure_lease_owner_or_reclaim(agent_id, ttl_secs).await
 }
 
@@ -102,6 +106,7 @@ async fn is_consultation_supervisor_human_wait(
     if !agent_id.starts_with("supervisor:") {
         return Ok(false);
     }
+
     Ok(project::task_awaiting_human_status(&context.task_id)
         .await?
         .as_deref()

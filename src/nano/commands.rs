@@ -2,8 +2,6 @@
 
 pub(super) mod backend;
 mod output;
-#[cfg(test)]
-mod tests;
 
 use super::{
     journal::{encode, valid_id},
@@ -235,14 +233,17 @@ impl<B: ExecutionBackend> Commands<B> {
         if !valid_exec(&request) {
             return Err(ToolError::InvalidArguments);
         }
+
         if self.closed || cancellation.is_cancelled() {
             return Err(ToolError::Interrupted);
         }
+
         if self.attempts >= self.limits.processes
             || self.potentially_active_writers() >= self.limits.concurrent
         {
             return Err(ToolError::Denied);
         }
+
         if !output::reserve(&self.charged, self.limits.total_bytes, STATE_BYTES) {
             return Err(ToolError::OutputLimit);
         }
@@ -304,7 +305,9 @@ impl<B: ExecutionBackend> Commands<B> {
             let task = tokio::spawn(async move {
                 supervisor.await;
                 if !completion.borrow().potentially_writing() {
-                    held.lock().unwrap().take();
+                    held.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
                 }
             });
             (task, Some(writer_guard))
@@ -368,7 +371,11 @@ impl<B: ExecutionBackend> Commands<B> {
 
         if entry.status.borrow().completion == Completion::Running {
             entry.cancel.cancel();
-            entry.tree.lock().unwrap().stop();
+            entry
+                .tree
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop();
         }
 
         self.read_process(id, MAX_WAIT_MS).await
@@ -423,7 +430,11 @@ impl<B: ExecutionBackend> Commands<B> {
         for entry in self.entries.values_mut() {
             if entry.status.borrow().completion == Completion::Running {
                 entry.cancel.cancel();
-                entry.tree.lock().unwrap().stop();
+                entry
+                    .tree
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .stop();
             }
         }
 
@@ -447,7 +458,11 @@ impl<B: ExecutionBackend> Drop for Commands<B> {
     fn drop(&mut self) {
         for entry in self.entries.values_mut() {
             entry.cancel.cancel();
-            entry.tree.lock().unwrap().stop();
+            entry
+                .tree
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop();
             if let Some(task) = &entry.task {
                 task.abort();
             }
@@ -477,6 +492,7 @@ enum Request {
     Stop(ProcessRequest),
     Output(OutputRequest),
 }
+
 fn decode(name: &str, arguments: &Value) -> std::result::Result<Request, ToolError> {
     if encode(arguments, 24 * 1024).is_err() {
         return Err(ToolError::InvalidArguments);
@@ -562,3 +578,6 @@ impl<B: ExecutionBackend> Tools for Commands<B> {
         Commands::shutdown(self).await
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -74,12 +74,14 @@ impl Storage {
                 "Keep private session storage outside the workspace"
             );
         }
+
         if path.try_exists()? {
             ensure!(
                 super::super::workspace::directory_identity(&path)? != identity,
                 "Keep private session storage outside the workspace"
             );
         }
+
         private::directory(&path, false)?;
         let lock_path = path.join("workspace.lock");
         let lock = lock_file(&lock_path)?;
@@ -111,6 +113,7 @@ impl Storage {
         if write_binding {
             persist_binding(&marker, &binding)?;
         }
+
         Ok(Self {
             path,
             workspace_id,
@@ -141,8 +144,10 @@ fn persist_binding(marker: &Path, binding: &Binding) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
+
     result
 }
+
 impl Drop for Storage {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock);
@@ -192,6 +197,7 @@ pub(super) fn resume(store: &Storage, id: &str) -> Result<Recovery> {
     for record in &records {
         display.apply(record);
     }
+
     Ok(Recovery {
         transcript,
         budget,

@@ -49,6 +49,7 @@ async fn run_checks_with_cwd(
         passed &= result.passed;
         results.push(result);
     }
+
     Ok(CheckResult {
         passed,
         commands: results,
@@ -68,12 +69,14 @@ async fn run_command(
             output: CapturedOutput::default(),
         });
     }
+
     let mut command = platform::shell_command(cmd);
     command.kill_on_drop(true);
     command.stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+
     let Some(log_path) = log_path else {
         let status = command
             .stdout(Stdio::null())
@@ -88,14 +91,14 @@ async fn run_command(
     };
     let stdout_spool = Spool::new(log_path, "stdout")?;
     let stderr_spool = Spool::new(log_path, "stderr")?;
-    let mut stdout_file = tokio::fs::File::from_std(stdout_spool.file().try_clone()?);
-    let mut stderr_file = tokio::fs::File::from_std(stderr_spool.file().try_clone()?);
+    let mut stdout_file = tokio::fs::File::from_std(stdout_spool.file()?.try_clone()?);
+    let mut stderr_file = tokio::fs::File::from_std(stderr_spool.file()?.try_clone()?);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let mut stdout = child.stdout.take().context("Missing stdout is piped")?;
+    let mut stderr = child.stderr.take().context("Missing stderr is piped")?;
     let (status, _, _) = tokio::try_join!(
         child.wait(),
         tokio::io::copy(&mut stdout, &mut stdout_file),
@@ -225,6 +228,7 @@ mod tests {
         ] {
             assert!(log.contains(expected), "missing {expected:?}");
         }
+
         assert!(log.contains("=== [PASS]"));
         assert!(log.contains("=== [FAIL]"));
         assert_eq!(

@@ -54,6 +54,7 @@ impl<'a> SqliteGraphQuery<'a> {
         if snapshot.repository != scope.repository {
             return Err(snapshot_not_found_error());
         }
+
         let freshness = freshness(&snapshot, self.freshness_comparison.as_ref());
         Ok(ResolvedScope {
             repository: scope.repository.clone(),
@@ -178,6 +179,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 true,
             ));
         }
+
         let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
         let latest_build = match self.latest_build(&resolved.repository) {
             Ok(build) => build,
@@ -304,6 +306,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 location,
             });
         }
+
         let truncated = items.len() > max_diagnostics as usize;
         items.truncate(max_diagnostics as usize);
         Ok(DiagnosticsEnvelope {
@@ -322,6 +325,7 @@ impl<'a> SqliteGraphQuery<'a> {
         if started.elapsed() >= duration {
             return Ok((truncated_diagnostics(), true));
         }
+
         let deadline = QueryDeadline::install(self.sidecar.connection(), started, duration)?;
         let diagnostics = self.diagnostics(&scope.snapshot.id, scope.budget.max_diagnostics);
         drop(deadline);
@@ -452,6 +456,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 Err(_) => return Err(backend_error()),
             }
         }
+
         Ok(SearchRows {
             rows: found,
             deadline_exceeded: false,
@@ -510,6 +515,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 Err(_) => return Err(backend_error()),
             }
         }
+
         Ok(NodeRows {
             rows: found,
             deadline_exceeded: false,
@@ -586,6 +592,7 @@ impl<'a> SqliteGraphQuery<'a> {
         while let Some(row) = rows.next().map_err(sqlite_query_error)? {
             found.push(decode_edge(row)?);
         }
+
         Ok(found)
     }
 
@@ -597,6 +604,7 @@ impl<'a> SqliteGraphQuery<'a> {
         if let ContextSeed::Node(id) = seed {
             return Ok(self.node(snapshot, id)?.into_iter().collect());
         }
+
         let (predicate, value) = match seed {
             ContextSeed::Symbol(key) => ("semantic_key = ?2", key.as_str()),
             ContextSeed::Path(path) => ("evidence_path = ?2", path.as_str()),
@@ -615,13 +623,14 @@ impl<'a> SqliteGraphQuery<'a> {
             .query(params![
                 snapshot.as_str(),
                 value,
-                i64::try_from(MAX_CONTEXT_CANDIDATES + 1).expect("context cap fits in i64"),
+                (MAX_CONTEXT_CANDIDATES + 1) as i64,
             ])
             .map_err(sqlite_query_error)?;
         let mut found = Vec::new();
         while let Some(row) = rows.next().map_err(sqlite_query_error)? {
             found.push(decode_node(row)?);
         }
+
         Ok(found)
     }
 
@@ -654,16 +663,19 @@ impl<'a> SqliteGraphQuery<'a> {
             if nodes.is_empty() {
                 return Err(invalid_request("context seed matched no nodes"));
             }
+
             if nodes.len() > MAX_CONTEXT_CANDIDATES {
                 nodes.truncate(MAX_CONTEXT_CANDIDATES);
                 set_context_truncation(&mut truncation, TruncationReason::Capability);
             }
+
             for node in nodes {
                 let id = node.id.clone();
                 if !candidates.contains_key(&id) && candidates.len() >= MAX_CONTEXT_CANDIDATES {
                     set_context_truncation(&mut truncation, TruncationReason::Capability);
                     break;
                 }
+
                 let is_new = insert_context_candidate(
                     &mut candidates,
                     node,
@@ -694,18 +706,20 @@ impl<'a> SqliteGraphQuery<'a> {
                 set_context_truncation(&mut truncation, TruncationReason::Duration);
                 break;
             }
+
             let remaining_edges = MAX_CONTEXT_CANDIDATES.saturating_sub(seen_edges.len());
             if remaining_edges == 0 {
                 set_context_truncation(&mut truncation, TruncationReason::Capability);
                 break;
             }
+
             let mut edges = match self.edges(
                 &scope.snapshot.id,
                 &current,
                 request.policy.direction,
                 &request.policy.edge_kinds,
                 seen_edges.iter(),
-                u32::try_from(remaining_edges).expect("context cap fits in u32"),
+                u32::try_from(remaining_edges).unwrap_or(u32::MAX),
             ) {
                 Ok(edges) => edges,
                 Err(error) if error.code == QueryErrorCode::BudgetExceeded => {
@@ -718,6 +732,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 edges.truncate(remaining_edges);
                 set_context_truncation(&mut truncation, TruncationReason::Capability);
             }
+
             if depth >= scope.budget.max_depth {
                 if edges
                     .iter()
@@ -725,6 +740,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 {
                     set_context_truncation(&mut truncation, TruncationReason::Depth);
                 }
+
                 continue;
             }
 
@@ -733,6 +749,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 if !context_edge_allowed(&edge, request) {
                     continue;
                 }
+
                 let Some(next_id) = adjacent_node(&edge, &current, request.policy.direction) else {
                     continue;
                 };
@@ -748,6 +765,7 @@ impl<'a> SqliteGraphQuery<'a> {
                 if !context_node_allowed(&next, request) {
                     continue;
                 }
+
                 let next_depth = depth.saturating_add(1);
                 let reason = ContextSelectionReason {
                     kind: context_selection_kind(&edge, &current, &next),
@@ -759,6 +777,7 @@ impl<'a> SqliteGraphQuery<'a> {
                     set_context_truncation(&mut truncation, TruncationReason::Capability);
                     break 'walk;
                 }
+
                 let is_new = insert_context_candidate(&mut candidates, next, next_depth, reason);
                 if is_new {
                     frontier.push_back((next_id, next_depth));
@@ -768,11 +787,12 @@ impl<'a> SqliteGraphQuery<'a> {
 
         let mut candidates = candidates
             .into_values()
-            .filter(|candidate| candidate.node.provenance.evidence.is_some())
+            .filter_map(ContextCandidate::with_evidence)
             .collect::<Vec<_>>();
         for candidate in &mut candidates {
             sort_context_reasons(&mut candidate.selection_reasons);
         }
+
         candidates.sort_by(context_candidate_order);
         Ok(ContextAssembly {
             candidates,

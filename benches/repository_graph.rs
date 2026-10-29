@@ -1,5 +1,7 @@
 //! Criterion benchmarks for repository graph indexing, queries, and incremental updates.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{hint::black_box, path::Path, time::Duration};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group};
@@ -104,6 +106,7 @@ fn write_fixture(root: &Path) {
         )
         .unwrap();
     }
+
     std::fs::write(root.join("src/lib.rs"), lib).unwrap();
 }
 
@@ -231,6 +234,7 @@ fn main() {
     if run_parser_worker_if_requested().expect("Cargo parser worker protocol failed") {
         return;
     }
+
     benches();
     Criterion::default().configure_from_args().final_summary();
 }

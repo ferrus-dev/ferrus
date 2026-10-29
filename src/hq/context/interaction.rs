@@ -61,6 +61,7 @@ impl HqContext {
                 .await?;
                 self.store_headless_handle(&name, handle);
             }
+
             return self.attach_nano_conversation(&name).await;
         }
 
@@ -101,6 +102,7 @@ impl HqContext {
                 .context("Native input pipe is unavailable")?
                 .open()?;
         }
+
         let data_dir = crate::project::current_project_data_dir().await?;
         let path = data_dir
             .join("nano/sessions")
@@ -127,6 +129,7 @@ impl HqContext {
         if response.trim().is_empty() {
             anyhow::bail!("Answer cannot be empty.");
         }
+
         self.answer_scoped_human_question(response).await
     }
 
@@ -134,6 +137,7 @@ impl HqContext {
         if self.has_scoped_human_question().await? {
             return Ok(true);
         }
+
         Ok(false)
     }
 
@@ -163,6 +167,7 @@ impl HqContext {
         if response.trim().is_empty() {
             anyhow::bail!("Answer cannot be empty.");
         }
+
         let question =
             select_human_question(crate::project::list_human_questions().await?, task_id)?;
 
@@ -177,6 +182,7 @@ impl HqContext {
         {
             self.nano_paused_tasks.remove(&question.task_id);
         }
+
         let agent_alive = owner
             .as_deref()
             .and_then(|agent_id| self.headless.get(agent_id))

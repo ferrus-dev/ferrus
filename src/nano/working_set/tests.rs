@@ -60,6 +60,7 @@ fn duplicate_selection_is_deterministic_and_preserves_journal_and_constraints() 
             read(&workspace, "a.rs", 1, 4),
         );
     }
+
     let before = messages.clone();
     let a = prepare(
         &messages,
@@ -153,6 +154,7 @@ fn external_add_edit_delete_rename_never_uses_generation_as_freshness() {
             "delete" => std::fs::remove_file(dir.path().join("a.rs")).unwrap(),
             _ => std::fs::rename(dir.path().join("a.rs"), dir.path().join("b.rs")).unwrap(),
         }
+
         std::fs::write(dir.path().join("new.rs"), "new source\n").unwrap();
         append(
             &mut messages,
@@ -190,6 +192,7 @@ fn patches_commands_checks_and_background_writers_invalidate_evidence() {
         let result = prepare(&messages, &json!({}), &json!({}), &workspace, false).unwrap();
         assert_eq!(result.replacements[0].value["kind"], "evidence_unavailable");
     }
+
     let mut messages = Vec::new();
     append(
         &mut messages,
@@ -223,16 +226,18 @@ fn changed_publications_and_memory_revisions_cannot_reuse_packets() {
 fn cache_keys_and_fifo_eviction_are_bounded_and_deterministic() {
     let mut cache = QueryCache::default();
     let base = json!({"query":"name", "cursor":"cursor-1", "snapshot":"s1", "task":"t1", "policy":"p1", "max_bytes":1024});
-    let key = identity(&base);
+    let key = identity(&base).unwrap();
     cache.insert(key.clone(), json!({"packet":1}));
     for field in ["query", "cursor", "snapshot", "task", "policy", "max_bytes"] {
         let mut changed = base.clone();
         changed[field] = json!("different");
-        assert!(cache.get(&identity(&changed)).is_none());
+        assert!(cache.get(&identity(&changed).unwrap()).is_none());
     }
+
     for i in 0..ENTRIES {
         cache.insert(i.to_string(), json!({"packet":i}));
     }
+
     assert!(cache.get(&key).is_none());
     assert_eq!(cache.entries.len(), ENTRIES);
     cache.insert("oversized".into(), json!("x".repeat(33 * 1024)));

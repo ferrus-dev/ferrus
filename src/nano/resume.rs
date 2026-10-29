@@ -42,6 +42,7 @@ fn patch_state(workspace: &Workspace, files: &[super::tools::PlannedFile]) -> Pa
     if files.is_empty() {
         return PatchState::Unknown;
     }
+
     let mut before = true;
     let mut after = true;
     for file in files {
@@ -51,6 +52,7 @@ fn patch_state(workspace: &Workspace, files: &[super::tools::PlannedFile]) -> Pa
         before &= current == file.before_digest;
         after &= current == file.after_digest;
     }
+
     if after {
         PatchState::After
     } else if before {
@@ -171,6 +173,7 @@ async fn retained_responses(session: &FerrusSession, records: &[Record]) -> Resu
     if !matches!(context.status.as_str(), "executing" | "addressing") {
         return Ok(String::new());
     }
+
     let mut note = String::new();
     for (tool, name, label) in [
         ("ask_human", "ANSWER.md", "human"),
@@ -181,6 +184,7 @@ async fn retained_responses(session: &FerrusSession, records: &[Record]) -> Resu
         }) {
             continue;
         }
+
         if let Some((answer, _)) = super::workspace::instruction_file(
             session.project_root(),
             &format!("{}/{name}", context.run_dir),
@@ -193,6 +197,7 @@ async fn retained_responses(session: &FerrusSession, records: &[Record]) -> Resu
             ));
         }
     }
+
     Ok(note)
 }
 
@@ -231,6 +236,7 @@ async fn reconcile_pending(
             if session.baseline_tree().is_some() {
                 let _ = release_submitted_tree_pin(session.workspace(), &session.scope.task_id);
             }
+
             pending.outcome = ToolOutcome::Unknown(ToolError::Interrupted);
             description = "The prior submit did not commit, but its check commands may have run or changed the workspace.".into();
         } else {
@@ -238,6 +244,7 @@ async fn reconcile_pending(
             description = "The prior submit has inconsistent SQLite and scoped artifacts.".into();
         }
     }
+
     if pending.execution_started && matches!(pending.name.as_str(), "ask_human" | "consult") {
         let context = session.status().await?;
         if matches!(context.status.as_str(), "executing" | "addressing") {
@@ -271,6 +278,7 @@ async fn reconcile_pending(
             }
         }
     }
+
     Ok((pending, description, submitted, delivered_answer))
 }
 
@@ -291,14 +299,17 @@ pub(crate) async fn recover_previous(
         if !directory.try_exists()? {
             continue;
         }
+
         session.authorize().await?;
         let (journal, records) = FileJournal::recover_open(&directory, Quotas::default())?;
         if records.is_empty() {
             continue;
         }
+
         selected = Some((previous, journal, records));
         break;
     }
+
     let Some((previous, mut journal, mut records)) = selected else {
         return Ok(None);
     };
@@ -342,6 +353,7 @@ pub(crate) async fn recover_previous(
         } else {
             description.push_str(" The historical journal was already sealed; the outcome was reconciled against current authority without rewriting it.");
         }
+
         session.authorize().await?;
         if unknown
             || !journal.state().unknown_effects.is_empty()
@@ -359,6 +371,7 @@ pub(crate) async fn recover_previous(
             anyhow::bail!("Previous Nano effect is unknown; task requires reconciliation");
         }
     }
+
     let directory = session.data_dir().join("nano/sessions").join(&previous);
     let expected_commands = recorded_commands(&records);
     if expected_commands
@@ -368,6 +381,7 @@ pub(crate) async fn recover_previous(
         session.fail_unknown_effect().await?;
         anyhow::bail!("Previous Nano command may still have effects; task requires reconciliation");
     }
+
     session.authorize().await?;
     if let Some(reason) = &journal.state().end {
         let retryable_provider_failure = records
@@ -393,20 +407,24 @@ pub(crate) async fn recover_previous(
             );
         }
     }
+
     if journal.state().end == Some(EndReason::Submitted) && !submitted {
         ensure!(
             session.previous_submit_committed(previous.clone()).await?,
             "Previous Nano submission has no committed handoff"
         );
     }
+
     // A rejected submission starts a new work phase. Reconcile the handoff and
     // command spools first, but do not carry its context or budget into Addressing.
     if submitted || journal.state().end == Some(EndReason::Submitted) {
         return Ok(None);
     }
+
     if !delivered_answer {
         description.push_str(&retained_responses(session, &records).await?);
     }
+
     if let Some(text) = records.iter().rev().find_map(|record| {
         if let SessionEvent::UserInput { text, .. } = &record.event {
             Some(text)
@@ -419,6 +437,7 @@ pub(crate) async fn recover_previous(
             serde_json::to_string(text)?
         ));
     }
+
     if let Some(text) = journal.state().messages.iter().rev().find_map(|message| {
         if let super::provider::Message::Assistant { response } = message
             && !response.text.trim().is_empty()
@@ -441,6 +460,7 @@ pub(crate) async fn recover_previous(
             serde_json::to_string(&excerpt)?
         ));
     }
+
     let spent = &journal.state().budget;
     let note = format!(
         "\n\nPrevious Nano run {previous} was recovered from its durable journal ({} records; {} model turns, {} tool calls, {} tokens charged). {description} Its tool calls are never replayed. Prior source and graph evidence is unavailable; inspect current files before relying on it.",
@@ -516,6 +536,7 @@ mod tests {
                     .unwrap(),
             );
         }
+
         assert!(!unresolved_commands(&session, "old-run", &expected).unwrap());
         snapshot.completion = super::super::commands::Completion::Cancelled;
         fs::write(
@@ -544,6 +565,7 @@ mod tests {
             .unwrap();
             assert!(unresolved_commands(&session, "old-run", &expected).unwrap());
         }
+
         snapshot.completion = super::super::commands::Completion::Cancelled;
         snapshot.output_complete = false;
         fs::write(
@@ -666,6 +688,7 @@ mod tests {
                 ToolOutcome::Failed(ToolError::Interrupted)
             ));
         }
+
         let SessionEvent::ToolIntent { call, .. } = &mut records[0].event else {
             unreachable!()
         };

@@ -102,7 +102,14 @@ impl Extractor for CargoExtractor {
         let source = match std::str::from_utf8(input.content) {
             Ok(source) => source,
             Err(_) => {
-                diagnostics.push("cargo.invalid_utf8", None);
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "cargo.invalid_utf8",
+                        )
+                    },
+                    None,
+                );
                 return Ok(GraphFragment {
                     diagnostics: diagnostics.finish(),
                     ..GraphFragment::default()
@@ -112,7 +119,14 @@ impl Extractor for CargoExtractor {
         let spans = SpanIndex::new(source);
         let budget = Duration::from_millis(input.context.max_parser_duration_ms);
         if budget.is_zero() {
-            diagnostics.push("cargo.parser_timeout", None);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.parser_timeout",
+                    )
+                },
+                None,
+            );
             return Ok(GraphFragment {
                 diagnostics: diagnostics.finish(),
                 ..GraphFragment::default()
@@ -132,7 +146,11 @@ impl Extractor for CargoExtractor {
             ParserDeadline::Completed(ParserOutput::Parsed { manifest }) => manifest,
             ParserDeadline::Completed(ParserOutput::Malformed { span }) => {
                 diagnostics.push(
-                    "cargo.malformed_manifest",
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "cargo.malformed_manifest",
+                        )
+                    },
                     span.map(ParserSpan::into_range)
                         .map(|range| spans.span(range)),
                 );
@@ -142,14 +160,28 @@ impl Extractor for CargoExtractor {
                 });
             }
             ParserDeadline::TimedOut => {
-                diagnostics.push("cargo.parser_timeout", None);
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "cargo.parser_timeout",
+                        )
+                    },
+                    None,
+                );
                 return Ok(GraphFragment {
                     diagnostics: diagnostics.finish(),
                     ..GraphFragment::default()
                 });
             }
             ParserDeadline::Unavailable => {
-                diagnostics.push("cargo.parser_unavailable", None);
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "cargo.parser_unavailable",
+                        )
+                    },
+                    None,
+                );
                 return Ok(GraphFragment {
                     diagnostics: diagnostics.finish(),
                     ..GraphFragment::default()
@@ -173,6 +205,7 @@ fn extract_manifest(manifest: &toml::Table, spans: &SpanIndex, facts: &mut FactB
     if !facts.active() {
         return;
     }
+
     let package = extract_package(manifest, spans, facts);
 
     if let (Some(workspace), Some(package)) = (&workspace, &package) {
@@ -193,8 +226,10 @@ fn extract_manifest(manifest: &toml::Table, spans: &SpanIndex, facts: &mut FactB
         if !facts.active() {
             return;
         }
+
         extract_dependency_groups(manifest, spans, facts, package);
     }
+
     if facts.active()
         && let Some(workspace) = &workspace
     {
@@ -210,7 +245,14 @@ fn extract_workspace(
     let value = manifest.get("workspace")?;
     let span = spans.header("workspace", 0);
     let Some(workspace) = value.as_table() else {
-        facts.diagnostic("cargo.invalid_workspace_table", span);
+        facts.diagnostic(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static(
+                    "cargo.invalid_workspace_table",
+                )
+            },
+            span,
+        );
         return None;
     };
 
@@ -233,15 +275,31 @@ fn extract_workspace(
         if !facts.active() {
             return None;
         }
+
         if let Some(patterns) = string_list(workspace.get(key)) {
             let (patterns, rejected) =
                 normalize_workspace_patterns(facts.manifest_path(), patterns);
             if rejected {
-                facts.diagnostic("cargo.workspace_path_outside_repository", span.clone());
+                facts.diagnostic(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "cargo.workspace_path_outside_repository",
+                        )
+                    },
+                    span.clone(),
+                );
             }
+
             properties.insert(property.to_string(), GraphValue::StringList(patterns));
         } else if workspace.contains_key(key) {
-            facts.diagnostic("cargo.invalid_workspace_paths", span.clone());
+            facts.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.invalid_workspace_paths",
+                    )
+                },
+                span.clone(),
+            );
         }
     }
 
@@ -264,11 +322,25 @@ fn extract_package(
     let value = manifest.get("package")?;
     let span = spans.header("package", 0);
     let Some(package) = value.as_table() else {
-        facts.diagnostic("cargo.invalid_package_table", span);
+        facts.diagnostic(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static(
+                    "cargo.invalid_package_table",
+                )
+            },
+            span,
+        );
         return None;
     };
     let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
-        facts.diagnostic("cargo.package_name_missing", span);
+        facts.diagnostic(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static(
+                    "cargo.package_name_missing",
+                )
+            },
+            span,
+        );
         return None;
     };
 
@@ -282,6 +354,7 @@ fn extract_package(
     for key in ["version", "edition", "rust-version"] {
         insert_string(package, key, &mut properties);
     }
+
     for key in [
         "publish",
         "autolib",
@@ -302,362 +375,6 @@ fn extract_package(
         Confidence::Exact,
         properties,
     )
-}
-
-fn extract_targets(
-    manifest: &toml::Table,
-    spans: &SpanIndex,
-    facts: &mut FactBuffer<'_, '_>,
-    package: &NodeId,
-) {
-    let package_table = manifest.get("package").and_then(toml::Value::as_table);
-    let package_name = package_table
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str)
-        .expect("package facts require a package name");
-
-    let explicit_lib = if let Some(value) = manifest.get("lib") {
-        if let Some(table) = value.as_table() {
-            let name = table
-                .get("name")
-                .and_then(toml::Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(|| package_name.replace('-', "_"));
-            emit_target(
-                facts,
-                package,
-                "lib",
-                &name,
-                package_name,
-                table,
-                spans.header("lib", 0),
-                true,
-            );
-            true
-        } else {
-            facts.diagnostic("cargo.invalid_target_table", spans.header("lib", 0));
-            false
-        }
-    } else {
-        false
-    };
-
-    for (manifest_key, target_kind) in [
-        ("bin", "bin"),
-        ("example", "example"),
-        ("test", "test"),
-        ("bench", "bench"),
-    ] {
-        if !facts.active() {
-            return;
-        }
-        let Some(value) = manifest.get(manifest_key) else {
-            continue;
-        };
-        let Some(targets) = value.as_array() else {
-            facts.diagnostic("cargo.invalid_target_array", spans.header(manifest_key, 0));
-            continue;
-        };
-        for (index, target) in targets.iter().enumerate() {
-            if !facts.active() {
-                return;
-            }
-            let span = spans.header(manifest_key, index);
-            let Some(table) = target.as_table() else {
-                facts.diagnostic("cargo.invalid_target_table", span);
-                continue;
-            };
-            let name = table
-                .get("name")
-                .and_then(toml::Value::as_str)
-                .map(ToString::to_string)
-                .or_else(|| {
-                    table
-                        .get("path")
-                        .and_then(toml::Value::as_str)
-                        .and_then(file_stem)
-                });
-            let Some(name) = name else {
-                facts.diagnostic("cargo.target_name_missing", span);
-                continue;
-            };
-            emit_target(
-                facts,
-                package,
-                target_kind,
-                &name,
-                package_name,
-                table,
-                span,
-                true,
-            );
-        }
-    }
-
-    // Cargo discovers these conventional roots from the package directory.
-    // This file-local extractor cannot prove that the source files exist, so
-    // it emits honest unresolved candidates for RG1.4 to resolve or discard.
-    let autolib = package_table
-        .and_then(|package| package.get("autolib"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(true);
-    if autolib && !explicit_lib {
-        emit_conventional_target(facts, package, "lib", &package_name.replace('-', "_"));
-    }
-    extract_build_target(package_table, spans.header("package", 0), facts, package);
-    let autobins = package_table
-        .and_then(|package| package.get("autobins"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(true);
-    let has_package_bin = target_tables(manifest, "bin").any(|target| {
-        target
-            .get("name")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|name| name == package_name)
-    });
-    if autobins && !has_package_bin {
-        emit_conventional_target(facts, package, "bin", package_name);
-    }
-}
-
-fn extract_build_target(
-    package: Option<&toml::Table>,
-    span: Option<SourceSpan>,
-    facts: &mut FactBuffer<'_, '_>,
-    package_id: &NodeId,
-) {
-    let declaration = package.and_then(|package| package.get("build"));
-    if declaration.is_some_and(|value| value.as_bool() == Some(false)) {
-        return;
-    }
-    let (path, explicit) = match declaration {
-        None => ("build.rs".to_string(), false),
-        Some(value) => match value.as_str() {
-            Some(path) => (path.to_string(), true),
-            None => {
-                facts.diagnostic("cargo.invalid_build_target", span);
-                return;
-            }
-        },
-    };
-    emit_target_with_path(
-        facts,
-        package_id,
-        "custom_build",
-        "build-script-build",
-        &toml::Table::new(),
-        span,
-        explicit,
-        Some(path),
-    );
-}
-
-fn target_tables<'a>(
-    manifest: &'a toml::Table,
-    key: &str,
-) -> impl Iterator<Item = &'a toml::Table> {
-    manifest
-        .get(key)
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_table)
-}
-
-fn emit_conventional_target(
-    facts: &mut FactBuffer<'_, '_>,
-    package: &NodeId,
-    target_kind: &str,
-    name: &str,
-) {
-    let path = match target_kind {
-        "lib" => "src/lib.rs".to_string(),
-        "bin" => "src/main.rs".to_string(),
-        _ => return,
-    };
-    let table = toml::Table::new();
-    emit_target_with_path(
-        facts,
-        package,
-        target_kind,
-        name,
-        &table,
-        None,
-        false,
-        Some(path),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_target(
-    facts: &mut FactBuffer<'_, '_>,
-    package: &NodeId,
-    target_kind: &str,
-    name: &str,
-    package_name: &str,
-    table: &toml::Table,
-    span: Option<SourceSpan>,
-    explicit: bool,
-) {
-    let declared_path = table
-        .get("path")
-        .and_then(toml::Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| conventional_path(target_kind, name, package_name));
-    emit_target_with_path(
-        facts,
-        package,
-        target_kind,
-        name,
-        table,
-        span,
-        explicit,
-        declared_path,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_target_with_path(
-    facts: &mut FactBuffer<'_, '_>,
-    package: &NodeId,
-    target_kind: &str,
-    name: &str,
-    table: &toml::Table,
-    span: Option<SourceSpan>,
-    explicit: bool,
-    declared_path: Option<String>,
-) {
-    let key = semantic_key("target", &[facts.manifest_path(), target_kind, name]);
-    let mut properties = BTreeMap::from([
-        ("name".to_string(), GraphValue::String(name.to_string())),
-        (
-            "target_kind".to_string(),
-            GraphValue::String(target_kind.to_string()),
-        ),
-        ("explicit".to_string(), GraphValue::Boolean(explicit)),
-        (
-            "origin".to_string(),
-            GraphValue::String(if explicit {
-                "manifest".to_string()
-            } else {
-                "conventional_candidate".to_string()
-            }),
-        ),
-    ]);
-    for table_key in ["crate-type", "required-features"] {
-        if let Some(values) = string_list(table.get(table_key)) {
-            properties.insert(table_key.replace('-', "_"), GraphValue::StringList(values));
-        }
-    }
-    for table_key in ["test", "bench", "doc", "doctest", "harness", "proc-macro"] {
-        insert_bool(table, table_key, &mut properties);
-    }
-
-    let resolution = if explicit {
-        ResolutionState::Resolved
-    } else {
-        ResolutionState::Unresolved
-    };
-    let confidence = if explicit {
-        Confidence::Exact
-    } else {
-        Confidence::Low
-    };
-    let Some(target) = facts.node(
-        "cargo_target",
-        &key,
-        span.clone(),
-        resolution,
-        confidence,
-        properties,
-    ) else {
-        return;
-    };
-    facts.edge(
-        "declares_target",
-        package,
-        EdgeTarget::Node(target.clone()),
-        &key,
-        span.clone(),
-        ResolutionState::Resolved,
-        Confidence::Exact,
-        BTreeMap::new(),
-    );
-
-    let Some(path) = declared_path else {
-        facts.edge(
-            "has_entry_point",
-            &target,
-            EdgeTarget::Unresolved(format!("cargo-entry:{key}")),
-            &key,
-            span,
-            ResolutionState::Unresolved,
-            Confidence::Low,
-            BTreeMap::new(),
-        );
-        return;
-    };
-    let Some(path) = normalize_from_manifest(facts.manifest_path(), &path) else {
-        facts.diagnostic("cargo.target_path_outside_repository", span.clone());
-        facts.edge(
-            "has_entry_point",
-            &target,
-            EdgeTarget::Unresolved(format!("cargo-entry:{key}")),
-            &key,
-            span,
-            ResolutionState::Unresolved,
-            Confidence::Low,
-            BTreeMap::new(),
-        );
-        return;
-    };
-    let entry_key = semantic_key("entry-point", &[&path]);
-    let Some(entry) = facts.node(
-        "entry_point",
-        &entry_key,
-        span.clone(),
-        ResolutionState::Unresolved,
-        if explicit {
-            Confidence::High
-        } else {
-            Confidence::Low
-        },
-        BTreeMap::from([
-            ("path".to_string(), GraphValue::String(path)),
-            (
-                "language".to_string(),
-                GraphValue::String("rust".to_string()),
-            ),
-        ]),
-    ) else {
-        return;
-    };
-    facts.edge(
-        "has_entry_point",
-        &target,
-        EdgeTarget::Node(entry),
-        &entry_key,
-        span,
-        ResolutionState::Unresolved,
-        if explicit {
-            Confidence::High
-        } else {
-            Confidence::Low
-        },
-        BTreeMap::new(),
-    );
-}
-
-fn conventional_path(target_kind: &str, name: &str, package_name: &str) -> Option<String> {
-    match target_kind {
-        "lib" => Some("src/lib.rs".to_string()),
-        "bin" if name == package_name => Some("src/main.rs".to_string()),
-        "bin" => Some(format!("src/bin/{name}.rs")),
-        "example" => Some(format!("examples/{name}.rs")),
-        "test" => Some(format!("tests/{name}.rs")),
-        "bench" => Some(format!("benches/{name}.rs")),
-        _ => None,
-    }
 }
 
 mod dependencies;
@@ -718,28 +435,29 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         if !self.active() {
             return None;
         }
+
         if semantic_key.len() > MAX_SEMANTIC_KEY_BYTES {
             self.source_limit();
             return None;
         }
+
         let properties = self.bounded_properties(properties);
         let identity = extractor_identity();
         let id = deterministic_node_id(&identity, kind, semantic_key);
         if self.node_ids.contains(&id) {
             return Some(id);
         }
+
         if !self.reserve() {
             return None;
         }
+
         self.node_ids.insert(id.clone());
         self.nodes.push(GraphNode {
             snapshot_id: self.input.context.snapshot_id.clone(),
             id: id.clone(),
             kind: kind.to_string(),
-            semantic_key: Some(
-                SemanticKey::new(semantic_key.to_string())
-                    .expect("Cargo semantic keys are always non-empty"),
-            ),
+            semantic_key: SemanticKey::new(semantic_key.to_string()).ok(),
             provenance: provenance(self.input, span, resolution, confidence),
             properties,
         });
@@ -767,17 +485,21 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
             {
                 self.source_limit();
             }
+
             return;
         }
+
         let properties = self.bounded_properties(properties);
         let identity = extractor_identity();
         let id = deterministic_edge_id(&identity, kind, source, &target, local_key);
         if self.edge_ids.contains(&id) {
             return;
         }
+
         if !self.reserve() {
             return;
         }
+
         self.edge_ids.insert(id.clone());
         self.edges.push(GraphEdge {
             snapshot_id: self.input.context.snapshot_id.clone(),
@@ -794,6 +516,7 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         if !self.active() {
             return false;
         }
+
         if self.used >= self.input.context.max_facts_per_file {
             self.truncated = true;
             false
@@ -803,7 +526,7 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         }
     }
 
-    fn diagnostic(&mut self, code: &'static str, span: Option<SourceSpan>) {
+    fn diagnostic(&mut self, code: DiagnosticCode, span: Option<SourceSpan>) {
         self.diagnostics.push(code, span);
     }
 
@@ -814,10 +537,22 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
             self.edges.clear();
             self.node_ids.clear();
             self.edge_ids.clear();
-            self.diagnostics.replace_with("cargo.parser_timeout");
+            self.diagnostics.replace_with(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.parser_timeout",
+                    )
+                },
+            );
         } else if self.truncated {
-            self.diagnostics.push("cargo.fact_limit", None);
+            self.diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static("cargo.fact_limit")
+                },
+                None,
+            );
         }
+
         self.nodes.sort_by(|left, right| left.id.cmp(&right.id));
         self.edges.sort_by(|left, right| left.id.cmp(&right.id));
     }
@@ -826,13 +561,21 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         if !self.timed_out && self.started.elapsed() >= self.budget {
             self.timed_out = true;
         }
+
         !self.timed_out
     }
 
     fn source_limit(&mut self) {
         if !self.source_limit_reported {
             self.source_limit_reported = true;
-            self.diagnostics.push("cargo.source_value_limit", None);
+            self.diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.source_value_limit",
+                    )
+                },
+                None,
+            );
         }
     }
 
@@ -858,6 +601,7 @@ impl<'input, 'diagnostics> FactBuffer<'input, 'diagnostics> {
         if properties.len() != before {
             self.source_limit();
         }
+
         properties
     }
 }
@@ -902,15 +646,16 @@ impl<'a> DiagnosticBuffer<'a> {
         }
     }
 
-    fn push(&mut self, code: &'static str, span: Option<SourceSpan>) {
+    fn push(&mut self, code: DiagnosticCode, span: Option<SourceSpan>) {
         if self.diagnostics.len() as u64 >= self.input.context.max_diagnostics {
             self.suppressed = self.suppressed.saturating_add(1);
             return;
         }
+
         self.diagnostics.push(self.diagnostic(code, span));
     }
 
-    fn replace_with(&mut self, code: &'static str) {
+    fn replace_with(&mut self, code: DiagnosticCode) {
         self.diagnostics.clear();
         self.suppressed = 0;
         self.push(code, None);
@@ -920,9 +665,16 @@ impl<'a> DiagnosticBuffer<'a> {
         if self.suppressed > 0 && self.input.context.max_diagnostics > 0 {
             let replaced = u64::from(!self.diagnostics.is_empty());
             let suppressed = self.suppressed.saturating_add(replaced);
-            let mut summary = self.diagnostic("cargo.diagnostics_truncated", None);
+            let mut summary = self.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "cargo.diagnostics_truncated",
+                    )
+                },
+                None,
+            );
             summary.metrics.insert(
-                DiagnosticCode::new("suppressed").expect("static diagnostic metric is valid"),
+                const { DiagnosticCode::from_static("suppressed") },
                 i64::try_from(suppressed).unwrap_or(i64::MAX),
             );
             if let Some(last) = self.diagnostics.last_mut() {
@@ -931,15 +683,16 @@ impl<'a> DiagnosticBuffer<'a> {
                 self.diagnostics.push(summary);
             }
         }
+
         self.diagnostics
     }
 
-    fn diagnostic(&self, code: &'static str, span: Option<SourceSpan>) -> GraphDiagnostic {
+    fn diagnostic(&self, code: DiagnosticCode, span: Option<SourceSpan>) -> GraphDiagnostic {
         GraphDiagnostic {
             build_id: self.input.context.build_id.clone(),
             snapshot_id: Some(self.input.context.snapshot_id.clone()),
             severity: DiagnosticSeverity::Warning,
-            code: DiagnosticCode::new(code).expect("static Cargo diagnostic code is valid"),
+            code,
             location: Some(DiagnosticLocation {
                 path: self.input.file.path.clone(),
                 span,
@@ -963,9 +716,11 @@ impl<'a> SpanIndex<'a> {
             lines.push((start, content_end, &source[start..content_end]));
             start += line.len();
         }
+
         if source.is_empty() || start < source.len() {
             lines.push((start, source.len(), &source[start..]));
         }
+
         Self { source, lines }
     }
 
@@ -1022,6 +777,9 @@ impl<'a> SpanIndex<'a> {
         }
     }
 }
+
+mod targets;
+use targets::*;
 
 #[cfg(test)]
 #[path = "cargo_tests.rs"]

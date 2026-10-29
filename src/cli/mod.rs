@@ -131,6 +131,7 @@ impl Cli {
                 if supervisor.is_none() && executor.is_none() {
                     anyhow::bail!("At least one of --supervisor or --executor must be specified");
                 }
+
                 commands::register::run(supervisor, supervisor_model, executor, executor_model)
                     .await
             }

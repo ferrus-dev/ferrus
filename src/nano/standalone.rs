@@ -2,6 +2,7 @@
 
 mod context;
 use super::frontend;
+
 mod storage;
 mod tools;
 
@@ -100,20 +101,24 @@ struct StandaloneHost {
 }
 
 struct SignalGuard(tokio::task::JoinHandle<()>);
+
 impl Drop for SignalGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
+
 impl Host for StandaloneHost {
     async fn authorize(&mut self, _: &ValidatedCall) -> Result<(), ToolError> {
         Ok(())
     }
+
     fn committed(&mut self, _: &Record) {}
 }
 
 #[derive(Clone)]
 struct Scope(PathBuf);
+
 impl instructions::InstructionScope for Scope {
     async fn snapshot(&self) -> Result<instructions::ScopeSnapshot> {
         Ok(instructions::ScopeSnapshot {
@@ -125,9 +130,11 @@ impl instructions::InstructionScope for Scope {
             review_path: None,
         })
     }
+
     fn workspace(&self) -> &std::path::Path {
         &self.0
     }
+
     fn project_root(&self) -> &std::path::Path {
         &self.0
     }
@@ -152,9 +159,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             anyhow::bail!("External MCP requires --features nano-mcp");
         }
     }
+
     if cli.interactive {
         frontend::require_terminal()?;
     }
+
     let initial_request = cli.interactive.then(|| cli.prompt.clone()).flatten();
     ensure!(
         initial_request
@@ -182,6 +191,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         println!("{}", serde_json::to_string(&outcome)?);
         return Ok(());
     }
+
     let config_path = cli
         .config
         .or_else(|| std::env::var_os("FERRUS_NANO_CONFIG").map(PathBuf::from))
@@ -249,6 +259,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .with_writer(std::sync::Mutex::new(diagnostic))
             .try_init();
     }
+
     let cancellation = Cancellation::default();
     // Discovery can also be cancelled. Abort the listener on every setup/run
     // exit, including when this frontend is embedded in a longer-lived runtime.
@@ -274,6 +285,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .await?,
             );
         }
+
         tools
     };
     let set = tools.instructions.load(&[], &[]).await?;
@@ -320,6 +332,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(budget) = inherited {
         engine.inherit_budget(budget)?;
     }
+
     eprintln!("Nano session: {session_id}");
     eprintln!("Nano journal: {}", directory.display());
     let end = if cli.interactive {
@@ -349,6 +362,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         {
             println!("{}", response.text);
         }
+
         Ok(())
     } else {
         anyhow::bail!(

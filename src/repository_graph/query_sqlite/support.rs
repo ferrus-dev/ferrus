@@ -44,6 +44,7 @@ pub(super) fn decode_cursor(
     if encoded.len() > 4096 || encoded.len() % 2 != 0 {
         return Err(stale_cursor_error());
     }
+
     let bytes = unhex(encoded).ok_or_else(stale_cursor_error)?;
     let payload: CursorPayload =
         serde_json::from_slice(&bytes).map_err(|_| stale_cursor_error())?;
@@ -54,6 +55,7 @@ pub(super) fn decode_cursor(
     {
         return Err(stale_cursor_error());
     }
+
     Ok(payload.offset)
 }
 
@@ -351,6 +353,7 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
+
     encoded
 }
 

@@ -55,6 +55,7 @@ pub(super) fn identity(file: &File) -> io::Result<(u64, u128)> {
     {
         return Err(io::Error::last_os_error());
     }
+
     Ok((
         info.VolumeSerialNumber,
         u128::from_le_bytes(info.FileId.Identifier),
@@ -202,6 +203,7 @@ pub(super) fn regular(file: &File) -> io::Result<()> {
 
     Ok(())
 }
+
 pub(super) fn publish(
     parent: &File,
     target: &str,

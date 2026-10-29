@@ -68,7 +68,11 @@ fn ordered_rules_use_the_last_matching_rule() {
     let policy = SourcePolicy::new(&config).unwrap();
     assert_eq!(
         policy.exclusion_for_file(&RepoPath::new("src/drop.rs").unwrap()),
-        Some("source_rule_excluded")
+        Some(
+            const {
+                crate::repository_graph::domain::DiagnosticCode::from_static("source_rule_excluded")
+            }
+        )
     );
     assert_eq!(
         policy.exclusion_for_file(&RepoPath::new("src/keep.rs").unwrap()),
@@ -89,8 +93,8 @@ fn extractor_set_identity_is_order_independent() {
         contract_version: 1,
     };
     assert_eq!(
-        extractor_set_digest(&[rust.clone(), cargo.clone()]),
-        extractor_set_digest(&[cargo, rust])
+        extractor_set_digest(&[rust.clone(), cargo.clone()]).unwrap(),
+        extractor_set_digest(&[cargo, rust]).unwrap()
     );
 }
 
@@ -130,6 +134,7 @@ fn bounded_reads_report_bytes_consumed_before_an_io_error() {
             if self.0 {
                 return Err(io::Error::other("injected read failure"));
             }
+
             self.0 = true;
             buffer[..3].copy_from_slice(b"abc");
             Ok(3)

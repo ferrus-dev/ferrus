@@ -43,10 +43,12 @@ pub trait MemorySource {
     type Error;
 
     fn manifest(&self) -> Result<AuthorizedSourceManifest, Self::Error>;
+
     fn read_verified(
         &self,
         source: &AuthorizedSourceDescriptor,
     ) -> Result<MemorySourceContent, Self::Error>;
+
     fn revalidate(&self, manifest: &AuthorizedSourceManifest) -> Result<(), Self::Error>;
 }
 
@@ -88,7 +90,9 @@ pub struct MemoryExtractionFailure {
 
 pub trait MemoryExtractor: Send + Sync {
     fn identity(&self) -> MemoryExtractorIdentity;
+
     fn supports(&self, category: MemorySourceCategory) -> bool;
+
     fn extract(
         &self,
         input: MemoryExtractionInput<'_>,
@@ -104,31 +108,40 @@ pub trait MemoryStore {
     type Error;
 
     fn start_build(&mut self, build: &MemoryBuild) -> Result<(), Self::Error>;
+
     fn fail_build(
         &mut self,
         build_id: &MemoryBuildId,
         failure: &MemoryBuildFailure,
     ) -> Result<(), Self::Error>;
+
     fn complete_build(&mut self, commit: &MemoryCommit) -> Result<(), Self::Error>;
+
     fn publish(
         &mut self,
         request: &MemoryPublishRequest,
     ) -> Result<MemoryPublicationOutcome, Self::Error>;
+
     fn supersede_build(&mut self, build_id: &MemoryBuildId) -> Result<(), Self::Error>;
+
     fn build(&self, build_id: &MemoryBuildId) -> Result<Option<MemoryBuild>, Self::Error>;
+
     fn revision(
         &self,
         revision_id: &MemoryRevisionId,
     ) -> Result<Option<MemoryRevision>, Self::Error>;
+
     fn published_view(
         &self,
         project: &ProjectRef,
         view_name: &MemoryViewName,
     ) -> Result<Option<PublishedMemoryRevision>, Self::Error>;
+
     fn load_cached_fragment(
         &self,
         key: &MemoryFragmentCacheKey,
     ) -> Result<Option<MemoryFragment>, Self::Error>;
+
     fn diagnostics_for_build(
         &self,
         build_id: &MemoryBuildId,
@@ -143,30 +156,36 @@ pub trait MemoryLinkStore {
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,
     ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+
     fn repository_link_set_for_snapshot(
         &self,
         revision_id: &MemoryRevisionId,
         repository: &crate::repository_graph::domain::RepositoryRef,
         snapshot_id: Option<&crate::repository_graph::domain::SnapshotId>,
     ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+
     fn latest_repository_link_set(
         &self,
         revision_id: &MemoryRevisionId,
         repository: &crate::repository_graph::domain::RepositoryRef,
     ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+
     fn latest_compatible_repository_link_set(
         &self,
         revision: &MemoryRevision,
         repository: &crate::repository_graph::domain::RepositoryRef,
     ) -> Result<Option<MemoryRepositoryLinkSet>, Self::Error>;
+
     fn repository_links(
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,
     ) -> Result<Vec<MemoryRelationship>, Self::Error>;
+
     fn repository_link_diagnostics(
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,
     ) -> Result<Vec<MemoryDiagnostic>, Self::Error>;
+
     fn bounded_repository_links(
         &self,
         link_set_id: &MemoryRepositoryLinkSetId,
@@ -189,10 +208,12 @@ pub trait MemoryQuery {
         &self,
         request: MemoryStatusRequest,
     ) -> Result<MemoryStatusResponse, MemoryQueryError>;
+
     fn search(
         &self,
         request: MemorySearchRequest,
     ) -> Result<MemorySearchResponse, MemoryQueryError>;
+
     fn context(
         &self,
         request: MemoryContextRequest,
@@ -222,6 +243,7 @@ pub trait MemoryContent {
                 super::query::MemoryTruncationReason::Duration,
             ));
         }
+
         let started = std::time::Instant::now();
         let response = self.content(request)?;
         if started.elapsed() >= max_duration {
@@ -239,6 +261,7 @@ pub trait ContextService {
         &self,
         request: FederatedSearchRequest,
     ) -> Result<FederatedSearchResponse, MemoryQueryError>;
+
     fn context(
         &self,
         request: FederatedContextRequest,

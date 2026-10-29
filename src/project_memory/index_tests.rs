@@ -101,6 +101,7 @@ fn insert_graph_snapshot(
             )
             .unwrap();
     }
+
     for (index, (semantic_key, path)) in symbols.iter().enumerate() {
         sidecar
             .connection_mut()
@@ -121,6 +122,7 @@ fn insert_graph_snapshot(
             )
             .unwrap();
     }
+
     if publish {
         sidecar
             .connection_mut()
@@ -185,6 +187,7 @@ fn source(root: &TempDir, data: &TempDir) -> LocalMemorySource {
             &spec_content,
         );
     }
+
     LocalMemorySource::discover_at(
         root.path().to_path_buf(),
         data.path().to_path_buf(),
@@ -204,6 +207,7 @@ fn normalize_index_timestamps(
         entity.provenance.timestamps.source_observed_at = epoch;
         entity.provenance.timestamps.indexed_at = epoch;
     }
+
     for relationship in relationships {
         relationship.provenance.timestamps.source_observed_at = epoch;
         relationship.provenance.timestamps.indexed_at = epoch;
@@ -715,6 +719,7 @@ fn archive_and_runtime_adapters_create_only_provenance_entities() {
     ] {
         fs::write(archive.join(path), body).unwrap();
     }
+
     fs::write(
         archive.join("manifest.toml"),
         r#"spec_path = "docs/specs/example.md"
@@ -831,6 +836,7 @@ archived_run_dir = "runs/t-1"
             "forbidden source body was persisted: {forbidden}"
         );
     }
+
     let links = store
         .repository_links(&outcome.repository_link_set.id)
         .unwrap();

@@ -57,6 +57,8 @@ pub use worktree::{
 
 #[derive(Debug, Error)]
 pub enum SourceError {
+    #[error("repository source identity serialization failed")]
+    Serialization(#[from] serde_json::Error),
     #[error("repository source root must be an existing directory")]
     InvalidRoot,
     #[error("repository source configuration is invalid")]
@@ -111,7 +113,7 @@ impl SourceDiscoveryContext {
             repository,
             analysis_config_digest,
             source_policy_digest,
-            extractor_set_digest: extractor_set_digest(extractors),
+            extractor_set_digest: extractor_set_digest(extractors)?,
             policy: SourcePolicy::new(&config.source)?,
             limits: config.index_limits.clone(),
         })
@@ -165,6 +167,7 @@ impl SourceRoot {
                     if component == Component::RootDir {
                         continue;
                     }
+
                     return Err(SourceError::InvalidRoot);
                 };
                 let component =
@@ -184,9 +187,11 @@ impl SourceRoot {
                         source: io::Error::last_os_error(),
                     });
                 }
+
                 // SAFETY: `openat` returned a new owned descriptor.
                 directory = unsafe { File::from_raw_fd(descriptor) };
             }
+
             Arc::new(directory)
         };
         #[cfg(windows)]
@@ -216,6 +221,7 @@ impl SourceRoot {
             {
                 return Err(SourceError::InvalidRoot);
             }
+
             let final_path = windows_final_path(&directory).map_err(|source| SourceError::Io {
                 operation: "resolve source root handle",
                 source,
@@ -223,6 +229,7 @@ impl SourceRoot {
             if !windows_paths_equal(&path, &final_path) {
                 return Err(SourceError::InvalidRoot);
             }
+
             Arc::new(directory)
         };
         Ok(Self {
@@ -265,7 +272,9 @@ impl SourceRoot {
         let mut directory = self.directory.try_clone().map_err(ConfinedOpenError::Io)?;
         let mut components = path.as_str().split('/').peekable();
         while let Some(component) = components.next() {
-            let component = CString::new(component).expect("RepoPath rejects NUL bytes");
+            let component = CString::new(component).map_err(|error| {
+                ConfinedOpenError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+            })?;
             let is_final = components.peek().is_none();
             let directory_flag = !is_final || final_component_is_directory;
             let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -274,6 +283,7 @@ impl SourceRoot {
             } else {
                 flags |= libc::O_NONBLOCK;
             }
+
             // SAFETY: `directory` is a live directory descriptor, `component`
             // is NUL-terminated, and the returned descriptor is owned below.
             let descriptor =
@@ -286,9 +296,11 @@ impl SourceRoot {
                     Err(ConfinedOpenError::Io(error))
                 };
             }
+
             // SAFETY: `openat` returned a new owned descriptor.
             directory = unsafe { File::from_raw_fd(descriptor) };
         }
+
         Ok(directory)
     }
 
@@ -394,19 +406,23 @@ impl SourceRoot {
                     )))
                 };
             }
+
             if handle.is_null() {
                 return Err(ConfinedOpenError::Io(io::Error::other(
                     "Windows returned an empty file handle",
                 )));
             }
+
             // SAFETY: successful `NtCreateFile` returned a new owned handle.
             let opened = unsafe { File::from_raw_handle(handle.cast()) };
             let metadata = opened.metadata().map_err(ConfinedOpenError::Io)?;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(ConfinedOpenError::Symlink);
             }
+
             directory = opened;
         }
+
         Ok(directory)
     }
 
@@ -431,10 +447,12 @@ impl SourceRoot {
             {
                 return Err(ConfinedOpenError::Symlink);
             }
+
             let resolved = fs::canonicalize(&absolute).map_err(ConfinedOpenError::Io)?;
             if !resolved.starts_with(&self.path) {
                 return Err(ConfinedOpenError::Symlink);
             }
+
             File::open(resolved).map_err(ConfinedOpenError::Io)
         }
     }
@@ -457,6 +475,7 @@ impl SourceRoot {
             if !metadata.file_type().is_dir() {
                 return Err(ConfinedOpenError::Symlink);
             }
+
             Ok(directory)
         }
     }
@@ -474,12 +493,14 @@ fn windows_final_path(file: &File) -> io::Result<String> {
     if required == 0 {
         return Err(io::Error::last_os_error());
     }
+
     let mut buffer = vec![0_u16; required as usize + 1];
     let written =
         unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
     if written == 0 || written as usize >= buffer.len() {
         return Err(io::Error::last_os_error());
     }
+
     String::from_utf16(&buffer[..written as usize])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-16 final path"))
 }
@@ -619,6 +640,7 @@ impl RepositorySource for TaskBaselineSource {
         if !self.manifest.files.iter().any(|stored| stored == file) {
             return Err(SourceError::FileNotInManifest);
         }
+
         worktree::read_tree_descriptor_verified(&self.root, &self.baseline_tree, file)
     }
 

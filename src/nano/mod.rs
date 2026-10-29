@@ -7,11 +7,15 @@ pub(crate) mod cli;
 pub(crate) mod coding;
 pub(crate) mod commands;
 pub(crate) mod compaction;
+#[cfg(feature = "nano-openai")]
+pub(crate) mod config;
 pub(crate) mod context;
 mod context_request;
 pub(crate) mod conversation;
 mod descriptors;
 mod effect_recovery;
+pub(crate) mod engine;
+mod eval;
 #[cfg(feature = "nano-openai")]
 mod frontend;
 pub(crate) mod instructions;
@@ -29,14 +33,14 @@ pub(crate) mod review;
 #[cfg(feature = "nano-openai")]
 mod supervisor;
 pub(crate) mod wire;
-
-#[cfg(feature = "nano-openai")]
-pub(crate) mod config;
-pub(crate) mod engine;
-mod eval;
 pub(crate) use eval::capture_launch as capture_evaluation_launch;
+
+#[cfg(test)]
+mod core_tests;
 pub(crate) mod ferrus;
 pub(crate) mod journal;
+#[cfg(test)]
+mod journal_tests;
 pub(crate) mod provider;
 #[cfg(feature = "nano-openai")]
 pub(crate) mod providers;
@@ -45,8 +49,3 @@ pub(crate) mod session;
 pub(crate) mod tools;
 pub(crate) mod working_set;
 pub(crate) mod workspace;
-
-#[cfg(test)]
-mod core_tests;
-#[cfg(test)]
-mod journal_tests;

@@ -65,8 +65,16 @@ impl Extractor for RustSyntaxExtractor {
         if !self.supports(input.file) {
             return Ok(GraphFragment::default());
         }
+
         if std::str::from_utf8(input.content).is_err() {
-            diagnostics.push("rust.invalid_utf8", None);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "rust.invalid_utf8",
+                    )
+                },
+                None,
+            );
             return Ok(GraphFragment {
                 diagnostics: diagnostics.finish(),
                 ..GraphFragment::default()
@@ -76,7 +84,14 @@ impl Extractor for RustSyntaxExtractor {
         let started = Instant::now();
         let budget = Duration::from_millis(input.context.max_parser_duration_ms);
         if budget.is_zero() {
-            diagnostics.push("rust.parser_timeout", None);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "rust.parser_timeout",
+                    )
+                },
+                None,
+            );
             return Ok(GraphFragment {
                 diagnostics: diagnostics.finish(),
                 ..GraphFragment::default()
@@ -100,7 +115,14 @@ impl Extractor for RustSyntaxExtractor {
         let mut read =
             |offset: usize, _position: Point| input.content.get(offset..).unwrap_or_default();
         let Some(tree) = parser.parse_with_options(&mut read, None, Some(options)) else {
-            diagnostics.push("rust.parser_timeout", None);
+            diagnostics.push(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "rust.parser_timeout",
+                    )
+                },
+                None,
+            );
             return Ok(GraphFragment {
                 diagnostics: diagnostics.finish(),
                 ..GraphFragment::default()
@@ -139,7 +161,7 @@ impl Extractor for RustSyntaxExtractor {
             span(root),
         );
         if !facts.push_root(root_fact) {
-            diagnostics.push("rust.fact_limit", None);
+            diagnostics.push(const { crate::repository_graph::domain::DiagnosticCode::from_static("rust.fact_limit") }, None);
             return Ok(GraphFragment {
                 diagnostics: diagnostics.finish(),
                 ..GraphFragment::default()
@@ -169,26 +191,50 @@ impl Extractor for RustSyntaxExtractor {
             }
 
             if work.node.is_error() {
-                diagnostics.push("rust.parse_error", Some(span(work.node)));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "rust.parse_error",
+                        )
+                    },
+                    Some(span(work.node)),
+                );
             } else if work.node.is_missing() {
-                diagnostics.push("rust.missing_syntax", Some(span(work.node)));
+                diagnostics.push(
+                    const {
+                        crate::repository_graph::domain::DiagnosticCode::from_static(
+                            "rust.missing_syntax",
+                        )
+                    },
+                    Some(span(work.node)),
+                );
             }
 
             let mut child_context = Rc::clone(&work.context);
             if let Some(mut declaration) = declaration(work.node, input.content) {
                 if declaration.enforce_source_value_limit() {
-                    diagnostics.push("rust.source_value_limit", Some(span(work.node)));
+                    diagnostics.push(
+                        const {
+                            crate::repository_graph::domain::DiagnosticCode::from_static(
+                                "rust.source_value_limit",
+                            )
+                        },
+                        Some(span(work.node)),
+                    );
                 }
+
                 let opens_module = declaration.kind == "module";
                 let built = build_declaration(input, &work, declaration);
                 if !facts.push_declaration(built.node, built.containment, built.relationship) {
                     break;
                 }
+
                 let context = Rc::make_mut(&mut child_context);
                 context.parent_id = built.id.clone();
                 if opens_module {
                     context.module_id = built.id;
                 }
+
                 if let Some(scope_segment) = built.scope_segment {
                     Rc::make_mut(&mut context.scope).push(scope_segment);
                 }
@@ -206,14 +252,18 @@ impl Extractor for RustSyntaxExtractor {
 
         if timed_out {
             let mut timeout = DiagnosticBuffer::new(input);
-            timeout.push("rust.parser_timeout", None);
+            timeout.push(
+                const { DiagnosticCode::from_static("rust.parser_timeout") },
+                None,
+            );
             return Ok(GraphFragment {
                 diagnostics: timeout.finish(),
                 ..GraphFragment::default()
             });
         }
+
         if facts.truncated {
-            diagnostics.push("rust.fact_limit", None);
+            diagnostics.push(const { crate::repository_graph::domain::DiagnosticCode::from_static("rust.fact_limit") }, None);
         }
 
         Ok(GraphFragment {
@@ -248,6 +298,7 @@ fn push_named_children<'tree>(
         if started.elapsed() >= budget {
             return false;
         }
+
         let Ok(index) = u32::try_from(index) else {
             continue;
         };
@@ -258,6 +309,7 @@ fn push_named_children<'tree>(
             });
         }
     }
+
     true
 }
 
@@ -291,6 +343,7 @@ impl Declaration {
             self.name = None;
             exceeded = true;
         }
+
         if self
             .relationship
             .as_ref()
@@ -299,10 +352,12 @@ impl Declaration {
             self.relationship = None;
             exceeded = true;
         }
+
         if self.visibility.len() > MAX_SOURCE_VALUE_BYTES {
             self.visibility = "unavailable".to_string();
             exceeded = true;
         }
+
         exceeded
     }
 }
@@ -385,13 +440,16 @@ fn has_path_attribute(node: Node<'_>, source: &[u8]) -> bool {
     if child_attribute {
         return true;
     }
+
     let mut sibling = node.prev_named_sibling();
     while let Some(attribute) = sibling.filter(|sibling| sibling.kind() == "attribute_item") {
         if is_path_attribute(attribute, source) {
             return true;
         }
+
         sibling = attribute.prev_named_sibling();
     }
+
     false
 }
 
@@ -399,6 +457,7 @@ fn is_path_attribute(node: Node<'_>, source: &[u8]) -> bool {
     if node.kind() != "attribute_item" {
         return false;
     }
+
     node_text(node, source).is_some_and(|attribute| {
         let compact = attribute
             .chars()
@@ -433,6 +492,7 @@ fn visibility(node: Node<'_>, source: &[u8]) -> String {
             return node_text(child, source).unwrap_or_else(|| "inherited".to_string());
         }
     }
+
     "inherited".to_string()
 }
 
@@ -456,10 +516,12 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
     }
+
     let mut boundary = max_bytes;
     while !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
+
     &value[..boundary]
 }
 
@@ -501,6 +563,7 @@ fn build_declaration(
     if !qualified_name.is_empty() {
         qualified_name.push_str("::");
     }
+
     qualified_name.push_str(&identity_name);
     let semantic_key = format!(
         "rust:{}:{}:{}",
@@ -525,6 +588,7 @@ fn build_declaration(
     if let Some(name) = &declaration.name {
         properties.insert("name".to_string(), GraphValue::String(name.clone()));
     }
+
     if declaration.kind == "module" {
         properties.insert(
             "module_origin".to_string(),
@@ -539,12 +603,14 @@ fn build_declaration(
             properties.insert("path_override".to_string(), GraphValue::Boolean(true));
         }
     }
+
     if declaration.kind == "impl" {
         properties.insert(
             "implementation_target".to_string(),
             GraphValue::String(display_name.clone()),
         );
     }
+
     if let Some(relationship) = &declaration.relationship {
         properties.insert(
             "target".to_string(),
@@ -600,8 +666,7 @@ fn graph_node(
         snapshot_id: input.context.snapshot_id.clone(),
         id,
         kind: kind.to_string(),
-        semantic_key: semantic_key
-            .map(|key| SemanticKey::new(key).expect("Rust semantic keys are always non-empty")),
+        semantic_key: semantic_key.and_then(|key| SemanticKey::new(key).ok()),
         provenance: provenance(input, source_span, ResolutionState::Resolved),
         properties,
     }
@@ -656,7 +721,7 @@ fn provenance(
 
 fn extractor_identity() -> ExtractorIdentity {
     ExtractorIdentity {
-        id: ExtractorId::new(EXTRACTOR_ID).expect("built-in extractor ID is non-empty"),
+        id: const { ExtractorId::from_static(EXTRACTOR_ID) },
         version: EXTRACTOR_VERSION.to_string(),
         contract_version: EXTRACTOR_CONTRACT_VERSION,
     }
@@ -720,6 +785,7 @@ impl FactBuffer {
         if !self.reserve(1) {
             return false;
         }
+
         self.nodes.push(node);
         true
     }
@@ -734,11 +800,13 @@ impl FactBuffer {
         if !self.reserve(required) {
             return false;
         }
+
         self.nodes.push(node);
         self.edges.push(containment);
         if let Some(relationship) = relationship {
             self.edges.push(relationship);
         }
+
         true
     }
 
@@ -770,11 +838,12 @@ impl<'a> DiagnosticBuffer<'a> {
         }
     }
 
-    fn push(&mut self, code: &'static str, source_span: Option<SourceSpan>) {
+    fn push(&mut self, code: DiagnosticCode, source_span: Option<SourceSpan>) {
         if self.diagnostics.len() as u64 >= self.limit {
             self.suppressed = self.suppressed.saturating_add(1);
             return;
         }
+
         self.diagnostics.push(self.diagnostic(code, source_span));
     }
 
@@ -782,9 +851,16 @@ impl<'a> DiagnosticBuffer<'a> {
         if self.suppressed > 0 && self.limit > 0 {
             let replaced = u64::from(!self.diagnostics.is_empty());
             let suppressed = self.suppressed.saturating_add(replaced);
-            let mut summary = self.diagnostic("rust.diagnostics_truncated", None);
+            let mut summary = self.diagnostic(
+                const {
+                    crate::repository_graph::domain::DiagnosticCode::from_static(
+                        "rust.diagnostics_truncated",
+                    )
+                },
+                None,
+            );
             summary.metrics.insert(
-                DiagnosticCode::new("suppressed").expect("static diagnostic metric is valid"),
+                const { DiagnosticCode::from_static("suppressed") },
                 i64::try_from(suppressed).unwrap_or(i64::MAX),
             );
             if self.diagnostics.is_empty() {
@@ -793,15 +869,16 @@ impl<'a> DiagnosticBuffer<'a> {
                 *last = summary;
             }
         }
+
         self.diagnostics
     }
 
-    fn diagnostic(&self, code: &'static str, source_span: Option<SourceSpan>) -> GraphDiagnostic {
+    fn diagnostic(&self, code: DiagnosticCode, source_span: Option<SourceSpan>) -> GraphDiagnostic {
         GraphDiagnostic {
             build_id: self.input.context.build_id.clone(),
             snapshot_id: Some(self.input.context.snapshot_id.clone()),
             severity: DiagnosticSeverity::Warning,
-            code: DiagnosticCode::new(code).expect("static Rust diagnostic code is valid"),
+            code,
             location: source_span.map(|source_span| DiagnosticLocation {
                 path: self.input.file.path.clone(),
                 span: Some(source_span),

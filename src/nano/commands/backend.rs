@@ -51,6 +51,7 @@ impl ChildEnvironment {
 /// Substitute an enforced backend here later. Model arguments cannot select one.
 pub(crate) trait ExecutionBackend {
     fn kind(&self) -> &'static str;
+
     fn spawn(&self, command: &str, cwd: &str) -> Result<Spawned>;
 }
 
@@ -142,7 +143,11 @@ impl ExecutionBackend for TrustedLocal {
         };
 
         let job = platform::attach_headless_process(pid)?;
-        spawned.tree.lock().unwrap().job = Some(job);
+        spawned
+            .tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .job = Some(job);
 
         #[cfg(windows)]
         resume(pid)?;
@@ -160,7 +165,10 @@ pub(crate) struct Spawned {
 
 impl Drop for Spawned {
     fn drop(&mut self) {
-        self.tree.lock().unwrap().stop();
+        self.tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
     }
 }
 
@@ -175,6 +183,7 @@ impl ProcessTree {
         if self.stopped {
             return;
         }
+
         // Windows closes the job, including all descendants. Unix kills the owned
         // process group before reaping its leader, so the ID cannot be reused here.
         #[cfg(unix)]
@@ -194,7 +203,11 @@ pub(crate) fn exited(process: &mut Spawned) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let pid = process.tree.lock().unwrap().pid;
+        let pid = process
+            .tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pid;
         // SAFETY: waitid writes one initialized siginfo for this owned child; WNOHANG
         // does not block, and WNOWAIT leaves the leader available for Child::wait.
         let status = unsafe {
@@ -256,8 +269,10 @@ fn resume(pid: u32) -> Result<()> {
                     found = ResumeThread(thread) != u32::MAX;
                     CloseHandle(thread);
                 }
+
                 break;
             }
+
             more = Thread32Next(snapshot, &mut entry) != 0;
         }
 

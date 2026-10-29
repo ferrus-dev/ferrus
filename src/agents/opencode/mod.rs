@@ -109,6 +109,7 @@ fn opencode_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
             if let Some(model) = model {
                 cmd.arg("--model").arg(model);
             }
+
             if let Some(prompt) = prompt {
                 cmd.arg("--prompt").arg(prompt);
             }
@@ -119,9 +120,11 @@ fn opencode_command(mode: AgentRunMode<'_>, model: Option<&str>) -> Command {
             if let Some(model) = model {
                 cmd.arg("--model").arg(model);
             }
+
             cmd.arg(prompt);
         }
     }
+
     cmd
 }
 
@@ -136,9 +139,11 @@ fn opencode_config_paths() -> Vec<PathBuf> {
         paths.push(config_dir.join("opencode").join(CONFIG_FILE));
         paths.push(config_dir.join("opencode").join("opencode.jsonc"));
     }
+
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".opencode.json"));
     }
+
     paths
 }
 
@@ -165,6 +170,7 @@ fn validate_interactive_launch(role: &str) -> Result<()> {
             display_path(path)
         )));
     }
+
     Ok(())
 }
 

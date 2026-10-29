@@ -1,5 +1,7 @@
 //! Ferrus executable entry point: initialize logging and dispatch CLI or interactive HQ.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod agent_id;
 mod agents;
 mod checks;
@@ -8,6 +10,7 @@ mod config;
 mod hq;
 mod legacy_state;
 mod shared;
+
 // Optional native frontend/provider entry points also build without nano-openai.
 #[allow(dead_code)]
 mod nano;
@@ -63,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     if repository_graph::extractors::cargo::run_parser_worker_if_requested()? {
         return Ok(());
     }
+
     let args = cli::Cli::parse();
     let debug = args.debug_enabled();
 

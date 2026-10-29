@@ -17,6 +17,7 @@ pub(super) fn load_history() -> Vec<String> {
     if lines.len() > MAX_HISTORY {
         lines = lines.split_off(lines.len() - MAX_HISTORY);
     }
+
     lines
 }
 
@@ -25,6 +26,7 @@ pub(super) fn save_history(history: &[String]) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+
     let keep_from = history.len().saturating_sub(MAX_HISTORY);
     let data = history[keep_from..].join("\n");
     let _ = fs::write(path, data);
@@ -68,6 +70,7 @@ pub(super) fn longest_common_prefix(candidates: &[(&'static str, &'static str)])
             .count()
             .min(end);
     }
+
     &first[..end]
 }
 

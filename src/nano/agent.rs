@@ -97,6 +97,7 @@ fn create_default_config(path: &Path, model: Option<&str>) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+
     write_new_config(path, contents.as_bytes(), |file, bytes| {
         file.write_all(bytes)
     })
@@ -125,6 +126,7 @@ fn write_new_config(
         })?;
         return Err(error).context("Cannot write Nano settings");
     }
+
     Ok(())
 }
 
@@ -136,12 +138,14 @@ pub(crate) fn load_config(path: &Path, model: Option<&str>) -> Result<super::con
     } else {
         config.model = config.model.trim().to_owned();
     }
+
     config.validate()?;
     config.authorization()?;
     #[cfg(feature = "nano-mcp")]
     if let Some(path) = &config.mcp_config_file {
         super::mcp::validate_config(path)?;
     }
+
     Ok(config)
 }
 
@@ -161,6 +165,7 @@ pub(crate) fn validate_config(path: Option<&Path>, model: Option<&str>) -> Resul
 pub(crate) struct Executor {
     model: Option<String>,
 }
+
 impl Executor {
     pub(crate) fn new(model: Option<&str>) -> Self {
         Self {
@@ -168,13 +173,16 @@ impl Executor {
         }
     }
 }
+
 impl ExecutorAgent for Executor {
     fn name(&self) -> &'static str {
         NAME
     }
+
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
             interactive: cfg!(feature = "nano-openai"),
@@ -183,6 +191,7 @@ impl ExecutorAgent for Executor {
             event_output: true,
         }
     }
+
     fn spawn_with_index(&self, mode: AgentRunMode<'_>, _: u32) -> Result<Command> {
         // The native host selects work or stored-response delivery from the bound
         // SQLite task; external-agent relaunch prompts are not model input here.
@@ -194,30 +203,38 @@ impl ExecutorAgent for Executor {
         if matches!(mode, AgentRunMode::Interactive { .. }) {
             command.arg("--interactive");
         }
+
         if let Some(model) = self.model() {
             command.arg("--model").arg(model);
         }
+
         Ok(command)
     }
+
     fn version_command(&self) -> Result<Command> {
         let mut command = Command::new(std::env::current_exe()?);
         command.args(["nano", "--version"]);
         Ok(command)
     }
+
     fn mcp_config_entry(&self, _: &str, _: u32) -> Result<McpConfigEntry> {
         bail!("Nano uses native Ferrus operations and has no loopback MCP entry")
     }
+
     fn validate_interactive_launch(&self, role: &str, _: u32) -> Result<()> {
         ensure!(role == "executor", "Nano supports the Executor role only");
         validate_config(None, self.model())
     }
+
     fn validate_headless_launch(&self, role: &str, _: u32) -> Result<()> {
         ensure!(role == "executor", "Nano supports the Executor role only");
         validate_config(None, self.model())
     }
+
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         HeadlessPromptTransport::Jsonl
     }
+
     fn display_config(&self) -> AgentDisplayConfig {
         let display = AgentDisplayConfig::from_model(self.model());
         #[cfg(feature = "nano-openai")]
@@ -227,6 +244,7 @@ impl ExecutorAgent for Executor {
         {
             return AgentDisplayConfig::from_model(Some(&config.model));
         }
+
         display
     }
 }
@@ -234,6 +252,7 @@ impl ExecutorAgent for Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(feature = "nano-openai")]
     #[test]
     fn default_config_is_private_valid_and_requires_a_model() {
@@ -272,6 +291,7 @@ mod tests {
         assert!(create_default_config(&path, Some("other-model")).is_err());
         assert_eq!(load_config(&path, None).unwrap().model, "local/model");
     }
+
     #[cfg(feature = "nano-openai")]
     #[test]
     fn provider_config_and_overrides_normalize_the_selected_model() {
@@ -289,6 +309,7 @@ mod tests {
             "override"
         );
     }
+
     #[test]
     fn native_capabilities_version_and_model_do_not_require_provider_setup() {
         let agent = Executor::new(Some("  local/model  "));
@@ -319,6 +340,7 @@ mod tests {
         );
         assert!(config_path(Some(Path::new("relative.toml"))).is_err());
     }
+
     #[test]
     fn supervisor_rejects_task_scoped_roles_before_provider_setup() {
         use crate::agents::SupervisorAgent;
@@ -338,12 +360,14 @@ mod tests {
         for role in ["executor", "reviewer", "consultant"] {
             assert!(agent.validate_interactive_launch(role, 1).is_err());
         }
+
         assert!(agent.mcp_config_entry("supervisor", 1).is_err());
         assert_eq!(
             agent.headless_prompt_transport(),
             HeadlessPromptTransport::Jsonl
         );
     }
+
     #[test]
     fn supervisor_profiles_keep_the_host_mode_prompt_count_and_identity() {
         use crate::agents::DefinitionMode;
@@ -378,6 +402,7 @@ mod tests {
             if profile == DefinitionMode::Task {
                 assert!(args.windows(2).any(|pair| pair == ["--task-count", "3"]));
             }
+
             let environment: std::collections::HashMap<_, _> = command.get_envs().collect();
             assert_eq!(
                 environment[std::ffi::OsStr::new(crate::agent_id::ENV_AGENT_ID)],
@@ -393,6 +418,7 @@ mod tests {
             }
         }
     }
+
     #[cfg(not(feature = "nano-openai"))]
     #[test]
     fn missing_provider_feature_fails_before_setup() {
@@ -410,6 +436,7 @@ pub(crate) const SUPERVISOR_POLICY: &str = "You are the Ferrus Nano Supervisor i
 pub(crate) struct Supervisor {
     model: Option<String>,
 }
+
 impl Supervisor {
     pub(crate) fn new(model: Option<&str>) -> Self {
         Self {
@@ -417,16 +444,20 @@ impl Supervisor {
         }
     }
 }
+
 impl crate::agents::SupervisorAgent for Supervisor {
     fn name(&self) -> &'static str {
         NAME
     }
+
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+
     fn native_definition(&self) -> bool {
         true
     }
+
     fn spawn_with_index(&self, mode: AgentRunMode<'_>, index: u32) -> Result<Command> {
         match mode {
             AgentRunMode::Interactive { prompt } => {
@@ -445,10 +476,12 @@ impl crate::agents::SupervisorAgent for Supervisor {
                 if let Some(model) = self.model() {
                     command.arg("--model").arg(model);
                 }
+
                 Ok(command)
             }
         }
     }
+
     fn headless_prompt_transport(&self) -> HeadlessPromptTransport {
         HeadlessPromptTransport::Jsonl
     }
@@ -461,15 +494,19 @@ impl crate::agents::SupervisorAgent for Supervisor {
     ) -> Result<Command> {
         self.spawn_profile(profile, prompt, count, crate::agent_id::DEFAULT_AGENT_INDEX)
     }
+
     fn version_command(&self) -> Result<Command> {
         Executor::new(self.model()).version_command()
     }
+
     fn mcp_config_entry(&self, _: &str, _: u32) -> Result<McpConfigEntry> {
         bail!("Nano uses native Ferrus operations and has no loopback MCP entry")
     }
+
     fn display_config(&self) -> AgentDisplayConfig {
         Executor::new(self.model()).display_config()
     }
+
     fn validate_interactive_launch(&self, role: &str, _: u32) -> Result<()> {
         ensure!(
             role == "supervisor",
@@ -478,6 +515,7 @@ impl crate::agents::SupervisorAgent for Supervisor {
         validate_config(None, self.model())
     }
 }
+
 impl Supervisor {
     fn spawn_profile(
         &self,
@@ -489,6 +527,7 @@ impl Supervisor {
         validate_config(None, self.model.as_deref())?;
         self.profile_command(profile, prompt, count, index, &config_path(None)?)
     }
+
     fn profile_command(
         &self,
         profile: crate::agents::DefinitionMode,
@@ -512,15 +551,19 @@ impl Supervisor {
         ] {
             command.env_remove(key);
         }
+
         if let Some(prompt) = prompt {
             command.arg("--prompt").arg(prompt);
         }
+
         if profile == crate::agents::DefinitionMode::Task {
             command.arg("--task-count").arg(count.max(1).to_string());
         }
+
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
         }
+
         Ok(command)
     }
 }

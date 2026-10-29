@@ -34,6 +34,7 @@ struct Scope {
     mode: DefinitionMode,
     archive_path: Option<String>,
 }
+
 impl Scope {
     async fn check(&self) -> Result<()> {
         self.binding.status().await?;
@@ -47,8 +48,10 @@ impl Scope {
                 "Selected archive specification changed; start a new archive session"
             );
         }
+
         Ok(())
     }
+
     fn operation(&self, call: &ValidatedCall) -> Result<Operation> {
         let operation = Operation::parse(&call.name, &call.arguments)?;
         ensure!(
@@ -66,6 +69,7 @@ impl Scope {
                 "Archive request must target the specification pinned at launch"
             );
         }
+
         Ok(operation)
     }
 }
@@ -77,18 +81,21 @@ struct TaskInput {
     spec_path: Option<String>,
     milestone_id: Option<String>,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArchiveInput {
     spec_path: String,
     outcome: String,
 }
+
 #[derive(Debug, Clone)]
 enum Operation {
     Enqueue(TaskInput),
     Spec(String),
     Archive(ArchiveInput),
 }
+
 impl Operation {
     fn preview(&self) -> String {
         match self {
@@ -97,6 +104,7 @@ impl Operation {
                 if let (Some(path), Some(milestone)) = (&input.spec_path, &input.milestone_id) {
                     text = format!("Specification: {path}\nMilestone: {milestone}\n\n{text}");
                 }
+
                 text
             }
             Self::Spec(markdown) => markdown.clone(),
@@ -111,11 +119,13 @@ impl Operation {
             serde_json::to_vec(arguments)?.len() <= AUTHORING_BYTES,
             "Authoring request exceeds byte limit"
         );
+
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wrapped<T> {
             input: T,
         }
+
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Markdown {
@@ -197,6 +207,7 @@ impl Operation {
             _ => anyhow::bail!("Not an authoring operation"),
         })
     }
+
     async fn preflight(&self, root: &std::path::Path) -> Result<()> {
         if let Self::Enqueue(input) = self
             && let (Some(path), Some(id)) = (&input.spec_path, &input.milestone_id)
@@ -216,8 +227,10 @@ impl Operation {
                 "Milestone already has a non-terminal task"
             );
         }
+
         Ok(())
     }
+
     async fn run(self) -> Result<String> {
         match self {
             Self::Enqueue(input) => {
@@ -228,9 +241,11 @@ impl Operation {
         }
     }
 }
+
 fn authoring_name(name: &str) -> bool {
     matches!(name, "enqueue_task" | "create_spec" | "archive_spec")
 }
+
 fn readable(name: &str) -> bool {
     matches!(
         name,
@@ -239,12 +254,14 @@ fn readable(name: &str) -> bool {
 }
 
 struct SupervisorTools {
+    operation_schema: Value,
     native: NativeTools<commands::TrustedLocal>,
     scope: Scope,
     goal: usize,
     saved: usize,
     pending: Option<tokio::task::JoinHandle<Result<String>>>,
 }
+
 impl SupervisorTools {
     async fn finish_operation(&mut self) -> ToolOutcome {
         let Some(pending) = self.pending.as_mut() else {
@@ -262,6 +279,7 @@ impl SupervisorTools {
             _ => ToolOutcome::Unknown(ToolError::Failed),
         }
     }
+
     async fn definition_context(&self) -> Result<Value> {
         self.scope.check().await?;
         let root = self.scope.binding.project_root();
@@ -280,6 +298,7 @@ impl SupervisorTools {
             tasks.retain(|task| task.status != "failed");
             skipped_failed_tasks = count - tasks.len();
         }
+
         ensure!(
             tasks.len() <= 128,
             "Too many tasks for one definition context packet"
@@ -296,6 +315,7 @@ impl SupervisorTools {
         Ok(value)
     }
 }
+
 impl Tools for SupervisorTools {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools: Vec<_> = self
@@ -312,43 +332,30 @@ impl Tools for SupervisorTools {
                 .into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         });
-        let operation = match self.scope.mode {
-            DefinitionMode::Plan => None,
-            DefinitionMode::Task => Some((
-                "enqueue_task",
-                "Propose a complete task for user review, then enqueue it if the user confirms in the host UI.",
-                enqueue_task::INPUT_SCHEMA,
-            )),
-            DefinitionMode::Spec => Some((
-                "create_spec",
-                "Propose a complete feature specification for user review, then save it if the user confirms in the host UI.",
-                create_spec::INPUT_SCHEMA,
-            )),
-            DefinitionMode::Archive => Some((
-                "archive_spec",
-                "Propose an Outcome for the selected specification. The host displays it for user review and archives only after confirmation.",
-                archive_spec::INPUT_SCHEMA,
-            )),
-        };
-        if let Some((name, description, schema)) = operation {
+        let operation = definition_operation(self.scope.mode);
+        if let Some((name, description, _schema)) = operation {
             tools.push(ToolDescriptor {
                 name: name.into(),
                 description: format!(
                     "{description} Invoke this tool when the draft is ready; do not ask for a \
                     separate conversational approval first."
                 ),
-                input_schema: serde_json::from_str(schema).expect("static tool schema"),
+                input_schema: self.operation_schema.clone(),
             });
         }
+
         if self.scope.mode == DefinitionMode::Archive {
             tools.push(artifacts::descriptor());
         }
+
         tools
     }
+
     fn validate(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
         if !self.descriptors().iter().any(|tool| tool.name == name) {
             return Err(ToolError::UnknownTool);
         }
+
         if name == artifacts::NAME {
             artifacts::parse(arguments)
                 .map(|_| ())
@@ -381,6 +388,7 @@ impl Tools for SupervisorTools {
             self.native.validate(name, arguments)
         }
     }
+
     async fn prepare_context(
         &mut self,
         messages: &[super::provider::Message],
@@ -388,10 +396,12 @@ impl Tools for SupervisorTools {
     ) -> Result<Option<super::working_set::Preparation>, ToolError> {
         self.native.prepare_context(messages, stop).await
     }
+
     async fn execute(&mut self, call: &ValidatedCall, stop: &Cancellation) -> ToolOutcome {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
         }
+
         if call.name == artifacts::NAME {
             return match artifacts::read(&self.scope, &call.arguments).await {
                 Ok(value) => ToolOutcome::Success(value),
@@ -401,6 +411,7 @@ impl Tools for SupervisorTools {
                 }))),
             };
         }
+
         if authoring_name(&call.name) {
             let operation = match self.scope.operation(call) {
                 Ok(operation) => operation,
@@ -411,6 +422,7 @@ impl Tools for SupervisorTools {
                     json!({"code":"invalid_definition", "message":error.to_string()}),
                 ));
             }
+
             let scope = self.scope.clone();
             self.pending = Some(tokio::spawn(async move {
                 scope.check().await?;
@@ -435,6 +447,7 @@ impl Tools for SupervisorTools {
             self.native.execute(call, stop).await
         }
     }
+
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         if self.pending.is_some() {
             Some(self.finish_operation().await)
@@ -442,6 +455,7 @@ impl Tools for SupervisorTools {
             self.native.interrupted().await
         }
     }
+
     async fn shutdown(&mut self) -> bool {
         let clean = if self.pending.is_some() {
             matches!(self.finish_operation().await, ToolOutcome::Success(_))
@@ -450,14 +464,17 @@ impl Tools for SupervisorTools {
         };
         self.native.shutdown().await && clean
     }
+
     fn end_reason(&self) -> Option<EndReason> {
         (self.goal > 0 && self.saved >= self.goal).then_some(EndReason::DefinitionCompleted)
     }
 }
+
 struct SupervisorHost {
     scope: Scope,
     approvals: mpsc::Sender<Approval>,
 }
+
 impl Host for SupervisorHost {
     async fn authorize(&mut self, call: &ValidatedCall) -> Result<(), ToolError> {
         self.scope.check().await.map_err(|_| ToolError::Denied)?;
@@ -483,10 +500,13 @@ impl Host for SupervisorHost {
             if !response.await.unwrap_or(false) {
                 return Err(ToolError::Denied);
             }
+
             self.scope.check().await.map_err(|_| ToolError::Denied)?;
         }
+
         Ok(())
     }
+
     fn committed(&mut self, _: &Record) {}
 }
 
@@ -592,6 +612,7 @@ fn failure_diagnostic(binding: &Binding, error: &anyhow::Error) -> PathBuf {
         ] {
             super::private::directory(&parent, false)?;
         }
+
         let mut file = super::private::file(&path, true)?;
         file.write_all(
             super::conversation::display_text(&format!("{error:#}\n"), 8192).as_bytes(),
@@ -602,8 +623,10 @@ fn failure_diagnostic(binding: &Binding, error: &anyhow::Error) -> PathBuf {
     if let Err(error) = save() {
         tracing::warn!(error = ?error, "Could not save Nano Supervisor diagnostics");
     }
+
     path
 }
+
 async fn run_bound(
     binding: Binding,
     mode: DefinitionMode,
@@ -624,7 +647,9 @@ async fn run_bound(
         let _ = tokio::signal::ctrl_c().await;
         signal.cancel();
     });
+
     struct Signal(tokio::task::JoinHandle<()>);
+
     impl Drop for Signal {
         fn drop(&mut self) {
             self.0.abort();
@@ -656,7 +681,9 @@ async fn run_bound(
         "Archive mode requires a selected specification"
     );
     scope.check().await?;
+    let operation_schema = definition_schema(mode)?;
     let tools = SupervisorTools {
+        operation_schema,
         native,
         scope: scope.clone(),
         goal: match mode {
@@ -722,6 +749,36 @@ async fn run_bound(
         end.durable
     );
     Ok(())
+}
+
+fn definition_schema(mode: DefinitionMode) -> Result<Value> {
+    Ok(definition_operation(mode)
+        .map(|(_, _, schema)| serde_json::from_str(schema))
+        .transpose()?
+        .unwrap_or(Value::Null))
+}
+
+fn definition_operation(
+    mode: DefinitionMode,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match mode {
+        DefinitionMode::Plan => None,
+        DefinitionMode::Task => Some((
+            "enqueue_task",
+            "Propose a complete task for user review, then enqueue it if the user confirms in the host UI.",
+            enqueue_task::INPUT_SCHEMA,
+        )),
+        DefinitionMode::Spec => Some((
+            "create_spec",
+            "Propose a complete feature specification for user review, then save it if the user confirms in the host UI.",
+            create_spec::INPUT_SCHEMA,
+        )),
+        DefinitionMode::Archive => Some((
+            "archive_spec",
+            "Propose an Outcome for the selected specification. The host displays it for user review and archives only after confirmation.",
+            archive_spec::INPUT_SCHEMA,
+        )),
+    }
 }
 
 #[cfg(test)]

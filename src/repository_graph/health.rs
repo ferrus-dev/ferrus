@@ -121,6 +121,7 @@ fn inspect_ready(path: &Path, schema_version: u32) -> Result<SidecarHealth> {
     if integrity != "ok" {
         issues.push(HealthIssueCode::IntegrityCheckFailed);
     }
+
     let foreign_key_violation = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",

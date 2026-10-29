@@ -5,7 +5,7 @@ use super::{
     session::{Budget, EndReason, Record, SessionEvent},
     tools::{ToolCall, ToolOutcome},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use std::collections::VecDeque;
 
 pub(crate) const JOURNAL_VERSION: u32 = 1;
@@ -187,6 +187,7 @@ impl Replay {
                     ensure!(!text.trim().is_empty(), "Empty system prompt");
                     self.messages.push(Message::System { text: text.clone() });
                 }
+
                 self.messages.push(Message::User {
                     text: input.clone(),
                 });
@@ -298,6 +299,7 @@ impl Replay {
                 if response.finish != super::provider::FinishReason::Length {
                     self.calls = response.calls.clone().into();
                 }
+
                 self.messages.extend(response.messages());
             }
             SessionEvent::CompactionCompleted { summary, .. } => {
@@ -364,6 +366,7 @@ impl Replay {
                         "Invalid patch effect plan"
                     );
                 }
+
                 self.pending_effect = Some(call_id.clone());
                 self.pending_requires_start = *start_recorded;
                 self.effect_started = false;
@@ -389,7 +392,10 @@ impl Replay {
                         || matches!(outcome, ToolOutcome::Failed(_)),
                     "Unstarted tool cannot succeed or have an unknown effect"
                 );
-                let call = self.calls.pop_front().expect("intent checked call queue");
+                let call = self
+                    .calls
+                    .pop_front()
+                    .context("Tool result has no queued call")?;
                 self.submitted = call.name == "submit"
                     && matches!(outcome, ToolOutcome::Success(value) if value["status"] == "submitted" && value["task_state"] == "reviewing");
                 self.definition_completed = self.taskless
@@ -419,6 +425,7 @@ impl Replay {
                 if matches!(outcome, ToolOutcome::Unknown(_)) {
                     self.unknown_effects.push(call_id.clone());
                 }
+
                 self.pending_effect = None;
                 self.pending_requires_start = false;
                 self.effect_started = false;
@@ -436,6 +443,7 @@ impl Replay {
                         "Role completion requires a confirmed lifecycle effect"
                     );
                 }
+
                 if *reason == EndReason::DefinitionCompleted {
                     ensure!(
                         self.definition_completed
@@ -445,12 +453,14 @@ impl Replay {
                         "Definition finish requires a confirmed taskless authoring operation"
                     );
                 }
+
                 if *reason == EndReason::Submitted {
                     ensure!(
                         self.submitted && self.pending_effect.is_none() && !self.model_active,
                         "Submit finish requires a confirmed native handoff"
                     );
                 }
+
                 if *reason == EndReason::ModelFinished {
                     ensure!(
                         self.checkpoint_ready(),
@@ -461,6 +471,7 @@ impl Replay {
                         "Model finish requires a completed headless final response"
                     );
                 }
+
                 self.end = Some(reason.clone());
             }
         }

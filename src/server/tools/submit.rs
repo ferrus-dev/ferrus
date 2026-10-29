@@ -87,6 +87,7 @@ async fn run(agent_id: Option<&str>, content: String) -> Result<String> {
             context.status
         );
     }
+
     ensure_lease_owner_or_reclaim(agent_id, config.lease.ttl_secs).await?;
 
     if config.checks.commands.is_empty() {
@@ -215,6 +216,7 @@ async fn project_root_for_isolation() -> Option<PathBuf> {
     if let Some(project_root) = project_root_from_env() {
         return Some(project_root);
     }
+
     project_root_from_local_ref().await
 }
 
@@ -311,6 +313,7 @@ pub(crate) async fn tree_patch_between(
             }
         );
     }
+
     submitted_patch_from_utf8(output.stdout)
 }
 
@@ -362,6 +365,7 @@ async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
         if tracked_set.contains(&path) {
             continue;
         }
+
         patch.push_str(&baseline_untracked_path_patch(baseline, &path).await?);
     }
 
@@ -373,8 +377,10 @@ async fn workspace_patch_against_baseline(baseline: &str) -> Result<String> {
         if baseline_set.contains(&path) {
             continue;
         }
+
         patch.push_str(&new_file_patch(&path).await?);
     }
+
     Ok(patch)
 }
 
@@ -382,6 +388,7 @@ async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<S
     if tracked.is_empty() {
         return Ok(String::new());
     }
+
     // Restricting the diff to tracked pathspecs keeps baseline-only paths (handled separately
     // as untracked) out of this patch. Spread the pathspecs across batched invocations rather
     // than expanding every tracked path into a single argv, which can exceed the OS arg limit
@@ -393,6 +400,7 @@ async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<S
         for path in batch {
             command.arg(path);
         }
+
         let output = command.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -405,8 +413,10 @@ async fn tracked_workspace_patch(baseline: &str, tracked: &[String]) -> Result<S
                 }
             );
         }
+
         patch.push_str(&submitted_patch_from_utf8(output.stdout)?);
     }
+
     Ok(patch)
 }
 
@@ -428,8 +438,10 @@ fn tracked_pathspec_batches(tracked: &[String]) -> Vec<&[String]> {
             start = index;
             used = 0;
         }
+
         used += cost;
     }
+
     batches.push(&tracked[start..]);
     batches
 }
@@ -464,6 +476,7 @@ async fn git_show_path(baseline: &str, path: &str) -> Result<Vec<u8>> {
             }
         );
     }
+
     Ok(output.stdout)
 }
 
@@ -495,6 +508,7 @@ async fn no_index_patch(
             }
         );
     }
+
     let patch = submitted_patch_from_utf8(output.stdout)?;
     Ok(rewrite_no_index_patch_paths(
         &patch, path, old_null, new_null,
@@ -535,6 +549,7 @@ fn rewrite_no_index_patch_paths(patch: &str, path: &str, old_null: bool, new_nul
             rewritten.push_str(line);
         }
     }
+
     rewritten
 }
 
@@ -617,6 +632,7 @@ impl Drop for SubmittedTreePinCleanup {
         if !self.armed {
             return;
         }
+
         let Some(workspace_root) = self.workspace_root.as_deref() else {
             tracing::warn!(
                 task_id = self.task_id,

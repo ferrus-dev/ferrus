@@ -1,6 +1,6 @@
 //! Managed checks reuse Ferrus log formatting and Nano's owned process backend.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use std::{path::Path, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -36,16 +36,21 @@ pub(super) async fn run(
         let stderr_spool = Spool::new(log, "stderr")?;
         let mut child = backend.spawn(command, ".")?;
 
-        let stdout = child.child.stdout.take().expect("piped stdout");
-        let stderr = child.child.stderr.take().expect("piped stderr");
-        let stdout_file = tokio::fs::File::from_std(stdout_spool.file().try_clone()?);
-        let stderr_file = tokio::fs::File::from_std(stderr_spool.file().try_clone()?);
+        let stdout = child.child.stdout.take().context("Missing piped stdout")?;
+        let stderr = child.child.stderr.take().context("Missing piped stderr")?;
+        let stdout_file = tokio::fs::File::from_std(stdout_spool.file()?.try_clone()?);
+        let stderr_file = tokio::fs::File::from_std(stderr_spool.file()?.try_clone()?);
 
         let observed = async {
             while !exited(&mut child)? {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            child.tree.lock().unwrap().stop();
+
+            child
+                .tree
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop();
             Ok::<_, anyhow::Error>(child.child.wait().await?)
         };
 
@@ -56,7 +61,11 @@ pub(super) async fn run(
         };
 
         // Always stop descendants and reap the owned leader before returning.
-        child.tree.lock().unwrap().stop();
+        child
+            .tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
         child.child.wait().await?;
 
         let (status, _, _) = result?;

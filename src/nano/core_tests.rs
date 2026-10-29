@@ -21,6 +21,7 @@ use std::{
 use tempfile::TempDir;
 
 type Script = VecDeque<Result<VecDeque<ProviderEvent>, ProviderError>>;
+
 #[derive(Default)]
 struct ScriptedProvider {
     turns: Script,
@@ -43,6 +44,7 @@ impl Provider for ScriptedProvider {
         if self.stall {
             std::future::pending::<()>().await;
         }
+
         Ok(self.active.pop_front())
     }
 }
@@ -119,11 +121,13 @@ impl Host for FakeHost {
                 cancel.cancel();
             }
         }
+
         if matches!(record.event, SessionEvent::InputRequested)
             && let Some(cancel) = &self.cancel_on_input
         {
             cancel.cancel();
         }
+
         self.records.push(record.clone());
     }
 }
@@ -230,6 +234,7 @@ fn setup(
 
     (dir, engine)
 }
+
 async fn run<P: Provider, T: Tools, H: Host, J: Journal>(
     engine: &mut Engine<P, T, H, J>,
     cancellation: &Cancellation,
@@ -245,777 +250,25 @@ async fn run<P: Provider, T: Tools, H: Host, J: Journal>(
         .unwrap()
 }
 
-#[tokio::test]
-async fn system_policy_is_durable_and_separate_from_task_and_tool_history() {
-    let (_dir, mut engine) = setup(
-        scripted(vec![
-            response("", vec![call("a", 1)]),
-            response("Done", vec![]),
-        ]),
-        limits(),
-    );
-    assert!(engine.set_system_prompt(" ").is_err());
-    engine.set_system_prompt("Host policy").unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert!(engine.set_system_prompt("Replacement").is_err());
-    for request in &engine.provider.requests {
-        assert_eq!(
-            request.messages[0],
-            Message::System {
-                text: "Host policy".into()
-            }
-        );
-        assert_eq!(
-            request.messages[1],
-            Message::User {
-                text: "Implement a fixture task".into()
-            }
-        );
-        assert!(super::compaction::boundaries(&request.messages).is_ok());
-    }
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(
-        &replay.messages[..2],
-        &engine.provider.requests[0].messages[..2]
-    );
-    assert!(
-        matches!(&engine.host.records[0].event, SessionEvent::Started { system_prompt: Some(prompt), .. } if prompt == "Host policy")
-    );
-    let mut legacy = serde_json::to_value(&engine.host.records[0]).unwrap();
-    legacy["event"]
-        .as_object_mut()
-        .unwrap()
-        .remove("system_prompt");
-    let record: Record = serde_json::from_value(legacy).unwrap();
-    let legacy_replay = Replay::from_records(&[record]).unwrap();
-    assert!(matches!(
-        &legacy_replay.messages[..],
-        [Message::User { .. }]
-    ));
-}
-
-#[tokio::test]
-async fn text_completion_records_usage_but_does_not_complete_a_ferrus_task() {
-    let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), limits());
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert!(end.durable);
-    assert_eq!(end.budget.reported_input_tokens, 10);
-    assert_eq!(end.budget.reported_output_tokens, 5);
-    assert_eq!(end.budget.estimated_input_tokens, 0);
-    assert_eq!(end.budget.reserved_input_tokens, 0);
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    assert!(matches!(
-        engine.host.records.last().unwrap().event,
-        SessionEvent::Ended {
-            reason: EndReason::ModelFinished
-        }
-    ));
-    assert!(
-        engine
-            .run(SessionCommand::Cancel, &Cancellation::default())
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn uncertain_tool_cleanup_cannot_certify_model_completion() {
-    let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), limits());
-    engine.tools.uncertain_cleanup = true;
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::EffectUnknown);
-    assert!(end.durable);
-    assert!(matches!(
-        engine.host.records.last().unwrap().event,
-        SessionEvent::Ended {
-            reason: EndReason::EffectUnknown
-        }
-    ));
-}
-
-#[tokio::test]
-async fn multiple_tools_keep_call_result_order_and_continuation_data() {
-    let (_dir, mut engine) = setup(
-        scripted(vec![
-            response("", vec![call("a", 1), call("b", 2)]),
-            response("Done", vec![]),
-        ]),
-        limits(),
-    );
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(*engine.tools.effects.lock().unwrap(), ["call-1", "call-2"]);
-    let order: Vec<_> = engine
-        .host
-        .records
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::ToolIntent { call_id, .. } => Some(format!("intent:{call_id}")),
-            SessionEvent::ToolStarted { call_id } => Some(format!("started:{call_id}")),
-            SessionEvent::ToolResult { call_id, .. } => Some(format!("result:{call_id}")),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        order,
-        [
-            "intent:call-1",
-            "started:call-1",
-            "result:call-1",
-            "intent:call-2",
-            "started:call-2",
-            "result:call-2"
-        ]
-    );
-    assert!(
-        matches!(&engine.provider.requests[1].messages[1], Message::Assistant { response } if response.continuation == Some(json!({"signed":"opaque"})))
-    );
-    assert!(
-        matches!(&engine.provider.requests[1].messages[2], Message::Tool { provider_call_id,.. } if provider_call_id=="a")
-    );
-    assert!(engine.provider.requests[0].max_output_tokens > 0);
-}
-
-#[tokio::test]
-async fn malformed_unknown_and_schema_invalid_calls_never_execute() {
-    let mut malformed = call("a", 1);
-    malformed.arguments = "{\"value\":".into();
-    let mut unknown = call("b", 2);
-    unknown.name = "other".into();
-    let mut invalid = call("c", 3);
-    invalid.arguments = "{\"value\":\"wrong\"}".into();
-    let mut budget = limits();
-    budget.no_progress = 5;
-    let (_dir, mut engine) = setup(
-        scripted(vec![
-            response("", vec![malformed, unknown, invalid]),
-            response("Done", vec![]),
-        ]),
-        budget,
-    );
-    assert_eq!(
-        run(&mut engine, &Cancellation::default()).await.reason,
-        EndReason::ModelFinished
-    );
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    let errors: Vec<_> = engine
-        .host
-        .records
-        .iter()
-        .filter_map(|r| match &r.event {
-            SessionEvent::ToolResult {
-                outcome: ToolOutcome::Failed(error),
-                ..
-            } => Some(error.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        errors,
-        [
-            ToolError::InvalidArguments,
-            ToolError::UnknownTool,
-            ToolError::InvalidArguments
-        ]
-    );
-}
-
-#[tokio::test]
-async fn partial_arguments_and_abrupt_stream_end_never_execute() {
-    let provider = ScriptedProvider {
-        turns: VecDeque::from([Ok(VecDeque::from([
-            ProviderEvent::ArgumentsDelta("{\"value\":".into()),
-            ProviderEvent::TextDelta("working".into()),
-        ]))]),
-        ..Default::default()
-    };
-    let (_dir, mut engine) = setup(provider, limits());
-    assert_eq!(
-        run(&mut engine, &Cancellation::default()).await.reason,
-        EndReason::ProviderProtocol
-    );
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    assert!(
-        engine
-            .host
-            .records
-            .iter()
-            .all(|r| !matches!(r.event, SessionEvent::ToolIntent { .. }))
-    );
-}
-
-#[tokio::test]
-async fn repeated_failures_and_identical_successes_stop_no_progress_loops() {
-    for fail in [false, true] {
-        let provider = scripted(
-            (0..8)
-                .map(|n| response("", vec![call(&n.to_string(), 1)]))
-                .collect(),
-        );
-        let (_dir, mut engine) = setup(provider, limits());
-        engine.tools.fail = fail;
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(end.reason, EndReason::Limit(LimitKind::NoProgress));
-        assert_eq!(
-            engine.tools.effects.lock().unwrap().len(),
-            if fail { 3 } else { 4 }
-        );
-    }
-}
-
-#[tokio::test]
-async fn turn_tool_token_retry_and_context_limits_are_enforced() {
-    for kind in [
-        LimitKind::ModelTurns,
-        LimitKind::ToolCalls,
-        LimitKind::Tokens,
-        LimitKind::Retries,
-        LimitKind::ContextBytes,
-        LimitKind::ResponseBytes,
-        LimitKind::ToolOutputBytes,
-    ] {
-        let mut budget = limits();
-        let mut provider = scripted(vec![
-            response("", vec![call("a", 1), call("b", 2)]),
-            response("Done", vec![]),
-        ]);
-        match kind {
-            LimitKind::ModelTurns => budget.model_turns = 1,
-            LimitKind::ToolCalls => budget.tool_calls = 1,
-            LimitKind::Tokens => budget.tokens = 1,
-            LimitKind::Retries => {
-                budget.retries = 0;
-                provider.turns =
-                    VecDeque::from([Err(ProviderError::new(ProviderErrorKind::Transport, true))]);
-            }
-            LimitKind::ContextBytes => budget.context_bytes = 1,
-            LimitKind::ResponseBytes => budget.response_bytes = 1,
-            LimitKind::ToolOutputBytes => budget.tool_output_bytes = 32,
-            _ => unreachable!(),
-        }
-        let (_dir, mut engine) = setup(provider, budget);
-        engine.tools.huge = kind == LimitKind::ToolOutputBytes;
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(end.reason, EndReason::Limit(kind.clone()), "{kind:?}");
-        if kind == LimitKind::ToolCalls {
-            assert_eq!(engine.tools.effects.lock().unwrap().len(), 1);
-        }
-    }
-}
-
-#[tokio::test]
-async fn retries_charge_estimates_and_successful_usage_stays_distinct() {
-    let mut provider = scripted(vec![response("Done", vec![])]);
-    provider
-        .turns
-        .push_front(Err(ProviderError::new(ProviderErrorKind::Transport, true)));
-    let (_dir, mut engine) = setup(provider, limits());
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(end.budget.retries, 1);
-    assert_eq!(end.budget.model_turns, 2);
-    assert!(end.budget.estimated_input_tokens > 0 && end.budget.estimated_output_tokens > 0);
-    assert_eq!(end.budget.reported_input_tokens, 10);
-    let state = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(state.budget, end.budget);
-}
-
-#[tokio::test]
-async fn cancellation_before_authorization_never_starts_an_effect() {
-    let cancellation = Cancellation::default();
-    let (_dir, mut engine) = setup(scripted(vec![response("", vec![call("a", 1)])]), limits());
-    engine.host.cancel_on_intent = Some(cancellation.clone());
-    let end = run(&mut engine, &cancellation).await;
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    assert!(engine.journal.state().unknown_effects.is_empty());
-}
-
-#[tokio::test(start_paused = true)]
-async fn cancellation_or_deadline_during_an_effect_records_unknown_outcome() {
-    for cancel in [false, true] {
-        let mut budget = limits();
-        budget.elapsed_ms = if cancel { 30_000 } else { 1_000 };
-        let (_dir, mut engine) = setup(scripted(vec![response("", vec![call("a", 1)])]), budget);
-        engine.tools.stall = true;
-        let cancellation = Cancellation::default();
-        let control = cancellation.clone();
-        let effects = engine.tools.effects.clone();
-        let interrupter = async move {
-            if cancel {
-                loop {
-                    if !effects.lock().unwrap().is_empty() {
-                        control.cancel();
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        };
-        let (end, ()) = tokio::join!(run(&mut engine, &cancellation), interrupter);
-        assert_eq!(
-            end.reason,
-            if cancel {
-                EndReason::Cancelled
-            } else {
-                EndReason::Limit(LimitKind::Elapsed)
-            }
-        );
-        assert_eq!(engine.journal.state().unknown_effects, ["call-1"]);
-        assert!(engine.journal.state().pending_effect.is_none());
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn stalled_provider_cannot_hide_elapsed_budget() {
-    let mut budget = limits();
-    budget.elapsed_ms = 20;
-    let provider = ScriptedProvider {
-        turns: VecDeque::from([Ok(VecDeque::new())]),
-        stall: true,
-        ..Default::default()
-    };
-    let (_dir, mut engine) = setup(provider, budget);
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::Elapsed));
-    assert!(end.budget.elapsed_ms >= 20);
-    assert_eq!(engine.provider.requests.len(), 1);
-    assert!(end.budget.estimated_input_tokens > 0);
-}
-
-#[tokio::test]
-async fn journal_failures_stop_unrecorded_effects_and_uncommitted_acknowledgments() {
-    for after_effect in [false, true] {
-        let dir = TempDir::new().unwrap();
-        let inner = FileJournal::create(
-            &dir.path().canonicalize().unwrap(),
-            "session-1",
-            Quotas::default(),
-        )
-        .unwrap();
-        let path = inner.directory().to_path_buf();
-        let journal = FailingJournal {
-            inner,
-            fail_intent: !after_effect,
-            fail_result: after_effect,
-        };
-        let mut engine = Engine::new(
-            identity(),
-            limits(),
-            scripted(vec![response("", vec![call("a", 1), call("b", 2)])]),
-            FakeTools::default(),
-            FakeHost::default(),
-            journal,
-        )
-        .unwrap();
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(end.reason, EndReason::JournalFailed);
-        assert!(!end.durable);
-        assert_eq!(
-            engine.tools.effects.lock().unwrap().len(),
-            usize::from(after_effect)
-        );
-        assert!(
-            engine
-                .host
-                .records
-                .iter()
-                .all(|r| !matches!(r.event, SessionEvent::ToolResult { .. }))
-        );
-        drop(engine);
-        let (journal, records) = FileJournal::recover(&path, Quotas::default()).unwrap();
-        assert_eq!(
-            journal.state().pending_effect.as_deref(),
-            after_effect.then_some("call-1")
-        );
-        assert_eq!(
-            Replay::from_records(&records).unwrap().end,
-            Some(EndReason::Limit(LimitKind::Elapsed))
-        );
-    }
-}
-
-#[tokio::test]
-async fn recorded_replay_is_deterministic_preserves_budgets_and_has_no_effect_ports() {
-    let (_dir, mut engine) = setup(
-        scripted(vec![
-            response("", vec![call("a", 1), call("b", 2)]),
-            response("Done", vec![]),
-        ]),
-        limits(),
-    );
-    run(&mut engine, &Cancellation::default()).await;
-    let records = engine.host.records.clone();
-    let effects = engine.tools.effects.clone();
-    let expected = effects.lock().unwrap().clone();
-    drop(engine);
-    let first = Replay::from_records(&records).unwrap();
-    let second = Replay::from_records(&records).unwrap();
-    assert_eq!(first.messages, second.messages);
-    assert_eq!(first.budget, second.budget);
-    assert_eq!(first.end, Some(EndReason::ModelFinished));
-    assert_eq!(*effects.lock().unwrap(), expected);
-    let mut undercharged = records.clone();
-    let completed = undercharged
-        .iter_mut()
-        .find(|record| matches!(record.event, SessionEvent::ModelCompleted { .. }))
-        .unwrap();
-    completed.budget.reported_input_tokens = 0;
-    assert!(Replay::from_records(&undercharged).is_err());
-    let mut reordered = records.clone();
-    let results: Vec<_> = reordered
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| matches!(r.event, SessionEvent::ToolResult { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    let event = reordered[results[0]].event.clone();
-    reordered[results[0]].event = reordered[results[1]].event.clone();
-    reordered[results[1]].event = event;
-    assert!(Replay::from_records(&reordered).is_err());
-}
-
-#[tokio::test]
-async fn replay_requires_a_final_response_from_the_latest_model_attempt() {
-    for case in [
-        "started",
-        "failed",
-        "empty",
-        "whitespace",
-        "length",
-        "tool_calls",
-        "tools_done",
-        "stale",
-        "valid",
-    ] {
-        let (_dir, mut engine) = setup(
-            scripted(vec![
-                response("", vec![call("a", 1)]),
-                response("Done", vec![]),
-            ]),
-            limits(),
-        );
-        run(&mut engine, &Cancellation::default()).await;
-        let mut records = engine.host.records.clone();
-        records.pop(); // Replace the engine's ending with an owner-written one.
-        match case {
-            "started" => records.truncate(1),
-            "tools_done" => {
-                let next = records
-                    .iter()
-                    .position(|r| matches!(r.event, SessionEvent::ModelStarted { turn: 2 }))
-                    .unwrap();
-                records.truncate(next);
-            }
-            "stale" => {
-                let mut next = records.last().unwrap().clone();
-                next.sequence += 1;
-                next.budget.model_turns += 1;
-                next.budget.reserved_input_tokens = 10;
-                next.budget.reserved_output_tokens = 5;
-                next.event = SessionEvent::ModelStarted {
-                    turn: next.budget.model_turns,
-                };
-                records.push(next.clone());
-                next.sequence += 1;
-                next.budget.reserved_input_tokens = 0;
-                next.budget.reserved_output_tokens = 0;
-                let usage = Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    reported: true,
-                };
-                next.budget.charge(&usage);
-                next.event = SessionEvent::ModelFailed {
-                    error: None,
-                    diagnostic: None,
-                    retryable: false,
-                    usage,
-                };
-                records.push(next);
-            }
-            "valid" => (),
-            _ => {
-                let record = records.last_mut().unwrap();
-                let SessionEvent::ModelCompleted { response, usage } = &mut record.event else {
-                    panic!("Expected final response")
-                };
-                match case {
-                    "failed" => {
-                        record.event = SessionEvent::ModelFailed {
-                            error: None,
-                            diagnostic: None,
-                            retryable: false,
-                            usage: usage.clone(),
-                        }
-                    }
-                    "empty" => response.text.clear(),
-                    "whitespace" => response.text = " \t\n".into(),
-                    "length" => response.finish = FinishReason::Length,
-                    "tool_calls" => response.finish = FinishReason::ToolCalls,
-                    _ => unreachable!(),
-                }
-            }
-        }
-        // The prefix remains valid; only the fabricated successful ending is invalid.
-        Replay::from_records(&records).unwrap();
-        let mut end = records.last().unwrap().clone();
-        end.sequence += 1;
-        end.event = SessionEvent::Ended {
-            reason: EndReason::ModelFinished,
-        };
-        records.push(end);
-        assert_eq!(
-            Replay::from_records(&records).is_ok(),
-            case == "valid",
-            "{case}"
-        );
-        let directory = engine.journal.directory().to_path_buf();
-        drop(engine);
-        let mut bytes = Vec::new();
-        for record in &records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        let path = directory.join("events.jsonl");
-        std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(
-            FileJournal::recover(&directory, Quotas::default()).is_ok(),
-            case == "valid",
-            "{case}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-    }
-}
-
-#[tokio::test]
-async fn truncated_calls_never_execute_and_continuation_can_make_progress() {
-    let mut truncated = response("Partial", vec![call("discarded", 1)]);
-    if let ProviderEvent::Completed { response, .. } = &mut truncated {
-        response.finish = FinishReason::Length;
-        response.calls[0].arguments = "{\"value\":".into();
-    }
-    let (_dir, mut engine) = setup(
-        scripted(vec![
-            truncated,
-            response("", vec![call("complete", 2)]),
-            response("Done", vec![]),
-        ]),
-        limits(),
-    );
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(end.budget.model_turns, 3);
-    assert_eq!(end.budget.tool_calls, 1);
-    assert_eq!(*engine.tools.effects.lock().unwrap(), ["call-1"]);
-    let messages = &engine.provider.requests[1].messages;
-    assert!(
-        matches!(&messages[1], Message::Assistant { response } if response.finish == FinishReason::Length && response.calls.is_empty() && response.text == "Partial")
-    );
-    assert!(
-        matches!(&messages[2], Message::User { text } if text.contains("No tools from that response were executed"))
-    );
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert!(replay.unknown_effects.is_empty());
-    assert!(replay.checkpoint_ready());
-    assert_eq!(replay.budget, end.budget);
-    let first = engine
-        .host
-        .records
-        .iter()
-        .position(|record| {
-            matches!(&record.event,
-        SessionEvent::ModelCompleted { response, .. } if response.finish == FinishReason::Length)
-        })
-        .unwrap();
-    assert_eq!(
-        Replay::from_records(&engine.host.records[..=first])
-            .unwrap()
-            .messages,
-        engine.provider.requests[1].messages
-    );
-}
-
-#[tokio::test]
-async fn repeated_truncated_responses_stop_at_no_progress_without_executing_calls() {
-    let events = (0..3)
-        .map(|_| {
-            let mut event = response("Partial", vec![call("duplicate", 1), call("duplicate", 2)]);
-            if let ProviderEvent::Completed { response, .. } = &mut event {
-                response.finish = FinishReason::Length;
-            }
-            event
-        })
-        .collect();
-    let (_dir, mut engine) = setup(scripted(events), limits());
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::NoProgress));
-    assert_eq!(end.budget.model_turns, 3);
-    assert_eq!(end.budget.tool_calls, 0);
-    assert_eq!(end.budget.retries, 0);
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert!(replay.checkpoint_ready());
-    assert_eq!(replay.budget, end.budget);
-}
-
-#[tokio::test]
-async fn duplicate_call_responses_never_execute() {
-    for truncated in [false, true] {
-        let mut event = response("Partial", vec![call("duplicate", 1), call("duplicate", 2)]);
-        if let ProviderEvent::Completed { response, .. } = &mut event {
-            if truncated {
-                response.finish = FinishReason::Length;
-            }
-        }
-        let (_dir, mut engine) = setup(
-            scripted(vec![event]),
-            Limits {
-                model_turns: 1,
-                ..limits()
-            },
-        );
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(
-            end.reason,
-            if truncated {
-                EndReason::Limit(LimitKind::ModelTurns)
-            } else {
-                EndReason::ProviderProtocol
-            }
-        );
-        assert!(engine.tools.effects.lock().unwrap().is_empty());
-    }
-}
-
-#[tokio::test]
-async fn host_denial_returns_feedback_and_absent_usage_is_estimated() {
-    let mut final_response = response("Done", vec![]);
-    if let ProviderEvent::Completed { usage, .. } = &mut final_response {
-        *usage = None;
-    }
-    let (_dir, mut engine) = setup(
-        scripted(vec![response("", vec![call("a", 1)]), final_response]),
-        limits(),
-    );
-    engine.host.deny = true;
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert!(engine.tools.effects.lock().unwrap().is_empty());
-    assert!(end.budget.estimated_output_tokens > 0);
-    assert_eq!(end.budget.reported_output_tokens, 5);
-    assert!(engine.host.records.iter().any(|record| matches!(
-        record.event,
-        SessionEvent::ToolResult {
-            outcome: ToolOutcome::Failed(ToolError::Denied),
-            ..
-        }
-    )));
-}
-
-#[tokio::test]
-async fn native_workspace_tools_run_through_the_durable_engine() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let journal_root = TempDir::new().unwrap();
-    let mut create = call("create", 1);
-    create.name = "apply_patch".into();
-    create.arguments =
-        json!({"operation":"create","path":"source.txt","content":"native tool result\n"})
-            .to_string();
-    let mut read = call("read", 1);
-    read.name = "read_file".into();
-    read.arguments = json!({"path":"source.txt"}).to_string();
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        scripted(vec![
-            response("", vec![create, read]),
-            response("Done", vec![]),
-        ]),
-        super::workspace::Workspace::new(&root, super::workspace::Limits::default()).unwrap(),
-        FakeHost::default(),
-        FileJournal::create(
-            &journal_root.path().canonicalize().unwrap(),
-            "session-1",
-            Quotas::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(
-        std::fs::read(root.join("source.txt")).unwrap(),
-        b"native tool result\n"
-    );
-    let results: Vec<_> = engine
-        .host
-        .records
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::ToolResult {
-                outcome: ToolOutcome::Success(value),
-                ..
-            } => Some(value),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(results.len(), 2);
-    assert_eq!(
-        results[0]["changes"][0]["after_digest"],
-        results[1]["source"]["digest"]
-    );
-    assert_eq!(results[1]["text"], "native tool result\n");
-    assert!(
-        engine
-            .host
-            .records
-            .iter()
-            .any(|record| matches!(&record.event,
-                SessionEvent::ToolIntent {effect_plan:Some(EffectPlan::Patch {files}),..}
-                if files.len()==1 && files[0].path=="source.txt" && files[0].before_digest.is_none()
-                    && files[0].after_digest.as_deref()==results[1]["source"]["digest"].as_str()
-            ))
-    );
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(replay.budget, end.budget);
-}
-
-#[tokio::test]
-async fn replay_rejects_authoring_and_submit_ends_without_confirmed_effects() {
-    let (_directory, mut engine) =
-        setup(scripted(vec![response("done", vec![])]), Limits::default());
-    run(&mut engine, &Cancellation::default()).await;
-    for reason in [
-        EndReason::Submitted,
-        EndReason::DefinitionCompleted,
-        EndReason::ReviewCompleted,
-        EndReason::ConsultationResponded,
-    ] {
-        let mut records = engine.host.records.clone();
-        records.last_mut().unwrap().event = SessionEvent::Ended { reason };
-        assert!(Replay::from_records(&records).is_err());
-    }
-}
-
 struct EvidenceTools {
     workspace: super::workspace::Workspace,
     enabled: bool,
     preparation_delay: Duration,
 }
+
 impl Tools for EvidenceTools {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.workspace.descriptors()
     }
+
     fn validate(&self, name: &str, args: &serde_json::Value) -> Result<(), ToolError> {
         self.workspace.validate(name, args)
     }
+
     async fn execute(&mut self, call: &ValidatedCall, cancel: &Cancellation) -> ToolOutcome {
         self.workspace.execute(call, cancel).await
     }
+
     async fn prepare_context(
         &mut self,
         messages: &[Message],
@@ -1024,116 +277,19 @@ impl Tools for EvidenceTools {
         if !self.preparation_delay.is_zero() {
             tokio::time::sleep(self.preparation_delay).await;
         }
+
         if !self.enabled {
             return Ok(None);
         }
+
         super::working_set::prepare(messages, &json!({}), &json!({}), &self.workspace, false)
             .map(Some)
             .map_err(|_| ToolError::OutputLimit)
     }
 }
 
-#[tokio::test]
-async fn context_assembly_includes_preparation_time() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        scripted(vec![response("done", vec![])]),
-        EvidenceTools {
-            workspace: super::workspace::Workspace::new(&root, super::workspace::Limits::default())
-                .unwrap(),
-            enabled: true,
-            preparation_delay: Duration::from_millis(40),
-        },
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        run(&mut engine, &Cancellation::default()).await.reason,
-        EndReason::ModelFinished
-    );
-    let assembly = engine
-        .host
-        .records
-        .iter()
-        .find_map(|record| match &record.event {
-            SessionEvent::ContextComposed { composition } => composition.assembly_elapsed_ms,
-            _ => None,
-        })
-        .unwrap();
-    assert!(
-        assembly >= 40,
-        "assembly time omitted preparation: {assembly}"
-    );
-}
-
-#[tokio::test]
-async fn working_set_projection_is_durable_replayable_and_independently_disabled() {
-    for enabled in [true, false] {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        std::fs::write(root.join("source.txt"), "content needed to edit\n").unwrap();
-        let read = |id: &str| ToolCall {
-            provider_call_id: id.into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"source.txt"}).to_string(),
-        };
-        let mut engine = Engine::new(
-            identity(),
-            limits(),
-            scripted(vec![
-                response("", vec![read("a")]),
-                response("", vec![read("b")]),
-                response("done", vec![]),
-            ]),
-            EvidenceTools {
-                workspace: super::workspace::Workspace::new(
-                    &root,
-                    super::workspace::Limits::default(),
-                )
-                .unwrap(),
-                enabled,
-                preparation_delay: Duration::ZERO,
-            },
-            FakeHost::default(),
-            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            run(&mut engine, &Cancellation::default()).await.reason,
-            EndReason::ModelFinished
-        );
-        let mut replay = Replay::default();
-        let mut projected = Vec::new();
-        for record in &engine.host.records {
-            replay.apply(record).unwrap();
-            if let SessionEvent::ContextPrepared { preparation } = &record.event {
-                projected.push(preparation.apply(&replay.messages).unwrap());
-            }
-        }
-        assert_eq!(projected.len(), if enabled { 3 } else { 0 });
-        if enabled {
-            for (messages, request) in projected.iter().zip(&engine.provider.requests) {
-                assert_eq!(messages, &request.messages);
-            }
-            assert!(
-                matches!(&projected[2][2], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["kind"] == "evidence_reference")
-            );
-        }
-        assert!(
-            matches!(&replay.messages[2], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["text"] == "content needed to edit\n")
-        );
-        assert!(
-            matches!(&engine.provider.requests[2].messages[4], Message::Tool { outcome:ToolOutcome::Success(value),.. } if value["text"] == "content needed to edit\n")
-        );
-        assert_eq!(engine.provider.requests[0].messages[0], replay.messages[0]);
-    }
-}
-
 struct RejectPreparation(FileJournal);
+
 impl Journal for RejectPreparation {
     fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
         anyhow::ensure!(
@@ -1142,34 +298,10 @@ impl Journal for RejectPreparation {
         );
         self.0.append(event, budget)
     }
+
     fn checkpoint(&mut self) -> Result<()> {
         self.0.checkpoint()
     }
-}
-
-#[tokio::test]
-async fn uncommitted_projection_never_reaches_the_provider() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        scripted(vec![response("done", vec![])]),
-        EvidenceTools {
-            workspace: super::workspace::Workspace::new(&root, super::workspace::Limits::default())
-                .unwrap(),
-            enabled: true,
-            preparation_delay: Duration::ZERO,
-        },
-        FakeHost::default(),
-        RejectPreparation(FileJournal::create(&root, "session-1", Quotas::default()).unwrap()),
-    )
-    .unwrap();
-    assert_eq!(
-        run(&mut engine, &Cancellation::default()).await.reason,
-        EndReason::JournalFailed
-    );
-    assert!(engine.provider.requests.is_empty());
 }
 
 #[derive(Default)]
@@ -1200,6 +332,7 @@ impl Provider for CompactionProvider {
                     self.summary_failure_retryable,
                 ));
             }
+
             ProviderEvent::Completed {
                 response: ModelResponse {
                     finish: FinishReason::Stop,
@@ -1230,6 +363,7 @@ impl Provider for CompactionProvider {
             if let ProviderEvent::Completed { response, .. } = &mut event {
                 response.text = "x".repeat(self.normal_text_bytes);
             }
+
             event
         } else {
             self.active_summary = false;
@@ -1244,11 +378,13 @@ impl Provider for CompactionProvider {
         if self.active_summary && self.stall_summary {
             std::future::pending::<()>().await;
         }
+
         if self.active_summary {
             if let Some(kind) = self.summary_stream_error.take() {
                 return Err(ProviderError::new(kind, false));
             }
         }
+
         Ok(self.active.pop_front())
     }
 }
@@ -1325,57 +461,6 @@ impl Journal for RejectPostCompactionPreparation {
     }
 }
 
-#[tokio::test]
-async fn prepared_context_precedes_compaction_and_survives_final_projection_failure() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let mut engine = Engine::new(
-        identity(),
-        bounds,
-        CompactionProvider {
-            read_calls: true,
-            ..Default::default()
-        },
-        PreparedReads,
-        FakeHost::default(),
-        RejectPostCompactionPreparation {
-            inner: FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-            compacted: false,
-        },
-    )
-    .unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::JournalFailed);
-    assert!(!end.durable);
-    let records = engine.host.records.clone();
-    let started = records
-        .iter()
-        .position(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-        .expect("the prepared session must compact");
-    assert!(records[..started].iter().rev().any(|record| {
-        matches!(&record.event, SessionEvent::ContextPrepared { preparation }
-            if preparation.observations[0]["marker"] == "prepared-input")
-    }));
-    assert!(
-        records
-            .iter()
-            .any(|record| { matches!(record.event, SessionEvent::CompactionCompleted { .. }) })
-    );
-    assert!(engine.provider.requests.iter().any(|request| {
-        request.tools.is_empty()
-            && matches!(request.messages.first(), Some(Message::User { text }) if text.contains("prepared-input"))
-    }));
-    drop(engine);
-    let (_journal, recovered) =
-        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
-    let replay = Replay::from_records(&recovered).unwrap();
-    assert!(replay.summary.is_some());
-    assert_eq!(replay.end, Some(EndReason::Limit(LimitKind::Elapsed)));
-}
-
 struct UnsupportedEstimate;
 
 impl Provider for UnsupportedEstimate {
@@ -1392,421 +477,6 @@ impl Provider for UnsupportedEstimate {
     }
 }
 
-#[tokio::test]
-async fn unsupported_provider_projection_fails_without_attempting_compaction() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        UnsupportedEstimate,
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ProviderProtocol);
-    assert_eq!(end.budget.model_turns, 0);
-    assert!(
-        !engine
-            .host
-            .records
-            .iter()
-            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
-    );
-}
-
-#[tokio::test]
-async fn remaining_token_budget_can_reduce_output_without_compaction() {
-    let provider = scripted(vec![response("Done", vec![])]);
-    let tools = FakeTools::default().descriptors();
-    let input = provider
-        .estimate_input_tokens(&ModelRequest {
-            messages: vec![Message::User {
-                text: "Implement a fixture task".into(),
-            }],
-            tools,
-            max_output_tokens: 12,
-        })
-        .unwrap();
-    let mut bounds = limits();
-    bounds.tokens = input + 12;
-    let (_dir, mut engine) = setup(provider, bounds);
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert_eq!(engine.provider.requests.len(), 1);
-    assert_eq!(engine.provider.requests[0].max_output_tokens, 12);
-    assert!(
-        !engine
-            .host
-            .records
-            .iter()
-            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
-    );
-}
-
-#[tokio::test]
-async fn uncompactable_request_reports_session_token_limit() {
-    let provider = scripted(vec![response("Done", vec![])]);
-    let input = provider
-        .estimate_input_tokens(&ModelRequest {
-            messages: vec![Message::User {
-                text: "Implement a fixture task".into(),
-            }],
-            tools: FakeTools::default().descriptors(),
-            max_output_tokens: 12,
-        })
-        .unwrap();
-    let mut bounds = limits();
-    bounds.tokens = input - 1;
-    let (_dir, mut engine) = setup(provider, bounds);
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
-    assert!(engine.provider.requests.is_empty());
-}
-
-#[tokio::test]
-async fn uncompactable_request_reports_serialized_context_limit() {
-    let mut bounds = limits();
-    bounds.context_bytes = 64;
-    let (_dir, mut engine) = setup(scripted(vec![response("Done", vec![])]), bounds);
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::ContextBytes));
-    assert!(engine.provider.requests.is_empty());
-}
-
-#[tokio::test]
-async fn canceled_compaction_is_charged_and_never_replays_tools() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let provider = CompactionProvider {
-        stall_summary: true,
-        ..Default::default()
-    };
-    let started = provider.summary_started.clone();
-    let cancellation = Cancellation::default();
-    let control = cancellation.clone();
-    let canceller = tokio::spawn(async move {
-        while !started.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-        control.cancel();
-    });
-    let mut engine = Engine::new(
-        identity(),
-        bounds,
-        provider,
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    let end = tokio::time::timeout(Duration::from_secs(10), run(&mut engine, &cancellation))
-        .await
-        .expect("compaction must become cancellable");
-    canceller.await.unwrap();
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(end.durable);
-    assert!(
-        engine
-            .host
-            .records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-    );
-    assert!(
-        engine
-            .host
-            .records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-    );
-    let effects = engine.tools.effects.lock().unwrap().len();
-    drop(engine);
-    let (_journal, recovered) =
-        FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
-    let replay = Replay::from_records(&recovered).unwrap();
-    assert_eq!(replay.end, Some(EndReason::Cancelled));
-    assert_eq!(replay.budget, end.budget);
-    assert!(effects > 0);
-}
-
-#[tokio::test]
-async fn failed_compaction_charges_reservation_and_recovers_without_replaying_effects() {
-    for retryable in [false, true] {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut bounds = limits();
-        bounds.context_bytes = 4 * 1024;
-        bounds.response_bytes = 1024;
-        let mut engine = Engine::new(
-            identity(),
-            bounds,
-            CompactionProvider {
-                fail_summary: true,
-                summary_failure_retryable: retryable,
-                ..Default::default()
-            },
-            FakeTools::default(),
-            FakeHost::default(),
-            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-        )
-        .unwrap();
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(end.reason, EndReason::ProviderFailed);
-        assert_eq!(end.retryable_provider_failure, retryable);
-        assert!(end.durable);
-        assert!(end.budget.estimated_input_tokens > 0);
-        let effects = engine.tools.effects.lock().unwrap().len();
-        let records = engine.host.records.clone();
-        assert!(
-            records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-        );
-        assert!(
-            records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-        );
-        drop(engine);
-        let (_journal, recovered) =
-            FileJournal::recover(&root.join("nano/sessions/session-1"), Quotas::default()).unwrap();
-        let replay = Replay::from_records(&recovered).unwrap();
-        assert_eq!(replay.end, Some(EndReason::ProviderFailed));
-        assert_eq!(replay.budget, end.budget);
-        assert!(effects > 0);
-    }
-}
-
-#[tokio::test]
-async fn compaction_stream_preserves_provider_error_kinds() {
-    for (kind, reason) in [
-        (
-            ProviderErrorKind::ResponseLimit,
-            EndReason::Limit(LimitKind::ResponseBytes),
-        ),
-        (ProviderErrorKind::Protocol, EndReason::ProviderProtocol),
-    ] {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut bounds = limits();
-        bounds.context_bytes = 4 * 1024;
-        bounds.response_bytes = 1024;
-        let mut engine = Engine::new(
-            identity(),
-            bounds,
-            CompactionProvider {
-                summary_stream_error: Some(kind.clone()),
-                ..Default::default()
-            },
-            FakeTools::default(),
-            FakeHost::default(),
-            FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-        )
-        .unwrap();
-        let end = run(&mut engine, &Cancellation::default()).await;
-        assert_eq!(end.reason, reason);
-        assert!(engine.host.records.iter().any(|record| {
-            matches!(&record.event, SessionEvent::ModelFailed { error: Some(actual), .. } if actual == &kind)
-        }));
-        let replay = Replay::from_records(&engine.host.records).unwrap();
-        assert_eq!(replay.end, Some(reason));
-        assert_eq!(replay.budget, end.budget);
-    }
-}
-
-#[tokio::test]
-async fn compaction_does_not_spend_the_last_normal_turn_reservation() {
-    let baseline_dir = TempDir::new().unwrap();
-    let baseline_root = baseline_dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let mut baseline = Engine::new(
-        identity(),
-        bounds.clone(),
-        CompactionProvider {
-            normal_text_bytes: 400,
-            ..Default::default()
-        },
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&baseline_root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        run(&mut baseline, &Cancellation::default()).await.reason,
-        EndReason::ModelFinished
-    );
-    let records = &baseline.host.records;
-    let started = records
-        .iter()
-        .position(|record| matches!(record.event, SessionEvent::CompactionStarted { .. }))
-        .unwrap();
-    let completed = records
-        .iter()
-        .position(|record| matches!(record.event, SessionEvent::CompactionCompleted { .. }))
-        .unwrap();
-    let cost = |record: &Record| match &record.event {
-        SessionEvent::ContextComposed { composition } => {
-            composition.input_tokens_estimated + composition.output_tokens_reserved
-        }
-        _ => unreachable!(),
-    };
-    let summary_cost = cost(
-        records[..started]
-            .iter()
-            .rev()
-            .find(|record| matches!(record.event, SessionEvent::ContextComposed { .. }))
-            .unwrap(),
-    );
-    let normal_cost = cost(
-        records[completed + 1..]
-            .iter()
-            .find(|record| matches!(record.event, SessionEvent::ContextComposed { .. }))
-            .unwrap(),
-    );
-    let consumed = records[started].budget.tokens()
-        - records[started].budget.reserved_input_tokens
-        - records[started].budget.reserved_output_tokens;
-    bounds.tokens = consumed + summary_cost.max(normal_cost) + 1;
-    assert!(bounds.tokens < consumed + summary_cost + normal_cost);
-    let normal_turns_before_summary = baseline
-        .provider
-        .requests
-        .iter()
-        .take_while(|request| !request.tools.is_empty())
-        .count();
-
-    let limited_dir = TempDir::new().unwrap();
-    let limited_root = limited_dir.path().canonicalize().unwrap();
-    let mut limited = Engine::new(
-        identity(),
-        bounds,
-        CompactionProvider {
-            normal_text_bytes: 400,
-            ..Default::default()
-        },
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&limited_root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    let end = run(&mut limited, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
-    assert_eq!(limited.provider.normal_turns, normal_turns_before_summary);
-    assert_eq!(limited.provider.summaries, 0);
-    assert!(
-        !limited
-            .host
-            .records
-            .iter()
-            .any(|record| { matches!(record.event, SessionEvent::CompactionStarted { .. }) })
-    );
-}
-
-#[tokio::test]
-async fn long_session_compacts_complete_groups_and_charges_summary_inference() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let mut bounds = limits();
-    bounds.context_bytes = 4 * 1024;
-    bounds.response_bytes = 1024;
-    let mut engine = Engine::new(
-        identity(),
-        bounds,
-        CompactionProvider::default(),
-        FakeTools::default(),
-        FakeHost::default(),
-        FileJournal::create(&root, "session-1", Quotas::default()).unwrap(),
-    )
-    .unwrap();
-    engine.set_system_prompt("Host policy").unwrap();
-    let end = run(&mut engine, &Cancellation::default()).await;
-    assert_eq!(end.reason, EndReason::ModelFinished);
-    assert!(engine.provider.summaries > 0);
-    assert_eq!(engine.provider.normal_turns, 10);
-    assert_eq!(
-        end.budget.model_turns,
-        11 + engine.provider.summaries as u64
-    );
-    assert!(end.budget.reported_input_tokens >= 110 + 17 * engine.provider.summaries as u64);
-    assert!(
-        engine
-            .host
-            .records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::CompactionCompleted { .. }))
-    );
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(replay.messages.len(), 23);
-    assert!(replay.summary.is_some());
-    let composed: Vec<_> = engine
-        .host
-        .records
-        .iter()
-        .filter_map(|record| {
-            if let SessionEvent::ContextComposed { composition } = &record.event {
-                Some(composition)
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(composed.len(), 11 + engine.provider.summaries);
-    assert!(composed.iter().any(|entry| entry.summary_present));
-    assert!(composed.iter().all(|entry| {
-        let margin = (entry.context_window_tokens / 20).clamp(16, 1024);
-        entry.input_tokens_estimated + entry.output_tokens_reserved + margin
-            <= entry.context_window_tokens
-            && entry.stable_prefix_messages <= entry.request_messages
-    }));
-    assert!(
-        engine
-            .provider
-            .requests
-            .iter()
-            .filter(|request| !request.tools.is_empty())
-            .all(|request| {
-                super::compaction::boundaries(&request.messages).is_ok()
-                    && request.messages[0]
-                        == Message::System {
-                            text: "Host policy".into(),
-                        }
-                    && request.messages[1]
-                        == Message::User {
-                            text: "Implement a fixture task".into(),
-                        }
-                    && serde_json::to_vec(&(&request.messages, &request.tools))
-                        .unwrap()
-                        .len()
-                        <= 4 * 1024
-            })
-    );
-    assert!(engine.provider.requests.iter().any(|request| {
-        request.messages.iter().any(|message| matches!(message, Message::User {text} if text.contains("Historical session summary")))
-    }));
-    assert!(engine
-        .provider
-        .requests
-        .iter()
-        .filter(|request| {
-            !request.tools.is_empty()
-                && request.messages.iter().any(|message| {
-                    matches!(message, Message::User { text } if text.contains("Historical session summary"))
-                })
-        })
-        .all(|request| request
-            .messages
-            .iter()
-            .any(|message| matches!(message, Message::Assistant { .. }))));
-}
-
 struct InteractiveJournal {
     inner: FileJournal,
     commands: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
@@ -1816,6 +486,133 @@ struct InteractiveJournal {
     user_requests: usize,
     fail_input: bool,
     inject_steering: bool,
+}
+
+impl Journal for InteractiveJournal {
+    fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
+        anyhow::ensure!(
+            !(self.fail_input && matches!(event, SessionEvent::UserInput { .. })),
+            "Injected input failure"
+        );
+        let record = self.inner.append(event, budget)?;
+        match &record.event {
+            // Simulate typing while inference is active, before its two tool effects.
+            SessionEvent::ModelStarted { turn: 1 } if self.inject_steering => {
+                self.sender.try_send(SessionCommand::Interact).unwrap();
+                self.sender
+                    .try_send(SessionCommand::Steer {
+                        input_id: None,
+                        text: "Keep the public API stable.".into(),
+                    })
+                    .unwrap();
+            }
+            SessionEvent::InputRequested => {
+                self.waits += 1;
+                let command = if self.waits <= self.user_requests {
+                    SessionCommand::Steer {
+                        input_id: None,
+                        text: "Explain the completed checks.".into(),
+                    }
+                } else {
+                    SessionCommand::Cancel
+                };
+                self.sender.try_send(command).unwrap();
+            }
+            _ => (),
+        }
+
+        Ok(record)
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        self.inner.checkpoint()
+    }
+
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    fn take_commands(&mut self) -> Option<tokio::sync::mpsc::Receiver<SessionCommand>> {
+        self.commands.take()
+    }
+}
+
+#[path = "core_tests/behavior.rs"]
+mod behavior_tests;
+#[path = "core_tests/cancellation.rs"]
+mod cancellation_tests;
+#[path = "core_tests/compaction.rs"]
+mod compaction_tests;
+#[path = "core_tests/context.rs"]
+mod context_tests;
+#[path = "core_tests/limits.rs"]
+mod limits_tests;
+#[path = "core_tests/provider.rs"]
+mod provider_tests;
+#[path = "core_tests/recovery.rs"]
+mod recovery_tests;
+
+#[tokio::test]
+async fn repeated_failures_and_identical_successes_stop_no_progress_loops() {
+    for fail in [false, true] {
+        let provider = scripted(
+            (0..8)
+                .map(|n| response("", vec![call(&n.to_string(), 1)]))
+                .collect(),
+        );
+        let (_dir, mut engine) = setup(provider, limits());
+        engine.tools.fail = fail;
+        let end = run(&mut engine, &Cancellation::default()).await;
+        assert_eq!(end.reason, EndReason::Limit(LimitKind::NoProgress));
+        assert_eq!(
+            engine.tools.effects.lock().unwrap().len(),
+            if fail { 3 } else { 4 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_unknown_and_schema_invalid_calls_never_execute() {
+    let mut malformed = call("a", 1);
+    malformed.arguments = "{\"value\":".into();
+    let mut unknown = call("b", 2);
+    unknown.name = "other".into();
+    let mut invalid = call("c", 3);
+    invalid.arguments = "{\"value\":\"wrong\"}".into();
+    let mut budget = limits();
+    budget.no_progress = 5;
+    let (_dir, mut engine) = setup(
+        scripted(vec![
+            response("", vec![malformed, unknown, invalid]),
+            response("Done", vec![]),
+        ]),
+        budget,
+    );
+    assert_eq!(
+        run(&mut engine, &Cancellation::default()).await.reason,
+        EndReason::ModelFinished
+    );
+    assert!(engine.tools.effects.lock().unwrap().is_empty());
+    let errors: Vec<_> = engine
+        .host
+        .records
+        .iter()
+        .filter_map(|r| match &r.event {
+            SessionEvent::ToolResult {
+                outcome: ToolOutcome::Failed(error),
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            ToolError::InvalidArguments,
+            ToolError::UnknownTool,
+            ToolError::InvalidArguments
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1839,6 +636,7 @@ async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
                     }
                     _ => unreachable!(),
                 }
+
                 let (_dir, base) = setup(scripted(vec![event]), limits.clone());
                 let (sender, commands) = tokio::sync::mpsc::channel(8);
                 let journal = InteractiveJournal {
@@ -1855,6 +653,7 @@ async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
                 if !queued {
                     identity.task_id = None;
                 }
+
                 let mut engine = Engine::new(
                     identity,
                     limits,
@@ -1896,548 +695,4 @@ async fn interactive_exhausted_turns_neither_request_nor_accept_more_input() {
             }
         }
     }
-}
-
-#[tokio::test]
-async fn interactive_rejects_unserviceable_text_before_durable_acceptance() {
-    let mut limits = limits();
-    limits.tokens = 2_000;
-    let (_dir, base) = setup(scripted(vec![]), limits.clone());
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    sender
-        .try_send(SessionCommand::Steer {
-            input_id: Some("draft-1".into()),
-            text: "x".repeat(4_000),
-        })
-        .unwrap();
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: true,
-        waits: 0,
-        user_requests: 0,
-        fail_input: false,
-        inject_steering: false,
-    };
-    let mut identity = identity();
-    identity.task_id = None;
-    let mut engine = Engine::new(
-        identity,
-        limits,
-        base.provider,
-        base.tools,
-        base.host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Workspace constraints".into(),
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::Limit(LimitKind::Tokens));
-    assert!(end.durable);
-    assert!(engine.provider.requests.is_empty());
-    let records = &engine.host.records;
-    assert!(
-        records
-            .iter()
-            .any(|r| matches!(r.event, SessionEvent::InputRequested))
-    );
-    assert!(
-        !records
-            .iter()
-            .any(|r| matches!(r.event, SessionEvent::UserInput { .. }))
-    );
-    Replay::from_records(records).unwrap();
-}
-
-#[tokio::test]
-async fn interactive_capacity_keeps_compaction_available_for_later_user_turns() {
-    let mut limits = limits();
-    limits.context_bytes = 4 * 1024;
-    limits.response_bytes = 1024;
-    let (_dir, base) = setup(scripted(vec![]), limits.clone());
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: true,
-        waits: 0,
-        user_requests: 40,
-        fail_input: false,
-        inject_steering: false,
-    };
-    let mut identity = identity();
-    identity.task_id = None;
-    let mut engine = Engine::new(
-        identity,
-        limits,
-        CompactionProvider {
-            normal_turns: 10,
-            ..Default::default()
-        },
-        base.tools,
-        base.host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Workspace constraints".into(),
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(end.durable);
-    assert!(engine.provider.summaries > 0);
-    let records = &engine.host.records;
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::UserInput { .. }))
-            .count(),
-        40
-    );
-    assert_eq!(
-        engine
-            .provider
-            .requests
-            .iter()
-            .filter(|r| !r.tools.is_empty())
-            .count(),
-        40
-    );
-    Replay::from_records(records).unwrap();
-}
-
-#[tokio::test]
-async fn taskless_interactive_waits_before_inference_and_reconstructs_from_journal() {
-    let (dir, base) = setup(scripted(vec![response("Checks passed.", vec![])]), limits());
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: true,
-        waits: 0,
-        user_requests: 1,
-        fail_input: false,
-        inject_steering: false,
-    };
-    let mut identity = identity();
-    identity.task_id = None;
-    let mut engine = Engine::new(
-        identity,
-        limits(),
-        base.provider,
-        base.tools,
-        base.host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Workspace constraints".into(),
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(end.durable);
-    assert_eq!(engine.provider.requests.len(), 1);
-    assert!(
-        matches!(engine.provider.requests[0].messages.last(), Some(Message::User { text }) if text == "Explain the completed checks.")
-    );
-    let records = &engine.host.records;
-    let wait = records
-        .iter()
-        .position(|r| matches!(r.event, SessionEvent::InputRequested))
-        .unwrap();
-    let input = records
-        .iter()
-        .position(|r| matches!(r.event, SessionEvent::UserInput { .. }))
-        .unwrap();
-    let model = records
-        .iter()
-        .position(|r| matches!(r.event, SessionEvent::ModelStarted { .. }))
-        .unwrap();
-    assert!(wait < input && input < model);
-    assert_eq!(records[wait].budget.model_turns, 0);
-    Replay::from_records(records).unwrap();
-    let snapshot = super::conversation::Reader::new(
-        dir.path().join("nano/sessions/session-1/events.jsonl"),
-        "session-1".into(),
-    )
-    .poll()
-    .unwrap()
-    .unwrap();
-    assert!(snapshot.ended);
-    assert!(snapshot.task_id.is_empty());
-    assert!(
-        snapshot
-            .entries
-            .iter()
-            .any(|entry| entry.contains("Checks passed."))
-    );
-}
-
-impl Journal for InteractiveJournal {
-    fn append(&mut self, event: SessionEvent, budget: &Budget) -> Result<Record> {
-        anyhow::ensure!(
-            !(self.fail_input && matches!(event, SessionEvent::UserInput { .. })),
-            "Injected input failure"
-        );
-        let record = self.inner.append(event, budget)?;
-        match &record.event {
-            // Simulate typing while inference is active, before its two tool effects.
-            SessionEvent::ModelStarted { turn: 1 } if self.inject_steering => {
-                self.sender.try_send(SessionCommand::Interact).unwrap();
-                self.sender
-                    .try_send(SessionCommand::Steer {
-                        input_id: None,
-                        text: "Keep the public API stable.".into(),
-                    })
-                    .unwrap();
-            }
-            SessionEvent::InputRequested => {
-                self.waits += 1;
-                let command = if self.waits <= self.user_requests {
-                    SessionCommand::Steer {
-                        input_id: None,
-                        text: "Explain the completed checks.".into(),
-                    }
-                } else {
-                    SessionCommand::Cancel
-                };
-                self.sender.try_send(command).unwrap();
-            }
-            _ => (),
-        }
-        Ok(record)
-    }
-    fn checkpoint(&mut self) -> Result<()> {
-        self.inner.checkpoint()
-    }
-    fn interactive(&self) -> bool {
-        self.interactive
-    }
-    fn take_commands(&mut self) -> Option<tokio::sync::mpsc::Receiver<SessionCommand>> {
-        self.commands.take()
-    }
-}
-
-#[tokio::test]
-async fn interactive_steering_waits_for_complete_tool_groups_and_replays() {
-    let (dir, base) = setup(
-        scripted(vec![
-            response("Editing", vec![call("a", 1), call("b", 2)]),
-            response("Checks completed.", vec![]),
-            response("Both checks passed.", vec![]),
-        ]),
-        limits(),
-    );
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: false,
-        waits: 0,
-        user_requests: 1,
-        fail_input: false,
-        inject_steering: true,
-    };
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        base.provider,
-        base.tools,
-        base.host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Implement the task".into(),
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(end.durable);
-    assert_eq!(engine.provider.requests.len(), 3);
-    let messages = &engine.provider.requests[1].messages;
-    assert!(
-        matches!(messages.last(), Some(Message::User { text }) if text == "Keep the public API stable.")
-    );
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|m| matches!(m, Message::Tool { .. }))
-            .count(),
-        2
-    );
-    assert!(
-        matches!(engine.provider.requests[2].messages.last(), Some(Message::User { text }) if text == "Explain the completed checks.")
-    );
-    let records = &engine.host.records;
-    let first_input = records
-        .iter()
-        .position(|r| matches!(r.event, SessionEvent::UserInput { .. }))
-        .unwrap();
-    assert_eq!(
-        records[..first_input]
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::ToolResult { .. }))
-            .count(),
-        2
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::InteractionOpened))
-            .count(),
-        1
-    );
-    let replay = Replay::from_records(records).unwrap();
-    assert_eq!(
-        replay.messages.len(),
-        engine.provider.requests[2].messages.len() + 1
-    );
-    assert!(
-        matches!(replay.messages.last(), Some(Message::Assistant { response }) if response.text == "Both checks passed.")
-    );
-    // A fresh frontend can read the same durable conversation without touching its writer.
-    let path = dir.path().join("nano/sessions/session-1/events.jsonl");
-    let snapshot = super::conversation::Reader::new(path, "session-1".into())
-        .poll()
-        .unwrap()
-        .unwrap();
-    assert!(snapshot.ended);
-    assert!(
-        snapshot
-            .entries
-            .iter()
-            .any(|text| text.contains("Explain the completed checks."))
-    );
-    let second_turn = records
-        .iter()
-        .position(|record| matches!(record.event, SessionEvent::ModelStarted { turn: 2 }))
-        .unwrap();
-    let cut = Replay::from_records(&records[..second_turn])
-        .unwrap()
-        .messages
-        .len();
-    let mut summarized_steering = records.clone();
-    summarized_steering[second_turn].event = SessionEvent::CompactionStarted {
-        turn: 2,
-        retained_from: cut,
-    };
-    assert!(Replay::from_records(&summarized_steering).is_err());
-    // Owner-written input inside a pending tool group fails closed.
-    let mut malformed = records.clone();
-    let at = malformed
-        .iter()
-        .position(|r| matches!(r.event, SessionEvent::ToolStarted { .. }))
-        .unwrap();
-    malformed[at].event = SessionEvent::UserInput {
-        input_id: None,
-        text: "interrupt this tool".into(),
-    };
-    assert!(Replay::from_records(&malformed).is_err());
-}
-
-#[tokio::test]
-async fn interactive_user_turns_reset_loop_tracking_and_preserve_session_budgets() {
-    for fail in [false, true] {
-        let provider = scripted(
-            (0..5)
-                .flat_map(|turn| {
-                    [
-                        response(
-                            "",
-                            vec![call(&format!("{turn}-a"), 1), call(&format!("{turn}-b"), 1)],
-                        ),
-                        response("Request completed.", vec![]),
-                    ]
-                })
-                .collect(),
-        );
-        let (_dir, base) = setup(provider, limits());
-        let (sender, commands) = tokio::sync::mpsc::channel(8);
-        let journal = InteractiveJournal {
-            inner: base.journal,
-            commands: Some(commands),
-            sender,
-            interactive: true,
-            waits: 0,
-            user_requests: 5,
-            fail_input: false,
-            inject_steering: false,
-        };
-        let mut identity = identity();
-        identity.task_id = None;
-        let mut engine = Engine::new(
-            identity,
-            limits(),
-            base.provider,
-            base.tools,
-            base.host,
-            journal,
-        )
-        .unwrap();
-        engine.tools.fail = fail;
-        let end = engine
-            .run(
-                SessionCommand::Start {
-                    input: "Workspace constraints".into(),
-                },
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(end.reason, EndReason::Cancelled, "failed tools: {fail}");
-        assert!(end.durable);
-        assert_eq!(end.budget.model_turns, 10);
-        assert_eq!(end.budget.tool_calls, 10);
-        assert_eq!(end.budget.reported_input_tokens, 100);
-        assert_eq!(end.budget.reported_output_tokens, 50);
-        let records = &engine.host.records;
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::UserInput { .. }))
-                .count(),
-            5
-        );
-        for (index, record) in records.iter().enumerate() {
-            if matches!(record.event, SessionEvent::UserInput { .. }) {
-                assert_eq!(record.budget.no_progress, 0);
-                if index > 0 {
-                    let before = &records[index - 1].budget;
-                    assert_eq!(record.budget.model_turns, before.model_turns);
-                    assert_eq!(record.budget.tool_calls, before.tool_calls);
-                    assert_eq!(record.budget.tokens(), before.tokens());
-                    assert_eq!(record.budget.retries, before.retries);
-                }
-            }
-        }
-        // Repetition and failures still accumulate within each individual request.
-        let progress: Vec<_> = records
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::ToolResult { .. }))
-            .map(|r| r.budget.no_progress)
-            .collect();
-        assert_eq!(
-            progress,
-            if fail {
-                vec![1, 2].repeat(5)
-            } else {
-                vec![0, 1].repeat(5)
-            }
-        );
-        let replay = Replay::from_records(records).unwrap();
-        assert_eq!(replay.budget, end.budget);
-    }
-}
-
-#[tokio::test]
-async fn interactive_input_is_not_used_if_its_journal_commit_fails() {
-    let (_dir, base) = setup(
-        scripted(vec![response("Editing", vec![call("a", 1)])]),
-        limits(),
-    );
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: true,
-        waits: 0,
-        user_requests: 1,
-        fail_input: true,
-        inject_steering: true,
-    };
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        base.provider,
-        base.tools,
-        base.host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Implement".into(),
-            },
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::JournalFailed);
-    assert_eq!(engine.provider.requests.len(), 1);
-    assert_eq!(engine.tools.effects.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn interactive_input_wait_is_cancellable_without_an_extra_inference() {
-    let (_dir, base) = setup(
-        scripted(vec![response("Ready for direction.", vec![])]),
-        limits(),
-    );
-    let (sender, commands) = tokio::sync::mpsc::channel(8);
-    let journal = InteractiveJournal {
-        inner: base.journal,
-        commands: Some(commands),
-        sender,
-        interactive: true,
-        waits: 0,
-        user_requests: 1,
-        fail_input: false,
-        inject_steering: false,
-    };
-    let cancel = Cancellation::default();
-    let host = FakeHost {
-        cancel_on_input: Some(cancel.clone()),
-        ..Default::default()
-    };
-    let mut engine = Engine::new(
-        identity(),
-        limits(),
-        base.provider,
-        base.tools,
-        host,
-        journal,
-    )
-    .unwrap();
-    let end = engine
-        .run(
-            SessionCommand::Start {
-                input: "Implement".into(),
-            },
-            &cancel,
-        )
-        .await
-        .unwrap();
-    assert_eq!(end.reason, EndReason::Cancelled);
-    assert!(end.durable);
-    assert_eq!(engine.provider.requests.len(), 1);
-    let replay = Replay::from_records(&engine.host.records).unwrap();
-    assert_eq!(replay.end, Some(EndReason::Cancelled));
 }

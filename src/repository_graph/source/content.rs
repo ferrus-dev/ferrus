@@ -63,6 +63,7 @@ impl SnapshotContent for GitTreeSnapshotContent {
                 None,
             ));
         }
+
         if request.repository != self.repository || request.snapshot_id != self.snapshot_id {
             return Err(content_error(
                 QueryErrorCode::InvalidRequest,
@@ -71,6 +72,7 @@ impl SnapshotContent for GitTreeSnapshotContent {
                 None,
             ));
         }
+
         if self.policy.exclusion_for_file(&request.path).is_some() {
             return Err(content_error(
                 QueryErrorCode::ContentUnavailable,
@@ -79,6 +81,7 @@ impl SnapshotContent for GitTreeSnapshotContent {
                 None,
             ));
         }
+
         let Some(file) = self.files.get(&request.path) else {
             return Err(content_error(
                 QueryErrorCode::ContentUnavailable,
@@ -95,6 +98,7 @@ impl SnapshotContent for GitTreeSnapshotContent {
                 Some(RetrievalAction::RefreshIndex),
             ));
         }
+
         let content = worktree::read_tree_descriptor_verified(&self.root, &self.tree, file)
             .map_err(|error| match error {
                 SourceError::ContentChanged => content_error(
@@ -158,6 +162,7 @@ impl SnapshotContent for LocalSnapshotContent {
                 None,
             ));
         }
+
         if request.repository != self.repository || request.snapshot_id != self.snapshot_id {
             return Err(content_error(
                 QueryErrorCode::InvalidRequest,
@@ -166,6 +171,7 @@ impl SnapshotContent for LocalSnapshotContent {
                 None,
             ));
         }
+
         if self.policy.exclusion_for_file(&request.path).is_some() {
             return Err(content_error(
                 QueryErrorCode::ContentUnavailable,
@@ -174,6 +180,7 @@ impl SnapshotContent for LocalSnapshotContent {
                 None,
             ));
         }
+
         let Some(file) = self.files.get(&request.path) else {
             return Err(content_error(
                 QueryErrorCode::ContentUnavailable,
@@ -242,6 +249,7 @@ fn content_response_for_bytes(
     if start > end || end > bytes.len() {
         return Err(invalid_content_span());
     }
+
     let limit = request.max_bytes.get().min(hard_max_bytes.get());
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let selected = &bytes[start..end];
@@ -269,6 +277,7 @@ fn clamp_utf8_truncation(bytes: &[u8], requested_len: usize) -> usize {
     while !text.is_char_boundary(returned_len) {
         returned_len -= 1;
     }
+
     returned_len
 }
 
@@ -306,7 +315,7 @@ pub(super) fn set_manifest_source_state(
     source_kind: SourceKind,
     base_revision: Option<Digest>,
     dirty: bool,
-) {
+) -> Result<(), SourceError> {
     manifest.revision.id = revision_id(
         &manifest.revision.repository,
         source_kind,
@@ -315,8 +324,9 @@ pub(super) fn set_manifest_source_state(
         &manifest.revision.analysis_config_digest,
         dirty,
         manifest.revision.includes_untracked,
-    );
+    )?;
     manifest.revision.source_kind = source_kind;
     manifest.revision.base_revision = base_revision;
     manifest.revision.dirty = dirty;
+    Ok(())
 }

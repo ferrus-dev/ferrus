@@ -38,18 +38,21 @@ pub async fn ensure_claude_mcp_isolation_default() -> Result<()> {
     if !doc.contains_key("agents") {
         doc["agents"] = Item::Table(Table::new());
     }
+
     let agents = doc["agents"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("ferrus.toml [agents] must be a table"))?;
     if !agents.contains_key("claude") {
         agents["claude"] = Item::Table(Table::new());
     }
+
     let claude = agents["claude"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("ferrus.toml [agents.claude] must be a table"))?;
     if claude.contains_key("mcp_isolation") {
         return Ok(());
     }
+
     claude["mcp_isolation"] = value("merge-user");
 
     tokio::fs::write("ferrus.toml", doc.to_string())

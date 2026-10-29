@@ -290,6 +290,7 @@ pub async fn run_tui(
         status.branch = branch.clone();
         app.status = status;
     }
+
     refresh_dashboard_snapshot(&mut app, true).await;
 
     let mut stdout = io::stdout();
@@ -417,6 +418,7 @@ async fn refresh_dashboard_snapshot(app: &mut App, force: bool) -> bool {
         app.runtime_tasks = tasks;
         changed = true;
     }
+
     if let Ok(runs) = crate::project::list_runs(8).await
         && app.runtime_runs != runs
     {
@@ -474,10 +476,19 @@ fn handle_event(
         }
         Event::Mouse(mouse) if app.nano.is_some() => {
             match mouse.kind {
-                MouseEventKind::ScrollUp => app.nano.as_mut().unwrap().scroll.up(3),
-                MouseEventKind::ScrollDown => app.nano.as_mut().unwrap().scroll.down(3),
+                MouseEventKind::ScrollUp => {
+                    if let Some(nano) = app.nano.as_mut() {
+                        nano.scroll.up(3);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(nano) = app.nano.as_mut() {
+                        nano.scroll.down(3);
+                    }
+                }
                 _ => return Ok(()),
             }
+
             redraw_dashboard(stdout, app, ui)?;
         }
         Event::Paste(text) => {
@@ -495,6 +506,7 @@ fn handle_event(
             {
                 return Ok(());
             }
+
             app.input_suppressed_until = None;
 
             let mut full_redraw = false;
@@ -516,19 +528,27 @@ fn handle_event(
                         full_redraw = true;
                     }
                     (KeyCode::PageUp, _) if app.nano.is_some() => {
-                        app.nano.as_mut().unwrap().scroll.up(10);
+                        if let Some(nano) = app.nano.as_mut() {
+                            nano.scroll.up(10);
+                        };
                         full_redraw = true;
                     }
                     (KeyCode::PageDown, _) if app.nano.is_some() => {
-                        app.nano.as_mut().unwrap().scroll.down(10);
+                        if let Some(nano) = app.nano.as_mut() {
+                            nano.scroll.down(10);
+                        };
                         full_redraw = true;
                     }
                     (KeyCode::Home, KeyModifiers::CONTROL) if app.nano.is_some() => {
-                        app.nano.as_mut().unwrap().scroll.home();
+                        if let Some(nano) = app.nano.as_mut() {
+                            nano.scroll.home();
+                        };
                         full_redraw = true;
                     }
                     (KeyCode::End, KeyModifiers::CONTROL) if app.nano.is_some() => {
-                        app.nano.as_mut().unwrap().scroll.end();
+                        if let Some(nano) = app.nano.as_mut() {
+                            nano.scroll.end();
+                        };
                         full_redraw = true;
                     }
                     (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => {
@@ -670,6 +690,7 @@ fn handle_message(
                         .into(),
                 );
             }
+
             app.nano = Some(NanoConversation::new(name, run_id, snapshots, events));
             app.poll_nano_input();
             app.runtime_snapshot_at = None;
@@ -682,6 +703,7 @@ fn handle_message(
                     "Input delivery is unconfirmed; inspect the journal before retrying.".into(),
                 );
             }
+
             app.nano = None;
             app.runtime_snapshot_at = None;
             redraw_dashboard(stdout, app, ui)?;
@@ -742,9 +764,11 @@ fn handle_message(
             if next.directory.is_empty() {
                 next.directory = app.status.directory.clone();
             }
+
             if next.branch.is_none() {
                 next.branch = app.status.branch.clone();
             }
+
             app.status = next;
             if !app.suspended {
                 redraw_dashboard(stdout, app, ui)?;
@@ -809,6 +833,7 @@ fn handle_message(
             }
         }
     }
+
     Ok(false)
 }
 
@@ -878,6 +903,7 @@ fn line_start(chars: &[char], pos: usize) -> usize {
     while idx > 0 && chars[idx - 1] != '\n' {
         idx -= 1;
     }
+
     idx
 }
 
@@ -886,6 +912,7 @@ fn line_end(chars: &[char], pos: usize) -> usize {
     while idx < chars.len() && chars[idx] != '\n' {
         idx += 1;
     }
+
     idx
 }
 

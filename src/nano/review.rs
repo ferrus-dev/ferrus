@@ -25,6 +25,7 @@ fn readable(name: &str) -> bool {
         "read_file" | "search_text" | "load_instructions" | "repository_fallback"
     ) || super::context_request::NAMES.contains(&name)
 }
+
 struct ReviewTools<B: ExecutionBackend> {
     native: NativeTools<B>,
     session: Session,
@@ -34,6 +35,7 @@ struct ReviewTools<B: ExecutionBackend> {
     pending_stop: Cancellation,
     pending_name: String,
 }
+
 impl<B: ExecutionBackend> ReviewTools<B> {
     async fn finish(&mut self) -> ToolOutcome {
         let Some(task) = self.pending.as_mut() else {
@@ -49,6 +51,7 @@ impl<B: ExecutionBackend> ReviewTools<B> {
                 ) {
                     self.context_seen = true;
                 }
+
                 self.terminal = match value["status"].as_str() {
                     Some("approved" | "rejected") => Some(EndReason::ReviewCompleted),
                     Some("consulted") => Some(EndReason::ConsultationResponded),
@@ -82,6 +85,7 @@ impl<B: ExecutionBackend> ReviewTools<B> {
         }
     }
 }
+
 impl<B: ExecutionBackend> Tools for ReviewTools<B> {
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         let mut tools: Vec<_> = self
@@ -93,11 +97,13 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
         tools.extend(role_tools(self.session.mode));
         tools
     }
+
     fn validate(&self, name: &str, args: &Value) -> Result<(), ToolError> {
         ensure_tool(self.descriptors().iter().any(|tool| tool.name == name))?;
         if readable(name) {
             return self.native.validate(name, args);
         }
+
         if name == "read_artifact" {
             let args: Artifact =
                 serde_json::from_value(args.clone()).map_err(|_| ToolError::InvalidArguments)?;
@@ -116,6 +122,7 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
                 Err(ToolError::InvalidArguments)
             };
         }
+
         let field = match name {
             "reject" => Some("notes"),
             "respond_consult" => Some("response"),
@@ -138,6 +145,7 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
             Err(ToolError::InvalidArguments)
         }
     }
+
     async fn prepare_context(
         &mut self,
         messages: &[Message],
@@ -145,13 +153,16 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
     ) -> Result<Option<super::working_set::Preparation>, ToolError> {
         self.native.prepare_context(messages, stop).await
     }
+
     async fn execute(&mut self, call: &ValidatedCall, stop: &Cancellation) -> ToolOutcome {
         if self.validate(&call.name, &call.arguments).is_err() {
             return ToolOutcome::Failed(ToolError::Denied);
         }
+
         if readable(&call.name) {
             return self.native.execute(call, stop).await;
         }
+
         if matches!(call.name.as_str(), "approve" | "reject" | "respond_consult")
             && !self.context_seen
         {
@@ -159,6 +170,7 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
                 "Read review_pending or consultation_context before deciding",
             ));
         }
+
         if call.name == "read_artifact" {
             return match artifact(&self.session, &call.arguments).await {
                 Ok(value) => ToolOutcome::Success(value),
@@ -167,12 +179,14 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
                 )),
             };
         }
+
         let session = self.session.clone();
         let call = call.clone();
         self.pending_stop = Cancellation::default();
         if stop.is_cancelled() {
             self.pending_stop.cancel();
         }
+
         self.pending_name = call.name.clone();
         let stop = self.pending_stop.clone();
         self.pending = Some(tokio::spawn(async move {
@@ -180,6 +194,7 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
         }));
         self.finish().await
     }
+
     async fn interrupted(&mut self) -> Option<ToolOutcome> {
         self.pending_stop.cancel();
         if self.pending.is_some() {
@@ -188,6 +203,7 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
             None
         }
     }
+
     async fn shutdown(&mut self) -> bool {
         self.pending_stop.cancel();
         let settled = if self.pending.is_some() {
@@ -197,10 +213,12 @@ impl<B: ExecutionBackend> Tools for ReviewTools<B> {
         };
         self.native.shutdown().await && settled
     }
+
     fn end_reason(&self) -> Option<EndReason> {
         self.terminal.clone()
     }
 }
+
 fn ensure_tool(valid: bool) -> Result<(), ToolError> {
     if valid {
         Ok(())
@@ -232,6 +250,7 @@ async fn packet(session: &Session) -> Result<Value> {
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
+
                 artifacts.insert(
                     name.into(),
                     json!({"text":&text[..end],"truncated":end<text.len(),"path":path}),
@@ -243,10 +262,12 @@ async fn packet(session: &Session) -> Result<Value> {
             }
         }
     }
+
     Ok(
         json!({"task_id":context.task_id,"review_cycles":context.review_cycles,"check_retries":context.check_retries,"view":super::binding::view_identity(&context.repository_view),"artifacts":artifacts,"inspection":{"omitted_links":session.source.omitted_links,"omitted_paths":session.source.omitted_paths}}),
     )
 }
+
 async fn operation(session: &Session, call: &ValidatedCall, stop: &Cancellation) -> Result<Value> {
     let context = session.authorize().await?;
     ensure!(
@@ -267,7 +288,10 @@ async fn operation(session: &Session, call: &ValidatedCall, stop: &Cancellation)
         "reject" => {
             crate::server::tools::reject::run_for_context(
                 context,
-                call.arguments["notes"].as_str().unwrap().into(),
+                call.arguments["notes"]
+                    .as_str()
+                    .context("Missing notes")?
+                    .into(),
                 Config::load_from(&session.root).await?,
                 Some(session.scope.clone()),
             )
@@ -283,18 +307,29 @@ async fn operation(session: &Session, call: &ValidatedCall, stop: &Cancellation)
             );
             crate::server::tools::respond_consult::run_for_context(
                 context,
-                call.arguments["response"].as_str().unwrap().into(),
+                call.arguments["response"]
+                    .as_str()
+                    .context("Missing response")?
+                    .into(),
             )
             .await?;
             Ok(json!({"status":"consulted","task_id":session.scope.task_id}))
         }
         "ask_human" => {
-            ask(session, call.arguments["question"].as_str().unwrap().into()).await?;
+            ask(
+                session,
+                call.arguments["question"]
+                    .as_str()
+                    .context("Missing question")?
+                    .into(),
+            )
+            .await?;
             wait_answer(session, stop).await
         }
         _ => anyhow::bail!("Unavailable lifecycle tool"),
     }
 }
+
 async fn ask(session: &Session, question: String) -> Result<()> {
     let root = session.root.clone();
     let reviewer = session.mode == Mode::Review;
@@ -302,6 +337,7 @@ async fn ask(session: &Session, question: String) -> Result<()> {
         if reviewer {
             project::require_executor_owner(tx, scope)?;
         }
+
         let status = context.status.parse::<project::TaskStatus>()?;
         ensure!(
             status
@@ -333,6 +369,7 @@ async fn ask(session: &Session, question: String) -> Result<()> {
     })
     .await
 }
+
 async fn wait_answer(session: &Session, stop: &Cancellation) -> Result<Value> {
     let phase = sha256(phase_policy(session).await?.as_bytes());
     loop {
@@ -365,6 +402,7 @@ async fn wait_answer(session: &Session, stop: &Cancellation) -> Result<Value> {
                 if text.trim().is_empty() {
                     return Ok(None);
                 }
+
                 project::executor_event(
                     tx,
                     scope,
@@ -385,13 +423,16 @@ async fn wait_answer(session: &Session, stop: &Cancellation) -> Result<Value> {
         if let Some(answer) = answer {
             return Ok(answer);
         }
+
         tokio::select! {_ = stop.cancelled()=>anyhow::bail!("Human wait interrupted"),_ = tokio::time::sleep(Duration::from_millis(100))=>{}}
     }
 }
+
 struct ReviewHost {
     session: Session,
     stop: Cancellation,
 }
+
 impl Host for ReviewHost {
     async fn authorize(&mut self, _: &ValidatedCall) -> Result<(), ToolError> {
         if self.session.authorize().await.is_err() {
@@ -401,6 +442,7 @@ impl Host for ReviewHost {
             Ok(())
         }
     }
+
     fn committed(&mut self, _: &Record) {}
 }
 
@@ -434,7 +476,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             }
         }
     });
+
     struct Guard(Cancellation, tokio::task::JoinHandle<()>);
+
     impl Drop for Guard {
         fn drop(&mut self) {
             self.0.cancel();
@@ -445,6 +489,7 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if cancellation.is_cancelled() {
         stop.cancel();
     }
+
     let policy = phase_policy(&session).await?;
     let recovery = match reject_unfinished(&session, &policy).await {
         Ok(budget) => budget,
@@ -458,10 +503,12 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
     if session.authorize().await?.status == "awaiting_human" {
         answer = Some(wait_answer(&session, &stop).await?);
     }
+
     let new_user_turn = answer.is_some();
     if let Some(answer) = answer {
         input["human_answer"] = answer;
     }
+
     let mut guidance = native.instructions.load(&[], &[]).await?;
     guidance
         .documents
@@ -499,8 +546,10 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
         if new_user_turn {
             budget.no_progress = 0;
         }
+
         engine.inherit_budget(budget)?;
     }
+
     let mut execution = Box::pin(engine.run(SessionCommand::Start { input }, &stop));
     let end = tokio::select! {
         biased;
@@ -520,11 +569,9 @@ pub(crate) async fn run<P: Provider, B: ExecutionBackend, J: Journal>(
             session.fail_stopped(code).await?;
         }
     }
+
     Ok(end)
 }
-
-#[cfg(test)]
-mod tests;
 
 async fn phase_policy(session: &Session) -> Result<String> {
     use sha2::{Digest, Sha256};
@@ -561,11 +608,13 @@ async fn phase_policy(session: &Session) -> Result<String> {
         .collect::<String>();
     Ok(format!("{POLICY}\nHost role/phase binding: {fingerprint}"))
 }
+
 #[derive(Default)]
 struct Recovery {
     budget: Option<Budget>,
     answer: Option<Value>,
 }
+
 async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> {
     let runs=project::with_supervisor_session(&session.scope,false,|tx,scope,_| {
         let mut query=tx.prepare("SELECT id FROM runs WHERE task_id=?1 AND role='supervisor' AND rowid<(SELECT rowid FROM runs WHERE id=?2) ORDER BY rowid DESC LIMIT 128")?;
@@ -582,6 +631,7 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
         if !directory.try_exists()? {
             continue;
         }
+
         use std::io::{BufRead, Read};
         let file = super::private::read_only_file(&directory.join("events.jsonl"))?;
         let mut first = Vec::new();
@@ -589,6 +639,7 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
         if first.is_empty() {
             continue;
         }
+
         ensure!(
             first.len() <= 512 * 1024,
             "Historical Supervisor origin exceeds quota"
@@ -597,13 +648,16 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
         if !first.ends_with(b"\n") {
             continue;
         }
+
         let origin: Record = serde_json::from_slice(&first)?;
         if !matches!(&origin.event,SessionEvent::Started{system_prompt:Some(value),..} if value==policy)
         {
             continue;
         }
+
         let (_journal, records) = FileJournal::recover(&directory, Quotas::default())?;
         if !records.first().is_some_and(|record|matches!(&record.event,SessionEvent::Started{system_prompt:Some(value),..} if value==policy)){continue;}
+
         let replay = Replay::from_records(&records)?;
         if inherited.budget.is_none() {
             let mut budget = replay.budget.clone();
@@ -618,6 +672,7 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
             budget.elapsed_ms = 0;
             inherited.budget = Some(budget);
         }
+
         if inherited.answer.is_none() {
             inherited.answer = replay
                 .messages
@@ -641,6 +696,7 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
                     .and_then(|input| input.get("human_answer").cloned());
             }
         }
+
         for record in &records {
             if let SessionEvent::ToolIntent { call_id, call, .. } = &record.event
                 && matches!(call.name.as_str(), "approve" | "reject" | "respond_consult")
@@ -654,6 +710,7 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
             }
         }
     }
+
     // This receipt is transactional with restoration, including a crash before
     // the new journal's Started append. Telemetry is not used as acceptance evidence.
     if inherited.answer.is_none() && session.authorize().await?.status != "awaiting_human" {
@@ -679,8 +736,10 @@ async fn reject_unfinished(session: &Session, policy: &str) -> Result<Recovery> 
             }
         }
     }
+
     Ok(inherited)
 }
+
 fn sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
@@ -732,15 +791,18 @@ fn role_tools(mode: Mode) -> Vec<ToolDescriptor> {
             schema["properties"][field] = json!({"type":"string","minLength":1,"maxLength":16384});
             schema["required"] = json!([field]);
         }
+
         tools.push(ToolDescriptor {
             name: name.into(),
             description: description.into(),
             input_schema: schema,
         });
     }
+
     tools.push(ToolDescriptor{name:"read_artifact".into(),description:"Page a bound task/review/consultation artifact; no caller-selected paths. Artifacts over 1 MiB are unavailable.".into(),input_schema:json!({"type":"object","properties":{"artifact":{"type":"string","enum":["task","submission","review","patch","integration_error","consult_request"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":4096}},"required":["artifact"],"additionalProperties":false})});
     tools
 }
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Artifact {
@@ -750,9 +812,11 @@ struct Artifact {
     #[serde(default = "artifact_bytes")]
     max_bytes: usize,
 }
+
 fn artifact_bytes() -> usize {
     2048
 }
+
 fn artifact_path(context: &project::RuntimeTaskContext, name: &str) -> Result<String> {
     Ok(match name {
         "task" => context.task_path.clone(),
@@ -764,6 +828,7 @@ fn artifact_path(context: &project::RuntimeTaskContext, name: &str) -> Result<St
         _ => anyhow::bail!("Unavailable artifact"),
     })
 }
+
 async fn artifact(session: &Session, args: &Value) -> Result<Value> {
     let args: Artifact = serde_json::from_value(args.clone())?;
     let context = session.authorize().await?;
@@ -778,7 +843,11 @@ async fn artifact(session: &Session, args: &Value) -> Result<Value> {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
+
     Ok(
         json!({"artifact":args.artifact,"digest":digest,"text":&text[args.offset..end],"next_offset":end,"truncated":end<text.len()}),
     )
 }
+
+#[cfg(test)]
+mod tests;

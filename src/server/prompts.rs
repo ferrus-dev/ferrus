@@ -78,6 +78,7 @@ async fn read_task(context: Option<&RuntimeTaskContext>) -> anyhow::Result<Strin
     if let Some(context) = context {
         return store::read_task_at(&context.task_path).await;
     }
+
     store::read_task().await
 }
 
@@ -85,6 +86,7 @@ async fn read_review(context: Option<&RuntimeTaskContext>) -> anyhow::Result<Str
     if let Some(context) = context {
         return store::read_review_for_run_dir(&context.run_dir).await;
     }
+
     Ok(String::new())
 }
 
@@ -92,6 +94,7 @@ async fn read_submission(context: Option<&RuntimeTaskContext>) -> anyhow::Result
     if let Some(context) = context {
         return store::read_submission_for_run_dir(&context.run_dir).await;
     }
+
     Ok(String::new())
 }
 
@@ -116,6 +119,7 @@ fn state_section(title: &str, context: Option<&RuntimeTaskContext>) -> anyhow::R
         if let Some(run_id) = context.run_id.as_deref() {
             lines.push(format!("Run: `{run_id}`"));
         }
+
         if let Some(workspace_path) = context.workspace_path.as_deref() {
             lines.push(format!("Workspace: `{workspace_path}`"));
         }
@@ -125,6 +129,7 @@ fn state_section(title: &str, context: Option<&RuntimeTaskContext>) -> anyhow::R
                 .to_string(),
         );
     }
+
     Ok(lines.join("\n"))
 }
 

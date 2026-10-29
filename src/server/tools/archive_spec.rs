@@ -72,9 +72,11 @@ fn validate_input(input: ArchiveSpecInput) -> Result<ArchiveSpecInput> {
     if input.spec_path.trim().is_empty() {
         anyhow::bail!("Cannot archive spec: spec_path is required.");
     }
+
     if input.outcome.trim().is_empty() {
         anyhow::bail!("Cannot archive spec: outcome is required.");
     }
+
     Ok(input)
 }
 

@@ -80,6 +80,7 @@ impl IndexStore for Sidecar {
                 operation: "complete index",
             });
         }
+
         validate_snapshot_for_build(&commit.snapshot, &build)?;
 
         if commit.reuse_completed_snapshot {
@@ -91,6 +92,7 @@ impl IndexStore for Sidecar {
             {
                 return Err(StoreError::IdentityMismatch("reused snapshot payload"));
             }
+
             // Recheck under the completion transaction: retention or another
             // build may have changed the candidate after source revalidation.
             let existing =
@@ -119,6 +121,7 @@ impl IndexStore for Sidecar {
         for cached in &commit.cache_writes {
             upsert_cached_fragment(&transaction, &cached.key, &cached.fragment)?;
         }
+
         touch_cached_fragments(&transaction, &commit.cache_hits)?;
         upsert_metrics(&transaction, &commit.snapshot.completed_by, &commit.metrics)?;
         transaction.execute(
@@ -183,11 +186,13 @@ fn reusable_index_metrics(
     if (files, nodes, edges) != (actual_files, actual_nodes, actual_edges) {
         return Ok(None);
     }
+
     for build_id in [snapshot.completed_by.as_str(), diagnostics_build.as_str()] {
         if !diagnostics_match_source(connection, &snapshot, build_id, source_diagnostics)? {
             return Ok(None);
         }
     }
+
     Ok(Some(IndexBuildMetrics {
         discovered_files: files,
         nodes,
@@ -214,6 +219,7 @@ fn diagnostics_match_source(
     }) {
         return Ok(false);
     }
+
     let mut expected: BTreeSet<_> = source_diagnostics
         .iter()
         .map(|diagnostic| {
@@ -229,6 +235,7 @@ fn diagnostics_match_source(
     if expected.len() != source_diagnostics.len() {
         return Ok(false);
     }
+
     let mut statement = connection.prepare(
         "SELECT code, path, COALESCE(snapshot_id = ?2 AND severity = 'warning' \
             AND span_start_byte IS NULL AND span_start_line IS NULL \
@@ -245,6 +252,7 @@ fn diagnostics_match_source(
             return Ok(false);
         }
     }
+
     Ok(expected.is_empty())
 }
 
@@ -354,6 +362,7 @@ fn insert_files(
             file_mode(file.file_mode),
         ])?;
     }
+
     Ok(())
 }
 
@@ -395,6 +404,7 @@ fn insert_nodes(transaction: &Transaction<'_>, nodes: &[GraphNode]) -> Result<()
             normalized_node_name(node),
         ])?;
     }
+
     Ok(())
 }
 
@@ -456,6 +466,7 @@ fn insert_edges(transaction: &Transaction<'_>, edges: &[GraphEdge]) -> Result<()
             evidence.end_column,
         ])?;
     }
+
     Ok(())
 }
 
@@ -496,6 +507,7 @@ fn insert_diagnostics(
             timestamp(),
         ])?;
     }
+
     Ok(())
 }
 
@@ -510,6 +522,7 @@ fn replace_snapshot_diagnostics(
     }) {
         return Err(StoreError::IdentityMismatch("snapshot diagnostics"));
     }
+
     transaction.execute(
         "DELETE FROM diagnostics WHERE build_id = ?1 AND snapshot_id = ?2",
         params![snapshot.completed_by.as_str(), snapshot.id.as_str()],
@@ -566,6 +579,7 @@ fn touch_cached_fragments(
     if hits.is_empty() {
         return Ok(());
     }
+
     let now = timestamp();
     let mut statement = transaction.prepare_cached(
         "UPDATE fragment_cache SET last_used_at = ?13 WHERE \
@@ -592,6 +606,7 @@ fn touch_cached_fragments(
             now,
         ])?;
     }
+
     Ok(())
 }
 

@@ -72,6 +72,7 @@ impl RefreshLeaseHeartbeat {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
@@ -342,10 +343,12 @@ impl Sidecar {
             {
                 continue;
             }
+
             if ordinary_retained < config.max_snapshots {
                 ordinary_retained += 1;
                 continue;
             }
+
             removed_snapshots +=
                 transaction.execute("DELETE FROM snapshots WHERE id = ?1", [&snapshot_id])? as u64;
         }
@@ -407,6 +410,7 @@ impl Sidecar {
             if state == "failed" && retained_failed_builds.contains(&build_id) {
                 continue;
             }
+
             removed_builds +=
                 transaction.execute("DELETE FROM index_builds WHERE id = ?1", [&build_id])? as u64;
         }
@@ -577,6 +581,7 @@ mod tests {
             if renewed_expiration > initial_expiration {
                 break;
             }
+
             assert!(
                 wait_started.elapsed() < Duration::from_secs(8),
                 "refresh lease heartbeat did not extend its expiration"

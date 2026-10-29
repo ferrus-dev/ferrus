@@ -380,6 +380,7 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
     if !path.exists() {
         return Ok(SidecarStatus::Absent);
     }
+
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -399,6 +400,7 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
             reason: "file is not a Ferrus repository graph sidecar".to_string(),
         }));
     }
+
     let supported_version = MIGRATIONS
         .iter()
         .any(|migration| migration.version == schema_version);
@@ -411,6 +413,7 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
             ),
         }));
     }
+
     let migration_version = match connection
         .query_row(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
@@ -435,6 +438,7 @@ pub fn inspect_at(path: &Path) -> Result<SidecarStatus> {
             reason: "sidecar migration metadata is incomplete".to_string(),
         }));
     }
+
     Ok(SidecarStatus::Ready { schema_version })
 }
 
@@ -465,6 +469,7 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
             parent.display()
         );
     }
+
     let flags = if existed {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
     } else {
@@ -480,6 +485,7 @@ pub fn open_for_build_at(path: &Path) -> Result<OpenSidecarResult> {
     if schema_version < SIDECAR_SCHEMA_VERSION {
         migrate_sidecar(&mut connection, schema_version)?;
     }
+
     Ok(OpenSidecarResult::Ready(Sidecar {
         path: path.to_path_buf(),
         connection,
@@ -499,6 +505,7 @@ pub fn open_for_query_at(path: &Path) -> Result<OpenQuerySidecarResult> {
         }
         SidecarStatus::Ready { .. } => {}
     }
+
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -531,6 +538,7 @@ fn migrate_sidecar(connection: &mut Connection, schema_version: u32) -> Result<(
         )?;
         transaction.pragma_update(None, "user_version", migration.version)?;
     }
+
     transaction.commit()?;
     Ok(())
 }
@@ -574,6 +582,7 @@ mod tests {
                 .pragma_update(None, "user_version", migration.version)
                 .unwrap();
         }
+
         transaction.commit().unwrap();
     }
 

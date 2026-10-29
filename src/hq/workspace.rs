@@ -38,6 +38,7 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
                     baseline_tree: Some(baseline_tree),
                 });
             }
+
             cleanup_failed_executor_workspace(
                 &project_root,
                 &registration.data_dir,
@@ -71,6 +72,7 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
     } else {
         command.arg("--orphan").arg(&workspace_dir);
     }
+
     let output = command
         .output()
         .await
@@ -87,6 +89,7 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
             }
         );
     }
+
     let setup = async {
         seed_executor_workspace_from_canonical_changes(&project_root, &workspace_dir).await?;
         // Include the user's existing changes in the baseline so submission
@@ -118,6 +121,7 @@ pub(super) async fn prepare_executor_workspace(task_id: &str) -> Result<Executor
                     "Failed to clean up incomplete executor workspace: {cleanup_error:#}"
                 )));
             }
+
             return Err(error);
         }
     };
@@ -179,6 +183,7 @@ async fn seed_executor_workspace_from_canonical_changes(
     } else {
         copy_canonical_index_files(project_root, workspace_dir).await?;
     }
+
     copy_canonical_untracked_files(project_root, workspace_dir).await?;
     copy_canonical_agent_config_files(project_root, workspace_dir).await
 }
@@ -194,6 +199,7 @@ async fn read_executor_workspace_baseline_tree(path: &Path) -> Result<Option<Str
     if !tokio::fs::try_exists(path).await? {
         return Ok(None);
     }
+
     let value = tokio::fs::read_to_string(path).await.with_context(|| {
         format!(
             "Failed to read executor workspace baseline {}",
@@ -209,6 +215,7 @@ async fn write_executor_workspace_baseline_tree(path: &Path, baseline_tree: &str
             .await
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+
     tokio::fs::write(path, format!("{baseline_tree}\n"))
         .await
         .with_context(|| {
@@ -231,6 +238,7 @@ async fn persist_executor_workspace_baseline(
         let _ = crate::project::remove_executor_baseline(project_root, data_dir, task_id).await;
         return Err(err);
     }
+
     Ok(())
 }
 
@@ -263,6 +271,7 @@ async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path)
             }
         );
     }
+
     if diff.stdout.is_empty() {
         return Ok(());
     }
@@ -289,6 +298,7 @@ async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path)
             .await
             .context("Failed to stream canonical workspace diff")?;
     }
+
     let output = apply
         .wait_with_output()
         .await
@@ -305,6 +315,7 @@ async fn apply_canonical_tracked_diff(project_root: &Path, workspace_dir: &Path)
             }
         );
     }
+
     Ok(())
 }
 
@@ -364,6 +375,7 @@ async fn copy_canonical_listed_files(
         if relative.is_empty() {
             continue;
         }
+
         let relative = PathBuf::from(String::from_utf8_lossy(relative).into_owned());
         let source = project_root.join(&relative);
         let canonical_source = tokio::fs::canonicalize(&source)
@@ -372,6 +384,7 @@ async fn copy_canonical_listed_files(
         if canonical_source.starts_with(&workspace_dir) {
             continue;
         }
+
         let metadata = match tokio::fs::symlink_metadata(&source).await {
             Ok(metadata) => metadata,
             Err(error) if skip_missing && error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -382,9 +395,11 @@ async fn copy_canonical_listed_files(
         if metadata.is_dir() {
             continue;
         }
+
         let destination = workspace_dir.join(&relative);
         copy_canonical_entry(&source, &destination, metadata).await?;
     }
+
     Ok(())
 }
 
@@ -398,6 +413,7 @@ async fn copy_canonical_entry(
             .await
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+
     if source_metadata.file_type().is_symlink() {
         let target = tokio::fs::read_link(source)
             .await
@@ -411,12 +427,14 @@ async fn copy_canonical_entry(
         .await?;
         return Ok(());
     }
+
     if tokio::fs::symlink_metadata(destination)
         .await
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         remove_existing_file_or_symlink(destination).await?;
     }
+
     tokio::fs::copy(source, destination)
         .await
         .with_context(|| {
@@ -443,12 +461,14 @@ async fn remove_existing_file_or_symlink(path: &Path) -> Result<()> {
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
         anyhow::bail!("Refusing to replace directory {}", path.display());
     }
+
     #[cfg(windows)]
     if metadata.file_type().is_symlink_dir() {
         return tokio::fs::remove_dir(path)
             .await
             .with_context(|| format!("Failed to remove symlink {}", path.display()));
     }
+
     tokio::fs::remove_file(path)
         .await
         .with_context(|| format!("Failed to remove file or symlink {}", path.display()))
@@ -495,6 +515,7 @@ async fn copy_canonical_agent_config_files(
     for relative in AGENT_CONFIG_PATHS {
         copy_canonical_file_if_present(project_root, workspace_dir, Path::new(relative)).await?;
     }
+
     Ok(())
 }
 
@@ -518,6 +539,7 @@ async fn copy_canonical_ignored_agent_config_files(
             copy_canonical_file_if_present(project_root, workspace_dir, relative).await?;
         }
     }
+
     Ok(())
 }
 
@@ -533,9 +555,11 @@ async fn git_path_is_ignored(project_root: &Path, relative: &Path) -> Result<boo
     if output.status.success() {
         return Ok(true);
     }
+
     if output.status.code() == Some(1) {
         return Ok(false);
     }
+
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     anyhow::bail!(
         "Failed to inspect Git policy for {}: {}",

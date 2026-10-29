@@ -175,6 +175,7 @@ pub(super) async fn supervise(
             } else {
                 err_done = true;
             }
+
             continue;
         }
 
@@ -201,7 +202,11 @@ pub(super) async fn supervise(
         status.send_replace(snapshot.clone());
     };
 
-    process.tree.lock().unwrap().stop();
+    process
+        .tree
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .stop();
     snapshot.completion = reason;
     // An already-exited child cannot keep writing. Give its bounded pipe drain
     // and spool sync more time on slow filesystems without delaying cancellation.
@@ -218,6 +223,7 @@ pub(super) async fn supervise(
                 success: exit.success(),
             };
         }
+
         // Read the bounded tail after terminating descendants that inherited pipes.
         // Once quota is exceeded, close the pipes rather than drain unlimited data.
         while !(out_done && err_done)
@@ -238,8 +244,10 @@ pub(super) async fn supervise(
                 } else {
                     err_done = true;
                 }
+
                 continue;
             }
+
             if let Err(reason) = writer
                 .capture(
                     is_out,
@@ -254,6 +262,7 @@ pub(super) async fn supervise(
                 break;
             }
         }
+
         snapshot.output_complete = !interrupted_capture && out_done && err_done;
         writer.finish(&mut snapshot).await
     };
@@ -264,6 +273,7 @@ pub(super) async fn supervise(
         snapshot.completion = Completion::Unknown;
         snapshot.output_complete = false;
     }
+
     status.send_replace(snapshot);
 }
 
@@ -278,6 +288,7 @@ pub(super) async fn page(
     if offset > available {
         return Err(ToolError::InvalidArguments);
     }
+
     let count = (available - offset).min(max_bytes as u64) as usize;
     file.seek(std::io::SeekFrom::Start(offset))
         .await

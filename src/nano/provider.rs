@@ -44,6 +44,7 @@ impl ModelResponse {
         if self.finish != FinishReason::Length {
             return vec![Message::Assistant { response }];
         }
+
         response.calls.clear();
         vec![
             Message::Assistant { response },

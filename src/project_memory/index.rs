@@ -85,7 +85,7 @@ pub async fn index_current_project(
             Err(error) => return Err(error.into()),
         };
         MemoryIndexer::new(&source, &mut store)
-            .expect("static memory view name is valid")
+            .map_err(MemoryStoreError::from)?
             .index(options)
     })
     .await
@@ -110,6 +110,7 @@ fn remove_memory_sidecar_file_set(data_dir: &std::path::Path) -> Result<(), Memo
             }
         }
     }
+
     Ok(())
 }
 
@@ -131,7 +132,7 @@ impl<'a> MemoryIndexer<'a> {
     ) -> Result<MemoryIndexOutcome, MemoryIndexError> {
         let started = Instant::now();
         let manifest = self.source.manifest().map_err(MemoryIndexError::Source)?;
-        let build_id = next_build_id();
+        let build_id = next_build_id()?;
         let revision = MemoryRevision::from_manifest(&manifest, build_id.clone())?;
         let expected = self
             .store
@@ -153,7 +154,7 @@ impl<'a> MemoryIndexer<'a> {
                 let _ = self.store.fail_build(
                     &build_id,
                     &MemoryBuildFailure {
-                        code: diagnostic_code("build.failed"),
+                        code: diagnostic_code(const { crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("build.failed") }),
                     },
                 );
                 Err(error)
@@ -199,7 +200,11 @@ impl<'a> MemoryIndexer<'a> {
                     &mut diagnostics,
                     &revision,
                     source.category,
-                    "extractor.unavailable",
+                    const {
+                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                            "extractor.unavailable",
+                        )
+                    },
                 );
                 continue;
             };
@@ -243,10 +248,13 @@ impl<'a> MemoryIndexer<'a> {
                                     &mut diagnostics,
                                     &revision,
                                     source.category,
-                                    "extractor.fact_limit",
+                                    const {
+                                        crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static("extractor.fact.limit")
+                                    },
                                 );
                                 continue;
                             }
+
                             metrics.extracted_sources += 1;
                             cache_writes.push(CachedMemoryFragment {
                                 key,
@@ -269,6 +277,7 @@ impl<'a> MemoryIndexer<'a> {
             };
             merge_fragment(&mut entities, &mut relationships, fragment)?;
         }
+
         self.source
             .revalidate(manifest)
             .map_err(MemoryIndexError::Source)?;
@@ -341,7 +350,7 @@ impl<'a> MemoryIndexer<'a> {
         let repository_link_set = commit
             .repository_links
             .first()
-            .expect("local memory builds always resolve one repository link set")
+            .ok_or(MemoryStoreError::Corrupt)?
             .link_set
             .clone();
         let build_id = candidate_revision.completed_by.clone();
@@ -350,11 +359,18 @@ impl<'a> MemoryIndexer<'a> {
             let _ = self.store.fail_build(
                 &candidate_revision.completed_by,
                 &MemoryBuildFailure {
-                    code: diagnostic_code("build.commit_failed"),
+                    code: diagnostic_code(
+                        const {
+                            crate::project_memory::diagnostics::MemoryDiagnosticCode::from_static(
+                                "build.commit.failed",
+                            )
+                        },
+                    ),
                 },
             );
             return Err(error.into());
         }
+
         let revision = self
             .store
             .revision(&candidate_revision.id)?
@@ -403,6 +419,7 @@ fn merge_fragment(
             return Err(MemoryIndexError::FactCollision);
         }
     }
+
     for relationship in fragment.relationships {
         if let Some(existing) = relationships.insert(relationship.id.clone(), relationship.clone())
             && existing != relationship
@@ -410,6 +427,7 @@ fn merge_fragment(
             return Err(MemoryIndexError::FactCollision);
         }
     }
+
     Ok(())
 }
 
@@ -418,6 +436,7 @@ fn rebase_fragment(fragment: &mut MemoryFragment, revision: &MemoryRevision) {
         entity.memory_revision_id = revision.id.clone();
         entity.project = revision.project.clone();
     }
+
     for relationship in &mut fragment.relationships {
         relationship.memory_revision_id = revision.id.clone();
         relationship.project = revision.project.clone();
@@ -428,7 +447,7 @@ fn push_diagnostic(
     diagnostics: &mut Vec<MemoryDiagnostic>,
     revision: &MemoryRevision,
     category: MemorySourceCategory,
-    code: &str,
+    code: MemoryDiagnosticCode,
 ) {
     push_diagnostic_with_code(diagnostics, revision, category, diagnostic_code(code));
 }
@@ -442,6 +461,7 @@ fn push_diagnostic_with_code(
     if diagnostics.len() >= MAX_DIAGNOSTICS {
         return;
     }
+
     diagnostics.push(MemoryDiagnostic {
         build_id: revision.completed_by.clone(),
         revision_id: revision.id.clone(),
@@ -454,24 +474,25 @@ fn push_diagnostic_with_code(
     });
 }
 
-fn diagnostic_code(value: &str) -> MemoryDiagnosticCode {
-    MemoryDiagnosticCode::new(value).expect("static memory diagnostic code is valid")
+fn diagnostic_code(
+    value: crate::project_memory::diagnostics::MemoryDiagnosticCode,
+) -> MemoryDiagnosticCode {
+    value
 }
 
-fn next_build_id() -> MemoryBuildId {
+fn next_build_id() -> Result<MemoryBuildId, MemoryStoreError> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    let digest = super::extractors::canonical_digest(&(timestamp, sequence));
-    MemoryBuildId::new(format!("memory-build:{}", digest.value()))
-        .expect("sha256 memory build id is bounded")
+    let digest = super::extractors::canonical_digest(&(timestamp, sequence))?;
+    MemoryBuildId::new(format!("memory-build:{}", digest.value())).map_err(MemoryStoreError::from)
 }
 
 pub fn published_revision(
     store: &MemorySidecar,
     source: &LocalMemorySource,
 ) -> Result<Option<PublishedMemoryRevision>, MemoryStoreError> {
-    let view = MemoryViewName::new("project").expect("static memory view name is valid");
+    let view = const { MemoryViewName::from_static("project") };
     store.published_view(source.project(), &view)
 }
 
